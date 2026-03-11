@@ -8,7 +8,7 @@
     "basic": "tsx basic.ts",
     "agent": "tsx ai-agent-zapcode-ai.ts",
     "agent:anthropic": "tsx ai-agent-anthropic.ts",
-    "agent:vercel": "tsx ai-agent-vercel-ai.ts"
+    "agent:vercel": "tsx ai-agent-vercel-ai.ts",
   },
   "dependencies": {
     "@unchartedfr/zapcode": "file:../../crates/zapcode-js",
@@ -24,6 +24,7 @@
     "ai": "^4.1.0",
     "@ai-sdk/anthropic": "^1.1.0",
     "@ai-sdk/openai": "^1.1.0",
-    "@ai-sdk/google": "^1.1.0"
+    "@ai-sdk/google": "^1.1.0",
+    "@ai-sdk/amazon-bedrock": "^2.0.0"
   }
 }

@@ -27,6 +27,7 @@
  */
 
 import { Zapcode, ZapcodeSnapshotHandle } from "@unchartedfr/zapcode";
+import { jsonSchema, tool } from "ai";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -318,13 +319,13 @@ export function zapcode(options: ZapcodeAIOptions): ZapcodeAIResult {
     return executeCode(code, toolDefs, execOptions);
   };
 
-  // Vercel AI SDK format
-  const tools: Record<string, VercelAITool> = {
-    execute_code: {
+  // Vercel AI SDK format — use tool() + jsonSchema() for proper integration
+  const tools: Record<string, any> = {
+    execute_code: tool({
       description: CODE_TOOL_DESCRIPTION,
-      parameters: CODE_TOOL_SCHEMA,
-      execute: async (args: { code: string }) => handleToolCall(args.code),
-    },
+      parameters: jsonSchema(CODE_TOOL_SCHEMA),
+      execute: async (args: unknown) => handleToolCall((args as { code: string }).code),
+    }),
   };
 
   // OpenAI SDK format

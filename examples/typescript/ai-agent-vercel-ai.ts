@@ -63,6 +63,7 @@ async function main() {
     model: anthropic("claude-sonnet-4-20250514"),
     system,
     tools,
+    maxSteps: 5,
     messages: [
       { role: "user", content: "What's the weather in Tokyo?" },
     ],
@@ -76,6 +77,7 @@ async function main() {
     model: anthropic("claude-sonnet-4-20250514"),
     system,
     tools,
+    maxSteps: 5,
     messages: [
       {
         role: "user",
