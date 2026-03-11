@@ -78,6 +78,8 @@ jobs:
       - name: Build native module
         working-directory: crates/zapcode-js
         run: npx napi build --release --platform --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -144,6 +146,7 @@ jobs:
           - os: ubuntu-latest
             target: aarch64
             manylinux: auto
+            interpreter: "3.10 3.11 3.12"
           - os: macos-latest
             target: x86_64
             manylinux: auto
@@ -163,7 +166,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
-          args: --release --out dist -m crates/zapcode-py/Cargo.toml
+          args: --release --out dist -m crates/zapcode-py/Cargo.toml ${{ matrix.interpreter && format('-i {0}', matrix.interpreter) || '' }}
       - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:
