@@ -1,0 +1,22 @@
+language: en
+reviews:
+  profile: chill
+  high_level_summary: true
+  poem: false
+  review_status: true
+  auto_review:
+    enabled: true
+    drafts: false
+  path_instructions:
+    - path: "crates/zapcode-core/**"
+      instructions: |
+        This is the core sandbox interpreter. Pay special attention to:
+        - No std::fs, std::env, std::net, or std::process usage (sandbox invariant)
+        - No unsafe blocks without SAFETY comments
+        - Resource limit checks before allocations
+    - path: "crates/zapcode-js/**"
+      instructions: "Node.js bindings via NAPI-RS. No business logic here — only type marshaling."
+    - path: "crates/zapcode-py/**"
+      instructions: "Python bindings via PyO3. No business logic here — only type marshaling."
+chat:
+  auto_reply: true
