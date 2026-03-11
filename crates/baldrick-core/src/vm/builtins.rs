@@ -257,7 +257,7 @@ fn value_to_json(val: &Value) -> String {
                 .collect();
             format!("{{{}}}", pairs.join(","))
         }
-        Value::Function(_) | Value::BuiltinMethod { .. } => "undefined".to_string(),
+        Value::Function(_) | Value::BuiltinMethod { .. } | Value::Generator(_) => "undefined".to_string(),
     }
 }
 
@@ -594,7 +594,37 @@ fn call_array_method(arr: &[Value], method: &str, args: &[Value]) -> Result<Opti
             }
             Value::Array(result)
         }
-        "every" | "some" | "map" | "filter" | "reduce" | "forEach" | "find" | "findIndex" | "push" | "pop" | "shift" | "unshift" | "splice" | "sort" => {
+        "push" => {
+            let new_len = (arr.len() + args.len()) as i64;
+            Value::Int(new_len)
+        }
+        "pop" => {
+            arr.last().cloned().unwrap_or(Value::Undefined)
+        }
+        "shift" => {
+            arr.first().cloned().unwrap_or(Value::Undefined)
+        }
+        "unshift" => {
+            let new_len = (arr.len() + args.len()) as i64;
+            Value::Int(new_len)
+        }
+        "splice" => {
+            let len = arr.len() as i64;
+            let raw_start = if args.is_empty() { 0 } else { arg_int(args, 0) };
+            let start = if raw_start < 0 {
+                (len + raw_start).max(0) as usize
+            } else {
+                (raw_start as usize).min(arr.len())
+            };
+            let delete_count = if args.len() > 1 {
+                (arg_int(args, 1).max(0) as usize).min(arr.len() - start)
+            } else {
+                arr.len() - start
+            };
+            let deleted: Vec<Value> = arr[start..start + delete_count].to_vec();
+            Value::Array(deleted)
+        }
+        "every" | "some" | "map" | "filter" | "reduce" | "forEach" | "find" | "findIndex" | "sort" | "flatMap" => {
             // These require function callbacks — handled in VM dispatch
             return Ok(None);
         }

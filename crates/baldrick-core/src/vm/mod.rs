@@ -8,7 +8,7 @@ use crate::compiler::CompiledProgram;
 use crate::error::{BaldrickError, Result};
 use crate::sandbox::{ResourceLimits, ResourceTracker};
 use crate::snapshot::BaldrickSnapshot;
-use crate::value::{Closure, FunctionId, Value};
+use crate::value::{Closure, FunctionId, GeneratorObject, SuspendedFrame, Value};
 
 mod builtins;
 
@@ -25,36 +25,39 @@ pub enum VmState {
 
 /// A call frame in the VM stack.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct CallFrame {
-    func_index: Option<usize>,
-    ip: usize,
-    locals: Vec<Value>,
-    stack_base: usize,
+pub(crate) struct CallFrame {
+    pub(crate) func_index: Option<usize>,
+    pub(crate) ip: usize,
+    pub(crate) locals: Vec<Value>,
+    pub(crate) stack_base: usize,
+    /// The `this` value for method/constructor calls.
+    pub(crate) this_value: Option<Value>,
 }
 
 /// The Baldrick VM.
 pub struct Vm {
-    program: CompiledProgram,
-    stack: Vec<Value>,
-    frames: Vec<CallFrame>,
-    globals: HashMap<String, Value>,
-    #[allow(dead_code)]
-    stdout: String,
-    limits: ResourceLimits,
-    tracker: ResourceTracker,
-    external_functions: HashSet<String>,
-    try_stack: Vec<TryInfo>,
+    pub(crate) program: CompiledProgram,
+    pub(crate) stack: Vec<Value>,
+    pub(crate) frames: Vec<CallFrame>,
+    pub(crate) globals: HashMap<String, Value>,
+    pub(crate) stdout: String,
+    pub(crate) limits: ResourceLimits,
+    pub(crate) tracker: ResourceTracker,
+    pub(crate) external_functions: HashSet<String>,
+    pub(crate) try_stack: Vec<TryInfo>,
     /// The last object a property was accessed on — used for method dispatch.
     last_receiver: Option<Value>,
     /// The name of the last global loaded — used to identify known globals.
     last_global_name: Option<String>,
+    /// Counter for assigning unique generator IDs.
+    next_generator_id: u64,
 }
 
-#[derive(Debug, Clone)]
-struct TryInfo {
-    catch_ip: usize,
-    frame_depth: usize,
-    stack_depth: usize,
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct TryInfo {
+    pub(crate) catch_ip: usize,
+    pub(crate) frame_depth: usize,
+    pub(crate) stack_depth: usize,
 }
 
 impl Vm {
@@ -80,7 +83,56 @@ impl Vm {
             try_stack: Vec::new(),
             last_receiver: None,
             last_global_name: None,
+            next_generator_id: 0,
         }
+    }
+
+    /// Names of all builtin globals registered by `register_globals`.
+    pub(crate) const BUILTIN_GLOBAL_NAMES: &'static [&'static str] =
+        &["console", "JSON", "Object", "Array", "Math"];
+
+    /// Restore a VM from snapshot state and continue execution.
+    /// Builtins are re-registered after restoring user globals.
+    /// The return_value is pushed onto the stack (result of the external call).
+    pub(crate) fn from_snapshot(
+        program: CompiledProgram,
+        stack: Vec<Value>,
+        frames: Vec<CallFrame>,
+        user_globals: HashMap<String, Value>,
+        try_stack: Vec<TryInfo>,
+        stdout: String,
+        limits: ResourceLimits,
+        external_functions: HashSet<String>,
+    ) -> Self {
+        let mut globals = HashMap::new();
+        // Re-register builtins first
+        builtins::register_globals(&mut globals);
+        // Then overlay user globals (user globals take precedence if names collide)
+        for (k, v) in user_globals {
+            globals.insert(k, v);
+        }
+
+        Self {
+            program,
+            stack,
+            frames,
+            globals,
+            stdout,
+            limits,
+            tracker: ResourceTracker::default(),
+            external_functions,
+            try_stack,
+            last_receiver: None,
+            last_global_name: None,
+            next_generator_id: 0,
+        }
+    }
+
+    /// Resume execution after a snapshot restore. The return value from
+    /// the external function should already be pushed onto the stack.
+    pub(crate) fn resume_execution(&mut self) -> Result<VmState> {
+        self.tracker.start();
+        self.execute()
     }
 
     fn push(&mut self, value: Value) -> Result<()> {
@@ -126,6 +178,7 @@ impl Vm {
             ip: 0,
             locals: Vec::new(),
             stack_base: 0,
+            this_value: None,
         });
 
         self.execute()
@@ -154,9 +207,15 @@ impl Vm {
                     return Ok(VmState::Complete(result));
                 } else {
                     // Return from function
-                    self.frames.pop();
+                    let frame = self.frames.pop().unwrap();
                     self.tracker.pop_frame();
-                    self.push(Value::Undefined)?;
+                    // If this was a constructor, return `this`
+                    if let Some(this_val) = frame.this_value {
+                        self.stack.truncate(frame.stack_base);
+                        self.push(this_val)?;
+                    } else {
+                        self.push(Value::Undefined)?;
+                    }
                     continue;
                 }
             }
@@ -189,6 +248,480 @@ impl Vm {
                 }
             }
         }
+    }
+
+    /// Call a function value with the given arguments and run it to completion.
+    /// Returns the function's return value.
+    fn call_function_internal(&mut self, callee: &Value, args: Vec<Value>) -> Result<Value> {
+        let closure = match callee {
+            Value::Function(c) => c.clone(),
+            other => {
+                return Err(BaldrickError::TypeError(format!(
+                    "{} is not a function",
+                    other.to_js_string()
+                )));
+            }
+        };
+
+        let func_idx = closure.func_id.0;
+        self.tracker.push_frame();
+        self.tracker.check_stack(&self.limits)?;
+
+        let func = &self.program.functions[func_idx];
+
+        // Inject captured variables
+        for (name, val) in &closure.captured {
+            if !self.globals.contains_key(name) {
+                self.globals.insert(name.clone(), val.clone());
+            }
+        }
+
+        // Set up locals with args
+        let mut locals = Vec::with_capacity(func.local_count);
+        for (i, param) in func.params.iter().enumerate() {
+            match param {
+                ParamPattern::Ident(_) => {
+                    locals.push(args.get(i).cloned().unwrap_or(Value::Undefined));
+                }
+                ParamPattern::Rest(_) => {
+                    let rest: Vec<Value> = args[i..].to_vec();
+                    locals.push(Value::Array(rest));
+                }
+                ParamPattern::DefaultValue { default: _, .. } => {
+                    let val = args.get(i).cloned().unwrap_or(Value::Undefined);
+                    if matches!(val, Value::Undefined) {
+                        locals.push(Value::Undefined);
+                    } else {
+                        locals.push(val);
+                    }
+                }
+                _ => {
+                    locals.push(args.get(i).cloned().unwrap_or(Value::Undefined));
+                }
+            }
+        }
+
+        let target_frame_depth = self.frames.len();
+
+        self.frames.push(CallFrame {
+            func_index: Some(func_idx),
+            ip: 0,
+            locals,
+            stack_base: self.stack.len(),
+            this_value: None,
+        });
+
+        // Run until the new frame returns
+        loop {
+            self.tracker.check_time(&self.limits)?;
+
+            let frame = self.frames.last().unwrap();
+            let instructions = match frame.func_index {
+                Some(idx) => &self.program.functions[idx].instructions,
+                None => &self.program.instructions,
+            };
+
+            if frame.ip >= instructions.len() {
+                // End of function without explicit return
+                if self.frames.len() > target_frame_depth + 1 {
+                    // Inner function ended, pop and continue
+                    self.frames.pop();
+                    self.tracker.pop_frame();
+                    self.push(Value::Undefined)?;
+                    continue;
+                } else {
+                    // Our target function ended
+                    self.frames.pop();
+                    self.tracker.pop_frame();
+                    return Ok(Value::Undefined);
+                }
+            }
+
+            let instr = instructions[frame.ip].clone();
+            let result = self.dispatch(instr);
+
+            match result {
+                Ok(Some(VmState::Complete(val))) => {
+                    // A return happened that completed the top-level program.
+                    // This shouldn't happen inside a callback but handle gracefully.
+                    return Ok(val);
+                }
+                Ok(Some(VmState::Suspended { .. })) => {
+                    return Err(BaldrickError::RuntimeError(
+                        "cannot suspend inside array callback".to_string(),
+                    ));
+                }
+                Ok(None) => {
+                    // Check if the frame was popped by a Return instruction
+                    if self.frames.len() == target_frame_depth {
+                        // The function returned; return value is on the stack
+                        return Ok(self.pop().unwrap_or(Value::Undefined));
+                    }
+                }
+                Err(err) => {
+                    // Try to catch the error within the callback
+                    if let Some(try_info) = self.try_stack.pop() {
+                        while self.frames.len() > try_info.frame_depth {
+                            self.frames.pop();
+                            self.tracker.pop_frame();
+                        }
+                        self.stack.truncate(try_info.stack_depth);
+                        let error_val = Value::String(Arc::from(err.to_string()));
+                        self.push(error_val)?;
+                        self.current_frame_mut().ip = try_info.catch_ip;
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Execute an array callback method (map, filter, reduce, forEach, etc.)
+    fn execute_array_callback_method(
+        &mut self,
+        arr: Vec<Value>,
+        method: &str,
+        all_args: Vec<Value>,
+    ) -> Result<Value> {
+        let callback = all_args.first().cloned().unwrap_or(Value::Undefined);
+
+        match method {
+            "map" => {
+                let mut result = Vec::with_capacity(arr.len());
+                for (i, item) in arr.iter().enumerate() {
+                    let val = self.call_function_internal(
+                        &callback,
+                        vec![item.clone(), Value::Int(i as i64), Value::Array(arr.clone())],
+                    )?;
+                    result.push(val);
+                }
+                Ok(Value::Array(result))
+            }
+            "filter" => {
+                let mut result = Vec::new();
+                for (i, item) in arr.iter().enumerate() {
+                    let val = self.call_function_internal(
+                        &callback,
+                        vec![item.clone(), Value::Int(i as i64), Value::Array(arr.clone())],
+                    )?;
+                    if val.is_truthy() {
+                        result.push(item.clone());
+                    }
+                }
+                Ok(Value::Array(result))
+            }
+            "forEach" => {
+                for (i, item) in arr.iter().enumerate() {
+                    self.call_function_internal(
+                        &callback,
+                        vec![item.clone(), Value::Int(i as i64), Value::Array(arr.clone())],
+                    )?;
+                }
+                Ok(Value::Undefined)
+            }
+            "find" => {
+                for (i, item) in arr.iter().enumerate() {
+                    let val = self.call_function_internal(
+                        &callback,
+                        vec![item.clone(), Value::Int(i as i64), Value::Array(arr.clone())],
+                    )?;
+                    if val.is_truthy() {
+                        return Ok(item.clone());
+                    }
+                }
+                Ok(Value::Undefined)
+            }
+            "findIndex" => {
+                for (i, item) in arr.iter().enumerate() {
+                    let val = self.call_function_internal(
+                        &callback,
+                        vec![item.clone(), Value::Int(i as i64), Value::Array(arr.clone())],
+                    )?;
+                    if val.is_truthy() {
+                        return Ok(Value::Int(i as i64));
+                    }
+                }
+                Ok(Value::Int(-1))
+            }
+            "every" => {
+                for (i, item) in arr.iter().enumerate() {
+                    let val = self.call_function_internal(
+                        &callback,
+                        vec![item.clone(), Value::Int(i as i64), Value::Array(arr.clone())],
+                    )?;
+                    if !val.is_truthy() {
+                        return Ok(Value::Bool(false));
+                    }
+                }
+                Ok(Value::Bool(true))
+            }
+            "some" => {
+                for (i, item) in arr.iter().enumerate() {
+                    let val = self.call_function_internal(
+                        &callback,
+                        vec![item.clone(), Value::Int(i as i64), Value::Array(arr.clone())],
+                    )?;
+                    if val.is_truthy() {
+                        return Ok(Value::Bool(true));
+                    }
+                }
+                Ok(Value::Bool(false))
+            }
+            "reduce" => {
+                let init = all_args.get(1).cloned();
+                let mut accumulator;
+                let start_idx;
+
+                if let Some(init_val) = init {
+                    accumulator = init_val;
+                    start_idx = 0;
+                } else if !arr.is_empty() {
+                    accumulator = arr[0].clone();
+                    start_idx = 1;
+                } else {
+                    return Err(BaldrickError::TypeError(
+                        "Reduce of empty array with no initial value".to_string(),
+                    ));
+                }
+
+                for (i, item) in arr.iter().enumerate().skip(start_idx) {
+                    accumulator = self.call_function_internal(
+                        &callback,
+                        vec![
+                            accumulator,
+                            item.clone(),
+                            Value::Int(i as i64),
+                            Value::Array(arr.clone()),
+                        ],
+                    )?;
+                }
+                Ok(accumulator)
+            }
+            "sort" => {
+                let mut result = arr;
+                if matches!(callback, Value::Function(_)) {
+                    // Sort with comparator function using insertion sort
+                    let len = result.len();
+                    for i in 1..len {
+                        let mut j = i;
+                        while j > 0 {
+                            let cmp_val = self.call_function_internal(
+                                &callback,
+                                vec![result[j - 1].clone(), result[j].clone()],
+                            )?;
+                            let cmp = cmp_val.to_number();
+                            if cmp > 0.0 {
+                                result.swap(j - 1, j);
+                                j -= 1;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    // Default sort: convert to strings and sort lexicographically
+                    result.sort_by(|a, b| {
+                        let sa = a.to_js_string();
+                        let sb = b.to_js_string();
+                        sa.cmp(&sb)
+                    });
+                }
+                Ok(Value::Array(result))
+            }
+            "flatMap" => {
+                let mut result = Vec::new();
+                for (i, item) in arr.iter().enumerate() {
+                    let val = self.call_function_internal(
+                        &callback,
+                        vec![item.clone(), Value::Int(i as i64), Value::Array(arr.clone())],
+                    )?;
+                    match val {
+                        Value::Array(inner) => result.extend(inner),
+                        other => result.push(other),
+                    }
+                }
+                Ok(Value::Array(result))
+            }
+            _ => Err(BaldrickError::TypeError(format!(
+                "Unknown array callback method: {}",
+                method
+            ))),
+        }
+    }
+
+    fn alloc_generator_id(&mut self) -> u64 {
+        let id = self.next_generator_id;
+        self.next_generator_id += 1;
+        id
+    }
+
+    fn generator_next(&mut self, mut gen_obj: GeneratorObject, arg: Value) -> Result<Value> {
+        if gen_obj.done {
+            // Re-insert so subsequent calls still find it as done
+            let gen_id = gen_obj.id;
+            self.globals.insert(format!("__gen_{}", gen_id), Value::Generator(gen_obj));
+            return Ok(self.make_iterator_result(Value::Undefined, true));
+        }
+        for (name, val) in &gen_obj.captured {
+            if !self.globals.contains_key(name) {
+                self.globals.insert(name.clone(), val.clone());
+            }
+        }
+        let func_idx = gen_obj.func_id.0;
+        match gen_obj.suspended.take() {
+            None => {
+                let func = &self.program.functions[func_idx];
+                self.tracker.push_frame();
+                let mut locals = Vec::with_capacity(func.local_count);
+                for param in func.params.iter() {
+                    match param {
+                        ParamPattern::Ident(name) => {
+                            let val = gen_obj.captured.iter()
+                                .find(|(n, _)| n == name)
+                                .map(|(_, v)| v.clone())
+                                .unwrap_or(Value::Undefined);
+                            locals.push(val);
+                        }
+                        ParamPattern::Rest(name) => {
+                            let val = gen_obj.captured.iter()
+                                .find(|(n, _)| n == name)
+                                .map(|(_, v)| v.clone())
+                                .unwrap_or(Value::Array(Vec::new()));
+                            locals.push(val);
+                        }
+                        _ => { locals.push(Value::Undefined); }
+                    }
+                }
+                let stack_base = self.stack.len();
+                self.frames.push(CallFrame {
+                    func_index: Some(func_idx), ip: 0, locals, stack_base,
+                    this_value: None,
+                });
+                self.run_generator_until_yield_or_return(gen_obj)
+            }
+            Some(suspended) => {
+                self.tracker.push_frame();
+                let stack_base = self.stack.len();
+                for val in &suspended.stack {
+                    self.push(val.clone())?;
+                }
+                self.push(arg)?;
+                self.frames.push(CallFrame {
+                    func_index: Some(func_idx), ip: suspended.ip,
+                    locals: suspended.locals, stack_base,
+                    this_value: None,
+                });
+                self.run_generator_until_yield_or_return(gen_obj)
+            }
+        }
+    }
+
+    fn run_generator_until_yield_or_return(&mut self, mut gen_obj: GeneratorObject) -> Result<Value> {
+        let target_frame_depth = self.frames.len() - 1;
+        loop {
+            self.tracker.check_time(&self.limits)?;
+            let frame = self.frames.last().unwrap();
+            let instructions = match frame.func_index {
+                Some(idx) => &self.program.functions[idx].instructions,
+                None => &self.program.instructions,
+            };
+            if frame.ip >= instructions.len() {
+                if self.frames.len() > target_frame_depth + 1 {
+                    let frame = self.frames.pop().unwrap();
+                    self.tracker.pop_frame();
+                    if let Some(this_val) = frame.this_value {
+                        self.stack.truncate(frame.stack_base);
+                        self.push(this_val)?;
+                    } else {
+                        self.push(Value::Undefined)?;
+                    }
+                    continue;
+                }
+                let frame = self.frames.pop().unwrap();
+                self.tracker.pop_frame();
+                self.stack.truncate(frame.stack_base);
+                gen_obj.done = true;
+                gen_obj.suspended = None;
+                let gen_id = gen_obj.id;
+                self.globals.insert(format!("__gen_{}", gen_id), Value::Generator(gen_obj));
+                return Ok(self.make_iterator_result(Value::Undefined, true));
+            }
+            let instr = instructions[frame.ip].clone();
+            if matches!(instr, Instruction::Yield) {
+                self.current_frame_mut().ip += 1;
+                let yielded_value = self.pop()?;
+                let frame = self.frames.pop().unwrap();
+                self.tracker.pop_frame();
+                let frame_stack: Vec<Value> = self.stack.drain(frame.stack_base..).collect();
+                gen_obj.suspended = Some(SuspendedFrame {
+                    ip: frame.ip, locals: frame.locals, stack: frame_stack,
+                });
+                gen_obj.done = false;
+                let gen_id = gen_obj.id;
+                self.globals.insert(format!("__gen_{}", gen_id), Value::Generator(gen_obj));
+                return Ok(self.make_iterator_result(yielded_value, false));
+            }
+            if matches!(instr, Instruction::Return) {
+                self.current_frame_mut().ip += 1;
+                let return_val = self.pop().unwrap_or(Value::Undefined);
+                if self.frames.len() > target_frame_depth + 1 {
+                    let frame = self.frames.pop().unwrap();
+                    self.tracker.pop_frame();
+                    self.stack.truncate(frame.stack_base);
+                    self.push(return_val)?;
+                    continue;
+                }
+                let frame = self.frames.pop().unwrap();
+                self.tracker.pop_frame();
+                self.stack.truncate(frame.stack_base);
+                gen_obj.done = true;
+                gen_obj.suspended = None;
+                let gen_id = gen_obj.id;
+                self.globals.insert(format!("__gen_{}", gen_id), Value::Generator(gen_obj));
+                return Ok(self.make_iterator_result(return_val, true));
+            }
+            let result = self.dispatch(instr);
+            match result {
+                Ok(Some(VmState::Complete(val))) => return Ok(val),
+                Ok(Some(VmState::Suspended { .. })) => {
+                    return Err(BaldrickError::RuntimeError(
+                        "cannot suspend inside a generator".to_string(),
+                    ));
+                }
+                Ok(None) => {
+                    if self.frames.len() == target_frame_depth {
+                        let return_val = self.pop().unwrap_or(Value::Undefined);
+                        gen_obj.done = true;
+                        gen_obj.suspended = None;
+                        let gen_id = gen_obj.id;
+                        self.globals.insert(format!("__gen_{}", gen_id), Value::Generator(gen_obj));
+                        return Ok(self.make_iterator_result(return_val, true));
+                    }
+                }
+                Err(err) => {
+                    if let Some(try_info) = self.try_stack.pop() {
+                        while self.frames.len() > try_info.frame_depth {
+                            self.frames.pop();
+                            self.tracker.pop_frame();
+                        }
+                        self.stack.truncate(try_info.stack_depth);
+                        let error_val = Value::String(Arc::from(err.to_string()));
+                        self.push(error_val)?;
+                        self.current_frame_mut().ip = try_info.catch_ip;
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+    }
+
+    fn make_iterator_result(&self, value: Value, done: bool) -> Value {
+        let mut obj = IndexMap::new();
+        obj.insert(Arc::from("value"), value);
+        obj.insert(Arc::from("done"), Value::Bool(done));
+        Value::Object(obj)
     }
 
     fn dispatch(&mut self, instr: Instruction) -> Result<Option<VmState>> {
@@ -460,8 +993,10 @@ impl Vm {
                 self.push(result)?;
             }
             Instruction::SetProperty(name) => {
-                let value = self.pop()?;
+                // Stack: [value_to_store, object] with object on top
+                // (compile_store pushes object after the value)
                 let obj_val = self.pop()?;
+                let value = self.pop()?;
                 match obj_val {
                     Value::Object(mut obj) => {
                         obj.insert(Arc::from(name.as_str()), value);
@@ -552,10 +1087,22 @@ impl Vm {
                 self.push(Value::Bool(result))?;
             }
             Instruction::InstanceOf => {
-                let _right = self.pop()?;
-                let _left = self.pop()?;
-                // No class support yet — always false
-                self.push(Value::Bool(false))?;
+                let right = self.pop()?;
+                let left = self.pop()?;
+                // Check if left's __class__ matches right's __class_name__
+                let result = match (&left, &right) {
+                    (Value::Object(instance), Value::Object(class_obj)) => {
+                        if let (Some(inst_class), Some(class_name)) =
+                            (instance.get("__class__"), class_obj.get("__class_name__"))
+                        {
+                            inst_class == class_name
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                };
+                self.push(Value::Bool(result))?;
             }
 
             // Functions
@@ -599,62 +1146,111 @@ impl Vm {
                 match callee {
                     Value::Function(closure) => {
                         let func_idx = closure.func_id.0;
-                        self.tracker.push_frame();
-                        self.tracker.check_stack(&self.limits)?;
+                        let is_generator = self.program.functions[func_idx].is_generator;
 
-                        let func = &self.program.functions[func_idx];
-
-                        // Inject captured variables as globals
-                        for (name, val) in &closure.captured {
-                            if !self.globals.contains_key(name) {
-                                self.globals.insert(name.clone(), val.clone());
+                        // Generator function: create a Generator object instead of running
+                        if is_generator {
+                            let params = self.program.functions[func_idx].params.clone();
+                            let gen_id = self.alloc_generator_id();
+                            // Capture args as named params so generator_next can restore them
+                            let mut captured = closure.captured.clone();
+                            for (i, param) in params.iter().enumerate() {
+                                match param {
+                                    ParamPattern::Ident(name) => {
+                                        captured.push((name.clone(), args.get(i).cloned().unwrap_or(Value::Undefined)));
+                                    }
+                                    ParamPattern::Rest(name) => {
+                                        let rest: Vec<Value> = args[i..].to_vec();
+                                        captured.push((name.clone(), Value::Array(rest)));
+                                    }
+                                    _ => {}
+                                }
                             }
-                        }
+                            let gen_obj = GeneratorObject {
+                                id: gen_id,
+                                func_id: closure.func_id,
+                                captured,
+                                suspended: None,
+                                done: false,
+                            };
+                            // Store in globals registry so we can look it up by ID later
+                            self.globals.insert(format!("__gen_{}", gen_id), Value::Generator(gen_obj.clone()));
+                            self.push(Value::Generator(gen_obj))?;
+                            self.last_receiver = None;
+                        } else {
+                            self.tracker.push_frame();
+                            self.tracker.check_stack(&self.limits)?;
 
-                        // Set up locals with args
-                        let mut locals = Vec::with_capacity(func.local_count);
-                        for (i, param) in func.params.iter().enumerate() {
-                            match param {
-                                ParamPattern::Ident(_) => {
-                                    locals.push(args.get(i).cloned().unwrap_or(Value::Undefined));
+                            let func = &self.program.functions[func_idx];
+
+                            // Inject captured variables as globals
+                            for (name, val) in &closure.captured {
+                                if !self.globals.contains_key(name) {
+                                    self.globals.insert(name.clone(), val.clone());
                                 }
-                                ParamPattern::Rest(_) => {
-                                    let rest: Vec<Value> = args[i..].to_vec();
-                                    locals.push(Value::Array(rest));
-                                }
-                                ParamPattern::DefaultValue { default: _, .. } => {
-                                    let val = args.get(i).cloned().unwrap_or(Value::Undefined);
-                                    if matches!(val, Value::Undefined) {
-                                        locals.push(Value::Undefined);
-                                    } else {
-                                        locals.push(val);
+                            }
+
+                            // Set up locals with args
+                            let mut locals = Vec::with_capacity(func.local_count);
+                            for (i, param) in func.params.iter().enumerate() {
+                                match param {
+                                    ParamPattern::Ident(_) => {
+                                        locals.push(args.get(i).cloned().unwrap_or(Value::Undefined));
+                                    }
+                                    ParamPattern::Rest(_) => {
+                                        let rest: Vec<Value> = args[i..].to_vec();
+                                        locals.push(Value::Array(rest));
+                                    }
+                                    ParamPattern::DefaultValue { default: _, .. } => {
+                                        let val = args.get(i).cloned().unwrap_or(Value::Undefined);
+                                        if matches!(val, Value::Undefined) {
+                                            locals.push(Value::Undefined);
+                                        } else {
+                                            locals.push(val);
+                                        }
+                                    }
+                                    _ => {
+                                        locals.push(args.get(i).cloned().unwrap_or(Value::Undefined));
                                     }
                                 }
-                                _ => {
-                                    locals.push(args.get(i).cloned().unwrap_or(Value::Undefined));
-                                }
                             }
-                        }
 
-                        self.frames.push(CallFrame {
-                            func_index: Some(func_idx),
-                            ip: 0,
-                            locals,
-                            stack_base: self.stack.len(),
-                        });
-                        self.last_receiver = None;
+                            let this_value = self.last_receiver.take();
+
+                            self.frames.push(CallFrame {
+                                func_index: Some(func_idx),
+                                ip: 0,
+                                locals,
+                                stack_base: self.stack.len(),
+                                this_value,
+                            });
+                        }
                     }
                     Value::BuiltinMethod { object_name, method_name } => {
                         let receiver = self.last_receiver.take();
                         let result = match object_name.as_ref() {
                             "__array__" => {
                                 if let Some(Value::Array(arr)) = &receiver {
-                                    builtins::call_builtin(
-                                        &Value::Array(arr.clone()),
-                                        &method_name,
-                                        &args,
-                                        &mut self.stdout,
-                                    )?
+                                    // Check if this is a callback method first
+                                    match method_name.as_ref() {
+                                        "map" | "filter" | "forEach" | "find" | "findIndex"
+                                        | "every" | "some" | "reduce" | "sort" | "flatMap" => {
+                                            let result = self.execute_array_callback_method(
+                                                arr.clone(),
+                                                &method_name,
+                                                args,
+                                            )?;
+                                            Some(result)
+                                        }
+                                        _ => {
+                                            builtins::call_builtin(
+                                                &Value::Array(arr.clone()),
+                                                &method_name,
+                                                &args,
+                                                &mut self.stdout,
+                                            )?
+                                        }
+                                    }
                                 } else {
                                     None
                                 }
@@ -667,6 +1263,37 @@ impl Vm {
                                         &args,
                                         &mut self.stdout,
                                     )?
+                                } else {
+                                    None
+                                }
+                            }
+                            "__generator__" => {
+                                if let Some(Value::Generator(gen_obj)) = receiver {
+                                    match method_name.as_ref() {
+                                        "next" => {
+                                            let arg = args.into_iter().next().unwrap_or(Value::Undefined);
+                                            // Get the latest generator state from registry
+                                            let gen_key = format!("__gen_{}", gen_obj.id);
+                                            let current_gen = if let Some(Value::Generator(g)) = self.globals.remove(&gen_key) {
+                                                g
+                                            } else {
+                                                gen_obj
+                                            };
+                                            let result = self.generator_next(current_gen, arg)?;
+                                            Some(result)
+                                        }
+                                        "return" => {
+                                            let val = args.into_iter().next().unwrap_or(Value::Undefined);
+                                            let gen_key = format!("__gen_{}", gen_obj.id);
+                                            if let Some(Value::Generator(mut g)) = self.globals.remove(&gen_key) {
+                                                g.done = true;
+                                                g.suspended = None;
+                                                self.globals.insert(gen_key, Value::Generator(g));
+                                            }
+                                            Some(self.make_iterator_result(val, true))
+                                        }
+                                        _ => None,
+                                    }
                                 } else {
                                     None
                                 }
@@ -707,8 +1334,28 @@ impl Vm {
 
                 let frame = self.frames.pop().unwrap();
                 self.tracker.pop_frame();
+
+                // If this was a constructor frame (has this_value), return the
+                // updated `this` instead of the explicit return value (unless
+                // the constructor explicitly returns an object).
+                let actual_return = if let Some(ref this_val) = frame.this_value {
+                    // Also propagate this back to parent frame (for super() calls)
+                    if let Some(parent) = self.frames.last_mut() {
+                        if parent.this_value.is_some() {
+                            parent.this_value = Some(this_val.clone());
+                        }
+                    }
+                    if matches!(return_val, Value::Undefined) {
+                        this_val.clone()
+                    } else {
+                        return_val
+                    }
+                } else {
+                    return_val
+                };
+
                 self.stack.truncate(frame.stack_base);
-                self.push(return_val)?;
+                self.push(actual_return)?;
             }
             Instruction::CallExternal(name, arg_count) => {
                 if !self.external_functions.contains(&name) {
@@ -780,6 +1427,14 @@ impl Vm {
                         ]);
                         self.push(iter_obj)?;
                     }
+                    Value::Generator(gen_obj) => {
+                        let iter_obj = Value::Array(vec![
+                            Value::String(Arc::from("__gen__")),
+                            Value::Int(gen_obj.id as i64),
+                            Value::Bool(false),
+                        ]);
+                        self.push(iter_obj)?;
+                    }
                     _ => {
                         return Err(BaldrickError::TypeError(format!(
                             "{} is not iterable",
@@ -790,6 +1445,46 @@ impl Vm {
             }
             Instruction::IteratorNext => {
                 let iter = self.pop()?;
+                // Check for generator iterator (3-element sentinel)
+                if let Value::Array(ref items) = iter {
+                    if items.len() == 3 {
+                        if let Value::String(ref s) = items[0] {
+                            if s.as_ref() == "__gen__" {
+                                let gen_id = match &items[1] {
+                                    Value::Int(id) => *id as u64,
+                                    _ => return Err(BaldrickError::RuntimeError("bad gen iter".into())),
+                                };
+                                let gen_key = format!("__gen_{}", gen_id);
+                                let gen_obj = if let Some(Value::Generator(g)) = self.globals.remove(&gen_key) {
+                                    g
+                                } else {
+                                    self.push(Value::Array(vec![
+                                        Value::String(Arc::from("__gen__")),
+                                        Value::Int(gen_id as i64),
+                                        Value::Bool(true),
+                                    ]))?;
+                                    self.push(Value::Undefined)?;
+                                    return Ok(None);
+                                };
+                                let result = self.generator_next(gen_obj, Value::Undefined)?;
+                                if let Value::Object(ref obj) = result {
+                                    let done = obj.get("done").is_some_and(|v| matches!(v, Value::Bool(true)));
+                                    let value = obj.get("value").cloned().unwrap_or(Value::Undefined);
+                                    self.push(Value::Array(vec![
+                                        Value::String(Arc::from("__gen__")),
+                                        Value::Int(gen_id as i64),
+                                        Value::Bool(done),
+                                    ]))?;
+                                    self.push(value)?;
+                                } else {
+                                    self.push(iter)?;
+                                    self.push(Value::Undefined)?;
+                                }
+                                return Ok(None);
+                            }
+                        }
+                    }
+                }
                 match iter {
                     Value::Array(ref items) if items.len() == 2 => {
                         let arr = match &items[0] {
@@ -822,8 +1517,23 @@ impl Vm {
                 }
             }
             Instruction::IteratorDone => {
-                // Check if the top value is the "done" sentinel
                 let value = self.pop()?;
+                let iter = self.peek()?;
+                // Check for generator iterator first
+                if let Value::Array(items) = iter {
+                    if items.len() == 3 {
+                        if let Value::String(ref s) = items[0] {
+                            if s.as_ref() == "__gen__" {
+                                let done = matches!(&items[2], Value::Bool(true));
+                                if !done {
+                                    self.push(value)?;
+                                }
+                                self.push(Value::Bool(done))?;
+                                return Ok(None);
+                            }
+                        }
+                    }
+                }
                 let iter = self.peek()?;
                 match iter {
                     Value::Array(items) if items.len() == 2 => {
@@ -941,6 +1651,305 @@ impl Vm {
             }
 
             Instruction::Nop => {}
+
+            // Generators
+            Instruction::CreateGenerator(_func_idx) => {
+                // Generator creation is handled at Call time via is_generator check.
+            }
+            Instruction::Yield => {
+                // Yield is handled in run_generator_until_yield_or_return.
+                // Reaching here means yield outside a generator function.
+                return Err(BaldrickError::RuntimeError(
+                    "yield can only be used inside a generator function".to_string(),
+                ));
+            }
+
+            // Classes
+            Instruction::CreateClass { name, n_methods, n_statics, has_super } => {
+                // Stack layout (top to bottom):
+                // constructor closure (or undefined)
+                // n_methods * (closure, method_name_string) pairs
+                // n_statics * (closure, method_name_string) pairs
+                // [optional super class if has_super]
+
+                let constructor = self.pop()?;
+
+                // Pop instance methods
+                let mut prototype = IndexMap::new();
+                for _ in 0..n_methods {
+                    let method_closure = self.pop()?;
+                    let method_name = self.pop()?;
+                    if let Value::String(mn) = method_name {
+                        prototype.insert(mn, method_closure);
+                    }
+                }
+
+                // Pop static methods
+                let mut statics = IndexMap::new();
+                for _ in 0..n_statics {
+                    let method_closure = self.pop()?;
+                    let method_name = self.pop()?;
+                    if let Value::String(mn) = method_name {
+                        statics.insert(mn, method_closure);
+                    }
+                }
+
+                // Pop super class if present
+                let super_class = if has_super {
+                    Some(self.pop()?)
+                } else {
+                    None
+                };
+
+                // If super class, copy its prototype methods to ours (inheritance)
+                if let Some(Value::Object(ref sc)) = super_class {
+                    if let Some(Value::Object(super_proto)) = sc.get("__prototype__").cloned() {
+                        // Super prototype methods go first, then our own (which override)
+                        let mut merged = super_proto;
+                        for (k, v) in prototype {
+                            merged.insert(k, v);
+                        }
+                        prototype = merged;
+                    }
+                }
+
+                // Build the class object
+                let mut class_obj = IndexMap::new();
+                class_obj.insert(Arc::from("__class_name__"), Value::String(Arc::from(name.as_str())));
+                class_obj.insert(Arc::from("__constructor__"), constructor);
+                class_obj.insert(Arc::from("__prototype__"), Value::Object(prototype));
+
+                // Store super class reference for super() calls
+                if let Some(sc) = super_class {
+                    class_obj.insert(Arc::from("__super__"), sc);
+                }
+
+                // Add static methods directly on the class object
+                for (k, v) in statics {
+                    class_obj.insert(k, v);
+                }
+
+                self.push(Value::Object(class_obj))?;
+            }
+
+            Instruction::Construct(arg_count) => {
+                let mut args = Vec::with_capacity(arg_count);
+                for _ in 0..arg_count {
+                    args.push(self.pop()?);
+                }
+                args.reverse();
+
+                let callee = self.pop()?;
+
+                match &callee {
+                    Value::Object(class_obj) if class_obj.contains_key("__class_name__") => {
+                        // Create a new instance object
+                        let mut instance = IndexMap::new();
+
+                        // Copy prototype methods onto the instance
+                        if let Some(Value::Object(proto)) = class_obj.get("__prototype__") {
+                            for (k, v) in proto {
+                                instance.insert(k.clone(), v.clone());
+                            }
+                        }
+
+                        // Store class reference for instanceof
+                        if let Some(class_name) = class_obj.get("__class_name__") {
+                            instance.insert(Arc::from("__class__"), class_name.clone());
+                        }
+
+                        let instance_val = Value::Object(instance);
+
+                        // Call the constructor with `this` bound to the instance
+                        if let Some(ctor) = class_obj.get("__constructor__") {
+                            if let Value::Function(closure) = ctor {
+                                let func_idx = closure.func_id.0;
+                                self.tracker.push_frame();
+                                self.tracker.check_stack(&self.limits)?;
+
+                                let func = &self.program.functions[func_idx];
+
+                                // Inject captured variables
+                                for (cname, val) in &closure.captured {
+                                    if !self.globals.contains_key(cname) {
+                                        self.globals.insert(cname.clone(), val.clone());
+                                    }
+                                }
+
+                                // Set up locals with args
+                                let mut locals = Vec::with_capacity(func.local_count);
+                                for (i, param) in func.params.iter().enumerate() {
+                                    match param {
+                                        ParamPattern::Ident(_) => {
+                                            locals.push(args.get(i).cloned().unwrap_or(Value::Undefined));
+                                        }
+                                        ParamPattern::Rest(_) => {
+                                            let rest: Vec<Value> = args[i..].to_vec();
+                                            locals.push(Value::Array(rest));
+                                        }
+                                        ParamPattern::DefaultValue { .. } => {
+                                            let val = args.get(i).cloned().unwrap_or(Value::Undefined);
+                                            locals.push(val);
+                                        }
+                                        _ => {
+                                            locals.push(args.get(i).cloned().unwrap_or(Value::Undefined));
+                                        }
+                                    }
+                                }
+
+                                self.frames.push(CallFrame {
+                                    func_index: Some(func_idx),
+                                    ip: 0,
+                                    locals,
+                                    stack_base: self.stack.len(),
+                                    this_value: Some(instance_val),
+                                });
+                                self.last_receiver = None;
+                            } else {
+                                // No valid constructor, just return the instance
+                                self.push(instance_val)?;
+                            }
+                        } else {
+                            // No constructor, just return the instance
+                            self.push(instance_val)?;
+                        }
+                    }
+                    Value::Function(closure) => {
+                        // `new` on a plain function — just call it
+                        let func_idx = closure.func_id.0;
+                        self.tracker.push_frame();
+                        self.tracker.check_stack(&self.limits)?;
+
+                        let func = &self.program.functions[func_idx];
+
+                        for (cname, val) in &closure.captured {
+                            if !self.globals.contains_key(cname) {
+                                self.globals.insert(cname.clone(), val.clone());
+                            }
+                        }
+
+                        let mut locals = Vec::with_capacity(func.local_count);
+                        for (i, param) in func.params.iter().enumerate() {
+                            match param {
+                                ParamPattern::Ident(_) => {
+                                    locals.push(args.get(i).cloned().unwrap_or(Value::Undefined));
+                                }
+                                ParamPattern::Rest(_) => {
+                                    let rest: Vec<Value> = args[i..].to_vec();
+                                    locals.push(Value::Array(rest));
+                                }
+                                _ => {
+                                    locals.push(args.get(i).cloned().unwrap_or(Value::Undefined));
+                                }
+                            }
+                        }
+
+                        self.frames.push(CallFrame {
+                            func_index: Some(func_idx),
+                            ip: 0,
+                            locals,
+                            stack_base: self.stack.len(),
+                            this_value: None,
+                        });
+                        self.last_receiver = None;
+                    }
+                    _ => {
+                        return Err(BaldrickError::TypeError(format!(
+                            "{} is not a constructor",
+                            callee.to_js_string()
+                        )));
+                    }
+                }
+            }
+
+            Instruction::LoadThis => {
+                // Walk frames from top to find the nearest `this` value
+                let this_val = self.frames.iter().rev()
+                    .find_map(|f| f.this_value.clone())
+                    .unwrap_or(Value::Undefined);
+                self.push(this_val)?;
+            }
+            Instruction::StoreThis => {
+                let val = self.pop()?;
+                // Update this_value in the nearest frame that has one
+                for frame in self.frames.iter_mut().rev() {
+                    if frame.this_value.is_some() {
+                        frame.this_value = Some(val);
+                        break;
+                    }
+                }
+            }
+            Instruction::CallSuper(arg_count) => {
+                let mut args = Vec::with_capacity(arg_count);
+                for _ in 0..arg_count {
+                    args.push(self.pop()?);
+                }
+                args.reverse();
+
+                // Get current `this` value (the instance being constructed)
+                let this_val = self.frames.iter().rev()
+                    .find_map(|f| f.this_value.clone())
+                    .unwrap_or(Value::Undefined);
+
+                // Find the super class constructor from the class that's being constructed.
+                // We need to look it up from the globals — the class with __super__ key.
+                // The super class info is stored on the class object.
+                // We'll look through globals for the class that has __super__.
+                let mut super_ctor = None;
+                for (_name, val) in &self.globals {
+                    if let Value::Object(obj) = val {
+                        if let Some(Value::Object(super_class)) = obj.get("__super__") {
+                            if let Some(ctor) = super_class.get("__constructor__") {
+                                super_ctor = Some(ctor.clone());
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if let Some(Value::Function(closure)) = super_ctor {
+                    let func_idx = closure.func_id.0;
+                    self.tracker.push_frame();
+                    self.tracker.check_stack(&self.limits)?;
+
+                    let func = &self.program.functions[func_idx];
+
+                    for (cname, val) in &closure.captured {
+                        if !self.globals.contains_key(cname) {
+                            self.globals.insert(cname.clone(), val.clone());
+                        }
+                    }
+
+                    let mut locals = Vec::with_capacity(func.local_count);
+                    for (i, param) in func.params.iter().enumerate() {
+                        match param {
+                            ParamPattern::Ident(_) => {
+                                locals.push(args.get(i).cloned().unwrap_or(Value::Undefined));
+                            }
+                            ParamPattern::Rest(_) => {
+                                let rest: Vec<Value> = args[i..].to_vec();
+                                locals.push(Value::Array(rest));
+                            }
+                            _ => {
+                                locals.push(args.get(i).cloned().unwrap_or(Value::Undefined));
+                            }
+                        }
+                    }
+
+                    self.frames.push(CallFrame {
+                        func_index: Some(func_idx),
+                        ip: 0,
+                        locals,
+                        stack_base: self.stack.len(),
+                        this_value: Some(this_val),
+                    });
+                    self.last_receiver = None;
+                } else {
+                    // No super constructor found — push undefined
+                    self.push(Value::Undefined)?;
+                }
+            }
+
         }
 
         Ok(None)
@@ -996,6 +2005,15 @@ impl Vm {
                     "length" => Ok(Value::Int(s.chars().count() as i64)),
                     _ if is_string_method(name) => Ok(Value::BuiltinMethod {
                         object_name: Arc::from("__string__"),
+                        method_name: Arc::from(name),
+                    }),
+                    _ => Ok(Value::Undefined),
+                }
+            }
+            Value::Generator(_) => {
+                match name {
+                    "next" | "return" | "throw" => Ok(Value::BuiltinMethod {
+                        object_name: Arc::from("__generator__"),
                         method_name: Arc::from(name),
                     }),
                     _ => Ok(Value::Undefined),
@@ -1058,8 +2076,8 @@ impl BaldrickRun {
 
     pub fn run(&self, input_values: Vec<(String, Value)>) -> Result<RunResult> {
         let program = crate::parser::parse(&self.source)?;
-        let compiled = crate::compiler::compile(&program)?;
         let ext_set: HashSet<String> = self.external_functions.iter().cloned().collect();
+        let compiled = crate::compiler::compile_with_externals(&program, ext_set.clone())?;
         let mut vm = Vm::new(compiled, self.limits.clone(), ext_set);
 
         // Inject inputs as globals
@@ -1072,6 +2090,22 @@ impl BaldrickRun {
             state,
             stdout: vm.stdout,
         })
+    }
+
+    /// Start execution. Like `run()`, but returns the raw `VmState` directly
+    /// instead of wrapping it in a `RunResult`. This is the primary entry point
+    /// for code that needs to handle suspension / snapshot / resume.
+    pub fn start(&self, input_values: Vec<(String, Value)>) -> Result<VmState> {
+        let program = crate::parser::parse(&self.source)?;
+        let ext_set: HashSet<String> = self.external_functions.iter().cloned().collect();
+        let compiled = crate::compiler::compile_with_externals(&program, ext_set.clone())?;
+        let mut vm = Vm::new(compiled, self.limits.clone(), ext_set);
+
+        for (name, value) in input_values {
+            vm.globals.insert(name, value);
+        }
+
+        vm.run()
     }
 
     pub fn run_simple(&self) -> Result<Value> {

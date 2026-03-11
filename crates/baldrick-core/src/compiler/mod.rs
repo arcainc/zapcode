@@ -1,6 +1,6 @@
 pub mod instruction;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use instruction::*;
 use crate::error::{BaldrickError, Result};
@@ -22,6 +22,7 @@ pub struct CompiledFunction {
     pub local_count: usize,
     pub local_names: Vec<String>,
     pub is_async: bool,
+    pub is_generator: bool,
 }
 
 struct Compiler {
@@ -30,6 +31,7 @@ struct Compiler {
     local_indices: HashMap<String, usize>,
     functions: Vec<CompiledFunction>,
     loop_stack: Vec<LoopInfo>,
+    external_functions: HashSet<String>,
 }
 
 struct LoopInfo {
@@ -38,13 +40,14 @@ struct LoopInfo {
 }
 
 impl Compiler {
-    fn new() -> Self {
+    fn new(external_functions: HashSet<String>) -> Self {
         Self {
             instructions: Vec::new(),
             locals: Vec::new(),
             local_indices: HashMap::new(),
             functions: Vec::new(),
             loop_stack: Vec::new(),
+            external_functions,
         }
     }
 
@@ -115,7 +118,7 @@ impl Compiler {
     }
 
     fn compile_function_def(&mut self, func: &FunctionDef) -> Result<CompiledFunction> {
-        let mut func_compiler = Compiler::new();
+        let mut func_compiler = Compiler::new(self.external_functions.clone());
 
         // Set up parameters as locals
         for param in &func.params {
@@ -162,6 +165,7 @@ impl Compiler {
             local_count: func_compiler.locals.len(),
             local_names: func_compiler.locals,
             is_async: func.is_async,
+            is_generator: func.is_generator,
         })
     }
 
@@ -413,6 +417,20 @@ impl Compiler {
                     self.emit(Instruction::Pop);
                 }
             }
+            Statement::ClassDecl { name, super_class, constructor, methods, static_methods, .. } => {
+                self.compile_class(
+                    Some(name),
+                    super_class.as_deref(),
+                    constructor.as_deref(),
+                    methods,
+                    static_methods,
+                )?;
+                // Store the class as both local and global
+                self.emit(Instruction::Dup);
+                let idx = self.declare_local(name);
+                self.emit(Instruction::StoreLocal(idx));
+                self.emit(Instruction::StoreGlobal(name.clone()));
+            }
             Statement::Switch { discriminant, cases, .. } => {
                 self.compile_expr(discriminant)?;
                 let mut case_jumps = Vec::new();
@@ -565,7 +583,9 @@ impl Compiler {
                 self.emit(Instruction::Push(Constant::Undefined));
             }
             Expr::Ident(name) => {
-                if let Some(idx) = self.resolve_local(name) {
+                if name == "this" {
+                    self.emit(Instruction::LoadThis);
+                } else if let Some(idx) = self.resolve_local(name) {
                     self.emit(Instruction::LoadLocal(idx));
                 } else {
                     self.emit(Instruction::LoadGlobal(name.clone()));
@@ -793,6 +813,27 @@ impl Compiler {
                 }
             }
             Expr::Call { callee, args, .. } => {
+                // Check if this is a super() call
+                if let Expr::Ident(name) = callee.as_ref() {
+                    if name == "super" {
+                        for arg in args {
+                            self.compile_expr(arg)?;
+                        }
+                        self.emit(Instruction::CallSuper(args.len()));
+                        return Ok(());
+                    }
+                }
+                // Check if this is a direct call to an external function
+                if let Expr::Ident(name) = callee.as_ref() {
+                    if self.external_functions.contains(name) {
+                        // Emit args then CallExternal (no callee push needed)
+                        for arg in args {
+                            self.compile_expr(arg)?;
+                        }
+                        self.emit(Instruction::CallExternal(name.clone(), args.len()));
+                        return Ok(());
+                    }
+                }
                 self.compile_expr(callee)?;
                 for arg in args {
                     self.compile_expr(arg)?;
@@ -804,7 +845,7 @@ impl Compiler {
                 for arg in args {
                     self.compile_expr(arg)?;
                 }
-                self.emit(Instruction::Call(args.len()));
+                self.emit(Instruction::Construct(args.len()));
             }
             Expr::ArrowFunction { func_index } | Expr::FunctionExpr { func_index } => {
                 self.emit(Instruction::CreateClosure(*func_index));
@@ -813,16 +854,94 @@ impl Compiler {
                 self.compile_expr(expr)?;
                 // Await is handled at the VM level — for external calls it triggers suspension
             }
+            Expr::Yield { value, delegate: _ } => {
+                // Compile the yielded value (or undefined if none)
+                match value {
+                    Some(expr) => self.compile_expr(expr)?,
+                    None => { self.emit(Instruction::Push(Constant::Undefined)); }
+                }
+                // Yield instruction: suspends the generator, pops value, pushes received value on resume
+                self.emit(Instruction::Yield);
+            }
             Expr::TypeOf(operand) => {
                 self.compile_expr(operand)?;
                 self.emit(Instruction::TypeOf);
+            }
+            Expr::ClassExpr { name, super_class, constructor, methods, static_methods } => {
+                self.compile_class(
+                    name.as_deref(),
+                    super_class.as_deref(),
+                    constructor.as_deref(),
+                    methods,
+                    static_methods,
+                )?;
             }
         }
         Ok(())
     }
 
+    fn compile_class(
+        &mut self,
+        name: Option<&str>,
+        super_class: Option<&str>,
+        constructor: Option<&FunctionDef>,
+        methods: &[ClassMethod],
+        static_methods: &[ClassMethod],
+    ) -> Result<()> {
+        let class_name = name.unwrap_or("AnonymousClass").to_string();
+
+        // Push super class if present
+        if let Some(sc) = super_class {
+            if let Some(idx) = self.resolve_local(sc) {
+                self.emit(Instruction::LoadLocal(idx));
+            } else {
+                self.emit(Instruction::LoadGlobal(sc.to_string()));
+            }
+        }
+
+        // Push static methods: name, closure pairs
+        for sm in static_methods {
+            self.emit(Instruction::Push(Constant::String(sm.name.clone())));
+            let compiled = self.compile_function_def(&sm.func)?;
+            let func_idx = self.functions.len();
+            self.functions.push(compiled);
+            self.emit(Instruction::CreateClosure(func_idx));
+        }
+
+        // Push instance methods: name, closure pairs
+        for m in methods {
+            self.emit(Instruction::Push(Constant::String(m.name.clone())));
+            let compiled = self.compile_function_def(&m.func)?;
+            let func_idx = self.functions.len();
+            self.functions.push(compiled);
+            self.emit(Instruction::CreateClosure(func_idx));
+        }
+
+        // Push constructor closure (or undefined if none)
+        if let Some(ctor) = constructor {
+            let compiled = self.compile_function_def(ctor)?;
+            let func_idx = self.functions.len();
+            self.functions.push(compiled);
+            self.emit(Instruction::CreateClosure(func_idx));
+        } else {
+            self.emit(Instruction::Push(Constant::Undefined));
+        }
+
+        self.emit(Instruction::CreateClass {
+            name: class_name,
+            n_methods: methods.len(),
+            n_statics: static_methods.len(),
+            has_super: super_class.is_some(),
+        });
+
+        Ok(())
+    }
+
     fn compile_store(&mut self, target: &Expr) -> Result<()> {
         match target {
+            Expr::Ident(name) if name == "this" => {
+                self.emit(Instruction::StoreThis);
+            }
             Expr::Ident(name) => {
                 if let Some(idx) = self.resolve_local(name) {
                     self.emit(Instruction::StoreLocal(idx));
@@ -854,7 +973,14 @@ impl Compiler {
 }
 
 pub fn compile(program: &Program) -> Result<CompiledProgram> {
-    let mut compiler = Compiler::new();
+    compile_with_externals(program, HashSet::new())
+}
+
+pub fn compile_with_externals(
+    program: &Program,
+    external_functions: HashSet<String>,
+) -> Result<CompiledProgram> {
+    let mut compiler = Compiler::new(external_functions);
     compiler.compile_program(program)?;
 
     Ok(CompiledProgram {

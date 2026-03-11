@@ -99,6 +99,32 @@ pub enum Instruction {
     DestructureObject(Vec<String>),
     DestructureArray(usize),
 
+    // Classes
+    /// Create a class: pops constructor closure (or undefined), then n_methods method closures
+    /// with method names, then n_static static closures with names, then optional super class.
+    /// Pushes the class object (an Object with __constructor__, __prototype__, __class_name__).
+    CreateClass {
+        name: String,
+        n_methods: usize,
+        n_statics: usize,
+        has_super: bool,
+    },
+    /// Construct: pops class object + args, creates instance, calls constructor, pushes instance.
+    Construct(usize),
+    /// Load `this` from the current call frame.
+    LoadThis,
+    /// Store a value as the current `this` (used for this.prop = val).
+    StoreThis,
+    /// Call super constructor with n args. Pops args, looks up __super__.__constructor__,
+    /// calls it with current `this`.
+    CallSuper(usize),
+
+    // Generators
+    /// Create a generator object from a function index (like CreateClosure but for generators).
+    CreateGenerator(usize),
+    /// Yield a value from a generator. Pops the value, suspends execution.
+    Yield,
+
     // Misc
     Nop,
 }

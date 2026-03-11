@@ -14,6 +14,10 @@ pub enum Value {
     Array(Vec<Value>),
     Object(IndexMap<Arc<str>, Value>),
     Function(Closure),
+    /// A generator object — calling function* creates one of these.
+    /// Generators are stateful and cannot be serialized mid-yield.
+    #[serde(skip)]
+    Generator(GeneratorObject),
     /// Internal: a bound method on a built-in object (e.g., console.log, Math.floor).
     /// Not visible to user code — used to dispatch builtin calls.
     #[serde(skip)]
@@ -34,6 +38,29 @@ pub struct Closure {
     pub captured: Vec<(String, Value)>,
 }
 
+/// The state of a generator object.
+#[derive(Debug, Clone)]
+pub struct GeneratorObject {
+    /// Unique ID for this generator instance (used as key in VM generator registry).
+    pub id: u64,
+    /// The function this generator was created from.
+    pub func_id: FunctionId,
+    /// Captured closure variables.
+    pub captured: Vec<(String, Value)>,
+    /// Suspended execution state. None = not yet started.
+    pub suspended: Option<SuspendedFrame>,
+    /// Whether the generator has completed.
+    pub done: bool,
+}
+
+/// Saved execution state of a suspended generator.
+#[derive(Debug, Clone)]
+pub struct SuspendedFrame {
+    pub ip: usize,
+    pub locals: Vec<Value>,
+    pub stack: Vec<Value>,
+}
+
 impl Value {
     pub fn type_name(&self) -> &'static str {
         match self {
@@ -45,6 +72,7 @@ impl Value {
             Value::Array(_) => "object",
             Value::Object(_) => "object",
             Value::Function(_) | Value::BuiltinMethod { .. } => "function",
+            Value::Generator(_) => "object",
         }
     }
 
@@ -55,7 +83,8 @@ impl Value {
             Value::Int(n) => *n != 0,
             Value::Float(n) => *n != 0.0 && !n.is_nan(),
             Value::String(s) => !s.is_empty(),
-            Value::Array(_) | Value::Object(_) | Value::Function(_) | Value::BuiltinMethod { .. } => true,
+            Value::Array(_) | Value::Object(_) | Value::Function(_)
+            | Value::BuiltinMethod { .. } | Value::Generator(_) => true,
         }
     }
 
@@ -96,6 +125,7 @@ impl Value {
             }
             Value::Object(_) => "[object Object]".to_string(),
             Value::Function(_) | Value::BuiltinMethod { .. } => "function".to_string(),
+            Value::Generator(_) => "[object Generator]".to_string(),
         }
     }
 

@@ -33,6 +33,7 @@ pub struct FunctionDef {
     pub params: Vec<ParamPattern>,
     pub body: Vec<Statement>,
     pub is_async: bool,
+    pub is_generator: bool,
     pub is_arrow: bool,
     pub span: Span,
 }
@@ -124,6 +125,20 @@ pub enum Statement {
         test: Expr,
         span: Span,
     },
+    ClassDecl {
+        name: String,
+        super_class: Option<String>,
+        constructor: Option<Box<FunctionDef>>,
+        methods: Vec<ClassMethod>,
+        static_methods: Vec<ClassMethod>,
+        span: Span,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassMethod {
+    pub name: String,
+    pub func: FunctionDef,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,8 +264,23 @@ pub enum Expr {
     // Async
     Await(Box<Expr>),
 
+    // Generators
+    Yield {
+        value: Option<Box<Expr>>,
+        delegate: bool,
+    },
+
     // Typeof
     TypeOf(Box<Expr>),
+
+    // Classes
+    ClassExpr {
+        name: Option<String>,
+        super_class: Option<String>,
+        constructor: Option<Box<FunctionDef>>,
+        methods: Vec<ClassMethod>,
+        static_methods: Vec<ClassMethod>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

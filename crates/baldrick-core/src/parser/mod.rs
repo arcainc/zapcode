@@ -118,6 +118,7 @@ impl<'a> AstLowerer<'a> {
                 Ok(Statement::Continue { span: self.span(s.span) })
             }
             ast::Statement::FunctionDeclaration(func) => self.lower_func_decl(func),
+            ast::Statement::ClassDeclaration(class) => self.lower_class_decl(class),
             ast::Statement::SwitchStatement(switch) => self.lower_switch(switch),
             ast::Statement::EmptyStatement(_) => {
                 Ok(Statement::Expression {
@@ -414,6 +415,7 @@ impl<'a> AstLowerer<'a> {
             params,
             body,
             is_async: func.r#async,
+            is_generator: func.generator,
             is_arrow: false,
             span: self.span(func.span),
         })
@@ -442,6 +444,149 @@ impl<'a> AstLowerer<'a> {
             }
         }
         Ok(result)
+    }
+
+    fn lower_class_decl(&mut self, class: &ast::Class<'_>) -> Result<Statement> {
+        let span = self.span(class.span);
+        let name = class
+            .id
+            .as_ref()
+            .map(|id| id.name.to_string())
+            .unwrap_or_else(|| "AnonymousClass".to_string());
+
+        let super_class = match &class.super_class {
+            Some(expr) => {
+                if let ast::Expression::Identifier(id) = expr {
+                    Some(id.name.to_string())
+                } else {
+                    return Err(self.unsupported(class.span, "computed super class expressions are not supported"));
+                }
+            }
+            None => None,
+        };
+
+        let (constructor, methods, static_methods) = self.lower_class_body(&class.body)?;
+
+        Ok(Statement::ClassDecl {
+            name,
+            super_class,
+            constructor,
+            methods,
+            static_methods,
+            span,
+        })
+    }
+
+    fn lower_class_expr(&mut self, class: &ast::Class<'_>) -> Result<Expr> {
+        let name = class.id.as_ref().map(|id| id.name.to_string());
+
+        let super_class = match &class.super_class {
+            Some(expr) => {
+                if let ast::Expression::Identifier(id) = expr {
+                    Some(id.name.to_string())
+                } else {
+                    return Err(self.unsupported(class.span, "computed super class expressions are not supported"));
+                }
+            }
+            None => None,
+        };
+
+        let (constructor, methods, static_methods) = self.lower_class_body(&class.body)?;
+
+        Ok(Expr::ClassExpr {
+            name,
+            super_class,
+            constructor,
+            methods,
+            static_methods,
+        })
+    }
+
+    fn lower_class_body(
+        &mut self,
+        body: &ast::ClassBody<'_>,
+    ) -> Result<(Option<Box<FunctionDef>>, Vec<ClassMethod>, Vec<ClassMethod>)> {
+        let mut constructor = None;
+        let mut methods = Vec::new();
+        let mut static_methods = Vec::new();
+
+        for element in &body.body {
+            match element {
+                ast::ClassElement::MethodDefinition(method) => {
+                    let method_name = match &method.key {
+                        ast::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+                        ast::PropertyKey::StringLiteral(s) => s.value.to_string(),
+                        _ => continue, // skip computed method names
+                    };
+
+                    let func = &method.value;
+                    let params = self.lower_formal_params(&func.params)?;
+                    let body_stmts = match &func.body {
+                        Some(body) => self.lower_statements(&body.statements)?,
+                        None => Vec::new(),
+                    };
+
+                    let func_def = FunctionDef {
+                        name: Some(method_name.clone()),
+                        params,
+                        body: body_stmts,
+                        is_async: func.r#async,
+                        is_generator: false,
+                        is_arrow: false,
+                        span: self.span(func.span),
+                    };
+
+                    match method.kind {
+                        ast::MethodDefinitionKind::Constructor => {
+                            constructor = Some(Box::new(func_def));
+                        }
+                        ast::MethodDefinitionKind::Method => {
+                            if method.r#static {
+                                static_methods.push(ClassMethod {
+                                    name: method_name,
+                                    func: func_def,
+                                });
+                            } else {
+                                methods.push(ClassMethod {
+                                    name: method_name,
+                                    func: func_def,
+                                });
+                            }
+                        }
+                        ast::MethodDefinitionKind::Get | ast::MethodDefinitionKind::Set => {
+                            // Getters/setters: treat as regular methods for now
+                            if method.r#static {
+                                static_methods.push(ClassMethod {
+                                    name: method_name,
+                                    func: func_def,
+                                });
+                            } else {
+                                methods.push(ClassMethod {
+                                    name: method_name,
+                                    func: func_def,
+                                });
+                            }
+                        }
+                    }
+                }
+                ast::ClassElement::PropertyDefinition(_) => {
+                    // Class property declarations (e.g., `name: string;`) are type-level
+                    // and are handled at runtime through constructor assignments.
+                    // Skip them in the IR.
+                }
+                ast::ClassElement::AccessorProperty(s) => {
+                    return Err(self.unsupported(s.span, "accessor properties in classes are not supported"));
+                }
+                ast::ClassElement::TSIndexSignature(_) => {
+                    // TypeScript-only, skip
+                }
+                ast::ClassElement::StaticBlock(s) => {
+                    return Err(self.unsupported(s.span, "static blocks are not supported"));
+                }
+            }
+        }
+
+        Ok((constructor, methods, static_methods))
     }
 
     fn lower_switch(&mut self, switch: &ast::SwitchStatement<'_>) -> Result<Statement> {
@@ -707,6 +852,7 @@ impl<'a> AstLowerer<'a> {
                     params,
                     body,
                     is_async: arrow.r#async,
+                    is_generator: false,
                     is_arrow: true,
                     span: self.span(arrow.span),
                 });
@@ -737,11 +883,18 @@ impl<'a> AstLowerer<'a> {
             ast::Expression::Super(_) => {
                 Ok(Expr::Ident("super".to_string()))
             }
-            ast::Expression::YieldExpression(s) => {
-                Err(self.unsupported(s.span, "yield/generators are not yet supported"))
+            ast::Expression::YieldExpression(yield_expr) => {
+                let value = match &yield_expr.argument {
+                    Some(arg) => Some(Box::new(self.lower_expr(arg)?)),
+                    None => None,
+                };
+                Ok(Expr::Yield {
+                    value,
+                    delegate: yield_expr.delegate,
+                })
             }
-            ast::Expression::ClassExpression(s) => {
-                Err(self.unsupported(s.span, "class expressions are not yet supported"))
+            ast::Expression::ClassExpression(class) => {
+                self.lower_class_expr(class)
             }
             ast::Expression::MetaProperty(s) => {
                 Err(self.unsupported(s.span, "meta properties are not supported"))

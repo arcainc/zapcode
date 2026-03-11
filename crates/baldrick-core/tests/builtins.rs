@@ -257,3 +257,322 @@ fn test_array_is_array_false() {
     let result = eval_ts("Array.isArray(42)").unwrap();
     assert_eq!(result, Value::Bool(false));
 }
+
+// ── Array mutating methods ──────────────────────────────────────────
+
+#[test]
+fn test_array_push() {
+    let result = eval_ts("[1, 2, 3].push(4)").unwrap();
+    assert_eq!(result, Value::Int(4));
+}
+
+#[test]
+fn test_array_push_multiple() {
+    let result = eval_ts("[1].push(2, 3, 4)").unwrap();
+    assert_eq!(result, Value::Int(4));
+}
+
+#[test]
+fn test_array_pop() {
+    let result = eval_ts("[1, 2, 3].pop()").unwrap();
+    assert_eq!(result, Value::Int(3));
+}
+
+#[test]
+fn test_array_pop_empty() {
+    let result = eval_ts("[].pop()").unwrap();
+    assert_eq!(result, Value::Undefined);
+}
+
+#[test]
+fn test_array_shift() {
+    let result = eval_ts("[1, 2, 3].shift()").unwrap();
+    assert_eq!(result, Value::Int(1));
+}
+
+#[test]
+fn test_array_shift_empty() {
+    let result = eval_ts("[].shift()").unwrap();
+    assert_eq!(result, Value::Undefined);
+}
+
+#[test]
+fn test_array_unshift() {
+    let result = eval_ts("[3, 4].unshift(1, 2)").unwrap();
+    assert_eq!(result, Value::Int(4));
+}
+
+#[test]
+fn test_array_splice() {
+    let result = eval_ts("[1, 2, 3, 4, 5].splice(1, 2)").unwrap();
+    match result {
+        Value::Array(arr) => {
+            assert_eq!(arr.len(), 2);
+            assert_eq!(arr[0], Value::Int(2));
+            assert_eq!(arr[1], Value::Int(3));
+        }
+        other => panic!("expected array, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_array_splice_with_insert() {
+    let result = eval_ts("[1, 2, 3].splice(1, 1, 10, 20)").unwrap();
+    match result {
+        Value::Array(arr) => {
+            assert_eq!(arr.len(), 1);
+            assert_eq!(arr[0], Value::Int(2));
+        }
+        other => panic!("expected array, got {:?}", other),
+    }
+}
+
+// ── Array callback methods ──────────────────────────────────────────
+
+#[test]
+fn test_array_map() {
+    let result = eval_ts("[1, 2, 3].map((x) => x * 2)").unwrap();
+    match result {
+        Value::Array(arr) => {
+            assert_eq!(arr.len(), 3);
+            assert_eq!(arr[0], Value::Int(2));
+            assert_eq!(arr[1], Value::Int(4));
+            assert_eq!(arr[2], Value::Int(6));
+        }
+        other => panic!("expected array, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_array_map_with_index() {
+    let result = eval_ts("[10, 20, 30].map((x, i) => i)").unwrap();
+    match result {
+        Value::Array(arr) => {
+            assert_eq!(arr[0], Value::Int(0));
+            assert_eq!(arr[1], Value::Int(1));
+            assert_eq!(arr[2], Value::Int(2));
+        }
+        other => panic!("expected array, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_array_filter() {
+    let result = eval_ts("[1, 2, 3, 4, 5].filter((x) => x > 3)").unwrap();
+    match result {
+        Value::Array(arr) => {
+            assert_eq!(arr.len(), 2);
+            assert_eq!(arr[0], Value::Int(4));
+            assert_eq!(arr[1], Value::Int(5));
+        }
+        other => panic!("expected array, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_array_filter_empty_result() {
+    let result = eval_ts("[1, 2, 3].filter((x) => x > 10)").unwrap();
+    match result {
+        Value::Array(arr) => assert_eq!(arr.len(), 0),
+        other => panic!("expected array, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_array_reduce_with_init() {
+    let result = eval_ts("[1, 2, 3, 4].reduce((acc, x) => acc + x, 0)").unwrap();
+    assert_eq!(result, Value::Int(10));
+}
+
+#[test]
+fn test_array_reduce_no_init() {
+    let result = eval_ts("[1, 2, 3, 4].reduce((acc, x) => acc + x)").unwrap();
+    assert_eq!(result, Value::Int(10));
+}
+
+#[test]
+fn test_array_reduce_strings() {
+    let result = eval_ts(r#"["a", "b", "c"].reduce((acc, x) => acc + x, "")"#).unwrap();
+    assert_eq!(result, Value::String("abc".into()));
+}
+
+#[test]
+fn test_array_foreach() {
+    let (result, stdout) = eval_ts_with_output(
+        r#"
+        const arr = [1, 2, 3];
+        arr.forEach((x) => console.log(x));
+        "#,
+    ).unwrap();
+    assert_eq!(result, Value::Undefined);
+    assert_eq!(stdout, "1\n2\n3\n");
+}
+
+#[test]
+fn test_array_find() {
+    let result = eval_ts("[1, 2, 3, 4, 5].find((x) => x > 3)").unwrap();
+    assert_eq!(result, Value::Int(4));
+}
+
+#[test]
+fn test_array_find_not_found() {
+    let result = eval_ts("[1, 2, 3].find((x) => x > 10)").unwrap();
+    assert_eq!(result, Value::Undefined);
+}
+
+#[test]
+fn test_array_find_index() {
+    let result = eval_ts("[1, 2, 3, 4, 5].findIndex((x) => x > 3)").unwrap();
+    assert_eq!(result, Value::Int(3));
+}
+
+#[test]
+fn test_array_find_index_not_found() {
+    let result = eval_ts("[1, 2, 3].findIndex((x) => x > 10)").unwrap();
+    assert_eq!(result, Value::Int(-1));
+}
+
+#[test]
+fn test_array_every_true() {
+    let result = eval_ts("[2, 4, 6].every((x) => x % 2 === 0)").unwrap();
+    assert_eq!(result, Value::Bool(true));
+}
+
+#[test]
+fn test_array_every_false() {
+    let result = eval_ts("[2, 3, 6].every((x) => x % 2 === 0)").unwrap();
+    assert_eq!(result, Value::Bool(false));
+}
+
+#[test]
+fn test_array_some_true() {
+    let result = eval_ts("[1, 3, 4].some((x) => x % 2 === 0)").unwrap();
+    assert_eq!(result, Value::Bool(true));
+}
+
+#[test]
+fn test_array_some_false() {
+    let result = eval_ts("[1, 3, 5].some((x) => x % 2 === 0)").unwrap();
+    assert_eq!(result, Value::Bool(false));
+}
+
+#[test]
+fn test_array_sort_default() {
+    let result = eval_ts(r#"["banana", "apple", "cherry"].sort()"#).unwrap();
+    match result {
+        Value::Array(arr) => {
+            assert_eq!(arr[0], Value::String("apple".into()));
+            assert_eq!(arr[1], Value::String("banana".into()));
+            assert_eq!(arr[2], Value::String("cherry".into()));
+        }
+        other => panic!("expected array, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_array_sort_with_comparator() {
+    let result = eval_ts("[3, 1, 4, 1, 5].sort((a, b) => a - b)").unwrap();
+    match result {
+        Value::Array(arr) => {
+            assert_eq!(arr[0], Value::Int(1));
+            assert_eq!(arr[1], Value::Int(1));
+            assert_eq!(arr[2], Value::Int(3));
+            assert_eq!(arr[3], Value::Int(4));
+            assert_eq!(arr[4], Value::Int(5));
+        }
+        other => panic!("expected array, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_array_sort_descending() {
+    let result = eval_ts("[3, 1, 4, 1, 5].sort((a, b) => b - a)").unwrap();
+    match result {
+        Value::Array(arr) => {
+            assert_eq!(arr[0], Value::Int(5));
+            assert_eq!(arr[1], Value::Int(4));
+            assert_eq!(arr[2], Value::Int(3));
+            assert_eq!(arr[3], Value::Int(1));
+            assert_eq!(arr[4], Value::Int(1));
+        }
+        other => panic!("expected array, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_array_flat_map() {
+    let result = eval_ts("[1, 2, 3].flatMap((x) => [x, x * 2])").unwrap();
+    match result {
+        Value::Array(arr) => {
+            assert_eq!(arr.len(), 6);
+            assert_eq!(arr[0], Value::Int(1));
+            assert_eq!(arr[1], Value::Int(2));
+            assert_eq!(arr[2], Value::Int(2));
+            assert_eq!(arr[3], Value::Int(4));
+            assert_eq!(arr[4], Value::Int(3));
+            assert_eq!(arr[5], Value::Int(6));
+        }
+        other => panic!("expected array, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_array_flat_map_non_array() {
+    let result = eval_ts("[1, 2, 3].flatMap((x) => x * 2)").unwrap();
+    match result {
+        Value::Array(arr) => {
+            assert_eq!(arr.len(), 3);
+            assert_eq!(arr[0], Value::Int(2));
+            assert_eq!(arr[1], Value::Int(4));
+            assert_eq!(arr[2], Value::Int(6));
+        }
+        other => panic!("expected array, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_array_map_with_closure() {
+    let result = eval_ts(
+        r#"
+        const multiplier = 10;
+        [1, 2, 3].map((x) => x * multiplier)
+        "#,
+    ).unwrap();
+    match result {
+        Value::Array(arr) => {
+            assert_eq!(arr[0], Value::Int(10));
+            assert_eq!(arr[1], Value::Int(20));
+            assert_eq!(arr[2], Value::Int(30));
+        }
+        other => panic!("expected array, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_array_chained_methods() {
+    let result = eval_ts(
+        "[1, 2, 3, 4, 5].filter((x) => x % 2 === 0).map((x) => x * 10)",
+    ).unwrap();
+    match result {
+        Value::Array(arr) => {
+            assert_eq!(arr.len(), 2);
+            assert_eq!(arr[0], Value::Int(20));
+            assert_eq!(arr[1], Value::Int(40));
+        }
+        other => panic!("expected array, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_array_every_empty() {
+    // every on empty array returns true (vacuous truth)
+    let result = eval_ts("[].every((x) => x > 0)").unwrap();
+    assert_eq!(result, Value::Bool(true));
+}
+
+#[test]
+fn test_array_some_empty() {
+    // some on empty array returns false
+    let result = eval_ts("[].some((x) => x > 0)").unwrap();
+    assert_eq!(result, Value::Bool(false));
+}
