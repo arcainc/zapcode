@@ -107,7 +107,7 @@ jobs:
           path: crates/zapcode-js/artifacts
       - name: Move artifacts to correct locations
         working-directory: crates/zapcode-js
-        run: npx napi artifacts --dir artifacts
+        run: npx napi artifacts --output-dir artifacts
       - name: List packages
         working-directory: crates/zapcode-js
         run: ls -R npm/
