@@ -2,8 +2,6 @@
 
 ## Setup
 
-First, build the Baldrick Python bindings (requires Rust toolchain + maturin):
-
 ### With uv (recommended)
 
 ```bash
@@ -25,11 +23,14 @@ pip install anthropic      # for the AI agent example
 
 ```bash
 # Basic usage
-python basic.py                # or: uv run basic.py
+python basic.py                     # or: uv run basic.py
 
-# AI agent with Anthropic SDK (requires ANTHROPIC_API_KEY)
+# AI agent with baldrick-ai wrapper (recommended — requires ANTHROPIC_API_KEY)
 export ANTHROPIC_API_KEY=sk-ant-...
-python ai_agent_anthropic.py   # or: uv run ai_agent_anthropic.py
+python ai_agent_baldrick_ai.py
+
+# AI agent with raw Anthropic SDK
+python ai_agent_anthropic.py
 ```
 
 ## What's here
@@ -37,4 +38,5 @@ python ai_agent_anthropic.py   # or: uv run ai_agent_anthropic.py
 | File | Description |
 |---|---|
 | `basic.py` | Simple expressions, inputs, data processing, snapshot/resume, serialization |
-| `ai_agent_anthropic.py` | Claude writes TypeScript code, Baldrick executes it with getWeather/searchFlights tools |
+| `ai_agent_baldrick_ai.py` | **Recommended** — uses `baldrick-ai` wrapper with Anthropic SDK |
+| `ai_agent_anthropic.py` | Raw Anthropic SDK + manual snapshot/resume loop |

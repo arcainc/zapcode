@@ -25,11 +25,14 @@ bun install
 # Basic usage
 npm run basic          # or: bun run basic / yarn basic / pnpm basic
 
-# AI agent with Anthropic SDK (requires ANTHROPIC_API_KEY)
+# AI agent with @baldrick/ai wrapper (recommended — requires ANTHROPIC_API_KEY)
 export ANTHROPIC_API_KEY=sk-ant-...
+npm run agent
+
+# AI agent with raw Anthropic SDK
 npm run agent:anthropic
 
-# AI agent with Vercel AI SDK (requires ANTHROPIC_API_KEY)
+# AI agent with Vercel AI SDK
 npm run agent:vercel
 ```
 
@@ -38,5 +41,6 @@ npm run agent:vercel
 | File | Description |
 |---|---|
 | `basic.ts` | Simple expressions, inputs, data processing, classes, resource limits |
-| `ai-agent-anthropic.ts` | Claude writes TypeScript code, Baldrick executes it with getWeather/searchFlights tools |
-| `ai-agent-vercel-ai.ts` | Same pattern using Vercel AI SDK (`ai` + `@ai-sdk/anthropic`) |
+| `ai-agent-baldrick-ai.ts` | **Recommended** — uses `@baldrick/ai` wrapper with Vercel AI SDK |
+| `ai-agent-anthropic.ts` | Raw Anthropic SDK + manual snapshot/resume loop |
+| `ai-agent-vercel-ai.ts` | Vercel AI SDK with manual code generation |

@@ -140,93 +140,219 @@ This outputs a `pkg/` directory you can import in any browser or bundler.
 
 ## Usage
 
-### AI agent with tool calls (TypeScript + Anthropic)
+### With Vercel AI SDK (`@baldrick/ai`)
 
-The core use case: Claude writes code, Baldrick runs it safely, and your app resolves tool calls.
+The recommended way — one call gives you `{ system, tools }` that plug directly into `generateText` / `streamText`:
+
+```typescript
+import { baldrick } from "@baldrick/ai";
+import { generateText } from "ai";
+import { anthropic } from "@ai-sdk/anthropic";
+
+const { system, tools } = baldrick({
+  system: "You are a helpful travel assistant.",
+  tools: {
+    getWeather: {
+      description: "Get current weather for a city",
+      parameters: { city: { type: "string", description: "City name" } },
+      execute: async ({ city }) => {
+        const res = await fetch(`https://api.weather.com/${city}`);
+        return res.json();
+      },
+    },
+    searchFlights: {
+      description: "Search flights between two cities",
+      parameters: {
+        from: { type: "string" },
+        to: { type: "string" },
+        date: { type: "string" },
+      },
+      execute: async ({ from, to, date }) => {
+        return flightAPI.search(from, to, date);
+      },
+    },
+  },
+});
+
+// Works with any AI SDK model — Anthropic, OpenAI, Google, etc.
+const { text } = await generateText({
+  model: anthropic("claude-sonnet-4-20250514"),
+  system,
+  tools,
+  messages: [{ role: "user", content: "Weather in Tokyo and cheapest flight from London?" }],
+});
+```
+
+Under the hood: the LLM writes TypeScript code that calls your tools → Baldrick executes it in a sandbox → tool calls suspend the VM → your `execute` functions run on the host → results flow back in. All in ~2µs startup + tool execution time.
+
+See [`examples/typescript/ai-agent-baldrick-ai.ts`](examples/typescript/ai-agent-baldrick-ai.ts) for the full working example.
+
+### With Anthropic SDK directly
+
+<details>
+<summary><strong>TypeScript</strong></summary>
 
 ```typescript
 import Anthropic from "@anthropic-ai/sdk";
 import { Baldrick, BaldrickSnapshotHandle } from "@baldrick/core";
 
-// Your tools — real implementations on your server
 const tools = {
-    getWeather: async (city: string) => {
-        const res = await fetch(`https://api.weather.com/${city}`);
-        return res.json();
-    },
+  getWeather: async (city: string) => {
+    const res = await fetch(`https://api.weather.com/${city}`);
+    return res.json();
+  },
 };
 
-// Ask Claude to write code
 const client = new Anthropic();
 const response = await client.messages.create({
-    model: "claude-sonnet-4-20250514",
-    max_tokens: 1024,
-    system: `Write TypeScript to answer the user's question.
+  model: "claude-sonnet-4-20250514",
+  max_tokens: 1024,
+  system: `Write TypeScript to answer the user's question.
 Available functions (use await): getWeather(city: string) → { condition, temp }
-Input variable: userQuery (string). Last expression = output. No markdown fences.`,
-    messages: [{ role: "user", content: "What's the weather in Tokyo?" }],
+Last expression = output. No markdown fences.`,
+  messages: [{ role: "user", content: "What's the weather in Tokyo?" }],
 });
 
 const code = response.content[0].type === "text" ? response.content[0].text : "";
 
-// Execute in the sandbox
-const sandbox = new Baldrick(code, {
-    inputs: ["userQuery"],
-    externalFunctions: ["getWeather"],
-    timeLimitMs: 10_000,
-});
-
-let state = sandbox.start({ userQuery: "What's the weather in Tokyo?" });
-
-// Resolve tool calls as Baldrick suspends on each one
+// Execute + resolve tool calls via snapshot/resume
+const sandbox = new Baldrick(code, { externalFunctions: ["getWeather"] });
+let state = sandbox.start();
 while (!state.completed) {
-    const result = await tools[state.functionName](...state.args);
-    const snapshot = BaldrickSnapshotHandle.load(state.snapshot);
-    state = snapshot.resume(result);
+  const result = await tools[state.functionName](...state.args);
+  state = BaldrickSnapshotHandle.load(state.snapshot).resume(result);
 }
-
 console.log(state.output);
-// "The weather in Tokyo is Clear, 26°C"
 ```
 
-See [`examples/typescript/ai-agent-anthropic.ts`](examples/typescript/ai-agent-anthropic.ts) for the full working example, or [`examples/typescript/ai-agent-vercel-ai.ts`](examples/typescript/ai-agent-vercel-ai.ts) for a Vercel AI SDK version.
+See [`examples/typescript/ai-agent-anthropic.ts`](examples/typescript/ai-agent-anthropic.ts).
+</details>
 
-### AI agent with tool calls (Python + Anthropic)
+<details>
+<summary><strong>Python</strong></summary>
 
 ```python
 import anthropic
 from baldrick import Baldrick
 
-# Ask Claude to write code
 client = anthropic.Anthropic()
 response = client.messages.create(
     model="claude-sonnet-4-20250514",
     max_tokens=1024,
     system="""Write TypeScript to answer the user's question.
 Available functions (use await): getWeather(city: string) → { condition, temp }
-Input variable: userQuery (string). Last expression = output. No markdown fences.""",
+Last expression = output. No markdown fences.""",
     messages=[{"role": "user", "content": "What's the weather in Tokyo?"}],
 )
 code = response.content[0].text
 
-# Execute in the sandbox
-sandbox = Baldrick(
-    code,
-    inputs=["userQuery"],
-    external_functions=["getWeather"],
-    time_limit_ms=10_000,
-)
-state = sandbox.start({"userQuery": "What's the weather in Tokyo?"})
-
-# Resolve tool calls
+sandbox = Baldrick(code, external_functions=["getWeather"])
+state = sandbox.start()
 while state.get("suspended"):
-    result = get_weather(*state["args"])  # your real implementation
+    result = get_weather(*state["args"])
     state = state["snapshot"].resume(result)
-
 print(state["output"])
 ```
 
-See [`examples/python/ai_agent_anthropic.py`](examples/python/ai_agent_anthropic.py) for the full working example.
+See [`examples/python/ai_agent_anthropic.py`](examples/python/ai_agent_anthropic.py).
+</details>
+
+### Multi-SDK support
+
+`baldrick()` returns adapters for all major AI SDKs from a single call:
+
+```typescript
+const { system, tools, openaiTools, anthropicTools, handleToolCall } = baldrick({
+  tools: { getWeather: { ... } },
+});
+
+// Vercel AI SDK
+await generateText({ model: anthropic("claude-sonnet-4-20250514"), system, tools, messages });
+
+// OpenAI SDK
+await openai.chat.completions.create({
+  messages: [{ role: "system", content: system }, ...userMessages],
+  tools: openaiTools,
+});
+
+// Anthropic SDK
+await anthropic.messages.create({ system, tools: anthropicTools, messages });
+
+// Any SDK — just extract the `code` from the tool call and pass it to handleToolCall
+const result = await handleToolCall(codeFromToolCall);
+```
+
+Python:
+
+```python
+b = baldrick(tools={...})
+b.anthropic_tools  # → Anthropic SDK format
+b.openai_tools     # → OpenAI SDK format
+b.handle_tool_call(code)  # → Universal handler
+```
+
+### Custom adapters
+
+Building a new AI SDK or framework? You can write a custom adapter without forking Baldrick:
+
+<details>
+<summary><strong>TypeScript</strong></summary>
+
+```typescript
+import { baldrick, createAdapter } from "@baldrick/ai";
+
+// Create a typed adapter for your SDK
+const myAdapter = createAdapter("my-sdk", (ctx) => {
+  // ctx gives you: system, toolName, toolDescription, toolSchema, handleToolCall
+  return {
+    systemMessage: ctx.system,
+    actions: [{
+      id: ctx.toolName,
+      schema: ctx.toolSchema,
+      run: async (input: { code: string }) => {
+        return ctx.handleToolCall(input.code);
+      },
+    }],
+  };
+});
+
+const { custom } = baldrick({
+  tools: { ... },
+  adapters: [myAdapter],
+});
+
+const myConfig = custom["my-sdk"];
+// { systemMessage: "...", actions: [{ id: "execute_code", ... }] }
+```
+</details>
+
+<details>
+<summary><strong>Python</strong></summary>
+
+```python
+from baldrick_ai import baldrick, Adapter, AdapterContext
+
+class LangChainAdapter(Adapter):
+    name = "langchain"
+
+    def adapt(self, ctx: AdapterContext):
+        from langchain_core.tools import StructuredTool
+        return StructuredTool.from_function(
+            func=lambda code: ctx.handle_tool_call(code),
+            name=ctx.tool_name,
+            description=ctx.tool_description,
+        )
+
+b = baldrick(
+    tools={...},
+    adapters=[LangChainAdapter()],
+)
+
+langchain_tool = b.custom["langchain"]
+```
+</details>
+
+The adapter receives an `AdapterContext` with everything needed: system prompt, tool name, tool JSON schema, and a `handleToolCall` function. Return whatever shape your SDK expects.
 
 ### Basic usage by language
 
