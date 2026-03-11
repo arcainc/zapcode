@@ -30,5 +30,6 @@ jobs:
     if: needs.release-please.outputs.release_created == 'true'
     uses: ./.github/workflows/release.yml
     with:
+      version: ${{ needs.release-please.outputs.version }}
       dry_run: false
     secrets: inherit
