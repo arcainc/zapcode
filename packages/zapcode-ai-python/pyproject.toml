@@ -13,15 +13,15 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+dependencies = [
+    "zapcode",
+]
 
 [project.urls]
 Homepage = "https://github.com/TheUncharted/zapcode"
 Repository = "https://github.com/TheUncharted/zapcode"
 Issues = "https://github.com/TheUncharted/zapcode/issues"
 Documentation = "https://github.com/TheUncharted/zapcode#readme"
-dependencies = [
-    "zapcode",
-]
 
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.39.0"]
