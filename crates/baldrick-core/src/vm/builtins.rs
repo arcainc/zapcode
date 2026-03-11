@@ -263,7 +263,19 @@ fn value_to_json(val: &Value) -> String {
     }
 }
 
+/// Maximum nesting depth for JSON parsing to prevent stack overflow.
+const JSON_MAX_DEPTH: usize = 64;
+
 fn json_to_value(s: &str) -> Result<Value> {
+    json_to_value_depth(s, 0)
+}
+
+fn json_to_value_depth(s: &str, depth: usize) -> Result<Value> {
+    if depth > JSON_MAX_DEPTH {
+        return Err(BaldrickError::RuntimeError(
+            "JSON nesting depth exceeded (max 64)".to_string(),
+        ));
+    }
     let s = s.trim();
     if s == "null" {
         return Ok(Value::Null);
@@ -290,28 +302,27 @@ fn json_to_value(s: &str) -> Result<Value> {
         return Ok(Value::Float(n));
     }
     if s.starts_with('[') {
-        return parse_json_array(s);
+        return parse_json_array(s, depth);
     }
     if s.starts_with('{') {
-        return parse_json_object(s);
+        return parse_json_object(s, depth);
     }
     Err(BaldrickError::RuntimeError(format!("Invalid JSON: {}", s)))
 }
 
-fn parse_json_array(s: &str) -> Result<Value> {
-    // Simple JSON array parser
+fn parse_json_array(s: &str, depth: usize) -> Result<Value> {
     let inner = &s[1..s.len() - 1].trim();
     if inner.is_empty() {
         return Ok(Value::Array(Vec::new()));
     }
     let mut items = Vec::new();
     for part in split_json_top_level(inner) {
-        items.push(json_to_value(part.trim())?);
+        items.push(json_to_value_depth(part.trim(), depth + 1)?);
     }
     Ok(Value::Array(items))
 }
 
-fn parse_json_object(s: &str) -> Result<Value> {
+fn parse_json_object(s: &str, depth: usize) -> Result<Value> {
     let inner = &s[1..s.len() - 1].trim();
     if inner.is_empty() {
         return Ok(Value::Object(IndexMap::new()));
@@ -327,10 +338,31 @@ fn parse_json_object(s: &str) -> Result<Value> {
             } else {
                 key
             };
-            map.insert(Arc::from(key), json_to_value(val)?);
+            map.insert(Arc::from(key), json_to_value_depth(val, depth + 1)?);
         }
     }
     Ok(Value::Object(map))
+}
+
+/// Count consecutive backslashes preceding position `i` in `bytes`.
+/// A quote is escaped only if preceded by an odd number of backslashes.
+fn count_preceding_backslashes(bytes: &[u8], i: usize) -> usize {
+    let mut count = 0;
+    let mut pos = i;
+    while pos > 0 {
+        pos -= 1;
+        if bytes[pos] == b'\\' {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    count
+}
+
+/// Returns true if the quote at position `i` is NOT escaped.
+fn is_unescaped_quote(bytes: &[u8], i: usize) -> bool {
+    count_preceding_backslashes(bytes, i) % 2 == 0
 }
 
 fn split_json_top_level(s: &str) -> Vec<&str> {
@@ -343,7 +375,7 @@ fn split_json_top_level(s: &str) -> Vec<&str> {
     for i in 0..bytes.len() {
         match bytes[i] {
             b'"' if !in_string => in_string = true,
-            b'"' if in_string && (i == 0 || bytes[i - 1] != b'\\') => in_string = false,
+            b'"' if in_string && is_unescaped_quote(bytes, i) => in_string = false,
             b'[' | b'{' if !in_string => depth += 1,
             b']' | b'}' if !in_string => depth -= 1,
             b',' if !in_string && depth == 0 => {
@@ -365,7 +397,7 @@ fn find_json_colon(s: &str) -> Option<usize> {
     for i in 0..bytes.len() {
         match bytes[i] {
             b'"' if !in_string => in_string = true,
-            b'"' if in_string && (i == 0 || bytes[i - 1] != b'\\') => in_string = false,
+            b'"' if in_string && is_unescaped_quote(bytes, i) => in_string = false,
             b':' if !in_string => return Some(i),
             _ => {}
         }

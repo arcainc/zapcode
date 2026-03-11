@@ -154,11 +154,13 @@ impl Vm {
     }
 
     fn current_frame(&self) -> &CallFrame {
-        self.frames.last().expect("no active frame")
+        // Frames are always non-empty during execution (run() pushes the initial frame).
+        // This is an internal invariant, not reachable by guest code.
+        self.frames.last().expect("internal error: no active frame")
     }
 
     fn current_frame_mut(&mut self) -> &mut CallFrame {
-        self.frames.last_mut().expect("no active frame")
+        self.frames.last_mut().expect("internal error: no active frame")
     }
 
     #[allow(dead_code)]
@@ -1026,10 +1028,21 @@ impl Vm {
                 match &mut obj {
                     Value::Array(arr) => {
                         let idx = match &index {
-                            Value::Int(i) => *i as usize,
-                            Value::Float(f) => *f as usize,
-                            _ => 0,
+                            Value::Int(i) if *i >= 0 => *i as usize,
+                            Value::Float(f) if *f >= 0.0 && *f == (*f as usize as f64) => *f as usize,
+                            _ => {
+                                // Negative or non-numeric index: treat as no-op (like JS)
+                                self.push(obj)?;
+                                return Ok(None);
+                            }
                         };
+                        // Cap maximum sparse array growth to prevent memory exhaustion
+                        if idx > arr.len() + 1024 {
+                            return Err(BaldrickError::RuntimeError(format!(
+                                "array index {} too far beyond length {}",
+                                idx, arr.len()
+                            )));
+                        }
                         while arr.len() <= idx {
                             arr.push(Value::Undefined);
                         }
