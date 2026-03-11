@@ -137,7 +137,7 @@ jobs:
   # ── Security audit ──────────────────────────────────────────────────
   security:
     name: Security
-    needs: [e2e-js, e2e-python, e2e-wasm, bench]
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       checks: write
