@@ -3,7 +3,15 @@
     "version": "0.1.0",
     "description": "A minimal, secure TypeScript interpreter for AI agents — Node.js bindings",
     "main": "index.js",
+    "module": "index.js",
     "types": "index.d.ts",
+    "exports": {
+        ".": {
+            "types": "./index.d.ts",
+            "import": "./index.js",
+            "require": "./index.js"
+        }
+    },
     "license": "MIT",
     "repository": {
         "type": "git",

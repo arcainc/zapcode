@@ -69,11 +69,12 @@ jobs:
         run: |
           npm install
           npx napi build --release --platform --js index.js --dts index.d.ts
+      - name: Install example dependencies
+        working-directory: examples/typescript
+        run: npm install
       - name: Run basic example
         working-directory: examples/typescript
-        run: |
-          npm install
-          npx tsx basic.ts
+        run: npx tsx basic.ts
 
   # ── Python bindings — build + e2e ───────────────────────────────────
   e2e-python:
@@ -88,14 +89,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install maturin
-        run: uv pip install --system maturin
+      - name: Create venv and install maturin
+        run: |
+          uv venv .venv
+          source .venv/bin/activate
+          uv pip install maturin
       - name: Build Python bindings
         working-directory: crates/zapcode-py
-        run: maturin develop --release
+        run: |
+          source ${{ github.workspace }}/.venv/bin/activate
+          maturin develop --release
       - name: Run basic example
         working-directory: examples/python
-        run: python basic.py
+        run: |
+          source ${{ github.workspace }}/.venv/bin/activate
+          python basic.py
 
   # ── WASM — build + smoke test ───────────────────────────────────────
   e2e-wasm:
