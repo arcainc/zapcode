@@ -93,6 +93,8 @@ jobs:
           uv venv .venv
           source .venv/bin/activate
           uv pip install maturin
+      - name: Copy README
+        run: cp README.md crates/zapcode-py/README.md
       - name: Build Python bindings
         working-directory: crates/zapcode-py
         run: |
