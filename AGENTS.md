@@ -1,106 +1,112 @@
 # AGENTS.md
 
-> Standard agent instructions for the `tyr` project.
-> Symlinked as `CLAUDE.md`, `CURSOR.md`, `.github/copilot-instructions.md` for tool compatibility.
+> Standard agent instructions for the `baldrick` project.
+> Read this before writing any code.
 
 ---
 
 ## What this project is
 
-**`tyr`** (TypeScript-in-Rust) is a minimal, secure TypeScript subset interpreter written in Rust,
+**Baldrick** is a minimal, secure TypeScript subset interpreter written in Rust,
 designed specifically to execute code written by AI agents. It is the TypeScript equivalent of
 [pydantic/monty](https://github.com/pydantic/monty).
 
 The core thesis: LLMs produce faster, cheaper, more reliable results when they write code instead of
-making sequential tool calls. `tyr` makes that possible for TypeScript/JavaScript stacks without
+making sequential tool calls. Baldrick makes that possible for TypeScript/JavaScript stacks without
 containers, sandbox services, or running untrusted code directly on the host.
 
-**What tyr can do:**
+**What Baldrick can do:**
 - Execute a safe subset of TypeScript — enough for an agent to express what it wants to do
 - Block all host access by default: filesystem, env vars, network, `require`, `import`
 - Expose host functions to the sandbox — only functions you explicitly register
 - Snapshot VM state to bytes at external function call boundaries — resume later in any process
-- Start in microseconds (no WASM cold start, no container, no process fork)
-- Be called from Rust, TypeScript/JavaScript (napi-rs), or Python (PyO3)
+- Start in microseconds (~2 µs for simple expressions)
+- Be called from Rust, TypeScript/JavaScript (napi-rs), Python (PyO3), or WebAssembly
 - Enforce resource limits: memory, execution time, stack depth, allocation count
 
-**What tyr cannot do (by design):**
-- Access the standard library beyond a safe subset (`console`, `JSON`, `Math`, `Date`, `Array`, `Object`, `Promise`)
+**What Baldrick cannot do (by design):**
+- Access the standard library beyond a safe subset (`console`, `JSON`, `Math`, `Array`, `Object`, `Promise`)
 - Use `import` / `require` / dynamic imports
 - Access `process`, `globalThis`, `eval`, `Function()`, `setTimeout`/`setInterval`
-- Define classes with inheritance (plain object literals and closures only — for now)
-- Use generators, proxies, WeakMap/WeakRef, or `with` statements
+- Use proxies, WeakMap/WeakRef, `Symbol`, or `with` statements
+- Execute regular expressions (parsed but execution is a no-op)
+- Use `var` declarations (use `let`/`const`)
 
 ---
 
 ## Repository layout
 
 ```
-tyr/
+baldrick/
 ├── crates/
-│   ├── tyr-core/           # Parser integration (oxc), IR, bytecode compiler, VM, snapshot
+│   ├── baldrick-core/       # Parser, IR, bytecode compiler, VM, snapshot
 │   │   ├── src/
-│   │   │   ├── parser/     # oxc_parser integration — AST → TyrIR
-│   │   │   ├── compiler/   # TyrIR → Bytecode
-│   │   │   ├── vm/         # Stack-based bytecode executor
-│   │   │   ├── value.rs    # Value enum — the runtime type system
-│   │   │   ├── snapshot.rs # Serialize/deserialize mid-execution VM state
-│   │   │   ├── sandbox.rs  # Resource limits, host function bridge
-│   │   │   └── error.rs    # TyrError — all error types
-│   │   └── tests/
-│   ├── tyr-js/             # napi-rs bindings → @tyr/core npm package
-│   ├── tyr-py/             # PyO3 bindings → tyr-py pip package
-│   └── tyr-wasm/           # wasm-bindgen target for browser/edge use
-├── examples/
-│   ├── basic/
-│   ├── aws-lambda/         # Lambda + Bedrock Converse pattern
-│   └── snapshot-resume/    # Step Functions / DynamoDB snapshot pattern
-├── scripts/
-│   ├── startup_perf.ts     # Benchmark: tyr vs QuickJS vs isolated-vm vs Docker
-│   └── build_all.sh
-├── AGENTS.md               # This file
-├── CLAUDE.md -> AGENTS.md
-├── Cargo.toml
-├── package.json            # workspace root for JS packages
-└── README.md
+│   │   │   ├── parser/      # oxc_parser integration — AST → BaldrickIR
+│   │   │   │   ├── mod.rs   # AST walker (oxc → IR)
+│   │   │   │   └── ir.rs    # IR type definitions
+│   │   │   ├── compiler/    # BaldrickIR → Bytecode
+│   │   │   │   ├── mod.rs   # Compiler logic
+│   │   │   │   └── instruction.rs  # Instruction enum (~55 opcodes)
+│   │   │   ├── vm/          # Stack-based bytecode executor
+│   │   │   │   ├── mod.rs   # VM main loop, dispatch, BaldrickRun entry point
+│   │   │   │   └── builtins.rs  # Built-in functions (console, Math, JSON, etc.)
+│   │   │   ├── value.rs     # Value enum — runtime type system
+│   │   │   ├── snapshot.rs  # Serialize/deserialize mid-execution VM state
+│   │   │   ├── sandbox.rs   # Resource limits and tracking
+│   │   │   ├── error.rs     # BaldrickError — all error types
+│   │   │   └── lib.rs       # Public API re-exports
+│   │   ├── tests/           # 14 test files, 214+ tests
+│   │   └── benches/         # divan benchmarks
+│   ├── baldrick-js/         # napi-rs bindings → @baldrick/core npm package
+│   ├── baldrick-py/         # PyO3 bindings → baldrick pip package
+│   └── baldrick-wasm/       # wasm-bindgen target for browser/edge use
+├── AGENTS.md                # This file
+├── CLAUDE.md                # Claude Code-specific guidance (references this file)
+├── Cargo.toml               # Workspace root
+└── README.md                # User-facing docs with benchmarks
 ```
 
 ---
 
 ## Architecture overview
 
+### Pipeline
+
+```
+TypeScript source → parser (oxc) → BaldrickIR → compiler → Bytecode → VM → Result/Snapshot
+```
+
 ### Parser
 
-`tyr` uses **[oxc_parser](https://github.com/oxc-project/oxc)** — the fastest TypeScript/JavaScript
-parser available in Rust. It does NOT use SWC (too heavy) or write its own parser.
-
-The parser phase produces `TyrIR` — a flat, typed intermediate representation that is intentionally
-simpler than the full TypeScript AST. Unsupported syntax causes an immediate, descriptive
-`TyrError::UnsupportedSyntax` rather than silent failure.
+Uses **[oxc_parser](https://github.com/oxc-project/oxc)** — the fastest TypeScript parser in Rust.
+The parser walks the oxc AST and emits `BaldrickIR`. Unsupported syntax produces
+`BaldrickError::UnsupportedSyntax` with span information.
 
 ### Supported syntax subset
 
-| Feature | Supported |
+| Feature | Status |
 |---|---|
 | `const`, `let` declarations | ✅ |
-| `function`, arrow functions | ✅ |
+| Functions (declarations, arrows, expressions) | ✅ |
 | `async function`, `await` | ✅ |
-| `if` / `else` | ✅ |
-| `for...of`, `while` | ✅ |
-| `return`, `throw` | ✅ |
-| `try` / `catch` | ✅ |
-| Object literals `{}` | ✅ |
-| Array literals `[]` | ✅ |
-| Destructuring | ✅ |
-| Template literals | ✅ |
+| Classes (`constructor`, methods, `extends`, `super`, `static`) | ✅ |
+| Generators (`function*`, `yield`, `.next()`) | ✅ |
+| Control flow (`if`, `for`, `while`, `do-while`, `switch`, `for-of`) | ✅ |
+| `try` / `catch` / `finally`, `throw` | ✅ |
+| Closures with mutable capture | ✅ |
+| Destructuring (object and array) | ✅ |
+| Spread/rest operators | ✅ |
 | Optional chaining `?.` | ✅ |
 | Nullish coalescing `??` | ✅ |
-| Type annotations (stripped) | ✅ |
-| `import` / `require` | ❌ sandbox violation |
-| `class` (with inheritance) | ❌ not yet |
-| `eval`, `Function()` | ❌ sandbox violation |
-| Generators | ❌ not yet |
-| `process`, `global`, `globalThis` | ❌ sandbox violation |
+| Template literals | ✅ |
+| Type annotations, interfaces, type aliases | Stripped at parse time |
+| String methods (30+) | ✅ |
+| Array methods (25+) | ✅ |
+| Math, JSON, Object, Array, Promise | ✅ |
+| `import` / `require` / `eval` | ❌ sandbox violation |
+| Regular expressions | Parsed, not executed |
+| `var` declarations | ❌ not supported |
+| Decorators, Symbol, WeakMap/WeakSet | ❌ not supported |
 
 ### Value system
 
@@ -112,223 +118,136 @@ pub enum Value {
     Int(i64),
     Float(f64),
     String(Arc<str>),
-    Array(HeapRef<Vec<Value>>),
-    Object(HeapRef<IndexMap<Arc<str>, Value>>),
-    Function(FunctionRef),
-    Promise(PromiseState),
+    Array(Vec<Value>),
+    Object(IndexMap<Arc<str>, Value>),
+    Function(Closure),
+    BuiltinMethod { object_name: Arc<str>, method_name: Arc<str> },
+    Generator(GeneratorObject),
 }
 ```
 
-All heap-allocated values use `HeapRef<T>` — a reference-counted wrapper that participates in
-`DropWithHeap`. See **Memory safety** section below.
+Arrays and objects are **value types** (owned `Vec<Value>` / `IndexMap`), not reference types.
+Mutation works via `SetIndex`/`SetProperty` instructions that push the modified value back
+onto the stack for store-back to the variable.
 
 ### VM
 
-Stack-based bytecode VM, same model as CPython / Monty. Approximately 40 instructions.
+Stack-based bytecode VM (~55 instructions). Single-threaded, no Tokio runtime inside the VM.
 
-The VM runs synchronously for sync code. For `async` functions, it drives a cooperative executor:
-each `await` suspends the current frame and polls registered host futures. The VM never spawns
-OS threads.
-
-**Suspension at external calls**: when the VM encounters a call to a registered external function,
-it does NOT call the function directly. Instead it:
-1. Serializes the current stack frame + continuation into a `TyrSnapshot`
+**Suspension at external calls**: when the VM encounters a `CallExternal` instruction for a
+registered external function, it:
+1. Captures the VM state into a `BaldrickSnapshot`
 2. Returns `VmState::Suspended { function_name, args, snapshot }`
 
-The caller is responsible for invoking the actual function and calling `snapshot.resume(return_value)`.
-This design makes snapshotting trivial — no continuations need to cross async boundaries.
+The caller resolves the external function and calls `snapshot.resume(return_value)`.
 
 ### Snapshotting
 
-`TyrSnapshot` and `TyrRun` implement `serde::Serialize` + `serde::Deserialize`. Snapshots are
-small (single-digit kilobytes for typical agent code). They can be stored in DynamoDB, S3, Redis,
-or any bytes store.
+`BaldrickSnapshot` uses `postcard` for serialization. Snapshots are small (< 2 KB for typical
+agent code). They can be stored in any bytes store (DB, Redis, S3).
 
 ```rust
-// Suspend and serialize
-let snapshot: TyrSnapshot = vm.run()?;   // Returns Suspended variant
-let bytes: Vec<u8> = snapshot.dump()?;   // serde + bincode
-
-// Resume in another process
-let snapshot = TyrSnapshot::load(&bytes)?;
-let result = snapshot.resume(return_value)?;
+let bytes: Vec<u8> = snapshot.dump()?;
+let restored = BaldrickSnapshot::load(&bytes)?;
+let final_state = restored.resume(return_value)?;
 ```
 
 ---
 
-## Memory safety — CRITICAL
+## Sandbox invariants — NEVER violate
 
-`tyr` will execute untrusted, potentially malicious code. Memory safety is non-negotiable.
+1. **No host filesystem access** — `std::fs` is forbidden in `baldrick-core`
+2. **No env var access** — `std::env::var` is forbidden in `baldrick-core`
+3. **No network access** — `std::net`, `tokio::net` are forbidden in `baldrick-core`
+4. **No `eval` equivalent** — no mechanism to compile new code at runtime from within the sandbox
+5. **Resource limits are enforced** — memory, time, stack depth, allocation count checked during execution
 
-### HeapGuard pattern
+If you are ever unsure whether something violates sandbox invariants: it does. Block it.
 
-All types that contain `HeapRef<T>` implement `DropWithHeap`. These MUST be cleaned up correctly
-on **every code path** — not just the happy path, but also:
-- Early returns via `?`
-- `continue` in loops
-- Conditional branches that skip cleanup
+---
 
-**Use `heap_guard!` macro (preferred):**
-```rust
-let arr = heap_guard!(vm.heap, Value::Array(HeapRef::new(vec![])));
-// arr is automatically dropped when scope exits, on any path
-```
+## Key implementation patterns
 
-**Never do:**
-```rust
-let arr = Value::Array(HeapRef::new(vec![]));
-if some_condition {
-    return Err(...); // LEAK — arr not dropped via DropWithHeap
-}
-arr.drop_with_heap(&mut vm.heap);
-```
+### Builtin dispatch
 
-A missed `drop_with_heap` leaks reference counts and eventually corrupts the heap. The compiler
-will not catch this — it requires discipline and code review.
+Methods on arrays, strings, and global objects (Math, JSON, etc.) use a `BuiltinMethod` value
+variant. The VM stores the `last_receiver` when a property access returns a function or builtin,
+and `last_global_name` for known global objects.
 
-### Sandbox invariants — NEVER violate
+### Closure capture
 
-1. **No host filesystem access** — `std::fs`, `std::path`, file descriptors are forbidden in
-   `tyr-core`. Filesystem operations are only accessible through explicitly registered host functions.
+Closures capture variables via `local_names` stored in `CompiledFunction`. At `CreateClosure` time,
+all locals from all active frames are captured by name. Captured variables are injected as globals
+when the closure is called.
 
-2. **No env var access** — `std::env::var` is forbidden in `tyr-core`.
+### Generator state
 
-3. **No network access** — `std::net`, `tokio::net`, `reqwest` etc. are forbidden in `tyr-core`.
+Generator objects are stored in the globals `HashMap` with `__gen_{id}` keys during execution.
+When a generator finishes (done=true), its key is removed to prevent unbounded growth.
 
-4. **No `eval` equivalent** — there is no mechanism to compile new code at runtime from within
-   the sandbox.
+### Classes
 
-5. **Resource limits are enforced before execution** — memory limit, execution time limit, and
-   stack depth limit are checked before each instruction dispatch, not just at external calls.
+Classes are represented as objects with special keys:
+- `__class_name__` — class name for instanceof
+- `__constructor__` — constructor closure
+- `__prototype__` — object containing instance methods
+- `__super__` — reference to super class (for inheritance)
+- Static methods are stored directly on the class object
 
-If you are ever unsure whether something violates sandbox invariants: it does. Ask before merging.
+### Promise
+
+Internal promises are plain objects with `{__promise__: true, status, value/reason}`.
+`await` on an external call suspends the VM; `await` on an internal `Promise.resolve()`
+is handled entirely inside the VM.
+
+---
+
+## How to add a new language feature
+
+1. **Check the supported subset table above.** Features listed as unsupported are excluded intentionally.
+2. **Add parser support** in `crates/baldrick-core/src/parser/`. Emit `BaldrickError::UnsupportedSyntax` for unhandled nodes.
+3. **Add compiler support** in `crates/baldrick-core/src/compiler/`. Prefer reusing existing instructions.
+4. **Add VM dispatch** in `crates/baldrick-core/src/vm/mod.rs`. Use `push_call_frame()` for function setup. Check resource limits before allocations.
+5. **Write tests** in `crates/baldrick-core/tests/`.
+6. **Update bindings** if the feature affects the public API.
 
 ---
 
 ## Development commands
 
 ```bash
-# Build all crates
-make build
+# Run all tests (214 tests)
+cargo test
 
-# Run all tests
-make test
+# Run benchmarks
+cargo bench
 
-# Build JS bindings (debug)
-make build-js
+# Check all crates
+cargo check --workspace
 
-# Build JS bindings (release, for publishing)
-make build-js-release
-
-# Run startup performance benchmark
-make bench
-
-# Lint (clippy + fmt check)
-make lint
-
-# Format
-make format
-
-# Build Python bindings
-make build-py
-
-# Build WASM target
-make build-wasm
+# Lint
+cargo clippy --workspace
 ```
 
 ---
 
 ## Testing philosophy
 
-Every language feature in the supported subset MUST have:
+Every language feature must have:
 1. A positive test (it executes correctly)
-2. A negative test (unsupported syntax produces the right error)
-3. A sandbox escape test (no way to access host resources through this feature)
+2. Edge case tests (boundary conditions, empty inputs)
+3. A sandbox escape test where applicable
 
-Tests live in `crates/tyr-core/tests/`. Name files after the feature: `array_methods.rs`,
-`async_await.rs`, `snapshot_resume.rs`, etc.
-
-Snapshot tests use `insta` for readable diffs on serialized state.
-
-Performance regression tests run in CI via `criterion`. The startup latency target is **< 1ms**
-for first execution after binary load.
-
----
-
-## Language bindings
-
-### TypeScript / JavaScript (napi-rs)
-
-Public API in `crates/tyr-js/`. Follow the `@pydantic/monty` API shape as closely as possible —
-this makes migration between the two easy.
-
-```typescript
-import { Tyr, TyrSnapshot, runTyrAsync } from '@tyr/core'
-
-// Basic sync
-const t = new Tyr('x + 1', { inputs: ['x'] })
-const result = t.run({ inputs: { x: 41 } })  // 42
-
-// External functions + async
-const t2 = new Tyr(`const data = await fetchData(url); return data.length`, {
-  inputs: ['url'],
-  externalFunctions: ['fetchData'],
-})
-
-const result2 = await runTyrAsync(t2, {
-  inputs: { url: 'https://example.com' },
-  externalFunctions: {
-    fetchData: async (url: string) => ({ length: 42 }),
-  },
-})
-
-// Iterative / snapshot
-let progress = t2.start({ inputs: { url: 'https://example.com' } })
-if (progress instanceof TyrSnapshot) {
-  const bytes = progress.dump()
-  // store bytes somewhere...
-  progress = TyrSnapshot.load(bytes).resume({ returnValue: { length: 42 } })
-}
-```
-
-### Python (PyO3)
-
-Public API in `crates/tyr-py/`. Mirror `pydantic_monty` API shape.
-
-### Lambda / napi prebuilt binaries
-
-Ship prebuilt binaries for:
-- `linux-x64-gnu` (Lambda x86_64)
-- `linux-arm64-gnu` (Lambda arm64 / Graviton)
-- `darwin-x64`, `darwin-arm64` (local dev)
-- `win32-x64-msvc`
-
-Use `@napi-rs/cli` matrix build in CI. Users never need a C++ compiler.
-
----
-
-## What good looks like
-
-A feature is complete when:
-- It passes the feature test suite
-- It passes the sandbox escape suite
-- The performance benchmark shows no regression
-- The JS and Python APIs expose it with proper types
-- A usage example exists in `examples/`
-- CHANGELOG.md is updated
-
-A PR that adds a feature without tests will not be merged.
+Tests live in `crates/baldrick-core/tests/`. Files are organized by feature:
+`basic.rs`, `builtins.rs`, `classes.rs`, `generators.rs`, `async_await.rs`,
+`control_flow.rs`, `functions.rs`, `integration.rs`, `objects_arrays.rs`,
+`sandbox.rs`, `error_handling.rs`, `variables.rs`, `snapshot.rs`.
 
 ---
 
 ## Relationship to other projects
 
 - **[pydantic/monty](https://github.com/pydantic/monty)** — direct inspiration, Python equivalent.
-  Study its architecture. Respect its design decisions. Don't copy its code.
+  Same architectural patterns (parse → compile → VM → snapshot).
 - **[oxc](https://github.com/oxc-project/oxc)** — parser dependency. Don't replace it.
-- **[boa](https://github.com/boa-dev/boa)** — full JS interpreter in Rust. Useful as reference for
-  VM design. Not a dependency — too heavy.
-- **[isolated-vm](https://github.com/laverdet/isolated-vm)** — V8-based alternative. `tyr` is
-  lighter, snapshotable, and doesn't require a C++ compiler on the user's machine.
-- **[@sebastianwessel/quickjs](https://github.com/sebastianwessel/quickjs)** — WASM-based alternative.
-  `tyr` starts faster and supports snapshotting. Not a drop-in replacement — different security model.
+- **[boa](https://github.com/boa-dev/boa)** — full JS interpreter in Rust. Useful as reference. Not a dependency.

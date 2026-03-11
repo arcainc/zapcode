@@ -1,6 +1,7 @@
 <p align="center">
   <h1 align="center">Baldrick</h1>
-  <p align="center"><strong>A minimal, secure TypeScript interpreter written in Rust for use by AI</strong></p>
+  <p align="center"><strong>"I have a cunning plan"</strong></p>
+  <p align="center">A minimal, secure TypeScript interpreter written in Rust for use by AI</p>
 </p>
 
 <p align="center">
@@ -13,6 +14,8 @@
 ---
 
 > **Experimental** — Baldrick is under active development. APIs may change.
+
+Named after Blackadder's eternally optimistic servant — because every AI agent says *"I have a cunning plan"* right before writing code to execute. Baldrick runs that code safely.
 
 When LLMs write TypeScript, you need to run it safely. Containers add hundreds of milliseconds of startup overhead and operational complexity. V8 isolates are fast but bring a 20MB+ runtime and a massive attack surface.
 
@@ -213,8 +216,6 @@ console.log(result.output);  // 7
 | Deno Deploy | Full TS | Isolate + permissions | ~10-50 ms | Not built-in | Cloud service |
 | QuickJS | Full ES2023 | Process isolation | ~1-5 ms | Not built-in | C library |
 | WASI/Wasmer | Depends on guest | Wasm sandbox | ~1-10 ms | Possible | Wasm runtime |
-| **Monty** (Python) | Python subset | Sandbox at language level | **~5 µs** | Built-in | `cargo add` / `pip install` |
-
 ### Why not just use V8?
 
 V8 is the gold standard for JavaScript execution. But it brings ~20 MB of binary size, millisecond startup times, and a vast API surface that must be carefully restricted for sandboxing. If you need full ECMAScript compliance, use V8. If you need microsecond startup, byte-sized snapshots, and a security model where "blocked by default" is the foundation rather than an afterthought, use Baldrick.
@@ -222,10 +223,6 @@ V8 is the gold standard for JavaScript execution. But it brings ~20 MB of binary
 ### Why not Docker?
 
 Docker provides strong isolation but adds hundreds of milliseconds of cold-start latency, requires a container runtime, and doesn't support snapshotting execution state mid-function. For AI agent loops that execute thousands of small code snippets, the overhead dominates.
-
-### Relationship to Monty
-
-Baldrick is the TypeScript counterpart to [Monty](https://github.com/pydantic/monty), Pydantic's Python interpreter. Both share the same philosophy: minimal, secure, embeddable interpreters purpose-built for AI agent code execution. Baldrick follows the same architectural patterns (parse → compile → VM → snapshot) and API shape, making it easy for teams to adopt both for polyglot agent systems.
 
 ## Architecture
 
@@ -267,6 +264,17 @@ cargo bench
 # Check all crates (including bindings)
 cargo check --workspace
 ```
+
+## Why AI agents should write code
+
+For motivation on why you might want LLMs to write and execute code instead of chaining tool calls:
+
+- [CodeMode](https://blog.cloudflare.com/codemode-ai-agent-coding) from Cloudflare
+- [Programmatic Tool Calling](https://docs.anthropic.com/en/docs/build-with-claude/tool-use/tool-use-examples#programmatic-tool-calling) from Anthropic
+- [Code Execution with MCP](https://www.anthropic.com/engineering/code-execution-mcp) from Anthropic
+- [Smol Agents](https://huggingface.co/docs/smolagents/en/index) from Hugging Face
+
+Baldrick is inspired by [Monty](https://github.com/pydantic/monty), Pydantic's Python subset interpreter that takes the same approach for Python.
 
 ## License
 

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyNone, PyString};
+use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString};
 
 use baldrick_core::{BaldrickError, BaldrickSnapshot as CoreSnapshot, ResourceLimits, Value, VmState};
 

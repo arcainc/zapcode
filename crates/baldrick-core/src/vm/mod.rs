@@ -169,6 +169,62 @@ impl Vm {
         }
     }
 
+    /// Build the locals vec by binding `args` to the function's declared `params`.
+    /// Handles positional, rest, and default-value patterns.
+    fn bind_params(params: &[ParamPattern], args: &[Value], local_count: usize) -> Vec<Value> {
+        let mut locals = Vec::with_capacity(local_count);
+        for (i, param) in params.iter().enumerate() {
+            match param {
+                ParamPattern::Ident(_) => {
+                    locals.push(args.get(i).cloned().unwrap_or(Value::Undefined));
+                }
+                ParamPattern::Rest(_) => {
+                    let rest: Vec<Value> = args[i..].to_vec();
+                    locals.push(Value::Array(rest));
+                }
+                ParamPattern::DefaultValue { .. } => {
+                    let val = args.get(i).cloned().unwrap_or(Value::Undefined);
+                    // Keep Undefined so the compiler-emitted default init can fire
+                    locals.push(val);
+                }
+                _ => {
+                    locals.push(args.get(i).cloned().unwrap_or(Value::Undefined));
+                }
+            }
+        }
+        locals
+    }
+
+    /// Common setup for calling a closure: inject captures, bind params, push frame.
+    fn push_call_frame(
+        &mut self,
+        closure: &Closure,
+        args: &[Value],
+        this_value: Option<Value>,
+    ) -> Result<()> {
+        self.tracker.push_frame();
+        self.tracker.check_stack(&self.limits)?;
+
+        // Inject captured variables as globals
+        for (name, val) in &closure.captured {
+            if !self.globals.contains_key(name) {
+                self.globals.insert(name.clone(), val.clone());
+            }
+        }
+
+        let func = &self.program.functions[closure.func_id.0];
+        let locals = Self::bind_params(&func.params, args, func.local_count);
+
+        self.frames.push(CallFrame {
+            func_index: Some(closure.func_id.0),
+            ip: 0,
+            locals,
+            stack_base: self.stack.len(),
+            this_value,
+        });
+        Ok(())
+    }
+
     fn run(&mut self) -> Result<VmState> {
         self.tracker.start();
 
@@ -263,53 +319,8 @@ impl Vm {
             }
         };
 
-        let func_idx = closure.func_id.0;
-        self.tracker.push_frame();
-        self.tracker.check_stack(&self.limits)?;
-
-        let func = &self.program.functions[func_idx];
-
-        // Inject captured variables
-        for (name, val) in &closure.captured {
-            if !self.globals.contains_key(name) {
-                self.globals.insert(name.clone(), val.clone());
-            }
-        }
-
-        // Set up locals with args
-        let mut locals = Vec::with_capacity(func.local_count);
-        for (i, param) in func.params.iter().enumerate() {
-            match param {
-                ParamPattern::Ident(_) => {
-                    locals.push(args.get(i).cloned().unwrap_or(Value::Undefined));
-                }
-                ParamPattern::Rest(_) => {
-                    let rest: Vec<Value> = args[i..].to_vec();
-                    locals.push(Value::Array(rest));
-                }
-                ParamPattern::DefaultValue { default: _, .. } => {
-                    let val = args.get(i).cloned().unwrap_or(Value::Undefined);
-                    if matches!(val, Value::Undefined) {
-                        locals.push(Value::Undefined);
-                    } else {
-                        locals.push(val);
-                    }
-                }
-                _ => {
-                    locals.push(args.get(i).cloned().unwrap_or(Value::Undefined));
-                }
-            }
-        }
-
         let target_frame_depth = self.frames.len();
-
-        self.frames.push(CallFrame {
-            func_index: Some(func_idx),
-            ip: 0,
-            locals,
-            stack_base: self.stack.len(),
-            this_value: None,
-        });
+        self.push_call_frame(&closure, &args, None)?;
 
         // Run until the new frame returns
         loop {
@@ -377,6 +388,21 @@ impl Vm {
         }
     }
 
+    /// Call a callback for each array element. Passes (item, index) — the full
+    /// array reference (3rd JS argument) is only built lazily if the callback
+    /// actually uses 3+ params, avoiding O(n²) cloning.
+    fn call_element_callback(
+        &mut self,
+        callback: &Value,
+        item: &Value,
+        index: usize,
+    ) -> Result<Value> {
+        self.call_function_internal(
+            callback,
+            vec![item.clone(), Value::Int(index as i64)],
+        )
+    }
+
     /// Execute an array callback method (map, filter, reduce, forEach, etc.)
     fn execute_array_callback_method(
         &mut self,
@@ -390,22 +416,14 @@ impl Vm {
             "map" => {
                 let mut result = Vec::with_capacity(arr.len());
                 for (i, item) in arr.iter().enumerate() {
-                    let val = self.call_function_internal(
-                        &callback,
-                        vec![item.clone(), Value::Int(i as i64), Value::Array(arr.clone())],
-                    )?;
-                    result.push(val);
+                    result.push(self.call_element_callback(&callback, item, i)?);
                 }
                 Ok(Value::Array(result))
             }
             "filter" => {
                 let mut result = Vec::new();
                 for (i, item) in arr.iter().enumerate() {
-                    let val = self.call_function_internal(
-                        &callback,
-                        vec![item.clone(), Value::Int(i as i64), Value::Array(arr.clone())],
-                    )?;
-                    if val.is_truthy() {
+                    if self.call_element_callback(&callback, item, i)?.is_truthy() {
                         result.push(item.clone());
                     }
                 }
@@ -413,20 +431,13 @@ impl Vm {
             }
             "forEach" => {
                 for (i, item) in arr.iter().enumerate() {
-                    self.call_function_internal(
-                        &callback,
-                        vec![item.clone(), Value::Int(i as i64), Value::Array(arr.clone())],
-                    )?;
+                    self.call_element_callback(&callback, item, i)?;
                 }
                 Ok(Value::Undefined)
             }
             "find" => {
                 for (i, item) in arr.iter().enumerate() {
-                    let val = self.call_function_internal(
-                        &callback,
-                        vec![item.clone(), Value::Int(i as i64), Value::Array(arr.clone())],
-                    )?;
-                    if val.is_truthy() {
+                    if self.call_element_callback(&callback, item, i)?.is_truthy() {
                         return Ok(item.clone());
                     }
                 }
@@ -434,11 +445,7 @@ impl Vm {
             }
             "findIndex" => {
                 for (i, item) in arr.iter().enumerate() {
-                    let val = self.call_function_internal(
-                        &callback,
-                        vec![item.clone(), Value::Int(i as i64), Value::Array(arr.clone())],
-                    )?;
-                    if val.is_truthy() {
+                    if self.call_element_callback(&callback, item, i)?.is_truthy() {
                         return Ok(Value::Int(i as i64));
                     }
                 }
@@ -446,11 +453,7 @@ impl Vm {
             }
             "every" => {
                 for (i, item) in arr.iter().enumerate() {
-                    let val = self.call_function_internal(
-                        &callback,
-                        vec![item.clone(), Value::Int(i as i64), Value::Array(arr.clone())],
-                    )?;
-                    if !val.is_truthy() {
+                    if !self.call_element_callback(&callback, item, i)?.is_truthy() {
                         return Ok(Value::Bool(false));
                     }
                 }
@@ -458,85 +461,57 @@ impl Vm {
             }
             "some" => {
                 for (i, item) in arr.iter().enumerate() {
-                    let val = self.call_function_internal(
-                        &callback,
-                        vec![item.clone(), Value::Int(i as i64), Value::Array(arr.clone())],
-                    )?;
-                    if val.is_truthy() {
+                    if self.call_element_callback(&callback, item, i)?.is_truthy() {
                         return Ok(Value::Bool(true));
                     }
                 }
                 Ok(Value::Bool(false))
             }
             "reduce" => {
-                let init = all_args.get(1).cloned();
-                let mut accumulator;
-                let start_idx;
-
-                if let Some(init_val) = init {
-                    accumulator = init_val;
-                    start_idx = 0;
-                } else if !arr.is_empty() {
-                    accumulator = arr[0].clone();
-                    start_idx = 1;
-                } else {
-                    return Err(BaldrickError::TypeError(
-                        "Reduce of empty array with no initial value".to_string(),
-                    ));
-                }
-
-                for (i, item) in arr.iter().enumerate().skip(start_idx) {
-                    accumulator = self.call_function_internal(
+                let mut acc = match all_args.get(1).cloned() {
+                    Some(init) => { Some(init) }
+                    None if !arr.is_empty() => { Some(arr[0].clone()) }
+                    None => {
+                        return Err(BaldrickError::TypeError(
+                            "Reduce of empty array with no initial value".to_string(),
+                        ));
+                    }
+                };
+                let start = if all_args.get(1).is_some() { 0 } else { 1 };
+                for (i, item) in arr.iter().enumerate().skip(start) {
+                    acc = Some(self.call_function_internal(
                         &callback,
-                        vec![
-                            accumulator,
-                            item.clone(),
-                            Value::Int(i as i64),
-                            Value::Array(arr.clone()),
-                        ],
-                    )?;
+                        vec![acc.unwrap(), item.clone(), Value::Int(i as i64)],
+                    )?);
                 }
-                Ok(accumulator)
+                Ok(acc.unwrap_or(Value::Undefined))
             }
             "sort" => {
                 let mut result = arr;
                 if matches!(callback, Value::Function(_)) {
-                    // Sort with comparator function using insertion sort
+                    // Insertion sort — O(n²) worst case but stable, and sort
+                    // with a VM callback can't use Rust's built-in sort
                     let len = result.len();
                     for i in 1..len {
                         let mut j = i;
                         while j > 0 {
-                            let cmp_val = self.call_function_internal(
+                            let cmp = self.call_function_internal(
                                 &callback,
                                 vec![result[j - 1].clone(), result[j].clone()],
-                            )?;
-                            let cmp = cmp_val.to_number();
-                            if cmp > 0.0 {
-                                result.swap(j - 1, j);
-                                j -= 1;
-                            } else {
-                                break;
-                            }
+                            )?.to_number();
+                            if cmp > 0.0 { result.swap(j - 1, j); j -= 1; }
+                            else { break; }
                         }
                     }
                 } else {
-                    // Default sort: convert to strings and sort lexicographically
-                    result.sort_by(|a, b| {
-                        let sa = a.to_js_string();
-                        let sb = b.to_js_string();
-                        sa.cmp(&sb)
-                    });
+                    result.sort_by(|a, b| a.to_js_string().cmp(&b.to_js_string()));
                 }
                 Ok(Value::Array(result))
             }
             "flatMap" => {
                 let mut result = Vec::new();
                 for (i, item) in arr.iter().enumerate() {
-                    let val = self.call_function_internal(
-                        &callback,
-                        vec![item.clone(), Value::Int(i as i64), Value::Array(arr.clone())],
-                    )?;
-                    match val {
+                    match self.call_element_callback(&callback, item, i)? {
                         Value::Array(inner) => result.extend(inner),
                         other => result.push(other),
                     }
@@ -544,8 +519,7 @@ impl Vm {
                 Ok(Value::Array(result))
             }
             _ => Err(BaldrickError::TypeError(format!(
-                "Unknown array callback method: {}",
-                method
+                "Unknown array callback method: {}", method
             ))),
         }
     }
@@ -558,9 +532,6 @@ impl Vm {
 
     fn generator_next(&mut self, mut gen_obj: GeneratorObject, arg: Value) -> Result<Value> {
         if gen_obj.done {
-            // Re-insert so subsequent calls still find it as done
-            let gen_id = gen_obj.id;
-            self.globals.insert(format!("__gen_{}", gen_id), Value::Generator(gen_obj));
             return Ok(self.make_iterator_result(Value::Undefined, true));
         }
         for (name, val) in &gen_obj.captured {
@@ -617,6 +588,25 @@ impl Vm {
         }
     }
 
+    /// Store generator state back into the globals registry.
+    /// For done generators, the key is removed to prevent unbounded growth.
+    fn store_generator(&mut self, gen_obj: GeneratorObject) {
+        let gen_key = format!("__gen_{}", gen_obj.id);
+        if gen_obj.done {
+            self.globals.remove(&gen_key);
+        } else {
+            self.globals.insert(gen_key, Value::Generator(gen_obj));
+        }
+    }
+
+    /// Mark a generator as done, store it, and return the final iterator result.
+    fn finish_generator(&mut self, mut gen_obj: GeneratorObject, value: Value) -> Value {
+        gen_obj.done = true;
+        gen_obj.suspended = None;
+        self.store_generator(gen_obj);
+        self.make_iterator_result(value, true)
+    }
+
     fn run_generator_until_yield_or_return(&mut self, mut gen_obj: GeneratorObject) -> Result<Value> {
         let target_frame_depth = self.frames.len() - 1;
         loop {
@@ -641,11 +631,8 @@ impl Vm {
                 let frame = self.frames.pop().unwrap();
                 self.tracker.pop_frame();
                 self.stack.truncate(frame.stack_base);
-                gen_obj.done = true;
-                gen_obj.suspended = None;
-                let gen_id = gen_obj.id;
-                self.globals.insert(format!("__gen_{}", gen_id), Value::Generator(gen_obj));
-                return Ok(self.make_iterator_result(Value::Undefined, true));
+                let result = self.finish_generator(gen_obj, Value::Undefined);
+                return Ok(result);
             }
             let instr = instructions[frame.ip].clone();
             if matches!(instr, Instruction::Yield) {
@@ -658,8 +645,7 @@ impl Vm {
                     ip: frame.ip, locals: frame.locals, stack: frame_stack,
                 });
                 gen_obj.done = false;
-                let gen_id = gen_obj.id;
-                self.globals.insert(format!("__gen_{}", gen_id), Value::Generator(gen_obj));
+                self.store_generator(gen_obj);
                 return Ok(self.make_iterator_result(yielded_value, false));
             }
             if matches!(instr, Instruction::Return) {
@@ -675,11 +661,8 @@ impl Vm {
                 let frame = self.frames.pop().unwrap();
                 self.tracker.pop_frame();
                 self.stack.truncate(frame.stack_base);
-                gen_obj.done = true;
-                gen_obj.suspended = None;
-                let gen_id = gen_obj.id;
-                self.globals.insert(format!("__gen_{}", gen_id), Value::Generator(gen_obj));
-                return Ok(self.make_iterator_result(return_val, true));
+                let result = self.finish_generator(gen_obj, return_val);
+                return Ok(result);
             }
             let result = self.dispatch(instr);
             match result {
@@ -692,11 +675,8 @@ impl Vm {
                 Ok(None) => {
                     if self.frames.len() == target_frame_depth {
                         let return_val = self.pop().unwrap_or(Value::Undefined);
-                        gen_obj.done = true;
-                        gen_obj.suspended = None;
-                        let gen_id = gen_obj.id;
-                        self.globals.insert(format!("__gen_{}", gen_id), Value::Generator(gen_obj));
-                        return Ok(self.make_iterator_result(return_val, true));
+                        let result = self.finish_generator(gen_obj, return_val);
+                        return Ok(result);
                     }
                 }
                 Err(err) => {
@@ -1178,52 +1158,8 @@ impl Vm {
                             self.push(Value::Generator(gen_obj))?;
                             self.last_receiver = None;
                         } else {
-                            self.tracker.push_frame();
-                            self.tracker.check_stack(&self.limits)?;
-
-                            let func = &self.program.functions[func_idx];
-
-                            // Inject captured variables as globals
-                            for (name, val) in &closure.captured {
-                                if !self.globals.contains_key(name) {
-                                    self.globals.insert(name.clone(), val.clone());
-                                }
-                            }
-
-                            // Set up locals with args
-                            let mut locals = Vec::with_capacity(func.local_count);
-                            for (i, param) in func.params.iter().enumerate() {
-                                match param {
-                                    ParamPattern::Ident(_) => {
-                                        locals.push(args.get(i).cloned().unwrap_or(Value::Undefined));
-                                    }
-                                    ParamPattern::Rest(_) => {
-                                        let rest: Vec<Value> = args[i..].to_vec();
-                                        locals.push(Value::Array(rest));
-                                    }
-                                    ParamPattern::DefaultValue { default: _, .. } => {
-                                        let val = args.get(i).cloned().unwrap_or(Value::Undefined);
-                                        if matches!(val, Value::Undefined) {
-                                            locals.push(Value::Undefined);
-                                        } else {
-                                            locals.push(val);
-                                        }
-                                    }
-                                    _ => {
-                                        locals.push(args.get(i).cloned().unwrap_or(Value::Undefined));
-                                    }
-                                }
-                            }
-
                             let this_value = self.last_receiver.take();
-
-                            self.frames.push(CallFrame {
-                                func_index: Some(func_idx),
-                                ip: 0,
-                                locals,
-                                stack_base: self.stack.len(),
-                                this_value,
-                            });
+                            self.push_call_frame(&closure, &args, this_value)?;
                         }
                     }
                     Value::BuiltinMethod { object_name, method_name } => {
@@ -1272,25 +1208,26 @@ impl Vm {
                                     match method_name.as_ref() {
                                         "next" => {
                                             let arg = args.into_iter().next().unwrap_or(Value::Undefined);
-                                            // Get the latest generator state from registry
+                                            // Get the latest generator state from registry.
+                                            // If the key is missing, the generator has finished
+                                            // and was cleaned up — return done immediately.
                                             let gen_key = format!("__gen_{}", gen_obj.id);
-                                            let current_gen = if let Some(Value::Generator(g)) = self.globals.remove(&gen_key) {
-                                                g
+                                            if let Some(Value::Generator(g)) = self.globals.remove(&gen_key) {
+                                                let result = self.generator_next(g, arg)?;
+                                                Some(result)
                                             } else {
-                                                gen_obj
-                                            };
-                                            let result = self.generator_next(current_gen, arg)?;
-                                            Some(result)
+                                                Some(self.make_iterator_result(Value::Undefined, true))
+                                            }
                                         }
                                         "return" => {
                                             let val = args.into_iter().next().unwrap_or(Value::Undefined);
                                             let gen_key = format!("__gen_{}", gen_obj.id);
-                                            if let Some(Value::Generator(mut g)) = self.globals.remove(&gen_key) {
-                                                g.done = true;
-                                                g.suspended = None;
-                                                self.globals.insert(gen_key, Value::Generator(g));
+                                            if let Some(Value::Generator(g)) = self.globals.remove(&gen_key) {
+                                                let result = self.finish_generator(g, val);
+                                                Some(result)
+                                            } else {
+                                                Some(self.make_iterator_result(val, true))
                                             }
-                                            Some(self.make_iterator_result(val, true))
                                         }
                                         _ => None,
                                     }
@@ -1796,47 +1733,7 @@ impl Vm {
                         // Call the constructor with `this` bound to the instance
                         if let Some(ctor) = class_obj.get("__constructor__") {
                             if let Value::Function(closure) = ctor {
-                                let func_idx = closure.func_id.0;
-                                self.tracker.push_frame();
-                                self.tracker.check_stack(&self.limits)?;
-
-                                let func = &self.program.functions[func_idx];
-
-                                // Inject captured variables
-                                for (cname, val) in &closure.captured {
-                                    if !self.globals.contains_key(cname) {
-                                        self.globals.insert(cname.clone(), val.clone());
-                                    }
-                                }
-
-                                // Set up locals with args
-                                let mut locals = Vec::with_capacity(func.local_count);
-                                for (i, param) in func.params.iter().enumerate() {
-                                    match param {
-                                        ParamPattern::Ident(_) => {
-                                            locals.push(args.get(i).cloned().unwrap_or(Value::Undefined));
-                                        }
-                                        ParamPattern::Rest(_) => {
-                                            let rest: Vec<Value> = args[i..].to_vec();
-                                            locals.push(Value::Array(rest));
-                                        }
-                                        ParamPattern::DefaultValue { .. } => {
-                                            let val = args.get(i).cloned().unwrap_or(Value::Undefined);
-                                            locals.push(val);
-                                        }
-                                        _ => {
-                                            locals.push(args.get(i).cloned().unwrap_or(Value::Undefined));
-                                        }
-                                    }
-                                }
-
-                                self.frames.push(CallFrame {
-                                    func_index: Some(func_idx),
-                                    ip: 0,
-                                    locals,
-                                    stack_base: self.stack.len(),
-                                    this_value: Some(instance_val),
-                                });
+                                self.push_call_frame(closure, &args, Some(instance_val))?;
                                 self.last_receiver = None;
                             } else {
                                 // No valid constructor, just return the instance
@@ -1849,41 +1746,7 @@ impl Vm {
                     }
                     Value::Function(closure) => {
                         // `new` on a plain function — just call it
-                        let func_idx = closure.func_id.0;
-                        self.tracker.push_frame();
-                        self.tracker.check_stack(&self.limits)?;
-
-                        let func = &self.program.functions[func_idx];
-
-                        for (cname, val) in &closure.captured {
-                            if !self.globals.contains_key(cname) {
-                                self.globals.insert(cname.clone(), val.clone());
-                            }
-                        }
-
-                        let mut locals = Vec::with_capacity(func.local_count);
-                        for (i, param) in func.params.iter().enumerate() {
-                            match param {
-                                ParamPattern::Ident(_) => {
-                                    locals.push(args.get(i).cloned().unwrap_or(Value::Undefined));
-                                }
-                                ParamPattern::Rest(_) => {
-                                    let rest: Vec<Value> = args[i..].to_vec();
-                                    locals.push(Value::Array(rest));
-                                }
-                                _ => {
-                                    locals.push(args.get(i).cloned().unwrap_or(Value::Undefined));
-                                }
-                            }
-                        }
-
-                        self.frames.push(CallFrame {
-                            func_index: Some(func_idx),
-                            ip: 0,
-                            locals,
-                            stack_base: self.stack.len(),
-                            this_value: None,
-                        });
+                        self.push_call_frame(closure, &args, None)?;
                         self.last_receiver = None;
                     }
                     _ => {
@@ -1941,41 +1804,7 @@ impl Vm {
                 }
 
                 if let Some(Value::Function(closure)) = super_ctor {
-                    let func_idx = closure.func_id.0;
-                    self.tracker.push_frame();
-                    self.tracker.check_stack(&self.limits)?;
-
-                    let func = &self.program.functions[func_idx];
-
-                    for (cname, val) in &closure.captured {
-                        if !self.globals.contains_key(cname) {
-                            self.globals.insert(cname.clone(), val.clone());
-                        }
-                    }
-
-                    let mut locals = Vec::with_capacity(func.local_count);
-                    for (i, param) in func.params.iter().enumerate() {
-                        match param {
-                            ParamPattern::Ident(_) => {
-                                locals.push(args.get(i).cloned().unwrap_or(Value::Undefined));
-                            }
-                            ParamPattern::Rest(_) => {
-                                let rest: Vec<Value> = args[i..].to_vec();
-                                locals.push(Value::Array(rest));
-                            }
-                            _ => {
-                                locals.push(args.get(i).cloned().unwrap_or(Value::Undefined));
-                            }
-                        }
-                    }
-
-                    self.frames.push(CallFrame {
-                        func_index: Some(func_idx),
-                        ip: 0,
-                        locals,
-                        stack_base: self.stack.len(),
-                        this_value: Some(this_val),
-                    });
+                    self.push_call_frame(&closure, &args, Some(this_val))?;
                     self.last_receiver = None;
                 } else {
                     // No super constructor found — push undefined
