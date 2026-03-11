@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Baldrick WASM Example</title>
+    <title>Zapcode WASM Example</title>
     <style>
         body { font-family: monospace; max-width: 700px; margin: 2rem auto; }
         textarea { width: 100%; height: 120px; font-family: monospace; font-size: 14px; }
@@ -12,8 +12,8 @@
     </style>
 </head>
 <body>
-    <h1>Baldrick — WASM Playground</h1>
-    <p>Execute TypeScript in the browser, sandboxed via Baldrick.</p>
+    <h1>Zapcode — WASM Playground</h1>
+    <p>Execute TypeScript in the browser, sandboxed via Zapcode.</p>
 
     <textarea id="code">// Try some TypeScript!
 const items = [
@@ -34,7 +34,7 @@ const cheapest = items.reduce((min, item) =>
     <pre id="output">Click "Run" to execute.</pre>
 
     <script type="module">
-        import init, { Baldrick } from './baldrick-wasm/baldrick_wasm.js';
+        import init, { Zapcode } from './zapcode-wasm/zapcode_wasm.js';
 
         await init();
 
@@ -44,7 +44,7 @@ const cheapest = items.reduce((min, item) =>
 
             try {
                 const start = performance.now();
-                const b = new Baldrick(code);
+                const b = new Zapcode(code);
                 const result = b.run();
                 const elapsed = (performance.now() - start).toFixed(2);
 

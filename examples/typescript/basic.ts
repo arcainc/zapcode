@@ -1,30 +1,30 @@
 /**
- * Basic Baldrick example — execute TypeScript from Node.js.
+ * Basic Zapcode example — execute TypeScript from Node.js.
  *
- * Prerequisites: build baldrick-js (see README)
+ * Prerequisites: build zapcode-js (see README)
  * Run with: npx ts-node examples/typescript/basic.ts
  */
 
-import { Baldrick, BaldrickSnapshotHandle } from "@baldrick/core";
+import { Zapcode, ZapcodeSnapshotHandle } from "@zapcode/core";
 
 // --- 1. Simple expression ---
-const simple = new Baldrick("1 + 2 * 3");
+const simple = new Zapcode("1 + 2 * 3");
 const result = simple.run();
 console.log("1 + 2 * 3 =", result.output); // 7
 
 // --- 2. Using inputs ---
-const greeter = new Baldrick(
+const greeter = new Zapcode(
   `
     const greeting = \`Hello, \${name}! You are \${age} years old.\`;
     greeting
   `,
   { inputs: ["name", "age"] }
 );
-const greetResult = greeter.run({ name: "Baldrick", age: 30 });
-console.log(greetResult.output); // "Hello, Baldrick! You are 30 years old."
+const greetResult = greeter.run({ name: "Zapcode", age: 30 });
+console.log(greetResult.output); // "Hello, Zapcode! You are 30 years old."
 
 // --- 3. Array/object manipulation ---
-const dataProcessor = new Baldrick(`
+const dataProcessor = new Zapcode(`
     const items = [
         { name: "Widget", price: 25.99, qty: 3 },
         { name: "Gadget", price: 49.99, qty: 1 },
@@ -39,7 +39,7 @@ console.log(dataResult.output);
 // { total: 227.86, expensive: ["Widget", "Gadget"] }
 
 // --- 4. External function (snapshot/resume) ---
-const weatherApp = new Baldrick(
+const weatherApp = new Zapcode(
   `
     const weather = await getWeather(city);
     const summary = \`Weather in \${city}: \${weather.condition}, \${weather.temp}°C\`;
@@ -62,7 +62,7 @@ if (!state.completed) {
   const mockWeather = { condition: "Partly cloudy", temp: 18 };
 
   // Resume with the result
-  const snapshot = BaldrickSnapshotHandle.load(state.snapshot);
+  const snapshot = ZapcodeSnapshotHandle.load(state.snapshot);
   const final_ = snapshot.resume(mockWeather);
   console.log(final_.output);
   // "Weather in London: Partly cloudy, 18°C"
@@ -70,7 +70,7 @@ if (!state.completed) {
 
 // --- 5. Resource limits ---
 try {
-  const dangerous = new Baldrick("while (true) {}", {
+  const dangerous = new Zapcode("while (true) {}", {
     timeLimitMs: 100,
   });
   dangerous.run();
@@ -80,7 +80,7 @@ try {
 }
 
 // --- 6. Classes and generators ---
-const classExample = new Baldrick(`
+const classExample = new Zapcode(`
     class Counter {
         count: number;
         constructor(start: number) {

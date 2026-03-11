@@ -1,21 +1,21 @@
 # AGENTS.md
 
-> Standard agent instructions for the `baldrick` project.
+> Standard agent instructions for the `zapcode` project.
 > Read this before writing any code.
 
 ---
 
 ## What this project is
 
-**Baldrick** is a minimal, secure TypeScript subset interpreter written in Rust,
+**Zapcode** is a minimal, secure TypeScript subset interpreter written in Rust,
 designed specifically to execute code written by AI agents. It is the TypeScript equivalent of
 [pydantic/monty](https://github.com/pydantic/monty).
 
 The core thesis: LLMs produce faster, cheaper, more reliable results when they write code instead of
-making sequential tool calls. Baldrick makes that possible for TypeScript/JavaScript stacks without
+making sequential tool calls. Zapcode makes that possible for TypeScript/JavaScript stacks without
 containers, sandbox services, or running untrusted code directly on the host.
 
-**What Baldrick can do:**
+**What Zapcode can do:**
 - Execute a safe subset of TypeScript — enough for an agent to express what it wants to do
 - Block all host access by default: filesystem, env vars, network, `require`, `import`
 - Expose host functions to the sandbox — only functions you explicitly register
@@ -24,7 +24,7 @@ containers, sandbox services, or running untrusted code directly on the host.
 - Be called from Rust, TypeScript/JavaScript (napi-rs), Python (PyO3), or WebAssembly
 - Enforce resource limits: memory, execution time, stack depth, allocation count
 
-**What Baldrick cannot do (by design):**
+**What Zapcode cannot do (by design):**
 - Access the standard library beyond a safe subset (`console`, `JSON`, `Math`, `Array`, `Object`, `Promise`)
 - Use `import` / `require` / dynamic imports
 - Access `process`, `globalThis`, `eval`, `Function()`, `setTimeout`/`setInterval`
@@ -37,29 +37,29 @@ containers, sandbox services, or running untrusted code directly on the host.
 ## Repository layout
 
 ```
-baldrick/
+zapcode/
 ├── crates/
-│   ├── baldrick-core/       # Parser, IR, bytecode compiler, VM, snapshot
+│   ├── zapcode-core/       # Parser, IR, bytecode compiler, VM, snapshot
 │   │   ├── src/
-│   │   │   ├── parser/      # oxc_parser integration — AST → BaldrickIR
+│   │   │   ├── parser/      # oxc_parser integration — AST → ZapcodeIR
 │   │   │   │   ├── mod.rs   # AST walker (oxc → IR)
 │   │   │   │   └── ir.rs    # IR type definitions
-│   │   │   ├── compiler/    # BaldrickIR → Bytecode
+│   │   │   ├── compiler/    # ZapcodeIR → Bytecode
 │   │   │   │   ├── mod.rs   # Compiler logic
 │   │   │   │   └── instruction.rs  # Instruction enum (~55 opcodes)
 │   │   │   ├── vm/          # Stack-based bytecode executor
-│   │   │   │   ├── mod.rs   # VM main loop, dispatch, BaldrickRun entry point
+│   │   │   │   ├── mod.rs   # VM main loop, dispatch, ZapcodeRun entry point
 │   │   │   │   └── builtins.rs  # Built-in functions (console, Math, JSON, etc.)
 │   │   │   ├── value.rs     # Value enum — runtime type system
 │   │   │   ├── snapshot.rs  # Serialize/deserialize mid-execution VM state
 │   │   │   ├── sandbox.rs   # Resource limits and tracking
-│   │   │   ├── error.rs     # BaldrickError — all error types
+│   │   │   ├── error.rs     # ZapcodeError — all error types
 │   │   │   └── lib.rs       # Public API re-exports
 │   │   ├── tests/           # 14 test files, 214+ tests
 │   │   └── benches/         # divan benchmarks
-│   ├── baldrick-js/         # napi-rs bindings → @baldrick/core npm package
-│   ├── baldrick-py/         # PyO3 bindings → baldrick pip package
-│   └── baldrick-wasm/       # wasm-bindgen target for browser/edge use
+│   ├── zapcode-js/         # napi-rs bindings → @zapcode/core npm package
+│   ├── zapcode-py/         # PyO3 bindings → zapcode pip package
+│   └── zapcode-wasm/       # wasm-bindgen target for browser/edge use
 ├── AGENTS.md                # This file
 ├── CLAUDE.md                # Claude Code-specific guidance (references this file)
 ├── Cargo.toml               # Workspace root
@@ -73,14 +73,14 @@ baldrick/
 ### Pipeline
 
 ```
-TypeScript source → parser (oxc) → BaldrickIR → compiler → Bytecode → VM → Result/Snapshot
+TypeScript source → parser (oxc) → ZapcodeIR → compiler → Bytecode → VM → Result/Snapshot
 ```
 
 ### Parser
 
 Uses **[oxc_parser](https://github.com/oxc-project/oxc)** — the fastest TypeScript parser in Rust.
-The parser walks the oxc AST and emits `BaldrickIR`. Unsupported syntax produces
-`BaldrickError::UnsupportedSyntax` with span information.
+The parser walks the oxc AST and emits `ZapcodeIR`. Unsupported syntax produces
+`ZapcodeError::UnsupportedSyntax` with span information.
 
 ### Supported syntax subset
 
@@ -136,19 +136,19 @@ Stack-based bytecode VM (~55 instructions). Single-threaded, no Tokio runtime in
 
 **Suspension at external calls**: when the VM encounters a `CallExternal` instruction for a
 registered external function, it:
-1. Captures the VM state into a `BaldrickSnapshot`
+1. Captures the VM state into a `ZapcodeSnapshot`
 2. Returns `VmState::Suspended { function_name, args, snapshot }`
 
 The caller resolves the external function and calls `snapshot.resume(return_value)`.
 
 ### Snapshotting
 
-`BaldrickSnapshot` uses `postcard` for serialization. Snapshots are small (< 2 KB for typical
+`ZapcodeSnapshot` uses `postcard` for serialization. Snapshots are small (< 2 KB for typical
 agent code). They can be stored in any bytes store (DB, Redis, S3).
 
 ```rust
 let bytes: Vec<u8> = snapshot.dump()?;
-let restored = BaldrickSnapshot::load(&bytes)?;
+let restored = ZapcodeSnapshot::load(&bytes)?;
 let final_state = restored.resume(return_value)?;
 ```
 
@@ -156,9 +156,9 @@ let final_state = restored.resume(return_value)?;
 
 ## Sandbox invariants — NEVER violate
 
-1. **No host filesystem access** — `std::fs` is forbidden in `baldrick-core`
-2. **No env var access** — `std::env::var` is forbidden in `baldrick-core`
-3. **No network access** — `std::net`, `tokio::net` are forbidden in `baldrick-core`
+1. **No host filesystem access** — `std::fs` is forbidden in `zapcode-core`
+2. **No env var access** — `std::env::var` is forbidden in `zapcode-core`
+3. **No network access** — `std::net`, `tokio::net` are forbidden in `zapcode-core`
 4. **No `eval` equivalent** — no mechanism to compile new code at runtime from within the sandbox
 5. **Resource limits are enforced** — memory, time, stack depth, allocation count checked during execution
 
@@ -205,10 +205,10 @@ is handled entirely inside the VM.
 ## How to add a new language feature
 
 1. **Check the supported subset table above.** Features listed as unsupported are excluded intentionally.
-2. **Add parser support** in `crates/baldrick-core/src/parser/`. Emit `BaldrickError::UnsupportedSyntax` for unhandled nodes.
-3. **Add compiler support** in `crates/baldrick-core/src/compiler/`. Prefer reusing existing instructions.
-4. **Add VM dispatch** in `crates/baldrick-core/src/vm/mod.rs`. Use `push_call_frame()` for function setup. Check resource limits before allocations.
-5. **Write tests** in `crates/baldrick-core/tests/`.
+2. **Add parser support** in `crates/zapcode-core/src/parser/`. Emit `ZapcodeError::UnsupportedSyntax` for unhandled nodes.
+3. **Add compiler support** in `crates/zapcode-core/src/compiler/`. Prefer reusing existing instructions.
+4. **Add VM dispatch** in `crates/zapcode-core/src/vm/mod.rs`. Use `push_call_frame()` for function setup. Check resource limits before allocations.
+5. **Write tests** in `crates/zapcode-core/tests/`.
 6. **Update bindings** if the feature affects the public API.
 
 ---
@@ -238,7 +238,7 @@ Every language feature must have:
 2. Edge case tests (boundary conditions, empty inputs)
 3. A sandbox escape test where applicable
 
-Tests live in `crates/baldrick-core/tests/`. Files are organized by feature:
+Tests live in `crates/zapcode-core/tests/`. Files are organized by feature:
 `basic.rs`, `builtins.rs`, `classes.rs`, `generators.rs`, `async_await.rs`,
 `control_flow.rs`, `functions.rs`, `integration.rs`, `objects_arrays.rs`,
 `sandbox.rs`, `error_handling.rs`, `variables.rs`, `snapshot.rs`.

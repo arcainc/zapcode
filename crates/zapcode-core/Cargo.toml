@@ -1,0 +1,26 @@
+[package]
+name = "zapcode-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A minimal, secure TypeScript subset interpreter — parse, compile, execute, snapshot"
+
+[dependencies]
+oxc_parser.workspace = true
+oxc_ast.workspace = true
+oxc_allocator.workspace = true
+oxc_span.workspace = true
+oxc_syntax.workspace = true
+serde.workspace = true
+postcard.workspace = true
+indexmap.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+divan.workspace = true
+
+[[bench]]
+name = "execution"
+harness = false

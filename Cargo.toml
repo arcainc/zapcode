@@ -1,9 +1,9 @@
 [workspace]
 members = [
-    "crates/baldrick-core",
-    "crates/baldrick-js",
-    "crates/baldrick-py",
-    "crates/baldrick-wasm",
+    "crates/zapcode-core",
+    "crates/zapcode-js",
+    "crates/zapcode-py",
+    "crates/zapcode-wasm",
 ]
 resolver = "2"
 
@@ -11,7 +11,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/TheUncharted/baldrick"
+repository = "https://github.com/TheUncharted/zapcode"
 
 [workspace.dependencies]
 # Parser

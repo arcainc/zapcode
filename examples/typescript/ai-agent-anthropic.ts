@@ -1,25 +1,25 @@
 /**
- * AI Agent with Baldrick — LOW-LEVEL approach using Anthropic SDK directly.
+ * AI Agent with Zapcode — LOW-LEVEL approach using Anthropic SDK directly.
  *
- * This shows the manual snapshot/resume loop using @baldrick/core.
- * For most use cases, prefer @baldrick/ai instead — see ai-agent-baldrick-ai.ts
+ * This shows the manual snapshot/resume loop using @zapcode/core.
+ * For most use cases, prefer @zapcode/ai instead — see ai-agent-zapcode-ai.ts
  * or ai-agent-vercel-ai.ts for the recommended approach.
  *
  * This example shows the "code as tool use" pattern:
  * 1. Claude writes TypeScript code that calls tools (external functions)
- * 2. Baldrick executes the code in a sandbox
- * 3. When the code calls a tool, Baldrick suspends and returns a snapshot
- * 4. Your app resolves the tool call, then resumes Baldrick with the result
+ * 2. Zapcode executes the code in a sandbox
+ * 3. When the code calls a tool, Zapcode suspends and returns a snapshot
+ * 4. Your app resolves the tool call, then resumes Zapcode with the result
  *
  * Prerequisites:
- *   npm install @anthropic-ai/sdk @baldrick/core
+ *   npm install @anthropic-ai/sdk @zapcode/core
  *   export ANTHROPIC_API_KEY=sk-...
  *
  * Run with: npx tsx ai-agent-anthropic.ts
  */
 
 import Anthropic from "@anthropic-ai/sdk";
-import { Baldrick, BaldrickSnapshotHandle } from "@baldrick/core";
+import { Zapcode, ZapcodeSnapshotHandle } from "@zapcode/core";
 
 // --- Tool implementations (the real functions that run on your server) ---
 
@@ -80,8 +80,8 @@ Return ONLY the TypeScript code, no markdown fences. The last expression is the 
     response.content[0].type === "text" ? response.content[0].text : "";
   console.log("Claude wrote:\n", code, "\n");
 
-  // Execute the AI-generated code in Baldrick's sandbox
-  const sandbox = new Baldrick(code, {
+  // Execute the AI-generated code in Zapcode's sandbox
+  const sandbox = new Zapcode(code, {
     inputs: ["userQuery"],
     externalFunctions: Object.keys(tools),
     timeLimitMs: 10000,
@@ -104,7 +104,7 @@ Return ONLY the TypeScript code, no markdown fences. The last expression is the 
     console.log(`  <- ${functionName} returned:`, result);
 
     // Resume the sandbox with the tool's result
-    const snapshot = BaldrickSnapshotHandle.load(state.snapshot);
+    const snapshot = ZapcodeSnapshotHandle.load(state.snapshot);
     state = snapshot.resume(result);
   }
 

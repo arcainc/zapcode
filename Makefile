@@ -10,7 +10,7 @@ test:
 	cargo test
 
 bench:
-	cargo bench -p baldrick-core
+	cargo bench -p zapcode-core
 
 lint:
 	cargo clippy --all-targets -- -D warnings

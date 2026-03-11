@@ -1,18 +1,18 @@
 {
-  "name": "baldrick-examples",
+  "name": "zapcode-examples",
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "description": "Example usage of Baldrick with AI agents",
+  "description": "Example usage of Zapcode with AI agents",
   "scripts": {
     "basic": "tsx basic.ts",
-    "agent": "tsx ai-agent-baldrick-ai.ts",
+    "agent": "tsx ai-agent-zapcode-ai.ts",
     "agent:anthropic": "tsx ai-agent-anthropic.ts",
     "agent:vercel": "tsx ai-agent-vercel-ai.ts"
   },
   "dependencies": {
-    "@baldrick/core": "file:../../crates/baldrick-js",
-    "@baldrick/ai": "file:../../packages/baldrick-ai"
+    "@zapcode/core": "file:../../crates/zapcode-js",
+    "@zapcode/ai": "file:../../packages/zapcode-ai"
   },
   "devDependencies": {
     "tsx": "^4.19.0",

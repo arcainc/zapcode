@@ -1,0 +1,16 @@
+[package]
+name = "zapcode-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Python bindings for the Zapcode TypeScript interpreter"
+
+[lib]
+name = "zapcode"
+crate-type = ["cdylib"]
+
+[dependencies]
+zapcode-core = { path = "../zapcode-core" }
+pyo3.workspace = true
+indexmap.workspace = true

@@ -1,10 +1,10 @@
 [project]
-name = "baldrick-examples"
+name = "zapcode-examples"
 version = "0.0.1"
-description = "Example usage of Baldrick with AI agents"
+description = "Example usage of Zapcode with AI agents"
 requires-python = ">=3.10"
 dependencies = [
-    "baldrick",
+    "zapcode",
 ]
 
 [project.optional-dependencies]
@@ -16,7 +16,7 @@ ai = [
 dev-dependencies = []
 
 [tool.uv.sources]
-baldrick = { path = "../../crates/baldrick-py" }
+zapcode = { path = "../../crates/zapcode-py" }
 
 [build-system]
 requires = ["maturin>=1.0,<2.0"]

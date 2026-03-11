@@ -2,11 +2,11 @@
 
 ## Setup
 
-First, build the Baldrick native addon (requires Rust toolchain):
+First, build the Zapcode native addon (requires Rust toolchain):
 
 ```bash
-cd ../../crates/baldrick-js
-cargo build -p baldrick-js --release
+cd ../../crates/zapcode-js
+cargo build -p zapcode-js --release
 ```
 
 Then install dependencies:
@@ -25,7 +25,7 @@ bun install
 # Basic usage
 npm run basic          # or: bun run basic / yarn basic / pnpm basic
 
-# AI agent with @baldrick/ai wrapper (recommended — requires ANTHROPIC_API_KEY)
+# AI agent with @zapcode/ai wrapper (recommended — requires ANTHROPIC_API_KEY)
 export ANTHROPIC_API_KEY=sk-ant-...
 npm run agent
 
@@ -41,6 +41,6 @@ npm run agent:vercel
 | File | Description |
 |---|---|
 | `basic.ts` | Simple expressions, inputs, data processing, classes, resource limits |
-| `ai-agent-baldrick-ai.ts` | **Recommended** — uses `@baldrick/ai` wrapper with Vercel AI SDK |
+| `ai-agent-zapcode-ai.ts` | **Recommended** — uses `@zapcode/ai` wrapper with Vercel AI SDK |
 | `ai-agent-anthropic.ts` | Raw Anthropic SDK + manual snapshot/resume loop |
 | `ai-agent-vercel-ai.ts` | Vercel AI SDK with manual code generation |

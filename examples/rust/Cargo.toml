@@ -1,5 +1,5 @@
 [package]
-name = "baldrick-examples"
+name = "zapcode-examples"
 version = "0.0.1"
 edition = "2021"
 publish = false
@@ -9,5 +9,5 @@ name = "basic"
 path = "basic.rs"
 
 [dependencies]
-baldrick-core = { path = "../../crates/baldrick-core" }
+zapcode-core = { path = "../../crates/zapcode-core" }
 indexmap = "2"

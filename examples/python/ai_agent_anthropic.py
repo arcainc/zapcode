@@ -1,25 +1,25 @@
 """
-AI Agent with Baldrick — LOW-LEVEL approach using Anthropic SDK directly.
+AI Agent with Zapcode — LOW-LEVEL approach using Anthropic SDK directly.
 
-This shows the manual snapshot/resume loop using the baldrick package.
-For most use cases, prefer baldrick-ai instead — see ai_agent_baldrick_ai.py
+This shows the manual snapshot/resume loop using the zapcode package.
+For most use cases, prefer zapcode-ai instead — see ai_agent_zapcode_ai.py
 for the recommended approach.
 
 The "code as tool use" pattern:
 1. Claude writes TypeScript code that calls tools (external functions)
-2. Baldrick executes the code in a sandbox
-3. When the code calls a tool, Baldrick suspends and returns a snapshot
-4. Your app resolves the tool call, then resumes Baldrick with the result
+2. Zapcode executes the code in a sandbox
+3. When the code calls a tool, Zapcode suspends and returns a snapshot
+4. Your app resolves the tool call, then resumes Zapcode with the result
 
 Prerequisites:
-    pip install anthropic baldrick
-    # or: uv add anthropic baldrick
+    pip install anthropic zapcode
+    # or: uv add anthropic zapcode
 
 Run with: python ai_agent_anthropic.py
 """
 
 import anthropic
-from baldrick import Baldrick, BaldrickSnapshot
+from zapcode import Zapcode, ZapcodeSnapshot
 
 # --- Tool implementations (the real functions that run on your server) ---
 
@@ -66,8 +66,8 @@ Return ONLY the TypeScript code, no markdown fences. The last expression is the 
 
 
 def execute_in_sandbox(code: str, inputs: dict) -> any:
-    """Execute AI-generated TypeScript in Baldrick's sandbox."""
-    sandbox = Baldrick(
+    """Execute AI-generated TypeScript in Zapcode's sandbox."""
+    sandbox = Zapcode(
         code,
         inputs=list(inputs.keys()),
         external_functions=list(TOOLS.keys()),
@@ -90,14 +90,14 @@ def execute_in_sandbox(code: str, inputs: dict) -> any:
         print(f"  <- {fn_name} returned: {result}")
 
         # Resume the sandbox with the tool's return value
-        snapshot: BaldrickSnapshot = state["snapshot"]
+        snapshot: ZapcodeSnapshot = state["snapshot"]
         state = snapshot.resume(result)
 
     return state["output"]
 
 
 def run_agent(user_query: str):
-    """Ask Claude to write code, then execute it in Baldrick."""
+    """Ask Claude to write code, then execute it in Zapcode."""
     client = anthropic.Anthropic()
 
     response = client.messages.create(

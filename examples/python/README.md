@@ -5,7 +5,7 @@
 ### With uv (recommended)
 
 ```bash
-uv sync                    # install dependencies + build baldrick from source
+uv sync                    # install dependencies + build zapcode from source
 uv sync --extra ai         # also install anthropic SDK for the AI agent example
 ```
 
@@ -13,7 +13,7 @@ uv sync --extra ai         # also install anthropic SDK for the AI agent example
 
 ```bash
 pip install maturin
-cd ../../crates/baldrick-py
+cd ../../crates/zapcode-py
 maturin develop --release
 cd ../../examples/python
 pip install anthropic      # for the AI agent example
@@ -25,9 +25,9 @@ pip install anthropic      # for the AI agent example
 # Basic usage
 python basic.py                     # or: uv run basic.py
 
-# AI agent with baldrick-ai wrapper (recommended — requires ANTHROPIC_API_KEY)
+# AI agent with zapcode-ai wrapper (recommended — requires ANTHROPIC_API_KEY)
 export ANTHROPIC_API_KEY=sk-ant-...
-python ai_agent_baldrick_ai.py
+python ai_agent_zapcode_ai.py
 
 # AI agent with raw Anthropic SDK
 python ai_agent_anthropic.py
@@ -38,5 +38,5 @@ python ai_agent_anthropic.py
 | File | Description |
 |---|---|
 | `basic.py` | Simple expressions, inputs, data processing, snapshot/resume, serialization |
-| `ai_agent_baldrick_ai.py` | **Recommended** — uses `baldrick-ai` wrapper with Anthropic SDK |
+| `ai_agent_zapcode_ai.py` | **Recommended** — uses `zapcode-ai` wrapper with Anthropic SDK |
 | `ai_agent_anthropic.py` | Raw Anthropic SDK + manual snapshot/resume loop |

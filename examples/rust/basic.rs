@@ -1,12 +1,12 @@
-//! Basic Baldrick example — execute TypeScript from Rust.
+//! Basic Zapcode example — execute TypeScript from Rust.
 //!
 //! Run with: cargo run --example basic
 
-use baldrick_core::{BaldrickRun, ResourceLimits, Value, VmState};
+use zapcode_core::{ZapcodeRun, ResourceLimits, Value, VmState};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- 1. Simple expression ---
-    let runner = BaldrickRun::new(
+    let runner = ZapcodeRun::new(
         "1 + 2 * 3".to_string(),
         vec![],
         vec![],
@@ -16,7 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("1 + 2 * 3 = {:?}", result); // Int(7)
 
     // --- 2. Using inputs ---
-    let runner = BaldrickRun::new(
+    let runner = ZapcodeRun::new(
         r#"
             const greeting = `Hello, ${name}! You are ${age} years old.`;
             greeting
@@ -27,13 +27,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ResourceLimits::default(),
     )?;
     let result = runner.run(vec![
-        ("name".to_string(), Value::String("Baldrick".into())),
+        ("name".to_string(), Value::String("Zapcode".into())),
         ("age".to_string(), Value::Int(30)),
     ])?;
-    println!("Greeting: {:?}", result.state); // Complete("Hello, Baldrick! You are 30 years old.")
+    println!("Greeting: {:?}", result.state); // Complete("Hello, Zapcode! You are 30 years old.")
 
     // --- 3. External function (snapshot/resume) ---
-    let runner = BaldrickRun::new(
+    let runner = ZapcodeRun::new(
         r#"
             const weather = await getWeather(city);
             const summary = `Weather in ${city}: ${weather.condition}, ${weather.temp}°C`;
@@ -81,7 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // --- 4. Snapshot serialization (store and resume later) ---
-    let runner = BaldrickRun::new(
+    let runner = ZapcodeRun::new(
         r#"
             const data = await fetchData(url);
             data.length
@@ -102,7 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Snapshot size: {} bytes", bytes.len());
 
         // Later (possibly in a different process): restore and resume
-        let restored = baldrick_core::BaldrickSnapshot::load(&bytes)?;
+        let restored = zapcode_core::ZapcodeSnapshot::load(&bytes)?;
         let final_state = restored.resume(Value::String("hello world".into()))?;
         if let VmState::Complete(value) = final_state {
             println!("Restored result: {:?}", value); // Int(11)

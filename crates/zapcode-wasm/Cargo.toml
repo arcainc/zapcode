@@ -1,0 +1,18 @@
+[package]
+name = "zapcode-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "WebAssembly bindings for the Zapcode TypeScript interpreter"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+zapcode-core = { path = "../zapcode-core" }
+wasm-bindgen.workspace = true
+serde-wasm-bindgen.workspace = true
+js-sys.workspace = true
+serde.workspace = true
+indexmap.workspace = true

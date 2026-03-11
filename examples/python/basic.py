@@ -1,30 +1,30 @@
 """
-Basic Baldrick example — execute TypeScript from Python.
+Basic Zapcode example — execute TypeScript from Python.
 
-Prerequisites: build baldrick-py (see README)
+Prerequisites: build zapcode-py (see README)
 Run with: python examples/python/basic.py
 """
 
-from baldrick import Baldrick, BaldrickSnapshot
+from zapcode import Zapcode, ZapcodeSnapshot
 
 # --- 1. Simple expression ---
-b = Baldrick("1 + 2 * 3")
+b = Zapcode("1 + 2 * 3")
 result = b.run()
 print("1 + 2 * 3 =", result["output"])  # 7
 
 # --- 2. Using inputs ---
-b = Baldrick(
+b = Zapcode(
     """
     const greeting = `Hello, ${name}! You are ${age} years old.`;
     greeting
     """,
     inputs=["name", "age"],
 )
-result = b.run({"name": "Baldrick", "age": 30})
-print(result["output"])  # "Hello, Baldrick! You are 30 years old."
+result = b.run({"name": "Zapcode", "age": 30})
+print(result["output"])  # "Hello, Zapcode! You are 30 years old."
 
 # --- 3. Data processing ---
-b = Baldrick("""
+b = Zapcode("""
     const items = [
         { name: "Widget", price: 25.99, qty: 3 },
         { name: "Gadget", price: 49.99, qty: 1 },
@@ -38,7 +38,7 @@ result = b.run()
 print(result["output"])  # {'total': 227.86, 'expensive': ['Widget', 'Gadget']}
 
 # --- 4. External function (snapshot/resume) ---
-b = Baldrick(
+b = Zapcode(
     """
     const weather = await getWeather(city);
     const summary = `Weather in ${city}: ${weather.condition}, ${weather.temp}°C`;
@@ -63,13 +63,13 @@ if state.get("suspended"):
 
 # --- 5. Resource limits ---
 try:
-    b = Baldrick("while (true) {}", time_limit_ms=100)
+    b = Zapcode("while (true) {}", time_limit_ms=100)
     b.run()
 except RuntimeError as e:
     print(f"Caught: {e}")  # allocation limit or time limit
 
 # --- 6. Snapshot serialization ---
-b = Baldrick(
+b = Zapcode(
     "const data = await fetchData(url); data.length",
     inputs=["url"],
     external_functions=["fetchData"],
@@ -82,6 +82,6 @@ if state.get("suspended"):
     print(f"Snapshot size: {len(snapshot_bytes)} bytes")
 
     # Later (possibly in a different process): restore and resume
-    restored = BaldrickSnapshot.load(snapshot_bytes)
+    restored = ZapcodeSnapshot.load(snapshot_bytes)
     final = restored.resume("hello world")
     print(f"Restored result: {final['output']}")  # 11
