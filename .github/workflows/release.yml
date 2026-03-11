@@ -98,6 +98,8 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+      - name: Copy README
+        run: cp README.md crates/zapcode-js/README.md
       - name: Install dependencies
         working-directory: crates/zapcode-js
         run: npm install

@@ -25,5 +25,7 @@ Repository = "https://github.com/TheUncharted/zapcode"
 Issues = "https://github.com/TheUncharted/zapcode/issues"
 Documentation = "https://github.com/TheUncharted/zapcode#readme"
 
+readme = "../../README.md"
+
 [tool.maturin]
 features = ["pyo3/extension-module"]

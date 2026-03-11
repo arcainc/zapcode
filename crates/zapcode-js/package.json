@@ -37,7 +37,8 @@
     "files": [
         "index.js",
         "index.d.ts",
-        "npm"
+        "npm",
+        "README.md"
     ],
     "napi": {
         "binaryName": "zapcode",
