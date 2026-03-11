@@ -1,29 +1,60 @@
 <p align="center">
   <h1 align="center">Zapcode</h1>
   <p align="center"><strong>Run AI code. Safely. Instantly.</strong></p>
-  <p align="center">A minimal, secure TypeScript interpreter written in Rust for use by AI</p>
+  <p align="center">A minimal, secure TypeScript interpreter written in Rust for use by AI agents</p>
 </p>
 
 <p align="center">
-  <a href="https://github.com/TheUncharted/zapcode/actions"><img src="https://img.shields.io/github/actions/workflow/status/TheUncharted/zapcode/ci.yml?branch=main&label=CI" alt="CI"></a>
+  <a href="https://github.com/TheUncharted/zapcode/actions"><img src="https://img.shields.io/github/actions/workflow/status/TheUncharted/zapcode/ci.yml?branch=master&label=CI" alt="CI"></a>
+  <a href="https://crates.io/crates/zapcode-core"><img src="https://img.shields.io/crates/v/zapcode-core" alt="crates.io"></a>
   <a href="https://www.npmjs.com/package/@unchartedfr/zapcode"><img src="https://img.shields.io/npm/v/@unchartedfr/zapcode" alt="npm"></a>
   <a href="https://pypi.org/project/zapcode/"><img src="https://img.shields.io/pypi/v/zapcode" alt="PyPI"></a>
-  <a href="https://github.com/TheUncharted/zapcode/blob/main/LICENSE"><img src="https://img.shields.io/github/license/TheUncharted/zapcode" alt="License"></a>
+  <a href="https://github.com/TheUncharted/zapcode/blob/master/LICENSE"><img src="https://img.shields.io/github/license/TheUncharted/zapcode" alt="License"></a>
 </p>
 
 ---
 
 > **Experimental** — Zapcode is under active development. APIs may change.
 
-When LLMs write code, you need to run it — fast and safe. That's Zapcode.
+## Why agents should write code
 
-When LLMs write TypeScript, you need to run it safely. Containers add hundreds of milliseconds of startup overhead and operational complexity. V8 isolates are fast but bring a 20MB+ runtime and a massive attack surface.
+AI agents are more capable when they **write code** instead of chaining tool calls. Code gives agents loops, conditionals, variables, and composition — things that tool chains simulate poorly.
 
-Zapcode takes a different approach: a purpose-built TypeScript interpreter that starts in **under 2 microseconds**, enforces a security sandbox at the language level, and can snapshot execution state to bytes for later resumption — all in a single, embeddable library with zero dependencies on Node.js or V8.
+- [CodeMode](https://blog.cloudflare.com/codemode-ai-agent-coding) — Cloudflare on why agents should write code
+- [Programmatic Tool Calling](https://docs.anthropic.com/en/docs/build-with-claude/tool-use/tool-use-examples#programmatic-tool-calling) — Anthropic's approach
+- [Code Execution with MCP](https://www.anthropic.com/engineering/code-execution-mcp) — Anthropic engineering
+- [Smol Agents](https://huggingface.co/docs/smolagents/en/index) — Hugging Face's code-first agents
+
+**But running AI-generated code is dangerous and slow.**
+
+Docker adds 200-500ms of cold-start latency and requires a container runtime. V8 isolates bring ~20MB of binary and millisecond startup. Neither supports snapshotting execution mid-function.
+
+Zapcode takes a different approach: a purpose-built TypeScript interpreter that starts in **2 microseconds**, enforces a security sandbox at the language level, and can snapshot execution state to bytes for later resumption — all in a single, embeddable library with zero dependencies on Node.js or V8.
+
+Inspired by [Monty](https://github.com/pydantic/monty), Pydantic's Python subset interpreter that takes the same approach for Python.
+
+## Alternatives
+
+| | Language completeness | Security | Startup | Snapshots | Setup |
+|---|---|---|---|---|---|
+| **Zapcode** | TypeScript subset | Language-level sandbox | **~2 µs** | Built-in, < 2 KB | `npm install` / `pip install` |
+| Docker + Node.js | Full Node.js | Container isolation | ~200-500 ms | No | Container runtime |
+| V8 Isolates | Full JS/TS | Isolate boundary | ~5-50 ms | No | V8 (~20 MB) |
+| Deno Deploy | Full TS | Isolate + permissions | ~10-50 ms | No | Cloud service |
+| QuickJS | Full ES2023 | Process isolation | ~1-5 ms | No | C library |
+| WASI/Wasmer | Depends on guest | Wasm sandbox | ~1-10 ms | Possible | Wasm runtime |
+
+### Why not Docker?
+
+Docker provides strong isolation but adds hundreds of milliseconds of cold-start latency, requires a container runtime, and doesn't support snapshotting execution state mid-function. For AI agent loops that execute thousands of small code snippets, the overhead dominates.
+
+### Why not V8?
+
+V8 is the gold standard for JavaScript execution. But it brings ~20 MB of binary size, millisecond startup times, and a vast API surface that must be carefully restricted for sandboxing. If you need full ECMAScript compliance, use V8. If you need microsecond startup, byte-sized snapshots, and a security model where "blocked by default" is the foundation rather than an afterthought, use Zapcode.
 
 ## Benchmarks
 
-All benchmarks run on the full pipeline: parse → compile → execute. No caching, no warm-up.
+All benchmarks run the full pipeline: parse → compile → execute. No caching, no warm-up.
 
 | Benchmark | Zapcode | Docker + Node.js | V8 Isolate |
 |---|---|---|---|
@@ -42,105 +73,180 @@ All benchmarks run on the full pipeline: parse → compile → execute. No cachi
 
 No background thread, no GC, no runtime — CPU usage is exactly proportional to the instructions executed.
 
-Run benchmarks: `cargo bench`
-
-## Quick start
-
-### One-line install
-
 ```bash
-curl -fsSL https://raw.githubusercontent.com/TheUncharted/zapcode/master/install.sh | bash
+cargo bench   # run benchmarks yourself
 ```
 
-The script auto-detects your project type (TypeScript, Python, Rust, WASM), installs prerequisites, and builds native bindings. Or specify explicitly:
+## Installation
 
+**TypeScript / JavaScript**
 ```bash
-curl -fsSL ... | bash -s -- --lang ts      # TypeScript / JavaScript
-curl -fsSL ... | bash -s -- --lang python   # Python
-curl -fsSL ... | bash -s -- --lang rust     # Rust
-curl -fsSL ... | bash -s -- --lang wasm     # WebAssembly
+npm install @unchartedfr/zapcode        # npm / yarn / pnpm / bun
 ```
 
-### Install by language
+**Python**
+```bash
+pip install zapcode                     # pip / uv
+```
+
+**Rust**
+```toml
+# Cargo.toml
+[dependencies]
+zapcode-core = "1.0.0-beta.3"
+```
+
+**WebAssembly**
+```bash
+wasm-pack build crates/zapcode-wasm --target web
+```
+
+## Basic Usage
+
+### TypeScript / JavaScript
+
+```typescript
+import { Zapcode, ZapcodeSnapshotHandle } from '@unchartedfr/zapcode';
+
+// Simple expression
+const b = new Zapcode('1 + 2 * 3');
+console.log(b.run().output);  // 7
+
+// With inputs
+const greeter = new Zapcode(
+    '`Hello, ${name}! You are ${age} years old.`',
+    { inputs: ['name', 'age'] },
+);
+console.log(greeter.run({ name: 'Zapcode', age: 30 }).output);
+
+// Data processing
+const processor = new Zapcode(`
+    const items = [
+        { name: "Widget", price: 25.99, qty: 3 },
+        { name: "Gadget", price: 49.99, qty: 1 },
+    ];
+    const total = items.reduce((sum, i) => sum + i.price * i.qty, 0);
+    ({ total, names: items.map(i => i.name) })
+`);
+console.log(processor.run().output);
+// { total: 127.96, names: ["Widget", "Gadget"] }
+
+// External function (snapshot/resume)
+const app = new Zapcode(`const data = await fetch(url); data`, {
+    inputs: ['url'],
+    externalFunctions: ['fetch'],
+});
+const state = app.start({ url: 'https://api.example.com' });
+if (!state.completed) {
+    console.log(state.functionName);  // "fetch"
+    const snapshot = ZapcodeSnapshotHandle.load(state.snapshot);
+    const final_ = snapshot.resume({ status: 'ok' });
+    console.log(final_.output);  // { status: "ok" }
+}
+```
+
+See [`examples/typescript/basic.ts`](examples/typescript/basic.ts) for more.
+
+### Python
+
+```python
+from zapcode import Zapcode, ZapcodeSnapshot
+
+# Simple expression
+b = Zapcode("1 + 2 * 3")
+print(b.run()["output"])  # 7
+
+# With inputs
+b = Zapcode(
+    '`Hello, ${name}!`',
+    inputs=["name"],
+)
+print(b.run({"name": "Zapcode"})["output"])  # "Hello, Zapcode!"
+
+# External function (snapshot/resume)
+b = Zapcode(
+    "const w = await getWeather(city); `${city}: ${w.temp}°C`",
+    inputs=["city"],
+    external_functions=["getWeather"],
+)
+state = b.start({"city": "London"})
+if state.get("suspended"):
+    result = state["snapshot"].resume({"condition": "Cloudy", "temp": 12})
+    print(result["output"])  # "London: 12°C"
+
+# Snapshot persistence
+state = b.start({"city": "Tokyo"})
+if state.get("suspended"):
+    bytes_ = state["snapshot"].dump()          # serialize to bytes
+    restored = ZapcodeSnapshot.load(bytes_)    # load from bytes
+    result = restored.resume({"condition": "Clear", "temp": 26})
+```
+
+See [`examples/python/basic.py`](examples/python/basic.py) for more.
 
 <details>
 <summary><strong>Rust</strong></summary>
 
-```toml
-[dependencies]
-zapcode-core = { git = "https://github.com/TheUncharted/zapcode.git" }
+```rust
+use zapcode_core::{ZapcodeRun, Value, ResourceLimits, VmState};
+
+// Simple expression
+let runner = ZapcodeRun::new(
+    "1 + 2 * 3".to_string(), vec![], vec![],
+    ResourceLimits::default(),
+)?;
+assert_eq!(runner.run_simple()?, Value::Int(7));
+
+// With inputs and external functions (snapshot/resume)
+let runner = ZapcodeRun::new(
+    r#"const weather = await getWeather(city);
+       `${city}: ${weather.condition}, ${weather.temp}°C`"#.to_string(),
+    vec!["city".to_string()],
+    vec!["getWeather".to_string()],
+    ResourceLimits::default(),
+)?;
+
+let state = runner.start(vec![
+    ("city".to_string(), Value::String("London".into())),
+])?;
+
+if let VmState::Suspended { snapshot, .. } = state {
+    let weather = Value::Object(indexmap::indexmap! {
+        "condition".into() => Value::String("Cloudy".into()),
+        "temp".into() => Value::Int(12),
+    });
+    let final_state = snapshot.resume(weather)?;
+    // VmState::Complete("London: Cloudy, 12°C")
+}
 ```
+
+See [`examples/rust/basic.rs`](examples/rust/basic.rs) for more.
 </details>
 
 <details>
-<summary><strong>JavaScript / TypeScript (Node.js)</strong></summary>
+<summary><strong>WebAssembly (browser)</strong></summary>
 
-Once published to npm (coming soon):
+```html
+<script type="module">
+import init, { Zapcode } from './zapcode-wasm/zapcode_wasm.js';
 
-```bash
-npm install @unchartedfr/zapcode    # npm
-yarn add @unchartedfr/zapcode       # yarn
-pnpm add @unchartedfr/zapcode       # pnpm
-bun add @unchartedfr/zapcode        # bun
+await init();
+
+const b = new Zapcode(`
+    const items = [10, 20, 30];
+    items.map(x => x * 2).reduce((a, b) => a + b, 0)
+`);
+const result = b.run();
+console.log(result.output);  // 120
+</script>
 ```
 
-Until then, build from source — requires Rust toolchain:
-
-```bash
-git clone https://github.com/TheUncharted/zapcode.git
-cd zapcode/crates/zapcode-js
-npm install && npm run build
-
-# Link into your project
-npm link                     # in zapcode-js/
-npm link @unchartedfr/zapcode      # in your project
-```
+See [`examples/wasm/index.html`](examples/wasm/index.html) for a full playground.
 </details>
 
-<details>
-<summary><strong>Python</strong></summary>
+## AI Agent Usage
 
-Once published to PyPI (coming soon):
-
-```bash
-pip install zapcode         # pip
-uv add zapcode              # uv (Astral)
-```
-
-Until then, build from source — requires Rust toolchain + [maturin](https://github.com/PyO3/maturin):
-
-```bash
-# With uv (recommended)
-uv tool install maturin
-git clone https://github.com/TheUncharted/zapcode.git
-cd zapcode/crates/zapcode-py
-maturin develop --release --uv
-
-# With pip
-pip install maturin
-git clone https://github.com/TheUncharted/zapcode.git
-cd zapcode/crates/zapcode-py
-maturin develop --release
-```
-</details>
-
-<details>
-<summary><strong>WebAssembly</strong></summary>
-
-Requires [wasm-pack](https://rustwasm.github.io/wasm-pack/):
-
-```bash
-git clone https://github.com/TheUncharted/zapcode.git
-cd zapcode/crates/zapcode-wasm
-wasm-pack build --target web
-```
-
-This outputs a `pkg/` directory you can import in any browser or bundler.
-</details>
-
-## Usage
-
-### With Vercel AI SDK (`@unchartedfr/zapcode-ai`)
+### Vercel AI SDK (@unchartedfr/zapcode-ai)
 
 The recommended way — one call gives you `{ system, tools }` that plug directly into `generateText` / `streamText`:
 
@@ -187,10 +293,10 @@ Under the hood: the LLM writes TypeScript code that calls your tools → Zapcode
 
 See [`examples/typescript/ai-agent-zapcode-ai.ts`](examples/typescript/ai-agent-zapcode-ai.ts) for the full working example.
 
-### With Anthropic SDK directly
-
 <details>
-<summary><strong>TypeScript</strong></summary>
+<summary><strong>Anthropic SDK</strong></summary>
+
+**TypeScript:**
 
 ```typescript
 import Anthropic from "@anthropic-ai/sdk";
@@ -225,11 +331,7 @@ while (!state.completed) {
 console.log(state.output);
 ```
 
-See [`examples/typescript/ai-agent-anthropic.ts`](examples/typescript/ai-agent-anthropic.ts).
-</details>
-
-<details>
-<summary><strong>Python</strong></summary>
+**Python:**
 
 ```python
 import anthropic
@@ -254,10 +356,11 @@ while state.get("suspended"):
 print(state["output"])
 ```
 
-See [`examples/python/ai_agent_anthropic.py`](examples/python/ai_agent_anthropic.py).
+See [`examples/typescript/ai-agent-anthropic.ts`](examples/typescript/ai-agent-anthropic.ts) and [`examples/python/ai_agent_anthropic.py`](examples/python/ai_agent_anthropic.py).
 </details>
 
-### Multi-SDK support
+<details>
+<summary><strong>Multi-SDK support</strong></summary>
 
 `zapcode()` returns adapters for all major AI SDKs from a single call:
 
@@ -278,11 +381,9 @@ await openai.chat.completions.create({
 // Anthropic SDK
 await anthropic.messages.create({ system, tools: anthropicTools, messages });
 
-// Any SDK — just extract the `code` from the tool call and pass it to handleToolCall
+// Any SDK — just extract the code from the tool call and pass it to handleToolCall
 const result = await handleToolCall(codeFromToolCall);
 ```
-
-Python:
 
 ```python
 b = zapcode(tools={...})
@@ -290,20 +391,17 @@ b.anthropic_tools  # → Anthropic SDK format
 b.openai_tools     # → OpenAI SDK format
 b.handle_tool_call(code)  # → Universal handler
 ```
-
-### Custom adapters
-
-Building a new AI SDK or framework? You can write a custom adapter without forking Zapcode:
+</details>
 
 <details>
-<summary><strong>TypeScript</strong></summary>
+<summary><strong>Custom adapters</strong></summary>
+
+Build a custom adapter for any AI SDK without forking Zapcode:
 
 ```typescript
 import { zapcode, createAdapter } from "@unchartedfr/zapcode-ai";
 
-// Create a typed adapter for your SDK
 const myAdapter = createAdapter("my-sdk", (ctx) => {
-  // ctx gives you: system, toolName, toolDescription, toolSchema, handleToolCall
   return {
     systemMessage: ctx.system,
     actions: [{
@@ -322,12 +420,7 @@ const { custom } = zapcode({
 });
 
 const myConfig = custom["my-sdk"];
-// { systemMessage: "...", actions: [{ id: "execute_code", ... }] }
 ```
-</details>
-
-<details>
-<summary><strong>Python</strong></summary>
 
 ```python
 from zapcode_ai import zapcode, Adapter, AdapterContext
@@ -343,188 +436,25 @@ class LangChainAdapter(Adapter):
             description=ctx.tool_description,
         )
 
-b = zapcode(
-    tools={...},
-    adapters=[LangChainAdapter()],
-)
-
+b = zapcode(tools={...}, adapters=[LangChainAdapter()])
 langchain_tool = b.custom["langchain"]
 ```
-</details>
 
 The adapter receives an `AdapterContext` with everything needed: system prompt, tool name, tool JSON schema, and a `handleToolCall` function. Return whatever shape your SDK expects.
-
-### Basic usage by language
-
-<details>
-<summary><strong>TypeScript / JavaScript</strong></summary>
-
-```typescript
-import { Zapcode, ZapcodeSnapshotHandle } from '@unchartedfr/zapcode';
-
-// Simple expression
-const b = new Zapcode('1 + 2 * 3');
-console.log(b.run().output);  // 7
-
-// With inputs
-const greeter = new Zapcode(
-    '`Hello, ${name}! You are ${age} years old.`',
-    { inputs: ['name', 'age'] },
-);
-console.log(greeter.run({ name: 'Zapcode', age: 30 }).output);
-
-// Data processing
-const processor = new Zapcode(`
-    const items = [
-        { name: "Widget", price: 25.99, qty: 3 },
-        { name: "Gadget", price: 49.99, qty: 1 },
-    ];
-    const total = items.reduce((sum, i) => sum + i.price * i.qty, 0);
-    ({ total, names: items.map(i => i.name) })
-`);
-console.log(processor.run().output);
-// { total: 127.96, names: ["Widget", "Gadget"] }
-
-// External function (snapshot/resume)
-const app = new Zapcode(`const data = await fetch(url); data`, {
-    inputs: ['url'],
-    externalFunctions: ['fetch'],
-});
-const state = app.start({ url: 'https://api.example.com' });
-if (!state.completed) {
-    console.log(state.functionName);  // "fetch"
-    const snapshot = ZapcodeSnapshotHandle.load(state.snapshot);
-    const final_ = snapshot.resume({ status: 'ok' });
-    console.log(final_.output);  // { status: "ok" }
-}
-
-// Classes
-const counter = new Zapcode(`
-    class Counter {
-        count: number;
-        constructor(start: number) { this.count = start; }
-        increment() { return ++this.count; }
-    }
-    const c = new Counter(10);
-    [c.increment(), c.increment(), c.increment()]
-`);
-console.log(counter.run().output);  // [11, 12, 13]
-```
-
-See [`examples/typescript/basic.ts`](examples/typescript/basic.ts) for the full example.
 </details>
 
-<details>
-<summary><strong>Rust</strong></summary>
+## What Zapcode Can and Cannot Do
 
-```rust
-use zapcode_core::{ZapcodeRun, Value, ResourceLimits, VmState};
+**Can do:**
 
-// Simple expression
-let runner = ZapcodeRun::new(
-    "1 + 2 * 3".to_string(), vec![], vec![],
-    ResourceLimits::default(),
-)?;
-assert_eq!(runner.run_simple()?, Value::Int(7));
+- Execute a useful subset of TypeScript — variables, functions, classes, generators, async/await, closures, destructuring, spread/rest, optional chaining, nullish coalescing, template literals, try/catch
+- Strip TypeScript types at parse time via [oxc](https://oxc.rs) — no `tsc` needed
+- Snapshot execution to bytes and resume later, even in a different process or machine
+- Call from Rust, Node.js, Python, or WebAssembly
+- Track and limit resources — memory, allocations, stack depth, and wall-clock time
+- 30+ string methods, 25+ array methods, plus Math, JSON, Object, and Promise builtins
 
-// With inputs and external functions (snapshot/resume)
-let runner = ZapcodeRun::new(
-    r#"const weather = await getWeather(city);
-       `${city}: ${weather.condition}, ${weather.temp}°C`"#.to_string(),
-    vec!["city".to_string()],
-    vec!["getWeather".to_string()],
-    ResourceLimits::default(),
-)?;
-
-let state = runner.start(vec![
-    ("city".to_string(), Value::String("London".into())),
-])?;
-
-if let VmState::Suspended { snapshot, .. } = state {
-    let weather = Value::Object(indexmap::indexmap! {
-        "condition".into() => Value::String("Cloudy".into()),
-        "temp".into() => Value::Int(12),
-    });
-    let final_state = snapshot.resume(weather)?;
-    // VmState::Complete("London: Cloudy, 12°C")
-}
-```
-
-See [`examples/rust/basic.rs`](examples/rust/basic.rs) for the full example.
-</details>
-
-<details>
-<summary><strong>Python</strong></summary>
-
-```python
-from zapcode import Zapcode, ZapcodeSnapshot
-
-# Simple expression
-b = Zapcode("1 + 2 * 3")
-print(b.run()["output"])  # 7
-
-# With inputs
-b = Zapcode(
-    '`Hello, ${name}!`',
-    inputs=["name"],
-)
-print(b.run({"name": "Zapcode"})["output"])  # "Hello, Zapcode!"
-
-# External function (snapshot/resume)
-b = Zapcode(
-    "const w = await getWeather(city); `${city}: ${w.temp}°C`",
-    inputs=["city"],
-    external_functions=["getWeather"],
-)
-state = b.start({"city": "London"})
-if state.get("suspended"):
-    result = state["snapshot"].resume({"condition": "Cloudy", "temp": 12})
-    print(result["output"])  # "London: 12°C"
-
-# Snapshot persistence
-state = b.start({"city": "Tokyo"})
-if state.get("suspended"):
-    bytes_ = state["snapshot"].dump()          # serialize to bytes
-    restored = ZapcodeSnapshot.load(bytes_)   # load from bytes
-    result = restored.resume({"condition": "Clear", "temp": 26})
-```
-
-See [`examples/python/basic.py`](examples/python/basic.py) for the full example.
-</details>
-
-<details>
-<summary><strong>WebAssembly (browser)</strong></summary>
-
-```html
-<script type="module">
-import init, { Zapcode } from './zapcode-wasm/zapcode_wasm.js';
-
-await init();
-
-const b = new Zapcode(`
-    const items = [10, 20, 30];
-    items.map(x => x * 2).reduce((a, b) => a + b, 0)
-`);
-const result = b.run();
-console.log(result.output);  // 120
-</script>
-```
-
-See [`examples/wasm/index.html`](examples/wasm/index.html) for a full playground.
-</details>
-
-## What Zapcode can and cannot do
-
-### Can do
-
-- **Execute a useful subset of TypeScript** — variables, functions, classes, generators, async/await, closures, destructuring, spread/rest, optional chaining, nullish coalescing, template literals, try/catch
-- **Strip TypeScript types** at parse time via [oxc](https://oxc.rs) — no `tsc` needed
-- **Snapshot execution to bytes** and resume later, even in a different process or machine
-- **Call from Rust, Node.js, Python, or WebAssembly**
-- **Track and limit resources** — memory, allocations, stack depth, and wall-clock time
-- **30+ string methods, 25+ array methods**, plus Math, JSON, Object, and Promise builtins
-
-### Cannot do
+**Cannot do:**
 
 - Run arbitrary npm packages or the full Node.js standard library
 - Execute regular expressions (parsing supported, execution is a no-op)
@@ -533,8 +463,7 @@ See [`examples/wasm/index.html`](examples/wasm/index.html) for a full playground
 
 These are intentional constraints, not bugs. Zapcode targets one use case: **running code written by AI agents** inside a secure, embeddable sandbox.
 
-<details>
-<summary><strong>Full supported syntax table</strong></summary>
+## Supported Syntax
 
 | Feature | Status |
 |---|---|
@@ -560,26 +489,6 @@ These are intentional constraints, not bugs. Zapcode targets one use case: **run
 | `var` declarations | Not supported (use `let`/`const`) |
 | Decorators | Not supported |
 | `Symbol`, `WeakMap`, `WeakSet` | Not supported |
-</details>
-
-## Alternatives
-
-| | Language completeness | Security | Startup | Snapshots | Setup |
-|---|---|---|---|---|---|
-| **Zapcode** | TypeScript subset | Language-level sandbox | **~2 µs** | Built-in, < 2 KB | `cargo add` / `npm install` |
-| Docker + Node.js | Full Node.js | Container isolation | ~200-500 ms | No | Container runtime |
-| V8 Isolates | Full JS/TS | Isolate boundary | ~5-50 ms | No | V8 (~20 MB) |
-| Deno Deploy | Full TS | Isolate + permissions | ~10-50 ms | No | Cloud service |
-| QuickJS | Full ES2023 | Process isolation | ~1-5 ms | No | C library |
-| WASI/Wasmer | Depends on guest | Wasm sandbox | ~1-10 ms | Possible | Wasm runtime |
-
-### Why not Docker?
-
-Docker provides strong isolation but adds hundreds of milliseconds of cold-start latency, requires a container runtime, and doesn't support snapshotting execution state mid-function. For AI agent loops that execute thousands of small code snippets, the overhead dominates.
-
-### Why not V8?
-
-V8 is the gold standard for JavaScript execution. But it brings ~20 MB of binary size, millisecond startup times, and a vast API surface that must be carefully restricted for sandboxing. If you need full ECMAScript compliance, use V8. If you need microsecond startup, byte-sized snapshots, and a security model where "blocked by default" is the foundation rather than an afterthought, use Zapcode.
 
 ## Security
 
@@ -610,16 +519,12 @@ The **only** escape hatch is external functions that you explicitly register. Wh
 | Call stack depth | 512 frames | `max_stack_depth` |
 | Heap allocations | 100,000 | `max_allocations` |
 
-Limits are checked during execution, so infinite loops, deep recursion, and allocation bombs are all caught.
-
 ### Zero `unsafe` code
 
-The `zapcode-core` crate contains **zero `unsafe` blocks**. Memory safety is guaranteed by the Rust compiler. No FFI calls, no raw pointers, no transmutes.
+The `zapcode-core` crate contains **zero `unsafe` blocks**. Memory safety is guaranteed by the Rust compiler.
 
 <details>
 <summary><strong>Adversarial test suite — 65 tests across 19 attack categories</strong></summary>
-
-The sandbox is validated by **65 adversarial security tests** (`tests/security.rs`) that simulate real attack scenarios:
 
 | Attack category | Tests | Result |
 |---|---|---|
@@ -643,7 +548,9 @@ The sandbox is validated by **65 adversarial security tests** (`tests/security.r
 | `setTimeout`, `setInterval`, `Proxy`, `Reflect` | 6 | Blocked |
 | `with` statement, `arguments.callee` | 3 | Blocked |
 
-Run the security tests: `cargo test -p zapcode-core --test security`
+```bash
+cargo test -p zapcode-core --test security   # run the security tests
+```
 
 **Known limitations:**
 - `Object.freeze()` is not yet implemented — frozen objects can still be mutated (correctness gap, not a sandbox escape)
@@ -680,27 +587,8 @@ TypeScript source
 ```bash
 git clone https://github.com/TheUncharted/zapcode.git
 cd zapcode
-
-# Run all tests (214 tests)
-cargo test
-
-# Run benchmarks
-cargo bench
-
-# Check all crates (including bindings)
-cargo check --workspace
+./scripts/dev-setup.sh   # installs toolchain, builds, runs tests
 ```
-
-## Why AI agents should write code
-
-For motivation on why you might want LLMs to write and execute code instead of chaining tool calls:
-
-- [CodeMode](https://blog.cloudflare.com/codemode-ai-agent-coding) from Cloudflare
-- [Programmatic Tool Calling](https://docs.anthropic.com/en/docs/build-with-claude/tool-use/tool-use-examples#programmatic-tool-calling) from Anthropic
-- [Code Execution with MCP](https://www.anthropic.com/engineering/code-execution-mcp) from Anthropic
-- [Smol Agents](https://huggingface.co/docs/smolagents/en/index) from Hugging Face
-
-Zapcode is inspired by [Monty](https://github.com/pydantic/monty), Pydantic's Python subset interpreter that takes the same approach for Python.
 
 ## License
 
