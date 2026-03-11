@@ -8,7 +8,7 @@ version = "1.0.0b1"
 description = "A minimal, secure TypeScript interpreter for AI agents — Python bindings"
 requires-python = ">=3.10"
 license = "MIT"
-authors = [{name = "UnchartedFR"}]
+authors = [{name = "Uncharted"}]
 keywords = ["typescript", "interpreter", "sandbox", "ai", "mcp", "snapshot", "secure"]
 classifiers = [
     "Development Status :: 4 - Beta",
