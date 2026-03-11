@@ -1,8 +1,9 @@
 <p align="center">
-  <h1 align="center">Zapcode</h1>
-  <p align="center"><strong>Run AI code. Safely. Instantly.</strong></p>
-  <p align="center">A minimal, secure TypeScript interpreter written in Rust for use by AI agents</p>
+  <img src="assets/logo.png" alt="Zapcode" width="160" />
 </p>
+<h1 align="center">Zapcode</h1>
+<p align="center"><strong>Run AI code. Safely. Instantly.</strong></p>
+<p align="center">A minimal, secure TypeScript interpreter written in Rust for use by AI agents</p>
 
 <p align="center">
   <a href="https://github.com/TheUncharted/zapcode/actions"><img src="https://img.shields.io/github/actions/workflow/status/TheUncharted/zapcode/ci.yml?branch=master&label=CI" alt="CI"></a>
