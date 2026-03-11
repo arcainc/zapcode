@@ -7,6 +7,9 @@ reviews:
   auto_review:
     enabled: true
     drafts: false
+    base_branches:
+      - master
+      - develop
   path_instructions:
     - path: "crates/zapcode-core/**"
       instructions: |
