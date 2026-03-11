@@ -89,7 +89,11 @@ async function main() {
   console.log(`\n--- Timing ---`);
   console.log(`Total (LLM + Zapcode): ${totalMs}ms`);
   console.log(`Steps: ${result.steps.length}`);
-  console.log(`Tool calls: ${result.steps.filter(s => s.toolCalls.length > 0).length}`);
+  const toolCallCount = result.steps.reduce(
+    (count, step) => count + step.toolCalls.length,
+    0,
+  );
+  console.log(`Tool calls: ${toolCallCount}`);
   console.log(`Usage: ${result.usage.promptTokens} prompt + ${result.usage.completionTokens} completion = ${result.usage.totalTokens} tokens`);
 }
 
