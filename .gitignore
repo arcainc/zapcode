@@ -23,5 +23,10 @@ __pycache__/
 # OS
 .DS_Store
 
+# Generated copies (CI creates these)
+crates/zapcode-py/README.md
+packages/zapcode-ai/README.md
+examples/*/Cargo.lock
+
 # Secrets
 .env
