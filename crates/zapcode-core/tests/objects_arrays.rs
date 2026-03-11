@@ -130,7 +130,10 @@ fn test_block_assignment_not_wrapped() {
 fn test_if_else_block_not_wrapped() {
     let result = eval_ts("const x = true\nif (x) { 1 } else { 2 }").unwrap();
     // if/else returns last expression
-    assert!(matches!(result, Value::Int(1) | Value::Int(2) | Value::Undefined));
+    assert!(matches!(
+        result,
+        Value::Int(1) | Value::Int(2) | Value::Undefined
+    ));
 }
 
 #[test]

@@ -73,8 +73,23 @@ fn wrap_trailing_object(source: &str) -> String {
             return source.to_string();
         }
         // If preceded by a keyword that takes a block, don't wrap
-        let last_word = before.rsplit(|c: char| !c.is_alphanumeric() && c != '_').next().unwrap_or("");
-        if matches!(last_word, "if" | "else" | "for" | "while" | "do" | "try" | "catch" | "finally" | "class" | "function" | "switch") {
+        let last_word = before
+            .rsplit(|c: char| !c.is_alphanumeric() && c != '_')
+            .next()
+            .unwrap_or("");
+        if matches!(
+            last_word,
+            "if" | "else"
+                | "for"
+                | "while"
+                | "do"
+                | "try"
+                | "catch"
+                | "finally"
+                | "class"
+                | "function"
+                | "switch"
+        ) {
             return source.to_string();
         }
     }
@@ -90,7 +105,9 @@ fn wrap_trailing_object(source: &str) -> String {
         // Check for shorthand properties: `{ a, b }` pattern
         inner.split(',').all(|part| {
             let p = part.trim();
-            !p.is_empty() && p.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == ' ')
+            !p.is_empty()
+                && p.chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == ' ')
         })
     };
 
