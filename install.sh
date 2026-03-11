@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Zapcode installer — "I have a cunning plan"
+# Zapcode installer — Run AI code. Safely. Instantly.
 #
 # Detects your platform, installs prerequisites, builds the native
 # bindings, and makes Zapcode available in your project.
@@ -70,7 +70,7 @@ case "$ARCH" in
 esac
 
 echo ""
-echo -e "${BOLD}Zapcode installer${NC} — \"I have a cunning plan\""
+echo -e "${BOLD}Zapcode installer${NC} — Run AI code. Safely. Instantly."
 echo -e "Platform: ${PLATFORM}-${ARCH}"
 echo ""
 

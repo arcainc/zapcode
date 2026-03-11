@@ -1,0 +1,33 @@
+name: Release Please
+
+# Disabled until 1.0.0 — uncomment the push trigger when ready
+on:
+  workflow_dispatch:
+  # push:
+  #   branches: [master]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    name: Release Please
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          release-type: rust
+          manifest-file: .release-please-manifest.json
+          config-file: release-please-config.json
+
+  publish:
+    name: Publish packages
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    uses: ./.github/workflows/release.yml
+    secrets: inherit

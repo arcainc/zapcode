@@ -1,6 +1,6 @@
 <p align="center">
   <h1 align="center">Zapcode</h1>
-  <p align="center"><strong>"I have a cunning plan"</strong></p>
+  <p align="center"><strong>Run AI code. Safely. Instantly.</strong></p>
   <p align="center">A minimal, secure TypeScript interpreter written in Rust for use by AI</p>
 </p>
 
@@ -15,7 +15,7 @@
 
 > **Experimental** — Zapcode is under active development. APIs may change.
 
-Named after Blackadder's eternally optimistic servant — because every AI agent says *"I have a cunning plan"* right before writing code to execute. Zapcode runs that code safely.
+When LLMs write code, you need to run it — fast and safe. That's Zapcode.
 
 When LLMs write TypeScript, you need to run it safely. Containers add hundreds of milliseconds of startup overhead and operational complexity. V8 isolates are fast but bring a 20MB+ runtime and a massive attack surface.
 
