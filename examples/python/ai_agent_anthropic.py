@@ -1,5 +1,9 @@
 """
-AI Agent with Baldrick — using Anthropic's Claude to write and execute code.
+AI Agent with Baldrick — LOW-LEVEL approach using Anthropic SDK directly.
+
+This shows the manual snapshot/resume loop using the baldrick package.
+For most use cases, prefer baldrick-ai instead — see ai_agent_baldrick_ai.py
+for the recommended approach.
 
 The "code as tool use" pattern:
 1. Claude writes TypeScript code that calls tools (external functions)
@@ -8,10 +12,10 @@ The "code as tool use" pattern:
 4. Your app resolves the tool call, then resumes Baldrick with the result
 
 Prerequisites:
-    pip install anthropic
-    # + baldrick Python bindings (see README)
+    pip install anthropic baldrick
+    # or: uv add anthropic baldrick
 
-Run with: python examples/python/ai_agent_anthropic.py
+Run with: python ai_agent_anthropic.py
 """
 
 import anthropic

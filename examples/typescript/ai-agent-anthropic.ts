@@ -1,5 +1,9 @@
 /**
- * AI Agent with Baldrick — using Anthropic's Claude to write and execute code.
+ * AI Agent with Baldrick — LOW-LEVEL approach using Anthropic SDK directly.
+ *
+ * This shows the manual snapshot/resume loop using @baldrick/core.
+ * For most use cases, prefer @baldrick/ai instead — see ai-agent-baldrick-ai.ts
+ * or ai-agent-vercel-ai.ts for the recommended approach.
  *
  * This example shows the "code as tool use" pattern:
  * 1. Claude writes TypeScript code that calls tools (external functions)
@@ -11,7 +15,7 @@
  *   npm install @anthropic-ai/sdk @baldrick/core
  *   export ANTHROPIC_API_KEY=sk-...
  *
- * Run with: npx ts-node examples/typescript/ai-agent-anthropic.ts
+ * Run with: npx tsx ai-agent-anthropic.ts
  */
 
 import Anthropic from "@anthropic-ai/sdk";
