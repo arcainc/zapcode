@@ -144,7 +144,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run benchmarks
-        run: cargo bench -p zapcode-core 2>&1 | tee bench-output.txt
+        run: cargo bench -p zapcode-core 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tee bench-output.txt
+        env:
+          CARGO_TERM_COLOR: never
       - name: Post benchmark results on PR
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
