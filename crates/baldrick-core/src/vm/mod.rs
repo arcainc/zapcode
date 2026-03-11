@@ -89,7 +89,7 @@ impl Vm {
 
     /// Names of all builtin globals registered by `register_globals`.
     pub(crate) const BUILTIN_GLOBAL_NAMES: &'static [&'static str] =
-        &["console", "JSON", "Object", "Array", "Math"];
+        &["console", "JSON", "Object", "Array", "Math", "Promise"];
 
     /// Restore a VM from snapshot state and continue execution.
     /// Builtins are re-registered after restoring user globals.
@@ -1664,6 +1664,39 @@ impl Vm {
                 ));
             }
 
+            Instruction::Await => {
+                // Check if the value on the stack is a Promise object.
+                // If resolved, unwrap its value. If rejected, throw its reason.
+                // If it's a regular (non-promise) value, leave it as-is.
+                let val = self.pop()?;
+                if builtins::is_promise(&val) {
+                    if let Value::Object(map) = &val {
+                        let status = map.get("status").cloned().unwrap_or(Value::Undefined);
+                        match status {
+                            Value::String(s) if s.as_ref() == "resolved" => {
+                                let inner = map.get("value").cloned().unwrap_or(Value::Undefined);
+                                self.push(inner)?;
+                            }
+                            Value::String(s) if s.as_ref() == "rejected" => {
+                                let reason = map.get("reason").cloned().unwrap_or(Value::Undefined);
+                                return Err(BaldrickError::RuntimeError(
+                                    format!("Unhandled promise rejection: {}", reason.to_js_string()),
+                                ));
+                            }
+                            _ => {
+                                // Unknown status — pass through
+                                self.push(val)?;
+                            }
+                        }
+                    } else {
+                        self.push(val)?;
+                    }
+                } else {
+                    // Not a promise — pass through (await on non-promise returns the value)
+                    self.push(val)?;
+                }
+            }
+
             // Classes
             Instruction::CreateClass { name, n_methods, n_statics, has_super } => {
                 // Stack layout (top to bottom):
@@ -1974,7 +2007,7 @@ impl Vm {
                 }
                 // Check if this is a known global object — return builtin method handle
                 if let Some(global_name) = &self.last_global_name {
-                    let known_globals = ["console", "Math", "JSON", "Object", "Array"];
+                    let known_globals = ["console", "Math", "JSON", "Object", "Array", "Promise"];
                     if known_globals.contains(&global_name.as_str()) {
                         return Ok(Value::BuiltinMethod {
                             object_name: Arc::from(global_name.as_str()),

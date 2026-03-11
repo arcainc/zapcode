@@ -13,6 +13,7 @@ pub fn register_globals(globals: &mut HashMap<String, Value>) {
     globals.insert("JSON".to_string(), Value::Object(IndexMap::new()));
     globals.insert("Object".to_string(), Value::Object(IndexMap::new()));
     globals.insert("Array".to_string(), Value::Object(IndexMap::new()));
+    globals.insert("Promise".to_string(), Value::Object(IndexMap::new()));
 
     // Math gets its constants as real properties
     let mut math = IndexMap::new();
@@ -54,6 +55,7 @@ pub fn call_global_method(
         "JSON" => call_json_method(method, args),
         "Object" => call_object_method(method, args),
         "Array" => call_array_static_method(method, args),
+        "Promise" => call_promise_method(method, args),
         _ => Ok(None),
     }
 }
@@ -717,6 +719,74 @@ fn call_array_static_method(method: &str, args: &[Value]) -> Result<Option<Value
             Ok(Some(Value::Array(args.to_vec())))
         }
         _ => Ok(None),
+    }
+}
+
+// ── Promise ──────────────────────────────────────────────────────────
+
+fn call_promise_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
+    match method {
+        "resolve" => {
+            let val = args.first().cloned().unwrap_or(Value::Undefined);
+            // If the value is already a promise, return it as-is
+            if is_promise(&val) {
+                return Ok(Some(val));
+            }
+            let mut obj = IndexMap::new();
+            obj.insert(Arc::from("__promise__"), Value::Bool(true));
+            obj.insert(Arc::from("status"), Value::String(Arc::from("resolved")));
+            obj.insert(Arc::from("value"), val);
+            Ok(Some(Value::Object(obj)))
+        }
+        "reject" => {
+            let reason = args.first().cloned().unwrap_or(Value::Undefined);
+            let mut obj = IndexMap::new();
+            obj.insert(Arc::from("__promise__"), Value::Bool(true));
+            obj.insert(Arc::from("status"), Value::String(Arc::from("rejected")));
+            obj.insert(Arc::from("reason"), reason);
+            Ok(Some(Value::Object(obj)))
+        }
+        "all" => {
+            // Basic Promise.all: takes an array of resolved promises and returns
+            // a resolved promise with an array of their values.
+            let arr = match args.first() {
+                Some(Value::Array(arr)) => arr.clone(),
+                _ => Vec::new(),
+            };
+            let mut results = Vec::with_capacity(arr.len());
+            for item in &arr {
+                if is_promise(item) {
+                    if let Value::Object(map) = item {
+                        if let Some(Value::String(status)) = map.get("status") {
+                            if status.as_ref() == "rejected" {
+                                // Promise.all rejects with the first rejection reason
+                                return Ok(Some(item.clone()));
+                            }
+                        }
+                        results.push(
+                            map.get("value").cloned().unwrap_or(Value::Undefined),
+                        );
+                    }
+                } else {
+                    results.push(item.clone());
+                }
+            }
+            let mut obj = IndexMap::new();
+            obj.insert(Arc::from("__promise__"), Value::Bool(true));
+            obj.insert(Arc::from("status"), Value::String(Arc::from("resolved")));
+            obj.insert(Arc::from("value"), Value::Array(results));
+            Ok(Some(Value::Object(obj)))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Check if a value is a promise object (has __promise__: true).
+pub fn is_promise(val: &Value) -> bool {
+    if let Value::Object(map) = val {
+        matches!(map.get("__promise__"), Some(Value::Bool(true)))
+    } else {
+        false
     }
 }
 

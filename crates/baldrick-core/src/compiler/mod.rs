@@ -852,7 +852,10 @@ impl Compiler {
             }
             Expr::Await(expr) => {
                 self.compile_expr(expr)?;
-                // Await is handled at the VM level — for external calls it triggers suspension
+                // Emit Await instruction to unwrap Promise objects.
+                // External call suspension is already handled by CallExternal
+                // before this point — Await only handles internal promise values.
+                self.emit(Instruction::Await);
             }
             Expr::Yield { value, delegate: _ } => {
                 // Compile the yielded value (or undefined if none)

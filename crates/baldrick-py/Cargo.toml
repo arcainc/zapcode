@@ -1,0 +1,16 @@
+[package]
+name = "baldrick-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Python bindings for the Baldrick TypeScript interpreter"
+
+[lib]
+name = "baldrick"
+crate-type = ["cdylib"]
+
+[dependencies]
+baldrick-core = { path = "../baldrick-core" }
+pyo3.workspace = true
+indexmap.workspace = true

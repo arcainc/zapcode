@@ -125,6 +125,11 @@ pub enum Instruction {
     /// Yield a value from a generator. Pops the value, suspends execution.
     Yield,
 
+    /// Await: if the top-of-stack is a resolved Promise object, unwrap its value.
+    /// If it's a regular value, leave it as-is. External call suspension is handled
+    /// by CallExternal before Await is reached.
+    Await,
+
     // Misc
     Nop,
 }

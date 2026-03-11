@@ -1,9 +1,9 @@
 [workspace]
 members = [
     "crates/baldrick-core",
-    # "crates/baldrick-js",
-    # "crates/baldrick-py",
-    # "crates/baldrick-wasm",
+    "crates/baldrick-js",
+    "crates/baldrick-py",
+    "crates/baldrick-wasm",
 ]
 resolver = "2"
 
@@ -36,3 +36,11 @@ insta = { version = "1.46.3", features = ["yaml"] }
 
 # Benchmarking
 divan = "0.1.21"
+
+# Python bindings
+pyo3 = { version = "0.23", features = ["extension-module"] }
+
+# WASM bindings
+wasm-bindgen = "0.2"
+serde-wasm-bindgen = "0.6"
+js-sys = "0.3"
