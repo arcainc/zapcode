@@ -69,17 +69,11 @@ jobs:
         run: |
           npm install
           npx napi build --release --platform --js index.js --dts index.d.ts
-      - name: Install example dependencies
-        working-directory: examples/typescript
-        run: npm install
-      - name: Link built bindings into example
-        run: |
-          cp crates/zapcode-js/index.js examples/typescript/node_modules/@unchartedfr/zapcode/index.js
-          cp crates/zapcode-js/index.d.ts examples/typescript/node_modules/@unchartedfr/zapcode/index.d.ts
-          cp crates/zapcode-js/*.node examples/typescript/node_modules/@unchartedfr/zapcode/ 2>/dev/null || true
       - name: Run basic example
         working-directory: examples/typescript
-        run: npx tsx basic.ts
+        run: |
+          npm install
+          npx tsx basic.ts
 
   # ── Python bindings — build + e2e ───────────────────────────────────
   e2e-python:
