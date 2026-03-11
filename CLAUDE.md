@@ -6,6 +6,12 @@
 
 ---
 
+## Git
+
+Do not add `Co-Authored-By` trailers to git commits.
+
+---
+
 ## Read AGENTS.md first
 
 Before writing any code in this repository, read `AGENTS.md` in full. It defines:
