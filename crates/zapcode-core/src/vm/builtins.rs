@@ -489,6 +489,10 @@ fn call_string_method(s: &Arc<str>, method: &str, args: &[Value]) -> Result<Opti
         "trimEnd" | "trimRight" => Value::String(Arc::from(s.trim_end())),
         "repeat" => {
             let count = arg_int(args, 0).max(0) as usize;
+            let result_len = s.len().saturating_mul(count);
+            if result_len > 10_000_000 {
+                return Err(ZapcodeError::AllocationLimitExceeded);
+            }
             Value::String(Arc::from(s.repeat(count).as_str()))
         }
         "padStart" => {

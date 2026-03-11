@@ -936,18 +936,12 @@ fn test_async_generator_dos() {
 
 #[test]
 fn test_string_repeat_huge() {
-    // This may OOM-panic on some platforms instead of returning an error,
-    // so we catch panics too — either outcome means the sandbox blocked it.
-    let outcome = std::panic::catch_unwind(|| {
-        eval_ts(
-            r#"
-            "a".repeat(1000000000)
-        "#,
-        )
-    });
-    if let Ok(Ok(_)) = outcome {
-        panic!("VULN: huge string.repeat not limited");
-    }
+    let result = eval_ts(
+        r#"
+        "a".repeat(1000000000)
+    "#,
+    );
+    assert!(result.is_err(), "VULN: huge string.repeat not limited");
 }
 
 #[test]
