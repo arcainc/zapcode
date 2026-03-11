@@ -1,5 +1,5 @@
 {
-  "name": "@zapcode/ai",
+  "name": "@unchartedfr/zapcode-ai",
   "version": "0.1.0",
   "description": "AI SDK integration for Zapcode — let LLMs write and execute TypeScript safely",
   "type": "module",
@@ -16,7 +16,7 @@
     "dev": "tsc --watch"
   },
   "dependencies": {
-    "@zapcode/core": "workspace:*"
+    "@unchartedfr/zapcode": "workspace:*"
   },
   "peerDependencies": {
     "ai": ">=4.0.0"

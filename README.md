@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/TheUncharted/zapcode/actions"><img src="https://img.shields.io/github/actions/workflow/status/TheUncharted/zapcode/ci.yml?branch=main&label=CI" alt="CI"></a>
-  <a href="https://www.npmjs.com/package/@zapcode/core"><img src="https://img.shields.io/npm/v/@zapcode/core" alt="npm"></a>
+  <a href="https://www.npmjs.com/package/@unchartedfr/zapcode"><img src="https://img.shields.io/npm/v/@unchartedfr/zapcode" alt="npm"></a>
   <a href="https://pypi.org/project/zapcode/"><img src="https://img.shields.io/pypi/v/zapcode" alt="PyPI"></a>
   <a href="https://github.com/TheUncharted/zapcode/blob/main/LICENSE"><img src="https://img.shields.io/github/license/TheUncharted/zapcode" alt="License"></a>
 </p>
@@ -78,10 +78,10 @@ zapcode-core = { git = "https://github.com/TheUncharted/zapcode.git" }
 Once published to npm (coming soon):
 
 ```bash
-npm install @zapcode/core    # npm
-yarn add @zapcode/core       # yarn
-pnpm add @zapcode/core       # pnpm
-bun add @zapcode/core        # bun
+npm install @unchartedfr/zapcode    # npm
+yarn add @unchartedfr/zapcode       # yarn
+pnpm add @unchartedfr/zapcode       # pnpm
+bun add @unchartedfr/zapcode        # bun
 ```
 
 Until then, build from source — requires Rust toolchain:
@@ -93,7 +93,7 @@ npm install && npm run build
 
 # Link into your project
 npm link                     # in zapcode-js/
-npm link @zapcode/core      # in your project
+npm link @unchartedfr/zapcode      # in your project
 ```
 </details>
 
@@ -140,12 +140,12 @@ This outputs a `pkg/` directory you can import in any browser or bundler.
 
 ## Usage
 
-### With Vercel AI SDK (`@zapcode/ai`)
+### With Vercel AI SDK (`@unchartedfr/zapcode-ai`)
 
 The recommended way — one call gives you `{ system, tools }` that plug directly into `generateText` / `streamText`:
 
 ```typescript
-import { zapcode } from "@zapcode/ai";
+import { zapcode } from "@unchartedfr/zapcode-ai";
 import { generateText } from "ai";
 import { anthropic } from "@ai-sdk/anthropic";
 
@@ -194,7 +194,7 @@ See [`examples/typescript/ai-agent-zapcode-ai.ts`](examples/typescript/ai-agent-
 
 ```typescript
 import Anthropic from "@anthropic-ai/sdk";
-import { Zapcode, ZapcodeSnapshotHandle } from "@zapcode/core";
+import { Zapcode, ZapcodeSnapshotHandle } from "@unchartedfr/zapcode";
 
 const tools = {
   getWeather: async (city: string) => {
@@ -299,7 +299,7 @@ Building a new AI SDK or framework? You can write a custom adapter without forki
 <summary><strong>TypeScript</strong></summary>
 
 ```typescript
-import { zapcode, createAdapter } from "@zapcode/ai";
+import { zapcode, createAdapter } from "@unchartedfr/zapcode-ai";
 
 // Create a typed adapter for your SDK
 const myAdapter = createAdapter("my-sdk", (ctx) => {
@@ -360,7 +360,7 @@ The adapter receives an `AdapterContext` with everything needed: system prompt, 
 <summary><strong>TypeScript / JavaScript</strong></summary>
 
 ```typescript
-import { Zapcode, ZapcodeSnapshotHandle } from '@zapcode/core';
+import { Zapcode, ZapcodeSnapshotHandle } from '@unchartedfr/zapcode';
 
 // Simple expression
 const b = new Zapcode('1 + 2 * 3');

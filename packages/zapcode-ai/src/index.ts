@@ -1,16 +1,16 @@
 /**
- * @zapcode/ai — High-level AI SDK integration for Zapcode.
+ * @unchartedfr/zapcode-ai — High-level AI SDK integration for Zapcode.
  *
  * Works with any AI SDK:
  *
  * ```typescript
  * // Vercel AI SDK (recommended)
- * import { zapcode } from "@zapcode/ai";
+ * import { zapcode } from "@unchartedfr/zapcode-ai";
  * const { system, tools } = zapcode({ tools: { ... } });
  * await generateText({ model, system, tools, messages });
  *
  * // OpenAI SDK
- * import { zapcode } from "@zapcode/ai";
+ * import { zapcode } from "@unchartedfr/zapcode-ai";
  * const { system, openaiTools, handleToolCall } = zapcode({ tools: { ... } });
  * const response = await openai.chat.completions.create({
  *   messages: [{ role: "system", content: system }, ...],
@@ -18,7 +18,7 @@
  * });
  *
  * // Anthropic SDK
- * import { zapcode } from "@zapcode/ai";
+ * import { zapcode } from "@unchartedfr/zapcode-ai";
  * const { system, anthropicTools, handleToolCall } = zapcode({ tools: { ... } });
  * const response = await anthropic.messages.create({
  *   system, tools: anthropicTools, messages,
@@ -26,7 +26,7 @@
  * ```
  */
 
-import { Zapcode, ZapcodeSnapshotHandle } from "@zapcode/core";
+import { Zapcode, ZapcodeSnapshotHandle } from "@unchartedfr/zapcode";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -379,7 +379,7 @@ export function zapcode(options: ZapcodeAIOptions): ZapcodeAIResult {
  *
  * @example
  * ```typescript
- * import { zapcode, createAdapter, ZapcodeAdapter } from "@zapcode/ai";
+ * import { zapcode, createAdapter, ZapcodeAdapter } from "@unchartedfr/zapcode-ai";
  *
  * // Example: adapter for a hypothetical SDK
  * const myAdapter: ZapcodeAdapter<MySDKConfig> = {
@@ -463,7 +463,7 @@ export function createAdapter<TOutput>(
  *
  * @example
  * ```typescript
- * import { execute } from "@zapcode/ai";
+ * import { execute } from "@unchartedfr/zapcode-ai";
  *
  * const result = await execute(
  *   `const w = await getWeather("Tokyo"); w.temp`,

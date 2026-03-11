@@ -1,18 +1,18 @@
 /**
- * AI Agent using @zapcode/ai — the high-level wrapper.
+ * AI Agent using @unchartedfr/zapcode-ai — the high-level wrapper.
  *
  * This is the recommended way to use Zapcode with AI models.
  * One call to `zapcode()` gives you `{ system, tools }` that plug
  * directly into Vercel AI SDK's `generateText` / `streamText`.
  *
  * Prerequisites:
- *   npm install @zapcode/ai ai @ai-sdk/anthropic
+ *   npm install @unchartedfr/zapcode-ai ai @ai-sdk/anthropic
  *   export ANTHROPIC_API_KEY=sk-...
  *
  * Run with: npx tsx ai-agent-zapcode-ai.ts
  */
 
-import { zapcode } from "@zapcode/ai";
+import { zapcode } from "@unchartedfr/zapcode-ai";
 import { generateText } from "ai";
 import { anthropic } from "@ai-sdk/anthropic";
 

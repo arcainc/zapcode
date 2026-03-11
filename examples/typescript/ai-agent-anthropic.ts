@@ -1,8 +1,8 @@
 /**
  * AI Agent with Zapcode — LOW-LEVEL approach using Anthropic SDK directly.
  *
- * This shows the manual snapshot/resume loop using @zapcode/core.
- * For most use cases, prefer @zapcode/ai instead — see ai-agent-zapcode-ai.ts
+ * This shows the manual snapshot/resume loop using @unchartedfr/zapcode.
+ * For most use cases, prefer @unchartedfr/zapcode-ai instead — see ai-agent-zapcode-ai.ts
  * or ai-agent-vercel-ai.ts for the recommended approach.
  *
  * This example shows the "code as tool use" pattern:
@@ -12,14 +12,14 @@
  * 4. Your app resolves the tool call, then resumes Zapcode with the result
  *
  * Prerequisites:
- *   npm install @anthropic-ai/sdk @zapcode/core
+ *   npm install @anthropic-ai/sdk @unchartedfr/zapcode
  *   export ANTHROPIC_API_KEY=sk-...
  *
  * Run with: npx tsx ai-agent-anthropic.ts
  */
 
 import Anthropic from "@anthropic-ai/sdk";
-import { Zapcode, ZapcodeSnapshotHandle } from "@zapcode/core";
+import { Zapcode, ZapcodeSnapshotHandle } from "@unchartedfr/zapcode";
 
 // --- Tool implementations (the real functions that run on your server) ---
 

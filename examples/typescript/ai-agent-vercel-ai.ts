@@ -1,20 +1,20 @@
 /**
  * AI Agent with Zapcode — using Vercel AI SDK.
  *
- * This example shows the clean integration via @zapcode/ai.
+ * This example shows the clean integration via @unchartedfr/zapcode-ai.
  * One call to `zapcode()` gives you `{ system, tools }` that plug
  * directly into `streamText` / `generateText` — just like CodeMode.
  *
  * Works with any AI SDK provider: Anthropic, OpenAI, Google, etc.
  *
  * Prerequisites:
- *   npm install @zapcode/ai ai @ai-sdk/anthropic
+ *   npm install @unchartedfr/zapcode-ai ai @ai-sdk/anthropic
  *   export ANTHROPIC_API_KEY=sk-...
  *
  * Run with: npx tsx ai-agent-vercel-ai.ts
  */
 
-import { zapcode } from "@zapcode/ai";
+import { zapcode } from "@unchartedfr/zapcode-ai";
 import { generateText, streamText } from "ai";
 import { anthropic } from "@ai-sdk/anthropic";
 

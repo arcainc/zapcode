@@ -57,7 +57,7 @@ zapcode/
 │   │   │   └── lib.rs       # Public API re-exports
 │   │   ├── tests/           # 14 test files, 214+ tests
 │   │   └── benches/         # divan benchmarks
-│   ├── zapcode-js/         # napi-rs bindings → @zapcode/core npm package
+│   ├── zapcode-js/         # napi-rs bindings → @unchartedfr/zapcode npm package
 │   ├── zapcode-py/         # PyO3 bindings → zapcode pip package
 │   └── zapcode-wasm/       # wasm-bindgen target for browser/edge use
 ├── AGENTS.md                # This file

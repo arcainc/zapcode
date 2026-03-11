@@ -166,24 +166,24 @@ case "$LANG" in
         # Link into current project
         if [[ -f "package.json" ]]; then
             case "$PM" in
-                npm)  (cd "$INSTALL_DIR/crates/zapcode-js" && npm link 2>/dev/null) && npm link @zapcode/core 2>/dev/null ;;
+                npm)  (cd "$INSTALL_DIR/crates/zapcode-js" && npm link 2>/dev/null) && npm link @unchartedfr/zapcode 2>/dev/null ;;
                 yarn) yarn link "$INSTALL_DIR/crates/zapcode-js" 2>/dev/null ;;
                 pnpm) pnpm link "$INSTALL_DIR/crates/zapcode-js" 2>/dev/null ;;
                 bun)  bun link "$INSTALL_DIR/crates/zapcode-js" 2>/dev/null ;;
             esac
-            ok "Linked @zapcode/core into your project"
+            ok "Linked @unchartedfr/zapcode into your project"
         else
             warn "No package.json found in current directory."
             info "To use in your project, run:"
             echo ""
             echo "  cd $INSTALL_DIR/crates/zapcode-js && ${PM} link"
-            echo "  cd /your/project && ${PM} link @zapcode/core"
+            echo "  cd /your/project && ${PM} link @unchartedfr/zapcode"
         fi
 
         echo ""
         ok "Ready! Import in your code:"
         echo ""
-        echo "  import { Zapcode } from '@zapcode/core';"
+        echo "  import { Zapcode } from '@unchartedfr/zapcode';"
         echo ""
         echo "  const b = new Zapcode('1 + 2 * 3');"
         echo "  const result = b.run();"

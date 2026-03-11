@@ -25,7 +25,7 @@ bun install
 # Basic usage
 npm run basic          # or: bun run basic / yarn basic / pnpm basic
 
-# AI agent with @zapcode/ai wrapper (recommended — requires ANTHROPIC_API_KEY)
+# AI agent with @unchartedfr/zapcode-ai wrapper (recommended — requires ANTHROPIC_API_KEY)
 export ANTHROPIC_API_KEY=sk-ant-...
 npm run agent
 
@@ -41,6 +41,6 @@ npm run agent:vercel
 | File | Description |
 |---|---|
 | `basic.ts` | Simple expressions, inputs, data processing, classes, resource limits |
-| `ai-agent-zapcode-ai.ts` | **Recommended** — uses `@zapcode/ai` wrapper with Vercel AI SDK |
+| `ai-agent-zapcode-ai.ts` | **Recommended** — uses `@unchartedfr/zapcode-ai` wrapper with Vercel AI SDK |
 | `ai-agent-anthropic.ts` | Raw Anthropic SDK + manual snapshot/resume loop |
 | `ai-agent-vercel-ai.ts` | Vercel AI SDK with manual code generation |

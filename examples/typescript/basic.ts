@@ -5,7 +5,7 @@
  * Run with: npx ts-node examples/typescript/basic.ts
  */
 
-import { Zapcode, ZapcodeSnapshotHandle } from "@zapcode/core";
+import { Zapcode, ZapcodeSnapshotHandle } from "@unchartedfr/zapcode";
 
 // --- 1. Simple expression ---
 const simple = new Zapcode("1 + 2 * 3");

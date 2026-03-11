@@ -1,5 +1,5 @@
 {
-    "name": "@zapcode/core",
+    "name": "@unchartedfr/zapcode",
     "version": "0.1.0",
     "main": "index.js",
     "types": "index.d.ts",
