@@ -34,7 +34,20 @@
   "files": [
     "dist"
   ],
+  "keywords": [
+    "typescript",
+    "interpreter",
+    "sandbox",
+    "ai",
+    "mcp",
+    "llm",
+    "tool-use",
+    "agent"
+  ],
+  "homepage": "https://github.com/TheUncharted/zapcode#readme",
+  "bugs": "https://github.com/TheUncharted/zapcode/issues",
   "license": "MIT",
+  "author": "UnchartedFR",
   "repository": {
     "type": "git",
     "url": "https://github.com/TheUncharted/zapcode.git",

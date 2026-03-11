@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "A minimal, secure TypeScript subset interpreter — parse, compile, execute, snapshot"
+readme = "../../README.md"
+homepage = "https://github.com/TheUncharted/zapcode"
 keywords = ["typescript", "interpreter", "sandbox", "ai", "mcp"]
 categories = ["compilers", "wasm"]
 

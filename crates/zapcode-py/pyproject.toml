@@ -5,13 +5,25 @@ build-backend = "maturin"
 [project]
 name = "zapcode"
 version = "1.0.0b1"
-description = "Python bindings for the Zapcode TypeScript interpreter"
+description = "A minimal, secure TypeScript interpreter for AI agents — Python bindings"
 requires-python = ">=3.10"
 license = "MIT"
-keywords = ["typescript", "interpreter", "sandbox", "ai", "mcp"]
+authors = [{name = "UnchartedFR"}]
+keywords = ["typescript", "interpreter", "sandbox", "ai", "mcp", "snapshot", "secure"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Interpreters",
+]
 
 [project.urls]
+Homepage = "https://github.com/TheUncharted/zapcode"
 Repository = "https://github.com/TheUncharted/zapcode"
+Issues = "https://github.com/TheUncharted/zapcode/issues"
+Documentation = "https://github.com/TheUncharted/zapcode#readme"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
