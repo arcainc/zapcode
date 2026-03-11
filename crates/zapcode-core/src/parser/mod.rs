@@ -43,6 +43,9 @@ fn wrap_trailing_object(source: &str) -> String {
     }
 
     // Find the matching `{`
+    // Note: this brace scanner does not track string literals or comments.
+    // This is acceptable because the input is AI-generated tool output (simple
+    // expressions), not arbitrary user code with embedded brace characters.
     let mut depth = 0;
     let mut open_pos = None;
     for (i, ch) in trimmed.char_indices().rev() {
