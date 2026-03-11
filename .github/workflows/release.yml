@@ -101,6 +101,9 @@ jobs:
       - name: Install dependencies
         working-directory: crates/zapcode-js
         run: npm install
+      - name: Generate platform packages
+        working-directory: crates/zapcode-js
+        run: npx napi create-npm-dirs
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
