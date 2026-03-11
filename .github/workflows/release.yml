@@ -1,6 +1,5 @@
 name: Release
 
-# Manual trigger only — activate when ready to publish
 on:
   workflow_dispatch:
     inputs:
@@ -14,6 +13,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   # ── Publish to crates.io ────────────────────────────────────────────
@@ -21,7 +21,7 @@ jobs:
     name: Publish crates.io
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - name: Dry run
         if: inputs.dry_run
@@ -55,13 +55,13 @@ jobs:
           - os: windows-latest
             target: aarch64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
@@ -91,10 +91,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-npm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           registry-url: https://registry.npmjs.org
       - name: Install dependencies
         working-directory: crates/zapcode-js
@@ -117,7 +117,7 @@ jobs:
             if [ -f "$dir/package.json" ]; then
               echo "Publishing $(basename $dir)..."
               cd "$dir"
-              npm publish --access public || true
+              npm publish --access public --tag beta || true
               cd ../..
             fi
           done
@@ -126,7 +126,7 @@ jobs:
       - name: Publish main package
         if: ${{ !inputs.dry_run }}
         working-directory: crates/zapcode-js
-        run: npm publish --access public
+        run: npm publish --access public --tag beta
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
@@ -154,8 +154,8 @@ jobs:
             target: x64
             manylinux: auto
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Build wheel
@@ -196,9 +196,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: [publish-crate, publish-npm, publish-pypi]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          tag_name: v${{ github.ref_name }}
+          tag_name: v1.0.0-beta.1
+          prerelease: true
