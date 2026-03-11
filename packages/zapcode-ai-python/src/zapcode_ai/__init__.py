@@ -135,7 +135,7 @@ Rules:
 - The last expression in your code is the return value.
 - You can use variables, loops, conditionals, array methods, etc.
 - All tool calls must use `await`.
-- Do NOT use regex, parseFloat, parseInt, or Number(). Tool functions return structured objects — access properties directly.
+- When a tool returns a structured object, access its properties directly instead of reparsing the result as text.
 - If the user's question doesn't need tools, you can compute the answer directly."""
     )
 
