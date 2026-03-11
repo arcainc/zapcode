@@ -33,9 +33,8 @@ fn test_try_catch_value() {
     )
     .unwrap();
     // The thrown value becomes a runtime error message
-    match result {
-        Value::String(s) => assert!(s.len() > 0),
-        _ => {} // Accept any non-undefined result
+    if let Value::String(s) = result {
+        assert!(!s.is_empty());
     }
 }
 

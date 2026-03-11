@@ -3,10 +3,10 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::compiler::CompiledProgram;
-use crate::error::{ZapcodeError, Result};
+use crate::error::{Result, ZapcodeError};
+use crate::sandbox::ResourceLimits;
 use crate::value::Value;
 use crate::vm::{CallFrame, TryInfo, Vm, VmState};
-use crate::sandbox::ResourceLimits;
 
 /// Internal serializable representation of VM state at a suspension point.
 #[derive(Debug, Clone, Serialize, Deserialize)]

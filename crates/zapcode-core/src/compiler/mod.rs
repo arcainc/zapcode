@@ -2,9 +2,9 @@ pub mod instruction;
 
 use std::collections::{HashMap, HashSet};
 
-use instruction::*;
-use crate::error::{ZapcodeError, Result};
+use crate::error::{Result, ZapcodeError};
 use crate::parser::ir::*;
+use instruction::*;
 
 /// Compiled program ready for VM execution.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -183,11 +183,18 @@ impl Compiler {
             Statement::Return { value, .. } => {
                 match value {
                     Some(expr) => self.compile_expr(expr)?,
-                    None => { self.emit(Instruction::Push(Constant::Undefined)); }
+                    None => {
+                        self.emit(Instruction::Push(Constant::Undefined));
+                    }
                 }
                 self.emit(Instruction::Return);
             }
-            Statement::If { test, consequent, alternate, .. } => {
+            Statement::If {
+                test,
+                consequent,
+                alternate,
+                ..
+            } => {
                 self.compile_expr(test)?;
                 let jump_else = self.emit(Instruction::JumpIfFalse(0));
 
@@ -260,7 +267,13 @@ impl Compiler {
                     self.patch_jump(patch, continue_target);
                 }
             }
-            Statement::For { init, test, update, body, .. } => {
+            Statement::For {
+                init,
+                test,
+                update,
+                body,
+                ..
+            } => {
                 if let Some(init) = init {
                     self.compile_statement(init)?;
                 }
@@ -303,7 +316,12 @@ impl Compiler {
                     self.patch_jump(patch, continue_target);
                 }
             }
-            Statement::ForOf { binding, iterable, body, .. } => {
+            Statement::ForOf {
+                binding,
+                iterable,
+                body,
+                ..
+            } => {
                 self.compile_expr(iterable)?;
                 self.emit(Instruction::GetIterator);
 
@@ -355,7 +373,13 @@ impl Compiler {
                 self.compile_expr(value)?;
                 self.emit(Instruction::Throw);
             }
-            Statement::TryCatch { try_body, catch_param, catch_body, finally_body, .. } => {
+            Statement::TryCatch {
+                try_body,
+                catch_param,
+                catch_body,
+                finally_body,
+                ..
+            } => {
                 let setup = self.emit(Instruction::SetupTry(0, None));
 
                 for s in try_body {
@@ -417,7 +441,14 @@ impl Compiler {
                     self.emit(Instruction::Pop);
                 }
             }
-            Statement::ClassDecl { name, super_class, constructor, methods, static_methods, .. } => {
+            Statement::ClassDecl {
+                name,
+                super_class,
+                constructor,
+                methods,
+                static_methods,
+                ..
+            } => {
                 self.compile_class(
                     Some(name),
                     super_class.as_deref(),
@@ -431,7 +462,11 @@ impl Compiler {
                 self.emit(Instruction::StoreLocal(idx));
                 self.emit(Instruction::StoreGlobal(name.clone()));
             }
-            Statement::Switch { discriminant, cases, .. } => {
+            Statement::Switch {
+                discriminant,
+                cases,
+                ..
+            } => {
                 self.compile_expr(discriminant)?;
                 let mut case_jumps = Vec::new();
                 let mut default_jump = None;
@@ -661,13 +696,25 @@ impl Compiler {
             Expr::Unary { op, operand } => {
                 self.compile_expr(operand)?;
                 match op {
-                    UnaryOp::Neg => { self.emit(Instruction::Neg); }
-                    UnaryOp::Not => { self.emit(Instruction::Not); }
-                    UnaryOp::BitNot => { self.emit(Instruction::BitNot); }
-                    UnaryOp::Void => { self.emit(Instruction::Void); }
+                    UnaryOp::Neg => {
+                        self.emit(Instruction::Neg);
+                    }
+                    UnaryOp::Not => {
+                        self.emit(Instruction::Not);
+                    }
+                    UnaryOp::BitNot => {
+                        self.emit(Instruction::BitNot);
+                    }
+                    UnaryOp::Void => {
+                        self.emit(Instruction::Void);
+                    }
                 }
             }
-            Expr::Update { op, prefix, operand } => {
+            Expr::Update {
+                op,
+                prefix,
+                operand,
+            } => {
                 // Load current value
                 self.compile_expr(operand)?;
 
@@ -676,8 +723,12 @@ impl Compiler {
                 }
 
                 match op {
-                    UpdateOp::Increment => { self.emit(Instruction::Increment); }
-                    UpdateOp::Decrement => { self.emit(Instruction::Decrement); }
+                    UpdateOp::Increment => {
+                        self.emit(Instruction::Increment);
+                    }
+                    UpdateOp::Decrement => {
+                        self.emit(Instruction::Decrement);
+                    }
                 }
 
                 if *prefix {
@@ -692,41 +743,43 @@ impl Compiler {
                     // Actually the dup before increment already has it
                 }
             }
-            Expr::Logical { op, left, right } => {
-                match op {
-                    LogicalOp::And => {
-                        self.compile_expr(left)?;
-                        self.emit(Instruction::Dup);
-                        let skip = self.emit(Instruction::JumpIfFalse(0));
-                        self.emit(Instruction::Pop);
-                        self.compile_expr(right)?;
-                        let end = self.current_offset();
-                        self.patch_jump(skip, end);
-                    }
-                    LogicalOp::Or => {
-                        self.compile_expr(left)?;
-                        self.emit(Instruction::Dup);
-                        let skip = self.emit(Instruction::JumpIfTrue(0));
-                        self.emit(Instruction::Pop);
-                        self.compile_expr(right)?;
-                        let end = self.current_offset();
-                        self.patch_jump(skip, end);
-                    }
-                    LogicalOp::NullishCoalescing => {
-                        self.compile_expr(left)?;
-                        self.emit(Instruction::Dup);
-                        let skip = self.emit(Instruction::JumpIfNullish(0));
-                        let jump_end = self.emit(Instruction::Jump(0));
-                        let nullish_target = self.current_offset();
-                        self.patch_jump(skip, nullish_target);
-                        self.emit(Instruction::Pop);
-                        self.compile_expr(right)?;
-                        let end = self.current_offset();
-                        self.patch_jump(jump_end, end);
-                    }
+            Expr::Logical { op, left, right } => match op {
+                LogicalOp::And => {
+                    self.compile_expr(left)?;
+                    self.emit(Instruction::Dup);
+                    let skip = self.emit(Instruction::JumpIfFalse(0));
+                    self.emit(Instruction::Pop);
+                    self.compile_expr(right)?;
+                    let end = self.current_offset();
+                    self.patch_jump(skip, end);
                 }
-            }
-            Expr::Conditional { test, consequent, alternate } => {
+                LogicalOp::Or => {
+                    self.compile_expr(left)?;
+                    self.emit(Instruction::Dup);
+                    let skip = self.emit(Instruction::JumpIfTrue(0));
+                    self.emit(Instruction::Pop);
+                    self.compile_expr(right)?;
+                    let end = self.current_offset();
+                    self.patch_jump(skip, end);
+                }
+                LogicalOp::NullishCoalescing => {
+                    self.compile_expr(left)?;
+                    self.emit(Instruction::Dup);
+                    let skip = self.emit(Instruction::JumpIfNullish(0));
+                    let jump_end = self.emit(Instruction::Jump(0));
+                    let nullish_target = self.current_offset();
+                    self.patch_jump(skip, nullish_target);
+                    self.emit(Instruction::Pop);
+                    self.compile_expr(right)?;
+                    let end = self.current_offset();
+                    self.patch_jump(jump_end, end);
+                }
+            },
+            Expr::Conditional {
+                test,
+                consequent,
+                alternate,
+            } => {
                 self.compile_expr(test)?;
                 let jump_else = self.emit(Instruction::JumpIfFalse(0));
                 self.compile_expr(consequent)?;
@@ -749,18 +802,42 @@ impl Compiler {
                         self.compile_expr(target)?;
                         self.compile_expr(value)?;
                         match op {
-                            AssignOp::AddAssign => { self.emit(Instruction::Add); }
-                            AssignOp::SubAssign => { self.emit(Instruction::Sub); }
-                            AssignOp::MulAssign => { self.emit(Instruction::Mul); }
-                            AssignOp::DivAssign => { self.emit(Instruction::Div); }
-                            AssignOp::RemAssign => { self.emit(Instruction::Rem); }
-                            AssignOp::PowAssign => { self.emit(Instruction::Pow); }
-                            AssignOp::BitAndAssign => { self.emit(Instruction::BitAnd); }
-                            AssignOp::BitOrAssign => { self.emit(Instruction::BitOr); }
-                            AssignOp::BitXorAssign => { self.emit(Instruction::BitXor); }
-                            AssignOp::ShlAssign => { self.emit(Instruction::Shl); }
-                            AssignOp::ShrAssign => { self.emit(Instruction::Shr); }
-                            AssignOp::UshrAssign => { self.emit(Instruction::Ushr); }
+                            AssignOp::AddAssign => {
+                                self.emit(Instruction::Add);
+                            }
+                            AssignOp::SubAssign => {
+                                self.emit(Instruction::Sub);
+                            }
+                            AssignOp::MulAssign => {
+                                self.emit(Instruction::Mul);
+                            }
+                            AssignOp::DivAssign => {
+                                self.emit(Instruction::Div);
+                            }
+                            AssignOp::RemAssign => {
+                                self.emit(Instruction::Rem);
+                            }
+                            AssignOp::PowAssign => {
+                                self.emit(Instruction::Pow);
+                            }
+                            AssignOp::BitAndAssign => {
+                                self.emit(Instruction::BitAnd);
+                            }
+                            AssignOp::BitOrAssign => {
+                                self.emit(Instruction::BitOr);
+                            }
+                            AssignOp::BitXorAssign => {
+                                self.emit(Instruction::BitXor);
+                            }
+                            AssignOp::ShlAssign => {
+                                self.emit(Instruction::Shl);
+                            }
+                            AssignOp::ShrAssign => {
+                                self.emit(Instruction::Shr);
+                            }
+                            AssignOp::UshrAssign => {
+                                self.emit(Instruction::Ushr);
+                            }
                             _ => {}
                         }
                         self.emit(Instruction::Dup);
@@ -776,7 +853,11 @@ impl Compiler {
                     }
                 }
             }
-            Expr::Member { object, property, optional } => {
+            Expr::Member {
+                object,
+                property,
+                optional,
+            } => {
                 self.compile_expr(object)?;
                 if *optional {
                     self.emit(Instruction::Dup);
@@ -793,7 +874,11 @@ impl Compiler {
                     self.emit(Instruction::GetProperty(property.clone()));
                 }
             }
-            Expr::ComputedMember { object, property, optional } => {
+            Expr::ComputedMember {
+                object,
+                property,
+                optional,
+            } => {
                 self.compile_expr(object)?;
                 if *optional {
                     self.emit(Instruction::Dup);
@@ -861,7 +946,9 @@ impl Compiler {
                 // Compile the yielded value (or undefined if none)
                 match value {
                     Some(expr) => self.compile_expr(expr)?,
-                    None => { self.emit(Instruction::Push(Constant::Undefined)); }
+                    None => {
+                        self.emit(Instruction::Push(Constant::Undefined));
+                    }
                 }
                 // Yield instruction: suspends the generator, pops value, pushes received value on resume
                 self.emit(Instruction::Yield);
@@ -870,7 +957,13 @@ impl Compiler {
                 self.compile_expr(operand)?;
                 self.emit(Instruction::TypeOf);
             }
-            Expr::ClassExpr { name, super_class, constructor, methods, static_methods } => {
+            Expr::ClassExpr {
+                name,
+                super_class,
+                constructor,
+                methods,
+                static_methods,
+            } => {
                 self.compile_class(
                     name.as_deref(),
                     super_class.as_deref(),
@@ -952,13 +1045,17 @@ impl Compiler {
                     self.emit(Instruction::StoreGlobal(name.clone()));
                 }
             }
-            Expr::Member { object, property, .. } => {
+            Expr::Member {
+                object, property, ..
+            } => {
                 self.compile_expr(object)?;
                 self.emit(Instruction::SetProperty(property.clone()));
                 // SetProperty pushes the modified object back — store it to the parent
                 self.compile_store(object)?;
             }
-            Expr::ComputedMember { object, property, .. } => {
+            Expr::ComputedMember {
+                object, property, ..
+            } => {
                 self.compile_expr(object)?;
                 self.compile_expr(property)?;
                 self.emit(Instruction::SetIndex);

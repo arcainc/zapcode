@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+/// Result type for parsing a class body: (constructor, instance methods, static methods).
+pub type ClassBodyParts = (Option<Box<FunctionDef>>, Vec<ClassMethod>, Vec<ClassMethod>);
+
 /// Span information for error reporting.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Span {
@@ -15,7 +18,10 @@ impl std::fmt::Display for Span {
 
 impl From<oxc_span::Span> for Span {
     fn from(s: oxc_span::Span) -> Self {
-        Span { start: s.start, end: s.end }
+        Span {
+            start: s.start,
+            end: s.end,
+        }
     }
 }
 
@@ -45,7 +51,10 @@ pub enum ParamPattern {
     ObjectDestructure(Vec<DestructureField>),
     ArrayDestructure(Vec<Option<ParamPattern>>),
     Rest(String),
-    DefaultValue { pattern: Box<ParamPattern>, default: Expr },
+    DefaultValue {
+        pattern: Box<ParamPattern>,
+        default: Expr,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,8 +118,12 @@ pub enum Statement {
         finally_body: Option<Vec<Statement>>,
         span: Span,
     },
-    Break { span: Span },
-    Continue { span: Span },
+    Break {
+        span: Span,
+    },
+    Continue {
+        span: Span,
+    },
     FunctionDecl {
         func_index: usize,
         span: Span,
@@ -303,17 +316,36 @@ pub enum PropKind {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum BinOp {
-    Add, Sub, Mul, Div, Rem, Pow,
-    Eq, Neq, StrictEq, StrictNeq,
-    Lt, Lte, Gt, Gte,
-    BitAnd, BitOr, BitXor,
-    Shl, Shr, Ushr,
-    In, InstanceOf,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Pow,
+    Eq,
+    Neq,
+    StrictEq,
+    StrictNeq,
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    Ushr,
+    In,
+    InstanceOf,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum UnaryOp {
-    Neg, Not, BitNot, Void,
+    Neg,
+    Not,
+    BitNot,
+    Void,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

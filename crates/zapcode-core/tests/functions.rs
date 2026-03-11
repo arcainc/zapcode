@@ -3,28 +3,20 @@ use zapcode_core::Value;
 
 #[test]
 fn test_function_declaration() {
-    let result = eval_ts(
-        "function add(a, b) { return a + b; } add(2, 3)",
-    )
-    .unwrap();
+    let result = eval_ts("function add(a, b) { return a + b; } add(2, 3)").unwrap();
     assert_eq!(result, Value::Int(5));
 }
 
 #[test]
 fn test_arrow_function() {
-    let result = eval_ts(
-        "const double = (x) => x * 2; double(21)",
-    )
-    .unwrap();
+    let result = eval_ts("const double = (x) => x * 2; double(21)").unwrap();
     assert_eq!(result, Value::Int(42));
 }
 
 #[test]
 fn test_arrow_function_block() {
-    let result = eval_ts(
-        "const greet = (name) => { return \"hello \" + name; }; greet(\"world\")",
-    )
-    .unwrap();
+    let result =
+        eval_ts("const greet = (name) => { return \"hello \" + name; }; greet(\"world\")").unwrap();
     assert_eq!(result, Value::String("hello world".into()));
 }
 
@@ -39,28 +31,21 @@ fn test_recursive_function() {
 
 #[test]
 fn test_function_no_return() {
-    let result = eval_ts(
-        "function noop() {} noop()",
-    )
-    .unwrap();
+    let result = eval_ts("function noop() {} noop()").unwrap();
     assert_eq!(result, Value::Undefined);
 }
 
 #[test]
 fn test_function_expression() {
-    let result = eval_ts(
-        "const mul = function(a, b) { return a * b; }; mul(6, 7)",
-    )
-    .unwrap();
+    let result = eval_ts("const mul = function(a, b) { return a * b; }; mul(6, 7)").unwrap();
     assert_eq!(result, Value::Int(42));
 }
 
 #[test]
 fn test_higher_order_function() {
-    let result = eval_ts(
-        "function apply(f, x) { return f(x); } const inc = (x) => x + 1; apply(inc, 41)",
-    )
-    .unwrap();
+    let result =
+        eval_ts("function apply(f, x) { return f(x); } const inc = (x) => x + 1; apply(inc, 41)")
+            .unwrap();
     assert_eq!(result, Value::Int(42));
 }
 

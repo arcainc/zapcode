@@ -4,7 +4,7 @@ use std::sync::Arc;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use zapcode_core::{ZapcodeRun, ZapcodeSnapshot, ResourceLimits, Value, VmState};
+use zapcode_core::{ResourceLimits, Value, VmState, ZapcodeRun, ZapcodeSnapshot};
 
 // ---------------------------------------------------------------------------
 // Options
@@ -72,8 +72,8 @@ impl ZapcodeSnapshotHandle {
     /// Load a snapshot from bytes previously obtained via `dump()`.
     #[napi(factory)]
     pub fn load(bytes: Buffer) -> napi::Result<Self> {
-        let snapshot = ZapcodeSnapshot::load(&bytes)
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let snapshot =
+            ZapcodeSnapshot::load(&bytes).map_err(|e| napi::Error::from_reason(e.to_string()))?;
         Ok(Self { inner: snapshot })
     }
 
@@ -209,9 +209,7 @@ fn json_to_value(json: &serde_json::Value) -> Value {
             }
         }
         serde_json::Value::String(s) => Value::String(Arc::from(s.as_str())),
-        serde_json::Value::Array(arr) => {
-            Value::Array(arr.iter().map(json_to_value).collect())
-        }
+        serde_json::Value::Array(arr) => Value::Array(arr.iter().map(json_to_value).collect()),
         serde_json::Value::Object(obj) => {
             let map = obj
                 .iter()
@@ -237,9 +235,7 @@ fn value_to_json(value: &Value) -> serde_json::Value {
             }
         }
         Value::String(s) => serde_json::Value::String(s.to_string()),
-        Value::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(value_to_json).collect())
-        }
+        Value::Array(arr) => serde_json::Value::Array(arr.iter().map(value_to_json).collect()),
         Value::Object(obj) => {
             let map: serde_json::Map<String, serde_json::Value> = obj
                 .iter()

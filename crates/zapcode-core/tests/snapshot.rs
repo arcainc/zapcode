@@ -1,5 +1,5 @@
-use zapcode_core::{ZapcodeRun, ZapcodeSnapshot, ResourceLimits, Value};
 use zapcode_core::vm::VmState;
+use zapcode_core::{ResourceLimits, Value, ZapcodeRun, ZapcodeSnapshot};
 
 /// Helper: create a ZapcodeRun with external functions and run start().
 fn start_with_externals(
@@ -91,9 +91,7 @@ fn test_snapshot_resume_with_computation_after() {
 
     match state {
         VmState::Suspended { snapshot, .. } => {
-            let result = snapshot
-                .resume(Value::String("data".into()))
-                .unwrap();
+            let result = snapshot.resume(Value::String("data".into())).unwrap();
 
             match result {
                 VmState::Complete(v) => {
@@ -148,9 +146,7 @@ fn test_snapshot_resume_chain() {
     };
 
     // Resume db with final value
-    let state3 = snapshot2
-        .resume(Value::String("db result".into()))
-        .unwrap();
+    let state3 = snapshot2.resume(Value::String("db result".into())).unwrap();
 
     match state3 {
         VmState::Complete(v) => {
@@ -173,9 +169,7 @@ fn test_snapshot_preserves_locals_and_globals() {
 
     match state {
         VmState::Suspended { snapshot, .. } => {
-            let result = snapshot
-                .resume(Value::String("world".into()))
-                .unwrap();
+            let result = snapshot.resume(Value::String("world".into())).unwrap();
             match result {
                 VmState::Complete(v) => {
                     assert_eq!(v, Value::String("hello world".into()));
@@ -200,9 +194,7 @@ fn test_snapshot_with_inputs() {
     match state {
         VmState::Suspended { args, snapshot, .. } => {
             assert_eq!(args[0], Value::String("https://test.com".into()));
-            let result = snapshot
-                .resume(Value::String("ok".into()))
-                .unwrap();
+            let result = snapshot.resume(Value::String("ok".into())).unwrap();
             match result {
                 VmState::Complete(v) => assert_eq!(v, Value::String("ok".into())),
                 _ => panic!("expected completion"),
@@ -265,9 +257,7 @@ fn test_snapshot_dump_load_resume() {
     let loaded = ZapcodeSnapshot::load(&bytes).unwrap();
 
     // Resume execution
-    let result = loaded
-        .resume(Value::String("response".into()))
-        .unwrap();
+    let result = loaded.resume(Value::String("response".into())).unwrap();
 
     match result {
         VmState::Complete(v) => {

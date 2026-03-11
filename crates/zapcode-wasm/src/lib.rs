@@ -4,7 +4,7 @@ use js_sys::{Array, Object, Reflect};
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 
-use zapcode_core::{ZapcodeError, ZapcodeSnapshot as CoreSnapshot, ResourceLimits, Value, VmState};
+use zapcode_core::{ResourceLimits, Value, VmState, ZapcodeError, ZapcodeSnapshot as CoreSnapshot};
 
 // ---------------------------------------------------------------------------
 // Value conversion: zapcode_core::Value <-> JsValue
@@ -40,9 +40,10 @@ fn js_to_value(js: &JsValue) -> Result<Value, JsError> {
         let mut map = indexmap::IndexMap::new();
         for i in 0..entries.length() {
             let pair = Array::from(&entries.get(i));
-            let key = pair.get(0).as_string().ok_or_else(|| {
-                JsError::new("object keys must be strings")
-            })?;
+            let key = pair
+                .get(0)
+                .as_string()
+                .ok_or_else(|| JsError::new("object keys must be strings"))?;
             let val = js_to_value(&pair.get(1))?;
             map.insert(Arc::from(key.as_str()), val);
         }
@@ -74,21 +75,13 @@ fn value_to_js(val: &Value) -> Result<JsValue, JsError> {
         Value::Object(map) => {
             let obj = Object::new();
             for (k, v) in map {
-                Reflect::set(
-                    &obj,
-                    &JsValue::from_str(k.as_ref()),
-                    &value_to_js(v)?,
-                )
-                .map_err(|_| JsError::new("failed to set object property"))?;
+                Reflect::set(&obj, &JsValue::from_str(k.as_ref()), &value_to_js(v)?)
+                    .map_err(|_| JsError::new("failed to set object property"))?;
             }
             Ok(obj.into())
         }
-        Value::Function(_) | Value::BuiltinMethod { .. } => {
-            Ok(JsValue::from_str("<function>"))
-        }
-        Value::Generator(_) => {
-            Ok(JsValue::from_str("<generator>"))
-        }
+        Value::Function(_) | Value::BuiltinMethod { .. } => Ok(JsValue::from_str("<function>")),
+        Value::Generator(_) => Ok(JsValue::from_str("<generator>")),
     }
 }
 
@@ -150,7 +143,9 @@ impl Zapcode {
 
         let defaults = ResourceLimits::default();
         let limits = ResourceLimits {
-            memory_limit_bytes: opts.memory_limit_bytes.unwrap_or(defaults.memory_limit_bytes),
+            memory_limit_bytes: opts
+                .memory_limit_bytes
+                .unwrap_or(defaults.memory_limit_bytes),
             time_limit_ms: opts.time_limit_ms.unwrap_or(defaults.time_limit_ms),
             max_stack_depth: opts.max_stack_depth.unwrap_or(defaults.max_stack_depth),
             max_allocations: opts.max_allocations.unwrap_or(defaults.max_allocations),
@@ -199,9 +194,10 @@ fn extract_inputs(inputs: &JsValue) -> Result<Vec<(String, Value)>, JsError> {
     let mut out = Vec::with_capacity(entries.length() as usize);
     for i in 0..entries.length() {
         let pair = Array::from(&entries.get(i));
-        let key = pair.get(0).as_string().ok_or_else(|| {
-            JsError::new("input keys must be strings")
-        })?;
+        let key = pair
+            .get(0)
+            .as_string()
+            .ok_or_else(|| JsError::new("input keys must be strings"))?;
         let val = js_to_value(&pair.get(1))?;
         out.push((key, val));
     }
@@ -215,8 +211,12 @@ fn vm_state_to_js(state: VmState, stdout: &str) -> Result<JsValue, JsError> {
         VmState::Complete(value) => {
             Reflect::set(&obj, &JsValue::from_str("output"), &value_to_js(&value)?)
                 .map_err(|_| JsError::new("failed to set output"))?;
-            Reflect::set(&obj, &JsValue::from_str("stdout"), &JsValue::from_str(stdout))
-                .map_err(|_| JsError::new("failed to set stdout"))?;
+            Reflect::set(
+                &obj,
+                &JsValue::from_str("stdout"),
+                &JsValue::from_str(stdout),
+            )
+            .map_err(|_| JsError::new("failed to set stdout"))?;
         }
         VmState::Suspended {
             function_name,
@@ -238,14 +238,14 @@ fn vm_state_to_js(state: VmState, stdout: &str) -> Result<JsValue, JsError> {
             Reflect::set(&obj, &JsValue::from_str("args"), &js_args.into())
                 .map_err(|_| JsError::new("failed to set args"))?;
             let snap = ZapcodeSnapshot { inner: snapshot };
+            Reflect::set(&obj, &JsValue::from_str("snapshot"), &snap.into_js()?)
+                .map_err(|_| JsError::new("failed to set snapshot"))?;
             Reflect::set(
                 &obj,
-                &JsValue::from_str("snapshot"),
-                &snap.into_js()?,
+                &JsValue::from_str("stdout"),
+                &JsValue::from_str(stdout),
             )
-            .map_err(|_| JsError::new("failed to set snapshot"))?;
-            Reflect::set(&obj, &JsValue::from_str("stdout"), &JsValue::from_str(stdout))
-                .map_err(|_| JsError::new("failed to set stdout"))?;
+            .map_err(|_| JsError::new("failed to set stdout"))?;
         }
     }
     Ok(obj.into())

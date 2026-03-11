@@ -26,10 +26,8 @@ fn loop_100() -> zapcode_core::Value {
 
 #[divan::bench]
 fn fibonacci_10() -> zapcode_core::Value {
-    eval_ts(
-        "function fib(n) { if (n <= 1) { return n; } return fib(n - 1) + fib(n - 2); } fib(10)",
-    )
-    .unwrap()
+    eval_ts("function fib(n) { if (n <= 1) { return n; } return fib(n - 1) + fib(n - 2); } fib(10)")
+        .unwrap()
 }
 
 #[divan::bench]

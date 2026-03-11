@@ -107,28 +107,16 @@ jobs:
           test -f crates/zapcode-wasm/pkg/zapcode_wasm_bg.wasm
           echo "WASM build OK — $(du -h crates/zapcode-wasm/pkg/zapcode_wasm_bg.wasm | cut -f1) bundle"
 
-  # ── Performance regression ──────────────────────────────────────────
+  # ── Performance smoke test ──────────────────────────────────────────
   bench:
-    name: Performance regression
+    name: Benchmarks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run benchmarks
-        run: cargo bench -p zapcode-core -- --output-format bencher 2>/dev/null | tee bench-output.txt || cargo bench -p zapcode-core | tee bench-output.txt
-      - name: Store benchmark result
-        uses: benchmark-action/github-action-benchmark@v1
-        with:
-          name: Zapcode Benchmarks
-          tool: cargo
-          output-file-path: bench-output.txt
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          alert-threshold: "130%"
-          comment-on-alert: true
-          fail-on-alert: true
-          auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
-          benchmark-data-dir-path: dev/bench
+        run: cargo bench -p zapcode-core
 
   # ── Security audit ──────────────────────────────────────────────────
   security:

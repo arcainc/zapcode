@@ -51,4 +51,4 @@ pub use error::ZapcodeError;
 pub use sandbox::ResourceLimits;
 pub use snapshot::ZapcodeSnapshot;
 pub use value::Value;
-pub use vm::{ZapcodeRun, RunResult, VmState};
+pub use vm::{RunResult, VmState, ZapcodeRun};

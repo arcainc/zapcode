@@ -83,8 +83,11 @@ impl Value {
             Value::Int(n) => *n != 0,
             Value::Float(n) => *n != 0.0 && !n.is_nan(),
             Value::String(s) => !s.is_empty(),
-            Value::Array(_) | Value::Object(_) | Value::Function(_)
-            | Value::BuiltinMethod { .. } | Value::Generator(_) => true,
+            Value::Array(_)
+            | Value::Object(_)
+            | Value::Function(_)
+            | Value::BuiltinMethod { .. }
+            | Value::Generator(_) => true,
         }
     }
 
@@ -109,13 +112,16 @@ impl Value {
             Value::Int(n) => n.to_string(),
             Value::Float(n) => {
                 if n.is_infinite() {
-                    if *n > 0.0 { "Infinity".to_string() } else { "-Infinity".to_string() }
+                    if *n > 0.0 {
+                        "Infinity".to_string()
+                    } else {
+                        "-Infinity".to_string()
+                    }
                 } else if n.is_nan() {
                     "NaN".to_string()
                 } else {
                     // Remove trailing ".0" for whole numbers
-                    let s = n.to_string();
-                    s
+                    n.to_string()
                 }
             }
             Value::String(s) => s.to_string(),

@@ -1,6 +1,6 @@
 use zapcode_core::vm::eval_ts;
-use zapcode_core::{ZapcodeRun, ResourceLimits, Value};
 use zapcode_core::vm::VmState;
+use zapcode_core::{ResourceLimits, Value, ZapcodeRun};
 
 /// Helper: create a ZapcodeRun with external functions and run start().
 fn start_with_externals(
@@ -23,21 +23,27 @@ fn start_with_externals(
 #[test]
 fn test_async_function_basic() {
     // An async function that doesn't await anything should work like a regular function.
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         async function greet(name: string): Promise<string> {
             return "hello " + name;
         }
         greet("world")
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::String("hello world".into()));
 }
 
 #[test]
 fn test_async_arrow_function() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         const add = async (a: number, b: number) => a + b;
         add(3, 4)
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::Int(7));
 }
 
@@ -45,61 +51,76 @@ fn test_async_arrow_function() {
 
 #[test]
 fn test_await_number_passthrough() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         async function f() {
             const x = await 42;
             return x;
         }
         f()
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::Int(42));
 }
 
 #[test]
 fn test_await_string_passthrough() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         async function f() {
             const x = await "hello";
             return x;
         }
         f()
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::String("hello".into()));
 }
 
 #[test]
 fn test_await_undefined_passthrough() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         async function f() {
             const x = await undefined;
             return x;
         }
         f()
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::Undefined);
 }
 
 #[test]
 fn test_await_null_passthrough() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         async function f() {
             const x = await null;
             return x;
         }
         f()
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::Null);
 }
 
 #[test]
 fn test_await_bool_passthrough() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         async function f() {
             const x = await true;
             return x;
         }
         f()
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::Bool(true));
 }
 
@@ -107,49 +128,64 @@ fn test_await_bool_passthrough() {
 
 #[test]
 fn test_promise_resolve_basic() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         const p = Promise.resolve(42);
         const val = await p;
         val
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::Int(42));
 }
 
 #[test]
 fn test_promise_resolve_string() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         const p = Promise.resolve("hello");
         const val = await p;
         val
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::String("hello".into()));
 }
 
 #[test]
 fn test_promise_resolve_undefined() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         const val = await Promise.resolve(undefined);
         val
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::Undefined);
 }
 
 #[test]
 fn test_promise_resolve_object() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         const p = Promise.resolve({ name: "test", value: 123 });
         const obj = await p;
         obj.name
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::String("test".into()));
 }
 
 #[test]
 fn test_promise_resolve_no_args() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         const val = await Promise.resolve();
         val
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::Undefined);
 }
 
@@ -157,21 +193,28 @@ fn test_promise_resolve_no_args() {
 
 #[test]
 fn test_promise_reject_throws() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         async function f() {
             const val = await Promise.reject("oops");
             return val;
         }
         f()
-    "#);
+    "#,
+    );
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("oops"), "error should contain rejection reason, got: {}", err);
+    assert!(
+        err.contains("oops"),
+        "error should contain rejection reason, got: {}",
+        err
+    );
 }
 
 #[test]
 fn test_promise_reject_caught() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         async function f() {
             try {
                 const val = await Promise.reject("oops");
@@ -181,10 +224,16 @@ fn test_promise_reject_caught() {
             }
         }
         f()
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     // The error message should contain "oops"
     match result {
-        Value::String(s) => assert!(s.contains("oops"), "caught error should contain 'oops', got: {}", s),
+        Value::String(s) => assert!(
+            s.contains("oops"),
+            "caught error should contain 'oops', got: {}",
+            s
+        ),
         other => panic!("expected string, got {:?}", other),
     }
 }
@@ -193,13 +242,16 @@ fn test_promise_reject_caught() {
 
 #[test]
 fn test_promise_all_resolved() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         const p1 = Promise.resolve(1);
         const p2 = Promise.resolve(2);
         const p3 = Promise.resolve(3);
         const all = await Promise.all([p1, p2, p3]);
         all
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     match result {
         Value::Array(arr) => {
             assert_eq!(arr.len(), 3);
@@ -213,10 +265,13 @@ fn test_promise_all_resolved() {
 
 #[test]
 fn test_promise_all_with_plain_values() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         const all = await Promise.all([1, 2, 3]);
         all
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     match result {
         Value::Array(arr) => {
             assert_eq!(arr.len(), 3);
@@ -269,10 +324,7 @@ fn test_await_external_function_resume() {
     let state = start_with_externals(code, vec!["fetch"], Vec::new());
 
     match state {
-        VmState::Suspended {
-            snapshot,
-            ..
-        } => {
+        VmState::Suspended { snapshot, .. } => {
             let result = snapshot
                 .resume(Value::String("response body".into()))
                 .unwrap();
@@ -292,7 +344,8 @@ fn test_await_external_function_resume() {
 
 #[test]
 fn test_multiple_awaits_in_async_function() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         async function f() {
             const a = await 10;
             const b = await Promise.resolve(20);
@@ -300,7 +353,9 @@ fn test_multiple_awaits_in_async_function() {
             return a + b + c;
         }
         f()
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::Int(60));
 }
 
@@ -319,7 +374,11 @@ fn test_multiple_external_awaits_suspend_resume() {
 
     // First suspension: getA()
     let snapshot = match state {
-        VmState::Suspended { function_name, snapshot, .. } => {
+        VmState::Suspended {
+            function_name,
+            snapshot,
+            ..
+        } => {
             assert_eq!(function_name, "getA");
             snapshot
         }
@@ -331,7 +390,11 @@ fn test_multiple_external_awaits_suspend_resume() {
 
     // Second suspension: getB()
     let snapshot2 = match state2 {
-        VmState::Suspended { function_name, snapshot, .. } => {
+        VmState::Suspended {
+            function_name,
+            snapshot,
+            ..
+        } => {
             assert_eq!(function_name, "getB");
             snapshot
         }
@@ -354,12 +417,15 @@ fn test_multiple_external_awaits_suspend_resume() {
 #[test]
 fn test_promise_resolve_of_promise() {
     // Promise.resolve on an already-resolved promise should return it as-is
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         const p1 = Promise.resolve(42);
         const p2 = Promise.resolve(p1);
         const val = await p2;
         val
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::Int(42));
 }
 
@@ -367,13 +433,16 @@ fn test_promise_resolve_of_promise() {
 
 #[test]
 fn test_async_function_return_value_used() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         async function double(n: number) {
             return n * 2;
         }
         const result = double(21);
         result
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::Int(42));
 }
 
@@ -381,13 +450,16 @@ fn test_async_function_return_value_used() {
 
 #[test]
 fn test_await_in_expression() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         async function f() {
             const result = (await Promise.resolve(10)) + (await Promise.resolve(20));
             return result;
         }
         f()
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::Int(30));
 }
 
@@ -395,10 +467,13 @@ fn test_await_in_expression() {
 
 #[test]
 fn test_promise_resolve_creates_object() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         const p = Promise.resolve(42);
         p
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     // Should be a promise object (not unwrapped)
     match result {
         Value::Object(map) => {

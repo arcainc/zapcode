@@ -27,19 +27,13 @@ fn test_while_loop() {
 
 #[test]
 fn test_for_loop() {
-    let result = eval_ts(
-        "let sum = 0; for (let i = 0; i < 5; i++) { sum += i; } sum",
-    )
-    .unwrap();
+    let result = eval_ts("let sum = 0; for (let i = 0; i < 5; i++) { sum += i; } sum").unwrap();
     assert_eq!(result, Value::Int(10));
 }
 
 #[test]
 fn test_break_in_loop() {
-    let result = eval_ts(
-        "let x = 0; while (true) { x++; if (x === 5) { break; } } x",
-    )
-    .unwrap();
+    let result = eval_ts("let x = 0; while (true) { x++; if (x === 5) { break; } } x").unwrap();
     assert_eq!(result, Value::Int(5));
 }
 
@@ -54,10 +48,7 @@ fn test_continue_in_loop() {
 
 #[test]
 fn test_nested_if() {
-    let result = eval_ts(
-        "let x = 0; if (true) { if (true) { x = 42; } } x",
-    )
-    .unwrap();
+    let result = eval_ts("let x = 0; if (true) { if (true) { x = 42; } } x").unwrap();
     assert_eq!(result, Value::Int(42));
 }
 

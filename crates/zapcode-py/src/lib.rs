@@ -4,7 +4,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString};
 
-use zapcode_core::{ZapcodeError, ZapcodeSnapshot as CoreSnapshot, ResourceLimits, Value, VmState};
+use zapcode_core::{ResourceLimits, Value, VmState, ZapcodeError, ZapcodeSnapshot as CoreSnapshot};
 
 // ---------------------------------------------------------------------------
 // Value conversion: zapcode_core::Value <-> Python object
@@ -70,9 +70,7 @@ fn value_to_py(py: Python<'_>, val: &Value) -> PyResult<PyObject> {
             // Functions cannot be meaningfully represented in Python.
             Ok("<function>".into_pyobject(py)?.into_any().unbind())
         }
-        Value::Generator(_) => {
-            Ok("<generator>".into_pyobject(py)?.into_any().unbind())
-        }
+        Value::Generator(_) => Ok("<generator>".into_pyobject(py)?.into_any().unbind()),
     }
 }
 

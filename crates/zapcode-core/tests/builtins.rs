@@ -17,9 +17,7 @@ fn test_console_log_multiple_args() {
 
 #[test]
 fn test_console_log_multiline() {
-    let (_, stdout) = eval_ts_with_output(
-        "console.log(\"a\"); console.log(\"b\")",
-    ).unwrap();
+    let (_, stdout) = eval_ts_with_output("console.log(\"a\"); console.log(\"b\")").unwrap();
     assert_eq!(stdout, "a\nb\n");
 }
 
@@ -403,7 +401,8 @@ fn test_array_foreach() {
         const arr = [1, 2, 3];
         arr.forEach((x) => console.log(x));
         "#,
-    ).unwrap();
+    )
+    .unwrap();
     assert_eq!(result, Value::Undefined);
     assert_eq!(stdout, "1\n2\n3\n");
 }
@@ -537,7 +536,8 @@ fn test_array_map_with_closure() {
         const multiplier = 10;
         [1, 2, 3].map((x) => x * multiplier)
         "#,
-    ).unwrap();
+    )
+    .unwrap();
     match result {
         Value::Array(arr) => {
             assert_eq!(arr[0], Value::Int(10));
@@ -550,9 +550,7 @@ fn test_array_map_with_closure() {
 
 #[test]
 fn test_array_chained_methods() {
-    let result = eval_ts(
-        "[1, 2, 3, 4, 5].filter((x) => x % 2 === 0).map((x) => x * 10)",
-    ).unwrap();
+    let result = eval_ts("[1, 2, 3, 4, 5].filter((x) => x % 2 === 0).map((x) => x * 10)").unwrap();
     match result {
         Value::Array(arr) => {
             assert_eq!(arr.len(), 2);

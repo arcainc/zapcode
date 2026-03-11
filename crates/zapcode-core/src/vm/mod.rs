@@ -5,7 +5,7 @@ use indexmap::IndexMap;
 
 use crate::compiler::instruction::{Constant, Instruction};
 use crate::compiler::CompiledProgram;
-use crate::error::{ZapcodeError, Result};
+use crate::error::{Result, ZapcodeError};
 use crate::sandbox::{ResourceLimits, ResourceTracker};
 use crate::snapshot::ZapcodeSnapshot;
 use crate::value::{Closure, FunctionId, GeneratorObject, SuspendedFrame, Value};
@@ -94,6 +94,7 @@ impl Vm {
     /// Restore a VM from snapshot state and continue execution.
     /// Builtins are re-registered after restoring user globals.
     /// The return_value is pushed onto the stack (result of the external call).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_snapshot(
         program: CompiledProgram,
         stack: Vec<Value>,
@@ -160,7 +161,9 @@ impl Vm {
     }
 
     fn current_frame_mut(&mut self) -> &mut CallFrame {
-        self.frames.last_mut().expect("internal error: no active frame")
+        self.frames
+            .last_mut()
+            .expect("internal error: no active frame")
     }
 
     #[allow(dead_code)]
@@ -399,10 +402,7 @@ impl Vm {
         item: &Value,
         index: usize,
     ) -> Result<Value> {
-        self.call_function_internal(
-            callback,
-            vec![item.clone(), Value::Int(index as i64)],
-        )
+        self.call_function_internal(callback, vec![item.clone(), Value::Int(index as i64)])
     }
 
     /// Execute an array callback method (map, filter, reduce, forEach, etc.)
@@ -471,8 +471,8 @@ impl Vm {
             }
             "reduce" => {
                 let mut acc = match all_args.get(1).cloned() {
-                    Some(init) => { Some(init) }
-                    None if !arr.is_empty() => { Some(arr[0].clone()) }
+                    Some(init) => Some(init),
+                    None if !arr.is_empty() => Some(arr[0].clone()),
                     None => {
                         return Err(ZapcodeError::TypeError(
                             "Reduce of empty array with no initial value".to_string(),
@@ -497,16 +497,22 @@ impl Vm {
                     for i in 1..len {
                         let mut j = i;
                         while j > 0 {
-                            let cmp = self.call_function_internal(
-                                &callback,
-                                vec![result[j - 1].clone(), result[j].clone()],
-                            )?.to_number();
-                            if cmp > 0.0 { result.swap(j - 1, j); j -= 1; }
-                            else { break; }
+                            let cmp = self
+                                .call_function_internal(
+                                    &callback,
+                                    vec![result[j - 1].clone(), result[j].clone()],
+                                )?
+                                .to_number();
+                            if cmp > 0.0 {
+                                result.swap(j - 1, j);
+                                j -= 1;
+                            } else {
+                                break;
+                            }
                         }
                     }
                 } else {
-                    result.sort_by(|a, b| a.to_js_string().cmp(&b.to_js_string()));
+                    result.sort_by_key(|a| a.to_js_string());
                 }
                 Ok(Value::Array(result))
             }
@@ -521,7 +527,8 @@ impl Vm {
                 Ok(Value::Array(result))
             }
             _ => Err(ZapcodeError::TypeError(format!(
-                "Unknown array callback method: {}", method
+                "Unknown array callback method: {}",
+                method
             ))),
         }
     }
@@ -550,25 +557,34 @@ impl Vm {
                 for param in func.params.iter() {
                     match param {
                         ParamPattern::Ident(name) => {
-                            let val = gen_obj.captured.iter()
+                            let val = gen_obj
+                                .captured
+                                .iter()
                                 .find(|(n, _)| n == name)
                                 .map(|(_, v)| v.clone())
                                 .unwrap_or(Value::Undefined);
                             locals.push(val);
                         }
                         ParamPattern::Rest(name) => {
-                            let val = gen_obj.captured.iter()
+                            let val = gen_obj
+                                .captured
+                                .iter()
                                 .find(|(n, _)| n == name)
                                 .map(|(_, v)| v.clone())
                                 .unwrap_or(Value::Array(Vec::new()));
                             locals.push(val);
                         }
-                        _ => { locals.push(Value::Undefined); }
+                        _ => {
+                            locals.push(Value::Undefined);
+                        }
                     }
                 }
                 let stack_base = self.stack.len();
                 self.frames.push(CallFrame {
-                    func_index: Some(func_idx), ip: 0, locals, stack_base,
+                    func_index: Some(func_idx),
+                    ip: 0,
+                    locals,
+                    stack_base,
                     this_value: None,
                 });
                 self.run_generator_until_yield_or_return(gen_obj)
@@ -581,8 +597,10 @@ impl Vm {
                 }
                 self.push(arg)?;
                 self.frames.push(CallFrame {
-                    func_index: Some(func_idx), ip: suspended.ip,
-                    locals: suspended.locals, stack_base,
+                    func_index: Some(func_idx),
+                    ip: suspended.ip,
+                    locals: suspended.locals,
+                    stack_base,
                     this_value: None,
                 });
                 self.run_generator_until_yield_or_return(gen_obj)
@@ -609,7 +627,10 @@ impl Vm {
         self.make_iterator_result(value, true)
     }
 
-    fn run_generator_until_yield_or_return(&mut self, mut gen_obj: GeneratorObject) -> Result<Value> {
+    fn run_generator_until_yield_or_return(
+        &mut self,
+        mut gen_obj: GeneratorObject,
+    ) -> Result<Value> {
         let target_frame_depth = self.frames.len() - 1;
         loop {
             self.tracker.check_time(&self.limits)?;
@@ -644,7 +665,9 @@ impl Vm {
                 self.tracker.pop_frame();
                 let frame_stack: Vec<Value> = self.stack.drain(frame.stack_base..).collect();
                 gen_obj.suspended = Some(SuspendedFrame {
-                    ip: frame.ip, locals: frame.locals, stack: frame_stack,
+                    ip: frame.ip,
+                    locals: frame.locals,
+                    stack: frame_stack,
                 });
                 gen_obj.done = false;
                 self.store_generator(gen_obj);
@@ -730,11 +753,7 @@ impl Vm {
             }
             Instruction::LoadLocal(idx) => {
                 let frame = self.current_frame();
-                let val = frame
-                    .locals
-                    .get(idx)
-                    .cloned()
-                    .unwrap_or(Value::Undefined);
+                let val = frame.locals.get(idx).cloned().unwrap_or(Value::Undefined);
                 self.push(val)?;
             }
             Instruction::StoreLocal(idx) => {
@@ -746,11 +765,7 @@ impl Vm {
                 frame.locals[idx] = val;
             }
             Instruction::LoadGlobal(name) => {
-                let val = self
-                    .globals
-                    .get(&name)
-                    .cloned()
-                    .unwrap_or(Value::Undefined);
+                let val = self.globals.get(&name).cloned().unwrap_or(Value::Undefined);
                 self.last_global_name = Some(name);
                 self.push(val)?;
             }
@@ -768,12 +783,10 @@ impl Vm {
                 let right = self.pop()?;
                 let left = self.pop()?;
                 let result = match (&left, &right) {
-                    (Value::Int(a), Value::Int(b)) => {
-                        match a.checked_add(*b) {
-                            Some(r) => Value::Int(r),
-                            None => Value::Float(*a as f64 + *b as f64),
-                        }
-                    }
+                    (Value::Int(a), Value::Int(b)) => match a.checked_add(*b) {
+                        Some(r) => Value::Int(r),
+                        None => Value::Float(*a as f64 + *b as f64),
+                    },
                     (Value::Float(a), Value::Float(b)) => Value::Float(a + b),
                     (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 + b),
                     (Value::Float(a), Value::Int(b)) => Value::Float(a + *b as f64),
@@ -795,12 +808,10 @@ impl Vm {
                 let right = self.pop()?;
                 let left = self.pop()?;
                 let result = match (&left, &right) {
-                    (Value::Int(a), Value::Int(b)) => {
-                        match a.checked_sub(*b) {
-                            Some(r) => Value::Int(r),
-                            None => Value::Float(*a as f64 - *b as f64),
-                        }
-                    }
+                    (Value::Int(a), Value::Int(b)) => match a.checked_sub(*b) {
+                        Some(r) => Value::Int(r),
+                        None => Value::Float(*a as f64 - *b as f64),
+                    },
                     _ => Value::Float(left.to_number() - right.to_number()),
                 };
                 self.push(result)?;
@@ -809,12 +820,10 @@ impl Vm {
                 let right = self.pop()?;
                 let left = self.pop()?;
                 let result = match (&left, &right) {
-                    (Value::Int(a), Value::Int(b)) => {
-                        match a.checked_mul(*b) {
-                            Some(r) => Value::Int(r),
-                            None => Value::Float(*a as f64 * *b as f64),
-                        }
-                    }
+                    (Value::Int(a), Value::Int(b)) => match a.checked_mul(*b) {
+                        Some(r) => Value::Int(r),
+                        None => Value::Float(*a as f64 * *b as f64),
+                    },
                     _ => Value::Float(left.to_number() * right.to_number()),
                 };
                 self.push(result)?;
@@ -1011,12 +1020,11 @@ impl Vm {
                         let key: Arc<str> = Arc::from(index.to_js_string().as_str());
                         map.get(key.as_ref()).cloned().unwrap_or(Value::Undefined)
                     }
-                    (Value::String(s), Value::Int(i)) => {
-                        s.chars()
-                            .nth(*i as usize)
-                            .map(|c| Value::String(Arc::from(c.to_string().as_str())))
-                            .unwrap_or(Value::Undefined)
-                    }
+                    (Value::String(s), Value::Int(i)) => s
+                        .chars()
+                        .nth(*i as usize)
+                        .map(|c| Value::String(Arc::from(c.to_string().as_str())))
+                        .unwrap_or(Value::Undefined),
                     _ => Value::Undefined,
                 };
                 self.push(result)?;
@@ -1029,7 +1037,9 @@ impl Vm {
                     Value::Array(arr) => {
                         let idx = match &index {
                             Value::Int(i) if *i >= 0 => *i as usize,
-                            Value::Float(f) if *f >= 0.0 && *f == (*f as usize as f64) => *f as usize,
+                            Value::Float(f) if *f >= 0.0 && *f == (*f as usize as f64) => {
+                                *f as usize
+                            }
                             _ => {
                                 // Negative or non-numeric index: treat as no-op (like JS)
                                 self.push(obj)?;
@@ -1040,7 +1050,8 @@ impl Vm {
                         if idx > arr.len() + 1024 {
                             return Err(ZapcodeError::RuntimeError(format!(
                                 "array index {} too far beyond length {}",
-                                idx, arr.len()
+                                idx,
+                                arr.len()
                             )));
                         }
                         while arr.len() <= idx {
@@ -1150,7 +1161,10 @@ impl Vm {
                             for (i, param) in params.iter().enumerate() {
                                 match param {
                                     ParamPattern::Ident(name) => {
-                                        captured.push((name.clone(), args.get(i).cloned().unwrap_or(Value::Undefined)));
+                                        captured.push((
+                                            name.clone(),
+                                            args.get(i).cloned().unwrap_or(Value::Undefined),
+                                        ));
                                     }
                                     ParamPattern::Rest(name) => {
                                         let rest: Vec<Value> = args[i..].to_vec();
@@ -1167,7 +1181,10 @@ impl Vm {
                                 done: false,
                             };
                             // Store in globals registry so we can look it up by ID later
-                            self.globals.insert(format!("__gen_{}", gen_id), Value::Generator(gen_obj.clone()));
+                            self.globals.insert(
+                                format!("__gen_{}", gen_id),
+                                Value::Generator(gen_obj.clone()),
+                            );
                             self.push(Value::Generator(gen_obj))?;
                             self.last_receiver = None;
                         } else {
@@ -1175,7 +1192,10 @@ impl Vm {
                             self.push_call_frame(&closure, &args, this_value)?;
                         }
                     }
-                    Value::BuiltinMethod { object_name, method_name } => {
+                    Value::BuiltinMethod {
+                        object_name,
+                        method_name,
+                    } => {
                         let receiver = self.last_receiver.take();
                         let result = match object_name.as_ref() {
                             "__array__" => {
@@ -1191,14 +1211,12 @@ impl Vm {
                                             )?;
                                             Some(result)
                                         }
-                                        _ => {
-                                            builtins::call_builtin(
-                                                &Value::Array(arr.clone()),
-                                                &method_name,
-                                                &args,
-                                                &mut self.stdout,
-                                            )?
-                                        }
+                                        _ => builtins::call_builtin(
+                                            &Value::Array(arr.clone()),
+                                            &method_name,
+                                            &args,
+                                            &mut self.stdout,
+                                        )?,
                                     }
                                 } else {
                                     None
@@ -1220,22 +1238,33 @@ impl Vm {
                                 if let Some(Value::Generator(gen_obj)) = receiver {
                                     match method_name.as_ref() {
                                         "next" => {
-                                            let arg = args.into_iter().next().unwrap_or(Value::Undefined);
+                                            let arg =
+                                                args.into_iter().next().unwrap_or(Value::Undefined);
                                             // Get the latest generator state from registry.
                                             // If the key is missing, the generator has finished
                                             // and was cleaned up — return done immediately.
                                             let gen_key = format!("__gen_{}", gen_obj.id);
-                                            if let Some(Value::Generator(g)) = self.globals.remove(&gen_key) {
+                                            if let Some(Value::Generator(g)) =
+                                                self.globals.remove(&gen_key)
+                                            {
                                                 let result = self.generator_next(g, arg)?;
                                                 Some(result)
                                             } else {
-                                                Some(self.make_iterator_result(Value::Undefined, true))
+                                                Some(
+                                                    self.make_iterator_result(
+                                                        Value::Undefined,
+                                                        true,
+                                                    ),
+                                                )
                                             }
                                         }
                                         "return" => {
-                                            let val = args.into_iter().next().unwrap_or(Value::Undefined);
+                                            let val =
+                                                args.into_iter().next().unwrap_or(Value::Undefined);
                                             let gen_key = format!("__gen_{}", gen_obj.id);
-                                            if let Some(Value::Generator(g)) = self.globals.remove(&gen_key) {
+                                            if let Some(Value::Generator(g)) =
+                                                self.globals.remove(&gen_key)
+                                            {
                                                 let result = self.finish_generator(g, val);
                                                 Some(result)
                                             } else {
@@ -1248,14 +1277,12 @@ impl Vm {
                                     None
                                 }
                             }
-                            global_name => {
-                                builtins::call_global_method(
-                                    global_name,
-                                    &method_name,
-                                    &args,
-                                    &mut self.stdout,
-                                )?
-                            }
+                            global_name => builtins::call_global_method(
+                                global_name,
+                                &method_name,
+                                &args,
+                                &mut self.stdout,
+                            )?,
                         };
                         match result {
                             Some(val) => self.push(val)?,
@@ -1360,10 +1387,7 @@ impl Vm {
                 match val {
                     Value::Array(arr) => {
                         // Push an iterator object: [array, index]
-                        let iter_obj = Value::Array(vec![
-                            Value::Array(arr),
-                            Value::Int(0),
-                        ]);
+                        let iter_obj = Value::Array(vec![Value::Array(arr), Value::Int(0)]);
                         self.push(iter_obj)?;
                     }
                     Value::String(s) => {
@@ -1371,10 +1395,7 @@ impl Vm {
                             .chars()
                             .map(|c| Value::String(Arc::from(c.to_string().as_str())))
                             .collect();
-                        let iter_obj = Value::Array(vec![
-                            Value::Array(chars),
-                            Value::Int(0),
-                        ]);
+                        let iter_obj = Value::Array(vec![Value::Array(chars), Value::Int(0)]);
                         self.push(iter_obj)?;
                     }
                     Value::Generator(gen_obj) => {
@@ -1402,10 +1423,16 @@ impl Vm {
                             if s.as_ref() == "__gen__" {
                                 let gen_id = match &items[1] {
                                     Value::Int(id) => *id as u64,
-                                    _ => return Err(ZapcodeError::RuntimeError("bad gen iter".into())),
+                                    _ => {
+                                        return Err(ZapcodeError::RuntimeError(
+                                            "bad gen iter".into(),
+                                        ))
+                                    }
                                 };
                                 let gen_key = format!("__gen_{}", gen_id);
-                                let gen_obj = if let Some(Value::Generator(g)) = self.globals.remove(&gen_key) {
+                                let gen_obj = if let Some(Value::Generator(g)) =
+                                    self.globals.remove(&gen_key)
+                                {
                                     g
                                 } else {
                                     self.push(Value::Array(vec![
@@ -1418,8 +1445,11 @@ impl Vm {
                                 };
                                 let result = self.generator_next(gen_obj, Value::Undefined)?;
                                 if let Value::Object(ref obj) = result {
-                                    let done = obj.get("done").is_some_and(|v| matches!(v, Value::Bool(true)));
-                                    let value = obj.get("value").cloned().unwrap_or(Value::Undefined);
+                                    let done = obj
+                                        .get("done")
+                                        .is_some_and(|v| matches!(v, Value::Bool(true)));
+                                    let value =
+                                        obj.get("value").cloned().unwrap_or(Value::Undefined);
                                     self.push(Value::Array(vec![
                                         Value::String(Arc::from("__gen__")),
                                         Value::Int(gen_id as i64),
@@ -1448,10 +1478,8 @@ impl Vm {
                         if idx < arr.len() {
                             let value = arr[idx].clone();
                             // Update iterator
-                            let new_iter = Value::Array(vec![
-                                items[0].clone(),
-                                Value::Int((idx + 1) as i64),
-                            ]);
+                            let new_iter =
+                                Value::Array(vec![items[0].clone(), Value::Int((idx + 1) as i64)]);
                             // Push updated iterator back, then the value
                             self.push(new_iter)?;
                             self.push(value)?;
@@ -1629,9 +1657,10 @@ impl Vm {
                             }
                             Value::String(s) if s.as_ref() == "rejected" => {
                                 let reason = map.get("reason").cloned().unwrap_or(Value::Undefined);
-                                return Err(ZapcodeError::RuntimeError(
-                                    format!("Unhandled promise rejection: {}", reason.to_js_string()),
-                                ));
+                                return Err(ZapcodeError::RuntimeError(format!(
+                                    "Unhandled promise rejection: {}",
+                                    reason.to_js_string()
+                                )));
                             }
                             _ => {
                                 // Unknown status — pass through
@@ -1648,7 +1677,12 @@ impl Vm {
             }
 
             // Classes
-            Instruction::CreateClass { name, n_methods, n_statics, has_super } => {
+            Instruction::CreateClass {
+                name,
+                n_methods,
+                n_statics,
+                has_super,
+            } => {
                 // Stack layout (top to bottom):
                 // constructor closure (or undefined)
                 // n_methods * (closure, method_name_string) pairs
@@ -1678,11 +1712,7 @@ impl Vm {
                 }
 
                 // Pop super class if present
-                let super_class = if has_super {
-                    Some(self.pop()?)
-                } else {
-                    None
-                };
+                let super_class = if has_super { Some(self.pop()?) } else { None };
 
                 // If super class, copy its prototype methods to ours (inheritance)
                 if let Some(Value::Object(ref sc)) = super_class {
@@ -1698,7 +1728,10 @@ impl Vm {
 
                 // Build the class object
                 let mut class_obj = IndexMap::new();
-                class_obj.insert(Arc::from("__class_name__"), Value::String(Arc::from(name.as_str())));
+                class_obj.insert(
+                    Arc::from("__class_name__"),
+                    Value::String(Arc::from(name.as_str())),
+                );
                 class_obj.insert(Arc::from("__constructor__"), constructor);
                 class_obj.insert(Arc::from("__prototype__"), Value::Object(prototype));
 
@@ -1773,7 +1806,10 @@ impl Vm {
 
             Instruction::LoadThis => {
                 // Walk frames from top to find the nearest `this` value
-                let this_val = self.frames.iter().rev()
+                let this_val = self
+                    .frames
+                    .iter()
+                    .rev()
                     .find_map(|f| f.this_value.clone())
                     .unwrap_or(Value::Undefined);
                 self.push(this_val)?;
@@ -1796,7 +1832,10 @@ impl Vm {
                 args.reverse();
 
                 // Get current `this` value (the instance being constructed)
-                let this_val = self.frames.iter().rev()
+                let this_val = self
+                    .frames
+                    .iter()
+                    .rev()
                     .find_map(|f| f.this_value.clone())
                     .unwrap_or(Value::Undefined);
 
@@ -1805,7 +1844,7 @@ impl Vm {
                 // The super class info is stored on the class object.
                 // We'll look through globals for the class that has __super__.
                 let mut super_ctor = None;
-                for (_name, val) in &self.globals {
+                for val in self.globals.values() {
                     if let Value::Object(obj) = val {
                         if let Some(Value::Object(super_class)) = obj.get("__super__") {
                             if let Some(ctor) = super_class.get("__constructor__") {
@@ -1824,7 +1863,6 @@ impl Vm {
                     self.push(Value::Undefined)?;
                 }
             }
-
         }
 
         Ok(None)
@@ -1859,41 +1897,35 @@ impl Vm {
                 }
                 Ok(Value::Undefined)
             }
-            Value::Array(arr) => {
-                match name {
-                    "length" => Ok(Value::Int(arr.len() as i64)),
-                    _ if is_array_method(name) => Ok(Value::BuiltinMethod {
-                        object_name: Arc::from("__array__"),
-                        method_name: Arc::from(name),
-                    }),
-                    _ => {
-                        if let Ok(idx) = name.parse::<usize>() {
-                            Ok(arr.get(idx).cloned().unwrap_or(Value::Undefined))
-                        } else {
-                            Ok(Value::Undefined)
-                        }
+            Value::Array(arr) => match name {
+                "length" => Ok(Value::Int(arr.len() as i64)),
+                _ if is_array_method(name) => Ok(Value::BuiltinMethod {
+                    object_name: Arc::from("__array__"),
+                    method_name: Arc::from(name),
+                }),
+                _ => {
+                    if let Ok(idx) = name.parse::<usize>() {
+                        Ok(arr.get(idx).cloned().unwrap_or(Value::Undefined))
+                    } else {
+                        Ok(Value::Undefined)
                     }
                 }
-            }
-            Value::String(s) => {
-                match name {
-                    "length" => Ok(Value::Int(s.chars().count() as i64)),
-                    _ if is_string_method(name) => Ok(Value::BuiltinMethod {
-                        object_name: Arc::from("__string__"),
-                        method_name: Arc::from(name),
-                    }),
-                    _ => Ok(Value::Undefined),
-                }
-            }
-            Value::Generator(_) => {
-                match name {
-                    "next" | "return" | "throw" => Ok(Value::BuiltinMethod {
-                        object_name: Arc::from("__generator__"),
-                        method_name: Arc::from(name),
-                    }),
-                    _ => Ok(Value::Undefined),
-                }
-            }
+            },
+            Value::String(s) => match name {
+                "length" => Ok(Value::Int(s.chars().count() as i64)),
+                _ if is_string_method(name) => Ok(Value::BuiltinMethod {
+                    object_name: Arc::from("__string__"),
+                    method_name: Arc::from(name),
+                }),
+                _ => Ok(Value::Undefined),
+            },
+            Value::Generator(_) => match name {
+                "next" | "return" | "throw" => Ok(Value::BuiltinMethod {
+                    object_name: Arc::from("__generator__"),
+                    method_name: Arc::from(name),
+                }),
+                _ => Ok(Value::Undefined),
+            },
             _ => Ok(Value::Undefined),
         }
     }
@@ -1905,23 +1937,68 @@ use crate::parser::ir::ParamPattern;
 fn is_array_method(name: &str) -> bool {
     matches!(
         name,
-        "push" | "pop" | "shift" | "unshift" | "splice" | "slice" | "concat"
-            | "join" | "reverse" | "sort" | "indexOf" | "lastIndexOf" | "includes"
-            | "find" | "findIndex" | "map" | "filter" | "reduce" | "forEach"
-            | "every" | "some" | "flat" | "flatMap" | "fill" | "at" | "entries"
-            | "keys" | "values"
+        "push"
+            | "pop"
+            | "shift"
+            | "unshift"
+            | "splice"
+            | "slice"
+            | "concat"
+            | "join"
+            | "reverse"
+            | "sort"
+            | "indexOf"
+            | "lastIndexOf"
+            | "includes"
+            | "find"
+            | "findIndex"
+            | "map"
+            | "filter"
+            | "reduce"
+            | "forEach"
+            | "every"
+            | "some"
+            | "flat"
+            | "flatMap"
+            | "fill"
+            | "at"
+            | "entries"
+            | "keys"
+            | "values"
     )
 }
 
 fn is_string_method(name: &str) -> bool {
     matches!(
         name,
-        "charAt" | "charCodeAt" | "indexOf" | "lastIndexOf" | "includes"
-            | "startsWith" | "endsWith" | "slice" | "substring" | "substr"
-            | "toUpperCase" | "toLowerCase" | "trim" | "trimStart" | "trimEnd"
-            | "trimLeft" | "trimRight" | "padStart" | "padEnd" | "repeat"
-            | "replace" | "replaceAll" | "split" | "concat" | "at"
-            | "match" | "search" | "normalize"
+        "charAt"
+            | "charCodeAt"
+            | "indexOf"
+            | "lastIndexOf"
+            | "includes"
+            | "startsWith"
+            | "endsWith"
+            | "slice"
+            | "substring"
+            | "substr"
+            | "toUpperCase"
+            | "toLowerCase"
+            | "trim"
+            | "trimStart"
+            | "trimEnd"
+            | "trimLeft"
+            | "trimRight"
+            | "padStart"
+            | "padEnd"
+            | "repeat"
+            | "replace"
+            | "replaceAll"
+            | "split"
+            | "concat"
+            | "at"
+            | "match"
+            | "search"
+            | "normalize"
     )
 }
 
@@ -1987,12 +2064,10 @@ impl ZapcodeRun {
         let result = self.run(Vec::new())?;
         match result.state {
             VmState::Complete(v) => Ok(v),
-            VmState::Suspended { function_name, .. } => {
-                Err(ZapcodeError::RuntimeError(format!(
-                    "execution suspended on external function '{}' — use run() instead",
-                    function_name
-                )))
-            }
+            VmState::Suspended { function_name, .. } => Err(ZapcodeError::RuntimeError(format!(
+                "execution suspended on external function '{}' — use run() instead",
+                function_name
+            ))),
         }
     }
 }
@@ -2025,11 +2100,9 @@ pub fn eval_ts_with_output(source: &str) -> Result<(Value, String)> {
     let result = runner.run(Vec::new())?;
     match result.state {
         VmState::Complete(v) => Ok((v, result.stdout)),
-        VmState::Suspended { function_name, .. } => {
-            Err(ZapcodeError::RuntimeError(format!(
-                "execution suspended on external function '{}'",
-                function_name
-            )))
-        }
+        VmState::Suspended { function_name, .. } => Err(ZapcodeError::RuntimeError(format!(
+            "execution suspended on external function '{}'",
+            function_name
+        ))),
     }
 }

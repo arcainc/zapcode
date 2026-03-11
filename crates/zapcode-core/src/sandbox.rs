@@ -12,7 +12,7 @@ impl Default for ResourceLimits {
     fn default() -> Self {
         Self {
             memory_limit_bytes: 32 * 1024 * 1024, // 32MB
-            time_limit_ms: 5000,                   // 5s
+            time_limit_ms: 5000,                  // 5s
             max_stack_depth: 512,
             max_allocations: 100_000,
         }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 
-use crate::error::{ZapcodeError, Result};
+use crate::error::{Result, ZapcodeError};
 use crate::value::Value;
 
 /// Register built-in global objects and functions.
@@ -24,7 +24,10 @@ pub fn register_globals(globals: &mut HashMap<String, Value>) {
     math.insert(Arc::from("LOG2E"), Value::Float(std::f64::consts::LOG2_E));
     math.insert(Arc::from("LOG10E"), Value::Float(std::f64::consts::LOG10_E));
     math.insert(Arc::from("SQRT2"), Value::Float(std::f64::consts::SQRT_2));
-    math.insert(Arc::from("SQRT1_2"), Value::Float(1.0 / std::f64::consts::SQRT_2));
+    math.insert(
+        Arc::from("SQRT1_2"),
+        Value::Float(1.0 / std::f64::consts::SQRT_2),
+    );
     globals.insert("Math".to_string(), Value::Object(math));
 }
 
@@ -62,11 +65,7 @@ pub fn call_global_method(
 
 // ── Console ──────────────────────────────────────────────────────────
 
-fn call_console_method(
-    method: &str,
-    args: &[Value],
-    stdout: &mut String,
-) -> Result<Option<Value>> {
+fn call_console_method(method: &str, args: &[Value], stdout: &mut String) -> Result<Option<Value>> {
     match method {
         "log" | "info" | "warn" | "error" | "debug" => {
             let output: Vec<String> = args.iter().map(|v| v.to_js_string()).collect();
@@ -223,9 +222,11 @@ fn call_json_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
         "parse" => {
             let s = match args.first() {
                 Some(Value::String(s)) => s.to_string(),
-                _ => return Err(ZapcodeError::TypeError(
-                    "JSON.parse requires a string argument".to_string(),
-                )),
+                _ => {
+                    return Err(ZapcodeError::TypeError(
+                        "JSON.parse requires a string argument".to_string(),
+                    ))
+                }
             };
             let val = json_to_value(&s)?;
             Ok(Some(val))
@@ -249,7 +250,7 @@ fn value_to_json(val: &Value) -> String {
         }
         Value::String(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
         Value::Array(arr) => {
-            let items: Vec<String> = arr.iter().map(|v| value_to_json(v)).collect();
+            let items: Vec<String> = arr.iter().map(value_to_json).collect();
             format!("[{}]", items.join(","))
         }
         Value::Object(map) => {
@@ -259,7 +260,9 @@ fn value_to_json(val: &Value) -> String {
                 .collect();
             format!("{{{}}}", pairs.join(","))
         }
-        Value::Function(_) | Value::BuiltinMethod { .. } | Value::Generator(_) => "undefined".to_string(),
+        Value::Function(_) | Value::BuiltinMethod { .. } | Value::Generator(_) => {
+            "undefined".to_string()
+        }
     }
 }
 
@@ -362,7 +365,7 @@ fn count_preceding_backslashes(bytes: &[u8], i: usize) -> usize {
 
 /// Returns true if the quote at position `i` is NOT escaped.
 fn is_unescaped_quote(bytes: &[u8], i: usize) -> bool {
-    count_preceding_backslashes(bytes, i) % 2 == 0
+    count_preceding_backslashes(bytes, i).is_multiple_of(2)
 }
 
 fn split_json_top_level(s: &str) -> Vec<&str> {
@@ -472,7 +475,11 @@ fn call_string_method(s: &Arc<str>, method: &str, args: &[Value]) -> Result<Opti
             } else {
                 len
             };
-            let (start, end) = if start > end { (end, start) } else { (start, end) };
+            let (start, end) = if start > end {
+                (end, start)
+            } else {
+                (start, end)
+            };
             Value::String(Arc::from(&s[start..end]))
         }
         "toUpperCase" => Value::String(Arc::from(s.to_uppercase().as_str())),
@@ -486,7 +493,11 @@ fn call_string_method(s: &Arc<str>, method: &str, args: &[Value]) -> Result<Opti
         }
         "padStart" => {
             let target_len = arg_int(args, 0).max(0) as usize;
-            let pad = if args.len() > 1 { arg_str(args, 1) } else { " ".to_string() };
+            let pad = if args.len() > 1 {
+                arg_str(args, 1)
+            } else {
+                " ".to_string()
+            };
             let current_len = s.len();
             if current_len >= target_len {
                 Value::String(s.clone())
@@ -498,7 +509,11 @@ fn call_string_method(s: &Arc<str>, method: &str, args: &[Value]) -> Result<Opti
         }
         "padEnd" => {
             let target_len = arg_int(args, 0).max(0) as usize;
-            let pad = if args.len() > 1 { arg_str(args, 1) } else { " ".to_string() };
+            let pad = if args.len() > 1 {
+                arg_str(args, 1)
+            } else {
+                " ".to_string()
+            };
             let current_len = s.len();
             if current_len >= target_len {
                 Value::String(s.clone())
@@ -511,9 +526,13 @@ fn call_string_method(s: &Arc<str>, method: &str, args: &[Value]) -> Result<Opti
         "split" => {
             let separator = arg_str(args, 0);
             let parts: Vec<Value> = if separator.is_empty() {
-                s.chars().map(|c| Value::String(Arc::from(c.to_string().as_str()))).collect()
+                s.chars()
+                    .map(|c| Value::String(Arc::from(c.to_string().as_str())))
+                    .collect()
             } else {
-                s.split(&*separator).map(|p| Value::String(Arc::from(p))).collect()
+                s.split(&*separator)
+                    .map(|p| Value::String(Arc::from(p)))
+                    .collect()
             };
             Value::Array(parts)
         }
@@ -537,7 +556,11 @@ fn call_string_method(s: &Arc<str>, method: &str, args: &[Value]) -> Result<Opti
         "at" => {
             let idx = arg_int(args, 0);
             let len = s.len() as i64;
-            let normalized = if idx < 0 { (len + idx).max(0) as usize } else { idx as usize };
+            let normalized = if idx < 0 {
+                (len + idx).max(0) as usize
+            } else {
+                idx as usize
+            };
             match s.chars().nth(normalized) {
                 Some(c) => Value::String(Arc::from(c.to_string().as_str())),
                 None => Value::Undefined,
@@ -568,7 +591,11 @@ fn call_array_method(arr: &[Value], method: &str, args: &[Value]) -> Result<Opti
             Value::Bool(arr.iter().any(|v| v.strict_eq(search)))
         }
         "join" => {
-            let sep = if args.is_empty() { ",".to_string() } else { arg_str(args, 0) };
+            let sep = if args.is_empty() {
+                ",".to_string()
+            } else {
+                arg_str(args, 0)
+            };
             let joined: Vec<String> = arr.iter().map(|v| v.to_js_string()).collect();
             Value::String(Arc::from(joined.join(&sep).as_str()))
         }
@@ -614,17 +641,29 @@ fn call_array_method(arr: &[Value], method: &str, args: &[Value]) -> Result<Opti
         "at" => {
             let idx = arg_int(args, 0);
             let len = arr.len() as i64;
-            let normalized = if idx < 0 { (len + idx).max(0) as usize } else { idx as usize };
+            let normalized = if idx < 0 {
+                (len + idx).max(0) as usize
+            } else {
+                idx as usize
+            };
             arr.get(normalized).cloned().unwrap_or(Value::Undefined)
         }
         "fill" => {
             let fill_val = args.first().unwrap_or(&Value::Undefined);
             let len = arr.len();
-            let start = if args.len() > 1 { normalize_index(arg_int(args, 1), len as i64) } else { 0 };
-            let end = if args.len() > 2 { normalize_index(arg_int(args, 2), len as i64) } else { len };
+            let start = if args.len() > 1 {
+                normalize_index(arg_int(args, 1), len as i64)
+            } else {
+                0
+            };
+            let end = if args.len() > 2 {
+                normalize_index(arg_int(args, 2), len as i64)
+            } else {
+                len
+            };
             let mut result = arr.to_vec();
-            for i in start..end.min(len) {
-                result[i] = fill_val.clone();
+            for item in result.iter_mut().take(end.min(len)).skip(start) {
+                *item = fill_val.clone();
             }
             Value::Array(result)
         }
@@ -632,12 +671,8 @@ fn call_array_method(arr: &[Value], method: &str, args: &[Value]) -> Result<Opti
             let new_len = (arr.len() + args.len()) as i64;
             Value::Int(new_len)
         }
-        "pop" => {
-            arr.last().cloned().unwrap_or(Value::Undefined)
-        }
-        "shift" => {
-            arr.first().cloned().unwrap_or(Value::Undefined)
-        }
+        "pop" => arr.last().cloned().unwrap_or(Value::Undefined),
+        "shift" => arr.first().cloned().unwrap_or(Value::Undefined),
         "unshift" => {
             let new_len = (arr.len() + args.len()) as i64;
             Value::Int(new_len)
@@ -658,7 +693,8 @@ fn call_array_method(arr: &[Value], method: &str, args: &[Value]) -> Result<Opti
             let deleted: Vec<Value> = arr[start..start + delete_count].to_vec();
             Value::Array(deleted)
         }
-        "every" | "some" | "map" | "filter" | "reduce" | "forEach" | "find" | "findIndex" | "sort" | "flatMap" => {
+        "every" | "some" | "map" | "filter" | "reduce" | "forEach" | "find" | "findIndex"
+        | "sort" | "flatMap" => {
             // These require function callbacks — handled in VM dispatch
             return Ok(None);
         }
@@ -697,9 +733,7 @@ fn call_object_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
                 Value::Object(map) => {
                     let entries: Vec<Value> = map
                         .iter()
-                        .map(|(k, v)| {
-                            Value::Array(vec![Value::String(k.clone()), v.clone()])
-                        })
+                        .map(|(k, v)| Value::Array(vec![Value::String(k.clone()), v.clone()]))
                         .collect();
                     Ok(Some(Value::Array(entries)))
                 }
@@ -739,7 +773,8 @@ fn call_array_static_method(method: &str, args: &[Value]) -> Result<Option<Value
             match val {
                 Value::Array(arr) => Ok(Some(Value::Array(arr.clone()))),
                 Value::String(s) => {
-                    let chars: Vec<Value> = s.chars()
+                    let chars: Vec<Value> = s
+                        .chars()
                         .map(|c| Value::String(Arc::from(c.to_string().as_str())))
                         .collect();
                     Ok(Some(Value::Array(chars)))
@@ -747,9 +782,7 @@ fn call_array_static_method(method: &str, args: &[Value]) -> Result<Option<Value
                 _ => Ok(Some(Value::Array(Vec::new()))),
             }
         }
-        "of" => {
-            Ok(Some(Value::Array(args.to_vec())))
-        }
+        "of" => Ok(Some(Value::Array(args.to_vec()))),
         _ => Ok(None),
     }
 }
@@ -795,9 +828,7 @@ fn call_promise_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
                                 return Ok(Some(item.clone()));
                             }
                         }
-                        results.push(
-                            map.get("value").cloned().unwrap_or(Value::Undefined),
-                        );
+                        results.push(map.get("value").cloned().unwrap_or(Value::Undefined));
                     }
                 } else {
                     results.push(item.clone());

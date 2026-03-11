@@ -6,7 +6,7 @@ use oxc_ast::ast;
 use oxc_parser::Parser;
 use oxc_span::SourceType;
 
-use crate::error::{ZapcodeError, Result};
+use crate::error::{Result, ZapcodeError};
 
 pub fn parse(source: &str) -> Result<Program> {
     let allocator = Allocator::default();
@@ -113,43 +113,35 @@ impl<'a> AstLowerer<'a> {
                 Ok(Statement::Throw { value, span })
             }
             ast::Statement::TryStatement(try_stmt) => self.lower_try(try_stmt),
-            ast::Statement::BreakStatement(s) => Ok(Statement::Break { span: self.span(s.span) }),
-            ast::Statement::ContinueStatement(s) => {
-                Ok(Statement::Continue { span: self.span(s.span) })
-            }
+            ast::Statement::BreakStatement(s) => Ok(Statement::Break {
+                span: self.span(s.span),
+            }),
+            ast::Statement::ContinueStatement(s) => Ok(Statement::Continue {
+                span: self.span(s.span),
+            }),
             ast::Statement::FunctionDeclaration(func) => self.lower_func_decl(func),
             ast::Statement::ClassDeclaration(class) => self.lower_class_decl(class),
             ast::Statement::SwitchStatement(switch) => self.lower_switch(switch),
-            ast::Statement::EmptyStatement(_) => {
-                Ok(Statement::Expression {
-                    expr: Expr::UndefinedLit,
-                    span: Span { start: 0, end: 0 },
-                })
-            }
-            ast::Statement::LabeledStatement(labeled) => {
-                self.lower_statement(&labeled.body)
-            }
-            ast::Statement::TSTypeAliasDeclaration(s) => {
-                Ok(Statement::Expression {
-                    expr: Expr::UndefinedLit,
-                    span: self.span(s.span),
-                })
-            }
-            ast::Statement::TSInterfaceDeclaration(s) => {
-                Ok(Statement::Expression {
-                    expr: Expr::UndefinedLit,
-                    span: self.span(s.span),
-                })
-            }
+            ast::Statement::EmptyStatement(_) => Ok(Statement::Expression {
+                expr: Expr::UndefinedLit,
+                span: Span { start: 0, end: 0 },
+            }),
+            ast::Statement::LabeledStatement(labeled) => self.lower_statement(&labeled.body),
+            ast::Statement::TSTypeAliasDeclaration(s) => Ok(Statement::Expression {
+                expr: Expr::UndefinedLit,
+                span: self.span(s.span),
+            }),
+            ast::Statement::TSInterfaceDeclaration(s) => Ok(Statement::Expression {
+                expr: Expr::UndefinedLit,
+                span: self.span(s.span),
+            }),
             ast::Statement::TSEnumDeclaration(s) => {
                 Err(self.unsupported(s.span, "TypeScript enums are not supported"))
             }
-            ast::Statement::ImportDeclaration(s) => {
-                Err(ZapcodeError::SandboxViolation(format!(
-                    "import declarations are forbidden in the sandbox (at {}..{})",
-                    s.span.start, s.span.end
-                )))
-            }
+            ast::Statement::ImportDeclaration(s) => Err(ZapcodeError::SandboxViolation(format!(
+                "import declarations are forbidden in the sandbox (at {}..{})",
+                s.span.start, s.span.end
+            ))),
             ast::Statement::ExportDefaultDeclaration(s) => {
                 Err(ZapcodeError::SandboxViolation(format!(
                     "export declarations are forbidden in the sandbox (at {}..{})",
@@ -168,12 +160,10 @@ impl<'a> AstLowerer<'a> {
                     s.span.start, s.span.end
                 )))
             }
-            _ => {
-                Err(ZapcodeError::UnsupportedSyntax {
-                    span: "unknown".to_string(),
-                    description: "unsupported statement type".to_string(),
-                })
-            }
+            _ => Err(ZapcodeError::UnsupportedSyntax {
+                span: "unknown".to_string(),
+                description: "unsupported statement type".to_string(),
+            }),
         }
     }
 
@@ -207,7 +197,11 @@ impl<'a> AstLowerer<'a> {
             };
             declarations.push(VarDeclarator { pattern, init });
         }
-        Ok(Statement::VariableDecl { kind, declarations, span })
+        Ok(Statement::VariableDecl {
+            kind,
+            declarations,
+            span,
+        })
     }
 
     fn lower_binding_pattern(&mut self, pat: &ast::BindingPattern<'_>) -> Result<AssignTarget> {
@@ -222,7 +216,11 @@ impl<'a> AstLowerer<'a> {
                     let alias = match &prop.value {
                         ast::BindingPattern::BindingIdentifier(id) => {
                             let name = id.name.to_string();
-                            if name != key { Some(name) } else { None }
+                            if name != key {
+                                Some(name)
+                            } else {
+                                None
+                            }
                         }
                         _ => None,
                     };
@@ -232,7 +230,11 @@ impl<'a> AstLowerer<'a> {
                         }
                         _ => None,
                     };
-                    fields.push(DestructureField { key, alias, default });
+                    fields.push(DestructureField {
+                        key,
+                        alias,
+                        default,
+                    });
                 }
                 Ok(AssignTarget::ObjectDestructure(fields))
             }
@@ -267,11 +269,19 @@ impl<'a> AstLowerer<'a> {
                     let alias = match &prop.value {
                         ast::BindingPattern::BindingIdentifier(id) => {
                             let name = id.name.to_string();
-                            if name != key { Some(name) } else { None }
+                            if name != key {
+                                Some(name)
+                            } else {
+                                None
+                            }
                         }
                         _ => None,
                     };
-                    fields.push(DestructureField { key, alias, default: None });
+                    fields.push(DestructureField {
+                        key,
+                        alias,
+                        default: None,
+                    });
                 }
                 Ok(ParamPattern::ObjectDestructure(fields))
             }
@@ -304,7 +314,12 @@ impl<'a> AstLowerer<'a> {
             Some(alt) => Some(self.lower_statement_as_block(alt)?),
             None => None,
         };
-        Ok(Statement::If { test, consequent, alternate, span })
+        Ok(Statement::If {
+            test,
+            consequent,
+            alternate,
+            span,
+        })
     }
 
     fn lower_for(&mut self, for_stmt: &ast::ForStatement<'_>) -> Result<Statement> {
@@ -336,7 +351,13 @@ impl<'a> AstLowerer<'a> {
             None => None,
         };
         let body = self.lower_statement_as_block(&for_stmt.body)?;
-        Ok(Statement::For { init, test, update, body, span })
+        Ok(Statement::For {
+            init,
+            test,
+            update,
+            body,
+            span,
+        })
     }
 
     fn lower_for_of(&mut self, for_of: &ast::ForOfStatement<'_>) -> Result<Statement> {
@@ -361,7 +382,12 @@ impl<'a> AstLowerer<'a> {
         };
         let iterable = self.lower_expr(&for_of.right)?;
         let body = self.lower_statement_as_block(&for_of.body)?;
-        Ok(Statement::ForOf { binding, iterable, body, span })
+        Ok(Statement::ForOf {
+            binding,
+            iterable,
+            body,
+            span,
+        })
     }
 
     fn lower_try(&mut self, try_stmt: &ast::TryStatement<'_>) -> Result<Statement> {
@@ -369,13 +395,9 @@ impl<'a> AstLowerer<'a> {
         let try_body = self.lower_statements(&try_stmt.block.body)?;
         let (catch_param, catch_body) = match &try_stmt.handler {
             Some(handler) => {
-                let param = handler.param.as_ref().and_then(|p| {
-                    match &p.pattern {
-                        ast::BindingPattern::BindingIdentifier(id) => {
-                            Some(id.name.to_string())
-                        }
-                        _ => None,
-                    }
+                let param = handler.param.as_ref().and_then(|p| match &p.pattern {
+                    ast::BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+                    _ => None,
                 });
                 let body = self.lower_statements(&handler.body.body)?;
                 (param, body)
@@ -459,7 +481,10 @@ impl<'a> AstLowerer<'a> {
                 if let ast::Expression::Identifier(id) = expr {
                     Some(id.name.to_string())
                 } else {
-                    return Err(self.unsupported(class.span, "computed super class expressions are not supported"));
+                    return Err(self.unsupported(
+                        class.span,
+                        "computed super class expressions are not supported",
+                    ));
                 }
             }
             None => None,
@@ -485,7 +510,10 @@ impl<'a> AstLowerer<'a> {
                 if let ast::Expression::Identifier(id) = expr {
                     Some(id.name.to_string())
                 } else {
-                    return Err(self.unsupported(class.span, "computed super class expressions are not supported"));
+                    return Err(self.unsupported(
+                        class.span,
+                        "computed super class expressions are not supported",
+                    ));
                 }
             }
             None => None,
@@ -502,10 +530,7 @@ impl<'a> AstLowerer<'a> {
         })
     }
 
-    fn lower_class_body(
-        &mut self,
-        body: &ast::ClassBody<'_>,
-    ) -> Result<(Option<Box<FunctionDef>>, Vec<ClassMethod>, Vec<ClassMethod>)> {
+    fn lower_class_body(&mut self, body: &ast::ClassBody<'_>) -> Result<ClassBodyParts> {
         let mut constructor = None;
         let mut methods = Vec::new();
         let mut static_methods = Vec::new();
@@ -575,7 +600,8 @@ impl<'a> AstLowerer<'a> {
                     // Skip them in the IR.
                 }
                 ast::ClassElement::AccessorProperty(s) => {
-                    return Err(self.unsupported(s.span, "accessor properties in classes are not supported"));
+                    return Err(self
+                        .unsupported(s.span, "accessor properties in classes are not supported"));
                 }
                 ast::ClassElement::TSIndexSignature(_) => {
                     // TypeScript-only, skip
@@ -601,33 +627,33 @@ impl<'a> AstLowerer<'a> {
             let consequent = self.lower_statements(&case.consequent)?;
             cases.push(SwitchCase { test, consequent });
         }
-        Ok(Statement::Switch { discriminant, cases, span })
+        Ok(Statement::Switch {
+            discriminant,
+            cases,
+            span,
+        })
     }
 
     fn lower_expr(&mut self, expr: &ast::Expression<'_>) -> Result<Expr> {
         match expr {
             ast::Expression::NumericLiteral(lit) => Ok(Expr::NumberLit(lit.value)),
-            ast::Expression::StringLiteral(lit) => {
-                Ok(Expr::StringLit(lit.value.to_string()))
-            }
+            ast::Expression::StringLiteral(lit) => Ok(Expr::StringLit(lit.value.to_string())),
             ast::Expression::BooleanLiteral(lit) => Ok(Expr::BoolLit(lit.value)),
             ast::Expression::NullLiteral(_) => Ok(Expr::NullLit),
             ast::Expression::TemplateLiteral(tpl) => {
-                let quasis: Vec<String> = tpl
-                    .quasis
-                    .iter()
-                    .map(|q| q.value.raw.to_string())
-                    .collect();
+                let quasis: Vec<String> =
+                    tpl.quasis.iter().map(|q| q.value.raw.to_string()).collect();
                 let exprs: Result<Vec<Expr>> =
                     tpl.expressions.iter().map(|e| self.lower_expr(e)).collect();
-                Ok(Expr::TemplateLit { quasis, exprs: exprs? })
-            }
-            ast::Expression::RegExpLiteral(re) => {
-                Ok(Expr::RegExpLit {
-                    pattern: format!("{:?}", re.regex.pattern),
-                    flags: re.regex.flags.to_string(),
+                Ok(Expr::TemplateLit {
+                    quasis,
+                    exprs: exprs?,
                 })
             }
+            ast::Expression::RegExpLiteral(re) => Ok(Expr::RegExpLit {
+                pattern: format!("{:?}", re.regex.pattern),
+                flags: re.regex.flags.to_string(),
+            }),
             ast::Expression::Identifier(id) => {
                 let name = id.name.to_string();
                 match name.as_str() {
@@ -722,7 +748,11 @@ impl<'a> AstLowerer<'a> {
                 let op = lower_binary_op(bin.operator)?;
                 let left = self.lower_expr(&bin.left)?;
                 let right = self.lower_expr(&bin.right)?;
-                Ok(Expr::Binary { op, left: Box::new(left), right: Box::new(right) })
+                Ok(Expr::Binary {
+                    op,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                })
             }
             ast::Expression::UnaryExpression(unary) => {
                 if matches!(unary.operator, ast::UnaryOperator::Typeof) {
@@ -750,7 +780,10 @@ impl<'a> AstLowerer<'a> {
                     }
                 };
                 let operand = self.lower_expr(&unary.argument)?;
-                Ok(Expr::Unary { op, operand: Box::new(operand) })
+                Ok(Expr::Unary {
+                    op,
+                    operand: Box::new(operand),
+                })
             }
             ast::Expression::UpdateExpression(update) => {
                 let op = match update.operator {
@@ -772,7 +805,11 @@ impl<'a> AstLowerer<'a> {
                 };
                 let left = self.lower_expr(&logical.left)?;
                 let right = self.lower_expr(&logical.right)?;
-                Ok(Expr::Logical { op, left: Box::new(left), right: Box::new(right) })
+                Ok(Expr::Logical {
+                    op,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                })
             }
             ast::Expression::ConditionalExpression(cond) => {
                 let test = self.lower_expr(&cond.test)?;
@@ -802,12 +839,19 @@ impl<'a> AstLowerer<'a> {
             ast::Expression::CallExpression(call) => {
                 let callee = self.lower_expr(&call.callee)?;
                 let args = self.lower_args(&call.arguments)?;
-                Ok(Expr::Call { callee: Box::new(callee), args, optional: call.optional })
+                Ok(Expr::Call {
+                    callee: Box::new(callee),
+                    args,
+                    optional: call.optional,
+                })
             }
             ast::Expression::NewExpression(new_expr) => {
                 let callee = self.lower_expr(&new_expr.callee)?;
                 let args = self.lower_args(&new_expr.arguments)?;
-                Ok(Expr::New { callee: Box::new(callee), args })
+                Ok(Expr::New {
+                    callee: Box::new(callee),
+                    args,
+                })
             }
             ast::Expression::StaticMemberExpression(member) => {
                 let object = self.lower_expr(&member.object)?;
@@ -868,21 +912,13 @@ impl<'a> AstLowerer<'a> {
                 let expr = self.lower_expr(&await_expr.argument)?;
                 Ok(Expr::Await(Box::new(expr)))
             }
-            ast::Expression::ParenthesizedExpression(paren) => {
-                self.lower_expr(&paren.expression)
-            }
-            ast::Expression::ChainExpression(chain) => {
-                self.lower_chain_expr(&chain.expression)
-            }
+            ast::Expression::ParenthesizedExpression(paren) => self.lower_expr(&paren.expression),
+            ast::Expression::ChainExpression(chain) => self.lower_chain_expr(&chain.expression),
             ast::Expression::TaggedTemplateExpression(s) => {
                 Err(self.unsupported(s.span, "tagged template expressions are not supported"))
             }
-            ast::Expression::ThisExpression(_) => {
-                Ok(Expr::Ident("this".to_string()))
-            }
-            ast::Expression::Super(_) => {
-                Ok(Expr::Ident("super".to_string()))
-            }
+            ast::Expression::ThisExpression(_) => Ok(Expr::Ident("this".to_string())),
+            ast::Expression::Super(_) => Ok(Expr::Ident("super".to_string())),
             ast::Expression::YieldExpression(yield_expr) => {
                 let value = match &yield_expr.argument {
                     Some(arg) => Some(Box::new(self.lower_expr(arg)?)),
@@ -893,29 +929,23 @@ impl<'a> AstLowerer<'a> {
                     delegate: yield_expr.delegate,
                 })
             }
-            ast::Expression::ClassExpression(class) => {
-                self.lower_class_expr(class)
-            }
+            ast::Expression::ClassExpression(class) => self.lower_class_expr(class),
             ast::Expression::MetaProperty(s) => {
                 Err(self.unsupported(s.span, "meta properties are not supported"))
             }
-            ast::Expression::ImportExpression(s) => {
-                Err(ZapcodeError::SandboxViolation(format!(
-                    "dynamic import() is forbidden in the sandbox (at {}..{})",
-                    s.span.start, s.span.end
-                )))
-            }
+            ast::Expression::ImportExpression(s) => Err(ZapcodeError::SandboxViolation(format!(
+                "dynamic import() is forbidden in the sandbox (at {}..{})",
+                s.span.start, s.span.end
+            ))),
             ast::Expression::TSAsExpression(ts) => self.lower_expr(&ts.expression),
             ast::Expression::TSSatisfiesExpression(ts) => self.lower_expr(&ts.expression),
             ast::Expression::TSNonNullExpression(ts) => self.lower_expr(&ts.expression),
             ast::Expression::TSTypeAssertion(ts) => self.lower_expr(&ts.expression),
             ast::Expression::TSInstantiationExpression(ts) => self.lower_expr(&ts.expression),
-            _ => {
-                Err(ZapcodeError::UnsupportedSyntax {
-                    span: "unknown".to_string(),
-                    description: "unsupported expression type".to_string(),
-                })
-            }
+            _ => Err(ZapcodeError::UnsupportedSyntax {
+                span: "unknown".to_string(),
+                description: "unsupported expression type".to_string(),
+            }),
         }
     }
 
@@ -950,9 +980,7 @@ impl<'a> AstLowerer<'a> {
             ast::ChainElement::PrivateFieldExpression(s) => {
                 Err(self.unsupported(s.span, "private fields are not supported"))
             }
-            ast::ChainElement::TSNonNullExpression(ts) => {
-                self.lower_expr(&ts.expression)
-            }
+            ast::ChainElement::TSNonNullExpression(ts) => self.lower_expr(&ts.expression),
         }
     }
 
@@ -1006,7 +1034,10 @@ impl<'a> AstLowerer<'a> {
         }
     }
 
-    fn lower_simple_assign_target(&mut self, target: &ast::SimpleAssignmentTarget<'_>) -> Result<Expr> {
+    fn lower_simple_assign_target(
+        &mut self,
+        target: &ast::SimpleAssignmentTarget<'_>,
+    ) -> Result<Expr> {
         match target {
             ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
                 Ok(Expr::Ident(id.name.to_string()))

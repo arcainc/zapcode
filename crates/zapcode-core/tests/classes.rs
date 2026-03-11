@@ -3,7 +3,8 @@ use zapcode_core::Value;
 
 #[test]
 fn test_basic_class_with_constructor() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         class Animal {
             name: string;
             constructor(name: string) {
@@ -12,13 +13,16 @@ fn test_basic_class_with_constructor() {
         }
         const a = new Animal("Dog");
         a.name
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::String("Dog".into()));
 }
 
 #[test]
 fn test_class_with_method() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         class Animal {
             name: string;
             constructor(name: string) {
@@ -30,13 +34,16 @@ fn test_class_with_method() {
         }
         const a = new Animal("Dog");
         a.speak()
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::String("Dog makes a sound".into()));
 }
 
 #[test]
 fn test_class_multiple_properties() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         class Point {
             x: number;
             y: number;
@@ -50,13 +57,16 @@ fn test_class_multiple_properties() {
         }
         const p = new Point(3, 4);
         p.sum()
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::Int(7));
 }
 
 #[test]
 fn test_class_inheritance() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         class Animal {
             name: string;
             constructor(name: string) {
@@ -76,13 +86,16 @@ fn test_class_inheritance() {
         }
         const d = new Dog("Rex");
         d.speak()
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::String("Rex barks".into()));
 }
 
 #[test]
 fn test_class_inheritance_parent_method() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         class Animal {
             name: string;
             constructor(name: string) {
@@ -105,26 +118,32 @@ fn test_class_inheritance_parent_method() {
         }
         const d = new Dog("Rex");
         d.getName()
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::String("Rex".into()));
 }
 
 #[test]
 fn test_static_method() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         class MathUtil {
             static add(a: number, b: number) {
                 return a + b;
             }
         }
         MathUtil.add(1, 2)
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::Int(3));
 }
 
 #[test]
 fn test_static_method_multiple() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         class MathUtil {
             static add(a: number, b: number) {
                 return a + b;
@@ -134,13 +153,16 @@ fn test_static_method_multiple() {
             }
         }
         MathUtil.add(2, 3) + MathUtil.mul(4, 5)
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::Int(25));
 }
 
 #[test]
 fn test_class_no_constructor() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         class Greeter {
             greet() {
                 return "hello";
@@ -148,7 +170,9 @@ fn test_class_no_constructor() {
         }
         const g = new Greeter();
         g.greet()
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::String("hello".into()));
 }
 
@@ -156,7 +180,8 @@ fn test_class_no_constructor() {
 fn test_class_method_chaining() {
     // Method chaining works by using the return value (this is a value-based VM,
     // so mutations don't propagate back to the original variable automatically)
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         class Builder {
             value: number;
             constructor() {
@@ -172,25 +197,31 @@ fn test_class_method_chaining() {
         }
         const b = new Builder();
         b.add(5).add(3).getResult()
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::Int(8));
 }
 
 #[test]
 fn test_instanceof() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         class Animal {
             constructor() {}
         }
         const a = new Animal();
         a instanceof Animal
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::Bool(true));
 }
 
 #[test]
 fn test_class_property_access() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         class Config {
             host: string;
             port: number;
@@ -201,13 +232,16 @@ fn test_class_property_access() {
         }
         const c = new Config("localhost", 8080);
         c.host + ":" + c.port
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::String("localhost:8080".into()));
 }
 
 #[test]
 fn test_class_expression() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         const MyClass = class {
             getValue() {
                 return 42;
@@ -215,13 +249,16 @@ fn test_class_expression() {
         };
         const obj = new MyClass();
         obj.getValue()
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::Int(42));
 }
 
 #[test]
 fn test_class_with_multiple_methods() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         class Calculator {
             value: number;
             constructor(initial: number) {
@@ -236,13 +273,16 @@ fn test_class_with_multiple_methods() {
         }
         const calc = new Calculator(10);
         calc.add(5) + calc.multiply(3)
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::Int(45));
 }
 
 #[test]
 fn test_multiple_instances() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         class Counter {
             count: number;
             constructor(start: number) {
@@ -255,13 +295,16 @@ fn test_multiple_instances() {
         const a = new Counter(10);
         const b = new Counter(20);
         a.getCount() + b.getCount()
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::Int(30));
 }
 
 #[test]
 fn test_class_with_string_method() {
-    let result = eval_ts(r#"
+    let result = eval_ts(
+        r#"
         class Greeter {
             prefix: string;
             constructor(prefix: string) {
@@ -273,6 +316,8 @@ fn test_class_with_string_method() {
         }
         const g = new Greeter("Hello");
         g.greet("World")
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert_eq!(result, Value::String("Hello World".into()));
 }
