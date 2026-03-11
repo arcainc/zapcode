@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "zapcode"
-version = "1.0.0b3"
+version = "1.0.0"
 description = "A minimal, secure TypeScript interpreter for AI agents — Python bindings"
 requires-python = ">=3.10"
 license = "MIT"

@@ -93,7 +93,7 @@ pip install zapcode                     # pip / uv
 ```toml
 # Cargo.toml
 [dependencies]
-zapcode-core = "1.0.0-beta.3"
+zapcode-core = "1.0.0"
 ```
 
 **WebAssembly**

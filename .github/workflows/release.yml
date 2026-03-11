@@ -124,7 +124,7 @@ jobs:
             if [ -f "$dir/package.json" ]; then
               echo "Publishing $(basename $dir)..."
               cd "$dir"
-              npm publish --access public --tag beta || true
+              npm publish --access public --tag latest || true
               cd ../..
             fi
           done
@@ -133,7 +133,7 @@ jobs:
       - name: Publish main package
         if: ${{ !inputs.dry_run }}
         working-directory: crates/zapcode-js
-        run: npm publish --access public --tag beta || echo "Already published, skipping"
+        run: npm publish --access public --tag latest || echo "Already published, skipping"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
@@ -211,5 +211,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          tag_name: v1.0.0-beta.3
-          prerelease: true
+          tag_name: v1.0.0
