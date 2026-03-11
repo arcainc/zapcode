@@ -1,4 +1,5 @@
 name: Release
+run-name: "Release ${{ inputs.dry_run && '(dry run)' || '(publish)' }} by @${{ github.actor }}"
 
 on:
   workflow_dispatch:
