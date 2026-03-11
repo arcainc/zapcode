@@ -209,5 +209,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          tag_name: v1.0.0-beta.1
+          tag_name: v1.0.0-beta.2
           prerelease: true
