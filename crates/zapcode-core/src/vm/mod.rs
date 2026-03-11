@@ -791,12 +791,22 @@ impl Vm {
                     (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 + b),
                     (Value::Float(a), Value::Int(b)) => Value::Float(a + *b as f64),
                     (Value::String(a), _) => {
+                        let rhs = right.to_js_string();
+                        let new_len = a.len().saturating_add(rhs.len());
+                        if new_len > 10_000_000 {
+                            return Err(ZapcodeError::AllocationLimitExceeded);
+                        }
                         let mut s = a.to_string();
-                        s.push_str(&right.to_js_string());
+                        s.push_str(&rhs);
                         Value::String(Arc::from(s.as_str()))
                     }
                     (_, Value::String(b)) => {
-                        let mut s = left.to_js_string();
+                        let lhs = left.to_js_string();
+                        let new_len = lhs.len().saturating_add(b.len());
+                        if new_len > 10_000_000 {
+                            return Err(ZapcodeError::AllocationLimitExceeded);
+                        }
+                        let mut s = lhs;
                         s.push_str(b);
                         Value::String(Arc::from(s.as_str()))
                     }
