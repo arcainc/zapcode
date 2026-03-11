@@ -1,22 +1,14 @@
 name: Release
-run-name: "Release v${{ inputs.version || '?.?.?' }} ${{ inputs.dry_run && '(dry run)' || '(publish)' }}"
 
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: "Version (e.g. 1.0.0) — for display only"
-        type: string
-        required: false
       dry_run:
         description: "Dry run (build only, no publish)"
         type: boolean
         default: true
   workflow_call:
     inputs:
-      version:
-        type: string
-        required: false
       dry_run:
         type: boolean
         default: false
