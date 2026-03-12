@@ -4,7 +4,10 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString};
 
-use zapcode_core::{ResourceLimits, Value, VmState, ZapcodeError, ZapcodeSnapshot as CoreSnapshot};
+use zapcode_core::{
+    ExecutionTrace, ResourceLimits, TraceSpan as CoreTraceSpan, TraceStatus, Value, VmState,
+    ZapcodeError, ZapcodeSnapshot as CoreSnapshot,
+};
 
 // ---------------------------------------------------------------------------
 // Value conversion: zapcode_core::Value <-> Python object
@@ -157,7 +160,7 @@ impl Zapcode {
     fn run(&self, py: Python<'_>, inputs: Option<&Bound<'_, PyDict>>) -> PyResult<PyObject> {
         let input_values = extract_inputs(inputs)?;
         let result = self.inner.run(input_values).map_err(zapcode_err)?;
-        run_result_to_py(py, result.state, &result.stdout)
+        run_result_to_py(py, result.state, &result.stdout, Some(&result.trace))
     }
 
     /// Start execution, returning raw state (for suspension / snapshot handling).
@@ -170,13 +173,45 @@ impl Zapcode {
     #[pyo3(signature = (inputs=None))]
     fn start(&self, py: Python<'_>, inputs: Option<&Bound<'_, PyDict>>) -> PyResult<PyObject> {
         let input_values = extract_inputs(inputs)?;
-        let state = self.inner.start(input_values).map_err(zapcode_err)?;
-        run_result_to_py(py, state, "")
+        let result = self.inner.run(input_values).map_err(zapcode_err)?;
+        run_result_to_py(py, result.state, &result.stdout, Some(&result.trace))
     }
 }
 
-/// Convert a `VmState` (+ optional stdout) to a Python dict.
-fn run_result_to_py(py: Python<'_>, state: VmState, stdout: &str) -> PyResult<PyObject> {
+/// Convert a `TraceSpan` to a Python dict.
+fn trace_span_to_py(py: Python<'_>, span: &CoreTraceSpan) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("name", &span.name)?;
+    dict.set_item("start_time_ms", span.start_time_ms)?;
+    dict.set_item("end_time_ms", span.end_time_ms)?;
+    dict.set_item("duration_us", span.duration_us)?;
+    dict.set_item(
+        "status",
+        match span.status {
+            TraceStatus::Ok => "ok",
+            TraceStatus::Error => "error",
+        },
+    )?;
+    let attrs = PyDict::new(py);
+    for (k, v) in &span.attributes {
+        attrs.set_item(k, v)?;
+    }
+    dict.set_item("attributes", attrs)?;
+    let children = PyList::empty(py);
+    for child in &span.children {
+        children.append(trace_span_to_py(py, child)?)?;
+    }
+    dict.set_item("children", children)?;
+    Ok(dict.into_pyobject(py)?.into_any().unbind())
+}
+
+/// Convert a `VmState` (+ optional stdout + trace) to a Python dict.
+fn run_result_to_py(
+    py: Python<'_>,
+    state: VmState,
+    stdout: &str,
+    trace: Option<&ExecutionTrace>,
+) -> PyResult<PyObject> {
     let dict = PyDict::new(py);
     match state {
         VmState::Complete(value) => {
@@ -198,6 +233,9 @@ fn run_result_to_py(py: Python<'_>, state: VmState, stdout: &str) -> PyResult<Py
             dict.set_item("snapshot", ZapcodeSnapshot { inner: snapshot })?;
             dict.set_item("stdout", stdout)?;
         }
+    }
+    if let Some(t) = trace {
+        dict.set_item("trace", trace_span_to_py(py, &t.root)?)?;
     }
     Ok(dict.into_pyobject(py)?.into_any().unbind())
 }
@@ -235,7 +273,7 @@ impl ZapcodeSnapshot {
     fn resume(&self, py: Python<'_>, return_value: &Bound<'_, PyAny>) -> PyResult<PyObject> {
         let val = py_to_value(return_value)?;
         let state = self.inner.clone().resume(val).map_err(zapcode_err)?;
-        run_result_to_py(py, state, "")
+        run_result_to_py(py, state, "", None)
     }
 }
 

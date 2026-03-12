@@ -4,7 +4,10 @@ use js_sys::{Array, Object, Reflect};
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 
-use zapcode_core::{ResourceLimits, Value, VmState, ZapcodeError, ZapcodeSnapshot as CoreSnapshot};
+use zapcode_core::{
+    ExecutionTrace, ResourceLimits, TraceSpan as CoreTraceSpan, TraceStatus, Value, VmState,
+    ZapcodeError, ZapcodeSnapshot as CoreSnapshot,
+};
 
 // ---------------------------------------------------------------------------
 // Value conversion: zapcode_core::Value <-> JsValue
@@ -170,7 +173,7 @@ impl Zapcode {
     pub fn run(&self, inputs: JsValue) -> Result<JsValue, JsError> {
         let input_values = extract_inputs(&inputs)?;
         let result = self.inner.run(input_values).map_err(zapcode_err)?;
-        vm_state_to_js(result.state, &result.stdout)
+        vm_state_to_js(result.state, &result.stdout, Some(&result.trace))
     }
 
     /// Start execution, returning raw state (for suspension / snapshot handling).
@@ -179,8 +182,8 @@ impl Zapcode {
     /// @returns Same shape as `run()`.
     pub fn start(&self, inputs: JsValue) -> Result<JsValue, JsError> {
         let input_values = extract_inputs(&inputs)?;
-        let state = self.inner.start(input_values).map_err(zapcode_err)?;
-        vm_state_to_js(state, "")
+        let result = self.inner.run(input_values).map_err(zapcode_err)?;
+        vm_state_to_js(result.state, &result.stdout, Some(&result.trace))
     }
 }
 
@@ -204,8 +207,51 @@ fn extract_inputs(inputs: &JsValue) -> Result<Vec<(String, Value)>, JsError> {
     Ok(out)
 }
 
-/// Convert a `VmState` (+ optional stdout) to a JS object.
-fn vm_state_to_js(state: VmState, stdout: &str) -> Result<JsValue, JsError> {
+/// Convert a `TraceSpan` to a JS object.
+fn trace_span_to_js(span: &CoreTraceSpan) -> Result<JsValue, JsError> {
+    let obj = Object::new();
+    Reflect::set(&obj, &"name".into(), &JsValue::from_str(&span.name))
+        .map_err(|_| JsError::new("failed to set trace field"))?;
+    Reflect::set(&obj, &"startTimeMs".into(), &JsValue::from(span.start_time_ms as f64))
+        .map_err(|_| JsError::new("failed to set trace field"))?;
+    Reflect::set(&obj, &"endTimeMs".into(), &JsValue::from(span.end_time_ms as f64))
+        .map_err(|_| JsError::new("failed to set trace field"))?;
+    Reflect::set(&obj, &"durationUs".into(), &JsValue::from(span.duration_us as f64))
+        .map_err(|_| JsError::new("failed to set trace field"))?;
+    Reflect::set(
+        &obj,
+        &"status".into(),
+        &JsValue::from_str(match span.status {
+            TraceStatus::Ok => "ok",
+            TraceStatus::Error => "error",
+        }),
+    )
+    .map_err(|_| JsError::new("failed to set trace field"))?;
+
+    let attrs = Object::new();
+    for (k, v) in &span.attributes {
+        Reflect::set(&attrs, &JsValue::from_str(k), &JsValue::from_str(v))
+            .map_err(|_| JsError::new("failed to set trace attribute"))?;
+    }
+    Reflect::set(&obj, &"attributes".into(), &attrs.into())
+        .map_err(|_| JsError::new("failed to set trace field"))?;
+
+    let children = Array::new_with_length(span.children.len() as u32);
+    for (i, child) in span.children.iter().enumerate() {
+        children.set(i as u32, trace_span_to_js(child)?);
+    }
+    Reflect::set(&obj, &"children".into(), &children.into())
+        .map_err(|_| JsError::new("failed to set trace field"))?;
+
+    Ok(obj.into())
+}
+
+/// Convert a `VmState` (+ optional stdout + trace) to a JS object.
+fn vm_state_to_js(
+    state: VmState,
+    stdout: &str,
+    trace: Option<&ExecutionTrace>,
+) -> Result<JsValue, JsError> {
     let obj = Object::new();
     match state {
         VmState::Complete(value) => {
@@ -248,6 +294,10 @@ fn vm_state_to_js(state: VmState, stdout: &str) -> Result<JsValue, JsError> {
             .map_err(|_| JsError::new("failed to set stdout"))?;
         }
     }
+    if let Some(t) = trace {
+        Reflect::set(&obj, &"trace".into(), &trace_span_to_js(&t.root)?)
+            .map_err(|_| JsError::new("failed to set trace"))?;
+    }
     Ok(obj.into())
 }
 
@@ -288,6 +338,6 @@ impl ZapcodeSnapshot {
     pub fn resume(&self, return_value: JsValue) -> Result<JsValue, JsError> {
         let val = js_to_value(&return_value)?;
         let state = self.inner.clone().resume(val).map_err(zapcode_err)?;
-        vm_state_to_js(state, "")
+        vm_state_to_js(state, "", None)
     }
 }

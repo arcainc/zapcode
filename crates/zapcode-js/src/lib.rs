@@ -4,7 +4,7 @@ use std::sync::Arc;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use zapcode_core::{ResourceLimits, Value, VmState, ZapcodeRun, ZapcodeSnapshot};
+use zapcode_core::{ExecutionTrace, ResourceLimits, TraceSpan, TraceStatus, Value, VmState, ZapcodeRun, ZapcodeSnapshot};
 
 // ---------------------------------------------------------------------------
 // Options
@@ -27,6 +27,17 @@ pub struct ZapcodeOptions {
 // ---------------------------------------------------------------------------
 
 #[napi(object)]
+pub struct JsTraceSpan {
+    pub name: String,
+    pub start_time_ms: f64,
+    pub end_time_ms: f64,
+    pub duration_us: f64,
+    pub status: String,
+    pub attributes: Vec<Vec<String>>,
+    pub children: Vec<JsTraceSpan>,
+}
+
+#[napi(object)]
 pub struct ZapcodeResult {
     /// Whether execution completed. Always true for this type.
     pub completed: bool,
@@ -34,6 +45,8 @@ pub struct ZapcodeResult {
     pub output: serde_json::Value,
     /// Captured stdout output.
     pub stdout: String,
+    /// Execution trace (parse → compile → execute).
+    pub trace: JsTraceSpan,
 }
 
 #[napi(object)]
@@ -92,7 +105,19 @@ impl ZapcodeSnapshotHandle {
             .clone()
             .resume(value)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
-        vm_state_to_either(state, String::new())
+        // resume() doesn't produce a full trace yet — use an empty one
+        let trace = ExecutionTrace {
+            root: TraceSpan {
+                name: "resume".to_string(),
+                start_time_ms: 0,
+                end_time_ms: 0,
+                duration_us: 0,
+                status: TraceStatus::Ok,
+                attributes: Vec::new(),
+                children: Vec::new(),
+            },
+        };
+        vm_state_to_either(state, String::new(), trace)
     }
 }
 
@@ -155,6 +180,7 @@ impl Zapcode {
                 completed: true,
                 output: value_to_json(&v),
                 stdout: result.stdout,
+                trace: trace_to_js(&result.trace),
             }),
             VmState::Suspended { function_name, .. } => Err(napi::Error::from_reason(format!(
                 "execution suspended on external function '{}' -- use start() instead",
@@ -177,7 +203,7 @@ impl Zapcode {
             .run(input_values)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
-        vm_state_to_either(result.state, result.stdout)
+        vm_state_to_either(result.state, result.stdout, result.trace)
     }
 }
 
@@ -251,16 +277,41 @@ fn value_to_json(value: &Value) -> serde_json::Value {
     }
 }
 
+fn trace_span_to_js(span: &TraceSpan) -> JsTraceSpan {
+    JsTraceSpan {
+        name: span.name.clone(),
+        start_time_ms: span.start_time_ms as f64,
+        end_time_ms: span.end_time_ms as f64,
+        duration_us: span.duration_us as f64,
+        status: match span.status {
+            TraceStatus::Ok => "ok".to_string(),
+            TraceStatus::Error => "error".to_string(),
+        },
+        attributes: span
+            .attributes
+            .iter()
+            .map(|(k, v)| vec![k.clone(), v.clone()])
+            .collect(),
+        children: span.children.iter().map(trace_span_to_js).collect(),
+    }
+}
+
+fn trace_to_js(trace: &ExecutionTrace) -> JsTraceSpan {
+    trace_span_to_js(&trace.root)
+}
+
 /// Package a `VmState` into either a `ZapcodeResult` or `ZapcodeSuspension`.
 fn vm_state_to_either(
     state: VmState,
     stdout: String,
+    trace: ExecutionTrace,
 ) -> napi::Result<Either<ZapcodeResult, ZapcodeSuspension>> {
     match state {
         VmState::Complete(v) => Ok(Either::A(ZapcodeResult {
             completed: true,
             output: value_to_json(&v),
             stdout,
+            trace: trace_to_js(&trace),
         })),
         VmState::Suspended {
             function_name,
