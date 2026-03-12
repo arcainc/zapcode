@@ -62,8 +62,7 @@ fn promise_then_single() -> zapcode_core::Value {
 
 #[divan::bench]
 fn promise_then_chain_3() -> zapcode_core::Value {
-    eval_ts("await Promise.resolve(1).then(x => x + 1).then(x => x * 2).then(x => x + 10)")
-        .unwrap()
+    eval_ts("await Promise.resolve(1).then(x => x + 1).then(x => x * 2).then(x => x + 10)").unwrap()
 }
 
 #[divan::bench]
