@@ -28,5 +28,8 @@ crates/zapcode-py/README.md
 packages/zapcode-ai/README.md
 examples/*/Cargo.lock
 
+# Claude Code
+.claude/
+
 # Secrets
 .env
