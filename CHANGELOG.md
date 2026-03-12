@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.4](https://github.com/TheUncharted/zapcode/compare/v1.1.3...v1.1.4) (2026-03-12)
+
+
+### Bug Fixes
+
+* strip trailing comment from version extraction in release workflow ([8bd63e1](https://github.com/TheUncharted/zapcode/commit/8bd63e11521246430f577eda42983d009ca7cc6e))
+* strip trailing comment from version extraction in release workflow ([12ea165](https://github.com/TheUncharted/zapcode/commit/12ea165e6d201d40b5d6aa59cd456107073ca63e))
+
 ## [1.1.3](https://github.com/TheUncharted/zapcode/compare/v1.1.2...v1.1.3) (2026-03-12)
 
 
