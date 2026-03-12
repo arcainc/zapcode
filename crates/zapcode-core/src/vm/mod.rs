@@ -8,6 +8,7 @@ use crate::compiler::CompiledProgram;
 use crate::error::{Result, ZapcodeError};
 use crate::sandbox::{ResourceLimits, ResourceTracker};
 use crate::snapshot::ZapcodeSnapshot;
+use crate::trace::{ExecutionTrace, SpanBuilder, TraceStatus};
 use crate::value::{Closure, FunctionId, GeneratorObject, SuspendedFrame, Value};
 
 mod builtins;
@@ -2201,20 +2202,88 @@ impl ZapcodeRun {
     }
 
     pub fn run(&self, input_values: Vec<(String, Value)>) -> Result<RunResult> {
-        let program = crate::parser::parse(&self.source)?;
+        let mut root_span = SpanBuilder::new("zapcode.run");
+
+        // Parse
+        let parse_span = SpanBuilder::new("parse");
+        let program = match crate::parser::parse(&self.source) {
+            Ok(p) => {
+                root_span.add_child(parse_span.finish_ok());
+                p
+            }
+            Err(e) => {
+                root_span.add_child(parse_span.finish_error(&e.to_string()));
+                let _trace = ExecutionTrace {
+                    root: root_span.finish(TraceStatus::Error),
+                };
+                return Err(e);
+            }
+        };
+
+        // Compile
+        let compile_span = SpanBuilder::new("compile");
         let ext_set: HashSet<String> = self.external_functions.iter().cloned().collect();
-        let compiled = crate::compiler::compile_with_externals(&program, ext_set.clone())?;
+        let compiled = match crate::compiler::compile_with_externals(&program, ext_set.clone()) {
+            Ok(c) => {
+                root_span.add_child(compile_span.finish_ok());
+                c
+            }
+            Err(e) => {
+                root_span.add_child(compile_span.finish_error(&e.to_string()));
+                let _trace = ExecutionTrace {
+                    root: root_span.finish(TraceStatus::Error),
+                };
+                return Err(e);
+            }
+        };
+
+        // Execute
+        let execute_span = SpanBuilder::new("execute");
         let mut vm = Vm::new(compiled, self.limits.clone(), ext_set);
 
-        // Inject inputs as globals
         for (name, value) in input_values {
             vm.globals.insert(name, value);
         }
 
-        let state = vm.run()?;
+        let state = match vm.run() {
+            Ok(s) => {
+                let status = match &s {
+                    VmState::Complete(_) => TraceStatus::Ok,
+                    VmState::Suspended { function_name, args, .. } => {
+                        let mut span = execute_span;
+                        span.set_attr("zapcode.suspended_on", function_name);
+                        span.set_attr("zapcode.args_count", args.len());
+                        root_span.add_child(span.finish(TraceStatus::Ok));
+                        let trace = ExecutionTrace {
+                            root: root_span.finish_ok(),
+                        };
+                        return Ok(RunResult {
+                            state: s,
+                            stdout: vm.stdout,
+                            trace,
+                        });
+                    }
+                };
+                root_span.add_child(execute_span.finish(status));
+                s
+            }
+            Err(e) => {
+                root_span.add_child(execute_span.finish_error(&e.to_string()));
+                let _trace = ExecutionTrace {
+                    root: root_span.finish(TraceStatus::Error),
+                };
+                return Err(e);
+            }
+        };
+
+        let trace = ExecutionTrace {
+            root: root_span.finish_ok(),
+        };
+
         Ok(RunResult {
             state,
             stdout: vm.stdout,
+            trace,
         })
     }
 
@@ -2222,16 +2291,8 @@ impl ZapcodeRun {
     /// instead of wrapping it in a `RunResult`. This is the primary entry point
     /// for code that needs to handle suspension / snapshot / resume.
     pub fn start(&self, input_values: Vec<(String, Value)>) -> Result<VmState> {
-        let program = crate::parser::parse(&self.source)?;
-        let ext_set: HashSet<String> = self.external_functions.iter().cloned().collect();
-        let compiled = crate::compiler::compile_with_externals(&program, ext_set.clone())?;
-        let mut vm = Vm::new(compiled, self.limits.clone(), ext_set);
-
-        for (name, value) in input_values {
-            vm.globals.insert(name, value);
-        }
-
-        vm.run()
+        let result = self.run(input_values)?;
+        Ok(result.state)
     }
 
     pub fn run_simple(&self) -> Result<Value> {
@@ -2250,6 +2311,8 @@ impl ZapcodeRun {
 pub struct RunResult {
     pub state: VmState,
     pub stdout: String,
+    /// Execution trace covering parse → compile → execute.
+    pub trace: ExecutionTrace,
 }
 
 /// Quick helper to evaluate a TypeScript expression.
