@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.3](https://github.com/TheUncharted/zapcode/compare/v1.1.2...v1.1.3) (2026-03-12)
+
+
+### Bug Fixes
+
+* sync Python package versions to 1.1.2 to match npm and crates.io ([728deda](https://github.com/TheUncharted/zapcode/commit/728dedac9f22b05a538ab8e6ed4cd31403dda886))
+* sync Python package versions to 1.1.2 to match npm and crates.io ([ba80dc4](https://github.com/TheUncharted/zapcode/commit/ba80dc425ad41f1987118472287cd68afecd83c8))
+
 ## [1.1.2](https://github.com/TheUncharted/zapcode/compare/v1.1.1...v1.1.2) (2026-03-12)
 
 
