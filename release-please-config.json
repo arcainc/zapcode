@@ -2,12 +2,17 @@
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
   "packages": {
     ".": {
-      "release-type": "rust",
+      "release-type": "simple",
       "component": "zapcode",
       "include-component-in-tag": false,
       "bump-minor-pre-major": true,
       "bump-patch-for-minor-pre-major": true,
       "extra-files": [
+        "Cargo.toml",
+        "crates/zapcode-core/Cargo.toml",
+        "crates/zapcode-js/Cargo.toml",
+        "crates/zapcode-py/Cargo.toml",
+        "crates/zapcode-wasm/Cargo.toml",
         "crates/zapcode-js/package.json",
         "crates/zapcode-py/pyproject.toml",
         "packages/zapcode-ai/package.json",
