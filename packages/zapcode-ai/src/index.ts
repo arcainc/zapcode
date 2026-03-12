@@ -62,13 +62,48 @@ export interface ZapcodeAIOptions {
   timeLimitMs?: number;
   /** Custom adapters for additional AI SDKs. */
   adapters?: ZapcodeAdapter[];
+  /**
+   * Log generated code, tool calls, and output to the console.
+   * Useful for understanding what the LLM generates.
+   */
+  debug?: boolean;
+  /**
+   * When true, execution errors are returned as tool results instead of
+   * throwing. The LLM sees the error and can self-correct on the next step.
+   * Works with `maxSteps` in the Vercel AI SDK. Default: false.
+   */
+  autoFix?: boolean;
+}
+
+/** A single span in the execution trace. OTel-compatible shape. */
+export interface TraceSpan {
+  /** Span name (e.g. "execute", "tool_call", "error", "retry"). */
+  name: string;
+  /** When the span started (ms since epoch). */
+  startTime: number;
+  /** When the span ended (ms since epoch). */
+  endTime: number;
+  /** Duration in ms. */
+  durationMs: number;
+  /** "ok" or "error". */
+  status: "ok" | "error";
+  /** Structured attributes — keys map to OTel attribute naming. */
+  attributes: Record<string, unknown>;
+  /** Child spans. */
+  children: TraceSpan[];
 }
 
 /** Result of executing guest code. */
 export interface ExecutionResult {
+  /** The TypeScript code that the LLM generated. */
+  code: string;
   output: unknown;
   stdout: string;
   toolCalls: Array<{ name: string; args: unknown[]; result: unknown }>;
+  /** Present when autoFix is enabled and execution failed. */
+  error?: string;
+  /** Execution trace. Present when debug or autoFix is enabled. */
+  trace?: TraceSpan;
 }
 
 /** What `zapcode()` returns — adapters for every major AI SDK. */
@@ -106,6 +141,19 @@ export interface ZapcodeAIResult {
    * Access with `result.custom["my-adapter-name"]`.
    */
   custom: Record<string, unknown>;
+
+  /**
+   * Get the full session trace tree (all attempts).
+   * Available when debug or autoFix is enabled.
+   * Call after generateText/streamText completes.
+   */
+  getTrace: () => TraceSpan | undefined;
+
+  /**
+   * Print the full session trace tree to the console.
+   * Available when debug or autoFix is enabled.
+   */
+  printTrace: () => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -213,62 +261,157 @@ const CODE_TOOL_DESCRIPTION =
   "The last expression is the return value.";
 
 // ---------------------------------------------------------------------------
+// Trace helpers
+// ---------------------------------------------------------------------------
+
+function createSpan(name: string, attributes: Record<string, unknown> = {}): TraceSpan {
+  return {
+    name,
+    startTime: Date.now(),
+    endTime: 0,
+    durationMs: 0,
+    status: "ok",
+    attributes,
+    children: [],
+  };
+}
+
+function endSpan(span: TraceSpan, status?: "ok" | "error"): TraceSpan {
+  span.endTime = Date.now();
+  span.durationMs = span.endTime - span.startTime;
+  if (status) span.status = status;
+  return span;
+}
+
+function printTrace(span: TraceSpan, indent = 0): void {
+  const prefix = indent === 0 ? "" : "│ ".repeat(indent - 1) + "├─ ";
+  const icon = span.status === "error" ? "✗" : "✓";
+  const duration = span.durationMs < 1 ? "<1ms" : `${span.durationMs}ms`;
+  const attrs = Object.entries(span.attributes)
+    .map(([k, v]) => {
+      const str = typeof v === "string" && v.length > 80 ? v.slice(0, 77) + "..." : String(v);
+      return `${k}=${str}`;
+    })
+    .join(" ");
+
+  console.log(`${prefix}${icon} ${span.name} (${duration})${attrs ? " " + attrs : ""}`);
+  for (const child of span.children) {
+    printTrace(child, indent + 1);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Execution engine
 // ---------------------------------------------------------------------------
 
 async function executeCode(
   code: string,
   toolDefs: Record<string, ToolDefinition>,
-  options: { memoryLimitMb?: number; timeLimitMs?: number }
+  options: { memoryLimitMb?: number; timeLimitMs?: number; debug?: boolean; autoFix?: boolean }
 ): Promise<ExecutionResult> {
   const toolNames = Object.keys(toolDefs);
   const toolCalls: ExecutionResult["toolCalls"] = [];
+  const debug = options.debug ?? false;
+  const autoFix = options.autoFix ?? false;
+  const tracing = debug || autoFix;
 
-  const sandbox = new Zapcode(code, {
-    externalFunctions: toolNames,
-    timeLimitMs: options.timeLimitMs ?? 10_000,
-    memoryLimitMb: options.memoryLimitMb ?? 32,
-  });
+  const execSpan = tracing ? createSpan("execute", { "zapcode.code": code }) : undefined;
 
-  let state = sandbox.start();
-  let stdout = "";
+  try {
+    const sandbox = new Zapcode(code, {
+      externalFunctions: toolNames,
+      timeLimitMs: options.timeLimitMs ?? 10_000,
+      memoryLimitMb: options.memoryLimitMb ?? 32,
+    });
 
-  // Snapshot/resume loop — resolve each tool call as the VM suspends
-  while (!state.completed) {
-    const { functionName, args } = state;
+    let state = sandbox.start();
+    let stdout = "";
 
-    const toolDef = toolDefs[functionName];
-    if (!toolDef) {
-      throw new Error(
-        `Guest code called unknown function '${functionName}'. ` +
-        `Available: ${toolNames.join(", ")}`
-      );
+    // Snapshot/resume loop — resolve each tool call as the VM suspends
+    while (!state.completed) {
+      const { functionName, args } = state;
+
+      const toolDef = toolDefs[functionName];
+      if (!toolDef) {
+        throw new Error(
+          `Guest code called unknown function '${functionName}'. ` +
+          `Available: ${toolNames.join(", ")}`
+        );
+      }
+
+      // Build named args from positional args using the parameter schema
+      const paramNames = Object.keys(toolDef.parameters);
+      const namedArgs: Record<string, unknown> = {};
+      for (let i = 0; i < paramNames.length && i < args.length; i++) {
+        namedArgs[paramNames[i]] = args[i];
+      }
+
+      const toolSpan = tracing ? createSpan("tool_call", {
+        "zapcode.tool.name": functionName,
+        "zapcode.tool.args": JSON.stringify(args),
+      }) : undefined;
+
+      const result = await toolDef.execute(namedArgs);
+      toolCalls.push({ name: functionName, args, result });
+
+      if (toolSpan) {
+        toolSpan.attributes["zapcode.tool.result"] = JSON.stringify(result);
+        endSpan(toolSpan);
+        execSpan!.children.push(toolSpan);
+      }
+
+      // Resume the VM with the tool's return value
+      const snapshot = ZapcodeSnapshotHandle.load(state.snapshot);
+      state = snapshot.resume(result);
     }
 
-    // Build named args from positional args using the parameter schema
-    const paramNames = Object.keys(toolDef.parameters);
-    const namedArgs: Record<string, unknown> = {};
-    for (let i = 0; i < paramNames.length && i < args.length; i++) {
-      namedArgs[paramNames[i]] = args[i];
+    if (state.stdout) {
+      stdout = state.stdout;
     }
 
-    const result = await toolDef.execute(namedArgs);
-    toolCalls.push({ name: functionName, args, result });
+    if (execSpan) {
+      execSpan.attributes["zapcode.output"] = JSON.stringify(state.output);
+      if (stdout) execSpan.attributes["zapcode.stdout"] = stdout;
+      endSpan(execSpan);
+    }
 
-    // Resume the VM with the tool's return value
-    const snapshot = ZapcodeSnapshotHandle.load(state.snapshot);
-    state = snapshot.resume(result);
+    if (debug && execSpan) {
+      printTrace(execSpan);
+    }
+
+    return {
+      code,
+      output: state.output,
+      stdout,
+      toolCalls,
+      ...(execSpan ? { trace: execSpan } : {}),
+    };
+  } catch (err: any) {
+    const errorMsg = err.message ?? String(err);
+
+    if (execSpan) {
+      execSpan.attributes["zapcode.error"] = errorMsg;
+      endSpan(execSpan, "error");
+    }
+
+    if (!autoFix) {
+      if (debug && execSpan) printTrace(execSpan);
+      throw err;
+    }
+
+    if (debug && execSpan) {
+      printTrace(execSpan);
+    }
+
+    return {
+      code,
+      output: null,
+      stdout: "",
+      toolCalls,
+      error: `Execution failed: ${errorMsg}. Please fix your code and try again.`,
+      ...(execSpan ? { trace: execSpan } : {}),
+    };
   }
-
-  if (state.stdout) {
-    stdout = state.stdout;
-  }
-
-  return {
-    output: state.output,
-    stdout,
-    toolCalls,
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -309,15 +452,31 @@ async function executeCode(
  * ```
  */
 export function zapcode(options: ZapcodeAIOptions): ZapcodeAIResult {
-  const { tools: toolDefs, system: userSystem, memoryLimitMb, timeLimitMs, adapters } = options;
+  const { tools: toolDefs, system: userSystem, memoryLimitMb, timeLimitMs, adapters, debug, autoFix } = options;
 
   const system = buildSystemPrompt(toolDefs, userSystem);
 
-  const execOptions = { memoryLimitMb, timeLimitMs };
+  const execOptions = { memoryLimitMb, timeLimitMs, debug: false, autoFix };
+  const tracing = debug || autoFix;
+
+  // Session-level trace collects all attempts
+  const sessionTrace: TraceSpan | undefined = tracing
+    ? createSpan("session", { "zapcode.tools": Object.keys(toolDefs).join(", ") })
+    : undefined;
+  let attemptCount = 0;
 
   // Universal handler
   const handleToolCall = async (code: string): Promise<ExecutionResult> => {
-    return executeCode(code, toolDefs, execOptions);
+    attemptCount++;
+    const result = await executeCode(code, toolDefs, execOptions);
+
+    if (sessionTrace && result.trace) {
+      result.trace.name = `attempt_${attemptCount}`;
+      result.trace.attributes["zapcode.attempt"] = attemptCount;
+      sessionTrace.children.push(result.trace);
+    }
+
+    return result;
   };
 
   // Vercel AI SDK format — use tool() + jsonSchema() for proper integration
@@ -365,7 +524,22 @@ export function zapcode(options: ZapcodeAIOptions): ZapcodeAIResult {
     }
   }
 
-  return { system, tools, openaiTools, anthropicTools, handleToolCall, custom };
+  const getTrace = (): TraceSpan | undefined => {
+    if (!sessionTrace) return undefined;
+    endSpan(sessionTrace, sessionTrace.children.some(c => c.status === "ok") ? "ok" : "error");
+    return sessionTrace;
+  };
+
+  const printSessionTrace = (): void => {
+    const trace = getTrace();
+    if (trace) {
+      console.log(`\n─── Zapcode Trace ───`);
+      printTrace(trace);
+      console.log(`─────────────────────\n`);
+    }
+  };
+
+  return { system, tools, openaiTools, anthropicTools, handleToolCall, custom, getTrace, printTrace: printSessionTrace };
 }
 
 // ---------------------------------------------------------------------------
@@ -483,7 +657,7 @@ export function createAdapter<TOutput>(
 export async function execute(
   code: string,
   tools: Record<string, ToolDefinition>,
-  options?: { memoryLimitMb?: number; timeLimitMs?: number }
+  options?: { memoryLimitMb?: number; timeLimitMs?: number; debug?: boolean; autoFix?: boolean }
 ): Promise<ExecutionResult> {
   return executeCode(code, tools, options ?? {});
 }
