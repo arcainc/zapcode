@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.2](https://github.com/TheUncharted/zapcode/compare/v1.1.1...v1.1.2) (2026-03-12)
+
+
+### Bug Fixes
+
+* use absolute URL for logo so it renders on PyPI, npm, and crates.io ([56d2c53](https://github.com/TheUncharted/zapcode/commit/56d2c53579d565db846a1acee6e27bc4f4b73a89))
+* use absolute URL for logo so it renders on PyPI, npm, and crates.io ([412308b](https://github.com/TheUncharted/zapcode/commit/412308baabd912caeaee9b8ab6c91cbee4cc8e8b))
+
 ## [1.1.1](https://github.com/TheUncharted/zapcode/compare/v1.1.0...v1.1.1) (2026-03-12)
 
 
