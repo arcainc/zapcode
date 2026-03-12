@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.5](https://github.com/TheUncharted/zapcode/compare/v1.1.4...v1.1.5) (2026-03-12)
+
+
+### Bug Fixes
+
+* persist this mutations back to receiver after method calls ([c1b657f](https://github.com/TheUncharted/zapcode/commit/c1b657fdc7658d335ca2c5d8e6c7c8d13098ed7a))
+* use latest published versions in examples instead of local paths ([4afd4d9](https://github.com/TheUncharted/zapcode/commit/4afd4d92a2ca8faccce2fe2f5b3dbe2095fb026b))
+
 ## [1.1.4](https://github.com/TheUncharted/zapcode/compare/v1.1.3...v1.1.4) (2026-03-12)
 
 
