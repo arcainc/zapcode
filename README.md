@@ -150,7 +150,7 @@ if (!state.completed) {
 }
 ```
 
-See [`examples/typescript/basic.ts`](examples/typescript/basic.ts) for more.
+See [`examples/typescript/basic/main.ts`](examples/typescript/basic/main.ts) for more.
 
 ### Python
 
@@ -187,7 +187,7 @@ if state.get("suspended"):
     result = restored.resume({"condition": "Clear", "temp": 26})
 ```
 
-See [`examples/python/basic.py`](examples/python/basic.py) for more.
+See [`examples/python/basic/main.py`](examples/python/basic/main.py) for more.
 
 <details>
 <summary><strong>Rust</strong></summary>
@@ -225,7 +225,7 @@ if let VmState::Suspended { snapshot, .. } = state {
 }
 ```
 
-See [`examples/rust/basic.rs`](examples/rust/basic.rs) for more.
+See [`examples/rust/basic/basic.rs`](examples/rust/basic/basic.rs) for more.
 </details>
 
 <details>
@@ -246,7 +246,7 @@ console.log(result.output);  // 120
 </script>
 ```
 
-See [`examples/wasm/index.html`](examples/wasm/index.html) for a full playground.
+See [`examples/wasm/basic/index.html`](examples/wasm/basic/index.html) for a full playground.
 </details>
 
 ## AI Agent Usage
@@ -300,7 +300,7 @@ const { text } = await generateText({
 
 Under the hood: the LLM writes TypeScript code that calls your tools → Zapcode executes it in a sandbox → tool calls suspend the VM → your `execute` functions run on the host → results flow back in. All in ~2µs startup + tool execution time.
 
-See [`examples/typescript/ai-agent-zapcode-ai.ts`](examples/typescript/ai-agent-zapcode-ai.ts) for the full working example.
+See [`examples/typescript/ai-agent/ai-agent-zapcode-ai.ts`](examples/typescript/ai-agent/ai-agent-zapcode-ai.ts) for the full working example.
 
 <details>
 <summary><strong>Anthropic SDK</strong></summary>
@@ -365,7 +365,7 @@ while state.get("suspended"):
 print(state["output"])
 ```
 
-See [`examples/typescript/ai-agent-anthropic.ts`](examples/typescript/ai-agent-anthropic.ts) and [`examples/python/ai_agent_anthropic.py`](examples/python/ai_agent_anthropic.py).
+See [`examples/typescript/ai-agent/ai-agent-anthropic.ts`](examples/typescript/ai-agent/ai-agent-anthropic.ts) and [`examples/python/ai-agent/ai_agent_anthropic.py`](examples/python/ai-agent/ai_agent_anthropic.py).
 </details>
 
 <details>
@@ -451,6 +451,63 @@ langchain_tool = b.custom["langchain"]
 
 The adapter receives an `AdapterContext` with everything needed: system prompt, tool name, tool JSON schema, and a `handleToolCall` function. Return whatever shape your SDK expects.
 </details>
+
+## Auto-Fix, Debug & Execution Tracing
+
+### Auto-fix (`autoFix`)
+
+When enabled, execution errors are returned as tool results instead of throwing — letting the LLM see the error and self-correct on the next step.
+
+**TypeScript:**
+```typescript
+const { system, tools } = zapcode({
+  autoFix: true,
+  tools: { /* ... */ },
+});
+```
+
+**Python:**
+```python
+zap = zapcode(auto_fix=True, tools={...})
+```
+
+### Execution Trace
+
+Every execution produces a trace tree with timing for each phase (parse → compile → execute). Use `printTrace()` / `print_trace()` to display the full session trace, or `getTrace()` / `get_trace()` to access the trace programmatically.
+
+**TypeScript:**
+```typescript
+const { system, tools, printTrace, getTrace } = zapcode({
+  autoFix: true,
+  tools: { /* ... */ },
+});
+
+// After running...
+printTrace();
+// ✓ zapcode.session  12.3ms
+//   ✓ execute_code    8.1ms
+//     ✓ parse          0.2ms
+//     ✓ compile        0.1ms
+//     ✓ execute        7.8ms
+
+const trace = getTrace(); // TraceSpan tree
+```
+
+**Python:**
+```python
+zap = zapcode(auto_fix=True, tools={...})
+
+# After running...
+zap.print_trace()
+trace = zap.get_trace()  # TraceSpan tree
+```
+
+### Debug Logging
+
+For detailed logging of generated code, tool calls, and output, see the debug-tracing examples which show how to inspect each execution step:
+
+- [TypeScript debug-tracing example](examples/typescript/debug-tracing/main.ts)
+- [Python debug-tracing example](examples/python/debug-tracing/main.py)
 
 ## What Zapcode Can and Cannot Do
 
