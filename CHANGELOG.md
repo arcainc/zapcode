@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.0](https://github.com/TheUncharted/zapcode/compare/v1.2.0...v1.3.0) (2026-03-12)
+
+
+### Features
+
+* Promise .then/.catch/.finally, VM bugfixes, release pipeline improvements ([b8f2c81](https://github.com/TheUncharted/zapcode/commit/b8f2c8118f3b3f447e76aa6774b6d278a911944b))
+
 ## [1.2.0](https://github.com/TheUncharted/zapcode/compare/v1.1.7...v1.2.0) (2026-03-12)
 
 
