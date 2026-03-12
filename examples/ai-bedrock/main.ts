@@ -17,14 +17,14 @@ import { createAmazonBedrock } from "@ai-sdk/amazon-bedrock";
 import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
 
 // --- Bedrock setup ---
-const REGION = process.env.AWS_REGION ?? "eu-west-2";
+const REGION = process.env.AWS_REGION ?? "eu-west-1";
 
 const bedrock = createAmazonBedrock({
   credentialProvider: fromNodeProviderChain(),
   region: REGION,
 });
 
-const MODEL_ID = process.env.MODEL_ID ?? "moonshotai.kimi-k2.5";
+const MODEL_ID = process.env.MODEL_ID ?? "global.amazon.nova-2-lite-v1:0";
 const model = bedrock(MODEL_ID);
 
 // --- Zapcode setup ---
