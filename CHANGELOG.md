@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.6](https://github.com/TheUncharted/zapcode/compare/v1.1.5...v1.1.6) (2026-03-12)
+
+
+### Bug Fixes
+
+* skip receiver writeback for builtin globals to prevent snapshot serialization error ([b41794a](https://github.com/TheUncharted/zapcode/commit/b41794a1b8c3a2a4e1f6ab8e500f7909504dd825))
+
 ## [1.1.5](https://github.com/TheUncharted/zapcode/compare/v1.1.4...v1.1.5) (2026-03-12)
 
 
