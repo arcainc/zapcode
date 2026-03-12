@@ -15,8 +15,8 @@ from zapcode_ai import zapcode, ToolDefinition, ParamDef
 
 
 # --- Bedrock setup ---
-REGION = os.environ.get("AWS_REGION", "eu-west-2")
-MODEL_ID = os.environ.get("MODEL_ID", "moonshotai.kimi-k2.5")
+REGION = os.environ.get("AWS_REGION", "eu-west-1")
+MODEL_ID = os.environ.get("MODEL_ID", "global.amazon.nova-2-lite-v1:0")
 
 bedrock = boto3.client("bedrock-runtime", region_name=REGION)
 
