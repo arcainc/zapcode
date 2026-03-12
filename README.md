@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.png" alt="Zapcode" width="160" />
+  <img src="https://raw.githubusercontent.com/TheUncharted/zapcode/master/assets/logo.png" alt="Zapcode" width="160" />
 </p>
 <h1 align="center">Zapcode</h1>
 <p align="center"><strong>Run AI code. Safely. Instantly.</strong></p>
