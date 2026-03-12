@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.1](https://github.com/TheUncharted/zapcode/compare/v1.1.0...v1.1.1) (2026-03-12)
+
+
+### Bug Fixes
+
+* add readme field to zapcode-ai pyproject.toml for PyPI description ([acef8a7](https://github.com/TheUncharted/zapcode/commit/acef8a79e11134d085c39bdf8b2a88e88879678a))
+* add readme field to zapcode-ai pyproject.toml for PyPI description ([4d2db80](https://github.com/TheUncharted/zapcode/commit/4d2db802885b7c3fff1b43b459e410048b1dcc76))
+
 ## [1.1.0](https://github.com/TheUncharted/zapcode/compare/v1.0.1...v1.1.0) (2026-03-12)
 
 
