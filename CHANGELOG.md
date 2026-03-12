@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.0](https://github.com/TheUncharted/zapcode/compare/v1.1.7...v1.2.0) (2026-03-12)
+
+
+### Features
+
+* add Promise .then(), .catch(), .finally() instance methods ([9cf33db](https://github.com/TheUncharted/zapcode/commit/9cf33db9bd767c6efb1540adbb0642041ad47d34))
+
 ## [1.1.7](https://github.com/TheUncharted/zapcode/compare/v1.1.6...v1.1.7) (2026-03-12)
 
 
