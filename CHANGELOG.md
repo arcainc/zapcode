@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.4.0](https://github.com/TheUncharted/zapcode/compare/v1.3.0...v1.4.0) (2026-03-12)
+
+
+### Features
+
+* add autoFix and execution trace to zapcode-ai packages ([124eec9](https://github.com/TheUncharted/zapcode/commit/124eec993cb0511e4163602e4da9c452e6998801))
+* add execution trace system to zapcode-core ([dc545dc](https://github.com/TheUncharted/zapcode/commit/dc545dc657c7133f72aeef7a02cafd18a5086ba2))
+* Add new feature related to debugging and tracing ([d3a37cc](https://github.com/TheUncharted/zapcode/commit/d3a37cc5dfef19026c26aba842321e3ca1bbc355))
+* expose execution trace in JS, Python, and WASM bindings ([299c10c](https://github.com/TheUncharted/zapcode/commit/299c10c045e9c0dd64757c2f06de240dbd7ebe1b))
+
+
+### Bug Fixes
+
+* address CodeRabbit review findings ([cdbc6ee](https://github.com/TheUncharted/zapcode/commit/cdbc6eeed8357a3b4fbc4066d584e003c42ff143))
+* update CI paths after examples directory reorganization ([ccfc2ee](https://github.com/TheUncharted/zapcode/commit/ccfc2ee8ee05e05d628b10211635a834a350f79d))
+
 ## [1.3.0](https://github.com/TheUncharted/zapcode/compare/v1.2.0...v1.3.0) (2026-03-12)
 
 
