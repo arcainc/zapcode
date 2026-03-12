@@ -21,10 +21,10 @@
 
 AI agents are more capable when they **write code** instead of chaining tool calls. Code gives agents loops, conditionals, variables, and composition — things that tool chains simulate poorly.
 
-- [CodeMode](https://blog.cloudflare.com/codemode-ai-agent-coding) — Cloudflare on why agents should write code
-- [Programmatic Tool Calling](https://docs.anthropic.com/en/docs/build-with-claude/tool-use/tool-use-examples#programmatic-tool-calling) — Anthropic's approach
-- [Code Execution with MCP](https://www.anthropic.com/engineering/code-execution-mcp) — Anthropic engineering
-- [Smol Agents](https://huggingface.co/docs/smolagents/en/index) — Hugging Face's code-first agents
+- [Codemode](https://blog.cloudflare.com/code-mode/) from Cloudflare
+- [Programmatic Tool Calling](https://platform.claude.com/docs/en/agents-and-tools/tool-use/programmatic-tool-calling) from Anthropic
+- [Code Execution with MCP](https://www.anthropic.com/engineering/code-execution-with-mcp) from Anthropic
+- [Smol Agents](https://github.com/huggingface/smolagents) from Hugging Face
 
 **But running AI-generated code is dangerous and slow.**
 
