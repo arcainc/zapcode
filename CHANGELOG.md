@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.7](https://github.com/TheUncharted/zapcode/compare/v1.1.6...v1.1.7) (2026-03-12)
+
+
+### Bug Fixes
+
+* switch Bedrock examples to global.amazon.nova-2-lite-v1:0 ([f6e5889](https://github.com/TheUncharted/zapcode/commit/f6e58891fc7798304f49f146355d77251e2134be))
+* switch Bedrock examples to global.amazon.nova-2-lite-v1:0 ([b5d29cb](https://github.com/TheUncharted/zapcode/commit/b5d29cbbfc037b06afc2a17e10e9ff1504985a6f))
+
 ## [1.1.6](https://github.com/TheUncharted/zapcode/compare/v1.1.5...v1.1.6) (2026-03-12)
 
 
