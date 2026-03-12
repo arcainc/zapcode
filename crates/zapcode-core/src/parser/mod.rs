@@ -43,9 +43,18 @@ fn wrap_trailing_object(source: &str) -> String {
     }
 
     // Find the matching `{`
-    // Note: this brace scanner does not track string literals or comments.
-    // This is acceptable because the input is AI-generated tool output (simple
-    // expressions), not arbitrary user code with embedded brace characters.
+    //
+    // Limitation: this brace scanner is a simple depth-counting heuristic that
+    // does not account for braces inside string literals, comments, or template
+    // literals. This is acceptable for preprocessing because:
+    //   1. The input is AI-generated tool output (simple expressions), not
+    //      arbitrary user code likely to contain embedded brace characters.
+    //   2. This is only a heuristic for trailing-object extraction — if the
+    //      heuristic produces malformed output, oxc will catch the parse error
+    //      downstream, so correctness is never silently lost.
+    //
+    // TODO: revisit this heuristic if real-world failures are reported (e.g.
+    // strings containing unbalanced braces causing incorrect extraction).
     let mut depth = 0;
     let mut open_pos = None;
     for (i, ch) in trimmed.char_indices().rev() {
