@@ -287,3 +287,110 @@ fn test_snapshot_resume_with_numeric_result() {
         _ => panic!("expected suspension"),
     }
 }
+
+#[test]
+fn test_snapshot_multi_await_with_let_and_console() {
+    // Reproduces the pattern AI models generate: multiple awaits with let bindings
+    // and console.log calls between them.
+    let code = r#"
+        const w1 = await getWeather("Tokyo");
+        console.log("Tokyo weather:", w1);
+        const w2 = await getWeather("Paris");
+        console.log("Paris weather:", w2);
+        const tokyoTemp = w1.temp;
+        const parisTemp = w2.temp;
+        let colderCity = "Paris";
+        let warmerCity = "Tokyo";
+        if (tokyoTemp < parisTemp) {
+            colderCity = "Tokyo";
+            warmerCity = "Paris";
+        }
+        const flights = await searchFlights(colderCity, warmerCity);
+        ({ tokyo: w1, paris: w2, colderCity, warmerCity, flights })
+    "#;
+
+    let state = start_with_externals(code, vec!["getWeather", "searchFlights"], Vec::new());
+
+    // First suspend: getWeather("Tokyo")
+    let snap1 = match state {
+        VmState::Suspended {
+            function_name,
+            snapshot,
+            ..
+        } => {
+            assert_eq!(function_name, "getWeather");
+            snapshot
+        }
+        _ => panic!("expected first suspension"),
+    };
+
+    let weather1 = Value::Object(
+        vec![
+            ("condition".into(), Value::String("Clear".into())),
+            ("temp".into(), Value::Int(26)),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    let state2 = snap1.resume(weather1).unwrap();
+
+    // Second suspend: getWeather("Paris")
+    let snap2 = match state2 {
+        VmState::Suspended {
+            function_name,
+            snapshot,
+            ..
+        } => {
+            assert_eq!(function_name, "getWeather");
+            snapshot
+        }
+        _ => panic!("expected second suspension"),
+    };
+
+    let weather2 = Value::Object(
+        vec![
+            ("condition".into(), Value::String("Sunny".into())),
+            ("temp".into(), Value::Int(22)),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    let state3 = snap2.resume(weather2).unwrap();
+
+    // Third suspend: searchFlights
+    let snap3 = match state3 {
+        VmState::Suspended {
+            function_name,
+            snapshot,
+            ..
+        } => {
+            assert_eq!(function_name, "searchFlights");
+            snapshot
+        }
+        _ => panic!("expected third suspension"),
+    };
+
+    let flights = Value::Array(vec![Value::Object(
+        vec![
+            ("airline".into(), Value::String("BA".into())),
+            ("price".into(), Value::Int(450)),
+        ]
+        .into_iter()
+        .collect(),
+    )]);
+    let final_state = snap3.resume(flights).unwrap();
+
+    match final_state {
+        VmState::Complete(v) => {
+            // Should have all fields
+            if let Value::Object(map) = &v {
+                assert!(map.contains_key("tokyo".into()));
+                assert!(map.contains_key("paris".into()));
+                assert!(map.contains_key("flights".into()));
+            } else {
+                panic!("expected object result, got {:?}", v);
+            }
+        }
+        _ => panic!("expected completion"),
+    }
+}

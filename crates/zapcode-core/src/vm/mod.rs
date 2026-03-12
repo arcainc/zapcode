@@ -806,7 +806,14 @@ impl Vm {
             Instruction::LoadGlobal(name) => {
                 let val = self.globals.get(&name).cloned().unwrap_or(Value::Undefined);
                 self.last_global_name = Some(name.clone());
-                self.last_load_source = Some(ReceiverSource::Global(name));
+                // Only track receiver source for user-defined globals — builtins
+                // (console, Math, JSON, etc.) contain non-serializable BuiltinMethod
+                // values that would break snapshot serialization if written back.
+                if Self::BUILTIN_GLOBAL_NAMES.contains(&name.as_str()) {
+                    self.last_load_source = None;
+                } else {
+                    self.last_load_source = Some(ReceiverSource::Global(name));
+                }
                 self.push(val)?;
             }
             Instruction::StoreGlobal(name) => {
