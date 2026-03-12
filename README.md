@@ -66,6 +66,10 @@ All benchmarks run the full pipeline: parse → compile → execute. No caching,
 | Array creation | **2.4 µs** | — | — |
 | Object creation | **5.2 µs** | — | — |
 | Function call | **4.6 µs** | — | — |
+| Promise.resolve + await | **3.1 µs** | — | — |
+| Promise.then (single) | **5.6 µs** | — | — |
+| Promise.then chain (×3) | **9.9 µs** | — | — |
+| Promise.all (3 promises) | **7.4 µs** | — | — |
 | Loop (100 iterations) | **77.8 µs** | — | — |
 | Fibonacci (n=10, 177 calls) | **138.4 µs** | — | — |
 | Snapshot size (typical agent) | **< 2 KB** | N/A | N/A |

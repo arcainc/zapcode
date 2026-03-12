@@ -49,3 +49,29 @@ fn string_concat() -> zapcode_core::Value {
 fn template_literal() -> zapcode_core::Value {
     eval_ts("const name = \"world\"; `hello ${name}`").unwrap()
 }
+
+#[divan::bench]
+fn promise_resolve_await() -> zapcode_core::Value {
+    eval_ts("await Promise.resolve(42)").unwrap()
+}
+
+#[divan::bench]
+fn promise_then_single() -> zapcode_core::Value {
+    eval_ts("await Promise.resolve(10).then(x => x * 2)").unwrap()
+}
+
+#[divan::bench]
+fn promise_then_chain_3() -> zapcode_core::Value {
+    eval_ts("await Promise.resolve(1).then(x => x + 1).then(x => x * 2).then(x => x + 10)").unwrap()
+}
+
+#[divan::bench]
+fn promise_catch_resolved() -> zapcode_core::Value {
+    eval_ts("await Promise.resolve(42).catch(e => 0)").unwrap()
+}
+
+#[divan::bench]
+fn promise_all_3() -> zapcode_core::Value {
+    eval_ts("await Promise.all([Promise.resolve(1), Promise.resolve(2), Promise.resolve(3)])")
+        .unwrap()
+}
