@@ -9,22 +9,136 @@ use oxc_span::SourceType;
 use crate::error::{Result, ZapcodeError};
 
 pub fn parse(source: &str) -> Result<Program> {
+    // Auto-wrap trailing object literals: `{ key: value }` → `({ key: value })`
+    // This avoids the JS ambiguity where `{` at statement start is a block.
+    let source = wrap_trailing_object(source);
+
     let allocator = Allocator::default();
     let source_type = SourceType::tsx();
-    let ret = Parser::new(&allocator, source, source_type).parse();
+    let ret = Parser::new(&allocator, &source, source_type).parse();
 
     if !ret.errors.is_empty() {
         let msgs: Vec<String> = ret.errors.iter().map(|e| e.to_string()).collect();
         return Err(ZapcodeError::ParseError(msgs.join("\n")));
     }
 
-    let mut lowerer = AstLowerer::new(source);
+    let mut lowerer = AstLowerer::new(&source);
     lowerer.lower_program(&ret.program)?;
 
     Ok(Program {
         body: lowerer.body,
         functions: lowerer.functions,
     })
+}
+
+/// If the source ends with a `{ ... }` block that looks like an object literal
+/// (contains `key: value` or `key,` patterns), wrap it in `(...)` so oxc
+/// parses it as an expression instead of a block statement.
+fn wrap_trailing_object(source: &str) -> String {
+    let trimmed = source.trim_end();
+
+    // Must end with `}`
+    if !trimmed.ends_with('}') {
+        return source.to_string();
+    }
+
+    // Find the matching `{`
+    //
+    // Limitation: this brace scanner is a simple depth-counting heuristic that
+    // does not account for braces inside string literals, comments, or template
+    // literals. This is acceptable for preprocessing because:
+    //   1. The input is AI-generated tool output (simple expressions), not
+    //      arbitrary user code likely to contain embedded brace characters.
+    //   2. This is only a heuristic for trailing-object extraction — if the
+    //      heuristic produces malformed output, oxc will catch the parse error
+    //      downstream, so correctness is never silently lost.
+    //
+    // TODO: revisit this heuristic if real-world failures are reported (e.g.
+    // strings containing unbalanced braces causing incorrect extraction).
+    let mut depth = 0;
+    let mut open_pos = None;
+    for (i, ch) in trimmed.char_indices().rev() {
+        match ch {
+            '}' => depth += 1,
+            '{' => {
+                depth -= 1;
+                if depth == 0 {
+                    open_pos = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let open_pos = match open_pos {
+        Some(pos) => pos,
+        None => return source.to_string(),
+    };
+
+    // The `{` must be at the start of a statement (preceded by newline, semicolon, or start)
+    let before = trimmed[..open_pos].trim_end();
+    if !before.is_empty() {
+        let last_char = before.chars().last().unwrap();
+        // If preceded by =, (, return, =>, etc. — it's already in expression context
+        if matches!(last_char, '=' | '(' | ',' | ':' | '>' | '[') {
+            return source.to_string();
+        }
+        // If preceded by a keyword that takes a block, don't wrap
+        let last_word = before
+            .rsplit(|c: char| !c.is_alphanumeric() && c != '_')
+            .next()
+            .unwrap_or("");
+        if matches!(
+            last_word,
+            "if" | "else"
+                | "for"
+                | "while"
+                | "do"
+                | "try"
+                | "catch"
+                | "finally"
+                | "class"
+                | "function"
+                | "switch"
+        ) {
+            return source.to_string();
+        }
+    }
+
+    // Check the content between braces looks like object literal syntax
+    let inner = &trimmed[open_pos + 1..trimmed.len() - 1].trim();
+    if inner.is_empty() {
+        return source.to_string();
+    }
+
+    // Heuristic: contains `identifier:` pattern (key-value) or commas between identifiers
+    let looks_like_object = inner.contains(':') || {
+        // Check for shorthand properties: `{ a, b }` pattern
+        inner.split(',').all(|part| {
+            let p = part.trim();
+            !p.is_empty()
+                && p.chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == ' ')
+        })
+    };
+
+    if !looks_like_object {
+        return source.to_string();
+    }
+
+    // Wrap in parentheses with a semicolon to prevent it being parsed
+    // as a function call on the preceding expression (e.g. `1({a})`)
+    let close_pos = source.rfind('}').unwrap();
+    let mut result = String::with_capacity(source.len() + 3);
+    result.push_str(&source[..open_pos]);
+    result.push_str(";(");
+    result.push_str(&source[open_pos..=close_pos]);
+    result.push(')');
+    if close_pos + 1 < source.len() {
+        result.push_str(&source[close_pos + 1..]);
+    }
+    result
 }
 
 struct AstLowerer<'a> {
@@ -160,10 +274,27 @@ impl<'a> AstLowerer<'a> {
                     s.span.start, s.span.end
                 )))
             }
-            _ => Err(ZapcodeError::UnsupportedSyntax {
-                span: "unknown".to_string(),
-                description: "unsupported statement type".to_string(),
-            }),
+            ast::Statement::DebuggerStatement(s) => {
+                Err(self.unsupported(s.span, "unsupported statement type"))
+            }
+            ast::Statement::WithStatement(s) => {
+                Err(self.unsupported(s.span, "unsupported statement type"))
+            }
+            ast::Statement::TSModuleDeclaration(s) => {
+                Err(self.unsupported(s.span, "unsupported statement type"))
+            }
+            ast::Statement::TSGlobalDeclaration(s) => {
+                Err(self.unsupported(s.span, "unsupported statement type"))
+            }
+            ast::Statement::TSImportEqualsDeclaration(s) => {
+                Err(self.unsupported(s.span, "unsupported statement type"))
+            }
+            ast::Statement::TSExportAssignment(s) => {
+                Err(self.unsupported(s.span, "unsupported statement type"))
+            }
+            ast::Statement::TSNamespaceExportDeclaration(s) => {
+                Err(self.unsupported(s.span, "unsupported statement type"))
+            }
         }
     }
 

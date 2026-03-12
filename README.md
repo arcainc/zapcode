@@ -249,6 +249,10 @@ See [`examples/wasm/index.html`](examples/wasm/index.html) for a full playground
 
 ### Vercel AI SDK (@unchartedfr/zapcode-ai)
 
+```bash
+npm install @unchartedfr/zapcode-ai ai @ai-sdk/anthropic  # or @ai-sdk/amazon-bedrock, @ai-sdk/openai
+```
+
 The recommended way — one call gives you `{ system, tools }` that plug directly into `generateText` / `streamText`:
 
 ```typescript
