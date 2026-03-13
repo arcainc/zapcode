@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.5.0](https://github.com/TheUncharted/zapcode/compare/v1.4.0...v1.5.0) (2026-03-13)
+
+
+### Features
+
+* add event loop for async array callbacks (Promise.all, .map, .forEach) ([17ae149](https://github.com/TheUncharted/zapcode/commit/17ae1498ca9b1e290283dd78142fca15dda66f12))
+* add event loop for async array callbacks (Promise.all, .map, .forEach) ([5e756a0](https://github.com/TheUncharted/zapcode/commit/5e756a09c2bfe64f9bb6e89ccb69cebf055e7ab0))
+
 ## [1.4.0](https://github.com/TheUncharted/zapcode/compare/v1.3.0...v1.4.0) (2026-03-12)
 
 

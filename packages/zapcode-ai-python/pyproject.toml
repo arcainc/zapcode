@@ -1,6 +1,6 @@
 [project]
 name = "zapcode-ai"
-version = "1.4.0" # x-release-please-version
+version = "1.5.0" # x-release-please-version
 description = "AI SDK integration for Zapcode — let LLMs write and execute TypeScript safely"
 readme = "README.md"
 requires-python = ">=3.10"
