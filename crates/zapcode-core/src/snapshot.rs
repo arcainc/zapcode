@@ -6,7 +6,7 @@ use crate::compiler::CompiledProgram;
 use crate::error::{Result, ZapcodeError};
 use crate::sandbox::ResourceLimits;
 use crate::value::Value;
-use crate::vm::{CallFrame, TryInfo, Vm, VmState};
+use crate::vm::{CallFrame, Continuation, TryInfo, Vm, VmState};
 
 /// Internal serializable representation of VM state at a suspension point.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,6 +17,7 @@ struct VmSnapshot {
     /// User-defined globals only — builtins are re-registered on resume.
     globals: Vec<(String, Value)>,
     try_stack: Vec<TryInfo>,
+    continuations: Vec<Continuation>,
     stdout: String,
     limits: ResourceLimits,
     external_functions: Vec<String>,
@@ -47,6 +48,7 @@ impl ZapcodeSnapshot {
             frames: vm.frames.clone(),
             globals: user_globals,
             try_stack: vm.try_stack.clone(),
+            continuations: vm.continuations.clone(),
             stdout: vm.stdout.clone(),
             limits: vm.limits.clone(),
             external_functions: vm.external_functions.iter().cloned().collect(),
@@ -85,6 +87,7 @@ impl ZapcodeSnapshot {
             vm_snap.frames,
             user_globals,
             vm_snap.try_stack,
+            vm_snap.continuations,
             vm_snap.stdout,
             vm_snap.limits,
             ext_set,

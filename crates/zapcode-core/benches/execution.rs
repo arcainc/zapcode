@@ -75,3 +75,17 @@ fn promise_all_3() -> zapcode_core::Value {
     eval_ts("await Promise.all([Promise.resolve(1), Promise.resolve(2), Promise.resolve(3)])")
         .unwrap()
 }
+
+#[divan::bench]
+fn async_map_3() -> zapcode_core::Value {
+    eval_ts(
+        r#"
+        const items = [1, 2, 3];
+        items.map(async (x) => {
+            const doubled = await Promise.resolve(x * 2);
+            return doubled;
+        })
+    "#,
+    )
+    .unwrap()
+}

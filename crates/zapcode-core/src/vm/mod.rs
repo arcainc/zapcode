@@ -48,6 +48,34 @@ pub(crate) struct CallFrame {
     pub(crate) receiver_source: Option<ReceiverSource>,
 }
 
+/// A continuation for array callback methods that may suspend (e.g., `.map()` with async callbacks).
+/// Instead of running callbacks in a Rust for-loop (which can't be suspended), the continuation
+/// tracks progress so the main `execute()` loop can drive iteration one callback at a time.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) enum Continuation {
+    /// Collecting `.map()` results element-by-element.
+    ArrayMap {
+        callback: Value,
+        source: Vec<Value>,
+        results: Vec<Value>,
+        next_index: usize,
+        /// Frame depth of the caller — the continuation fires when
+        /// we return to this depth AND the callback's frame has been popped.
+        caller_frame_depth: usize,
+        /// The frame index of the currently-executing callback. Only when
+        /// this specific frame is popped does the continuation advance.
+        callback_frame_index: usize,
+    },
+    /// Collecting `.forEach()` calls element-by-element.
+    ArrayForEach {
+        callback: Value,
+        source: Vec<Value>,
+        next_index: usize,
+        caller_frame_depth: usize,
+        callback_frame_index: usize,
+    },
+}
+
 /// The Zapcode VM.
 pub struct Vm {
     pub(crate) program: CompiledProgram,
@@ -59,6 +87,8 @@ pub struct Vm {
     pub(crate) tracker: ResourceTracker,
     pub(crate) external_functions: HashSet<String>,
     pub(crate) try_stack: Vec<TryInfo>,
+    /// Active continuations for array callback methods that may suspend.
+    pub(crate) continuations: Vec<Continuation>,
     /// The last object a property was accessed on — used for method dispatch.
     last_receiver: Option<Value>,
     /// Where the last receiver came from — used to write back `this` mutations.
@@ -99,6 +129,7 @@ impl Vm {
             tracker: ResourceTracker::default(),
             external_functions,
             try_stack: Vec::new(),
+            continuations: Vec::new(),
             last_receiver: None,
             last_receiver_source: None,
             last_global_name: None,
@@ -121,6 +152,7 @@ impl Vm {
         frames: Vec<CallFrame>,
         user_globals: HashMap<String, Value>,
         try_stack: Vec<TryInfo>,
+        continuations: Vec<Continuation>,
         stdout: String,
         limits: ResourceLimits,
         external_functions: HashSet<String>,
@@ -143,6 +175,7 @@ impl Vm {
             tracker: ResourceTracker::default(),
             external_functions,
             try_stack,
+            continuations,
             last_receiver: None,
             last_receiver_source: None,
             last_global_name: None,
@@ -310,6 +343,8 @@ impl Vm {
                     } else {
                         self.push(Value::Undefined)?;
                     }
+                    // Check if a continuation callback just completed
+                    self.process_continuation()?;
                     continue;
                 }
             }
@@ -319,7 +354,13 @@ impl Vm {
 
             match result {
                 Ok(Some(state)) => return Ok(state),
-                Ok(None) => {}
+                Ok(None) => {
+                    // After dispatch, check if a continuation callback returned
+                    // (via Return instruction or ip overflow)
+                    if self.process_continuation()? {
+                        continue;
+                    }
+                }
                 Err(err) => {
                     // Try to catch the error
                     if let Some(try_info) = self.try_stack.pop() {
@@ -339,6 +380,132 @@ impl Vm {
                     } else {
                         return Err(err);
                     }
+                }
+            }
+        }
+    }
+
+    /// Process the top continuation if the current frame depth indicates a callback
+    /// has returned. Returns `true` if a continuation was processed (caller should
+    /// `continue` the execute loop).
+    fn process_continuation(&mut self) -> Result<bool> {
+        let cont = match self.continuations.last() {
+            Some(c) => c,
+            None => return Ok(false),
+        };
+
+        // Check if the callback's specific frame has been popped — only then
+        // has the callback returned. This avoids false triggers when inner
+        // helper functions return to the same depth.
+        let callback_frame_index = match cont {
+            Continuation::ArrayMap {
+                callback_frame_index,
+                ..
+            } => *callback_frame_index,
+            Continuation::ArrayForEach {
+                callback_frame_index,
+                ..
+            } => *callback_frame_index,
+        };
+
+        // The callback frame is still active — not done yet
+        if self.frames.len() > callback_frame_index {
+            return Ok(false);
+        }
+
+        // The callback just returned — collect its result from the stack
+        let callback_result = self.pop().unwrap_or(Value::Undefined);
+
+        // Unwrap promise values: async callbacks return {status: "resolved", value: X}
+        // or {status: "rejected", reason: X}
+        let callback_result = if let Value::Object(ref map) = callback_result {
+            match map.get("status") {
+                Some(Value::String(s)) if s.as_ref() == "resolved" => {
+                    map.get("value").cloned().unwrap_or(Value::Undefined)
+                }
+                Some(Value::String(s)) if s.as_ref() == "rejected" => {
+                    let reason = map.get("reason").cloned().unwrap_or(Value::Undefined);
+                    // Clean up the continuation before returning error
+                    self.continuations.pop();
+                    return Err(ZapcodeError::RuntimeError(format!(
+                        "Unhandled promise rejection: {}",
+                        reason.to_js_string()
+                    )));
+                }
+                _ => callback_result,
+            }
+        } else {
+            callback_result
+        };
+
+        // Pop the continuation, take ownership to avoid cloning results
+        let cont = self.continuations.pop().unwrap();
+
+        match cont {
+            Continuation::ArrayMap {
+                callback,
+                source,
+                mut results,
+                next_index,
+                caller_frame_depth,
+                ..
+            } => {
+                results.push(callback_result);
+                let next = next_index + 1;
+
+                if next < source.len() {
+                    // Set up next callback call
+                    let item = source[next].clone();
+                    let closure = match &callback {
+                        Value::Function(c) => c.clone(),
+                        _ => unreachable!("callback validated at start"),
+                    };
+                    self.push_call_frame(&closure, &[item, Value::Int(next as i64)], None)?;
+                    let new_frame_index = self.frames.len() - 1;
+                    // Push updated continuation back
+                    self.continuations.push(Continuation::ArrayMap {
+                        callback,
+                        source,
+                        results,
+                        next_index: next,
+                        caller_frame_depth,
+                        callback_frame_index: new_frame_index,
+                    });
+                    Ok(true)
+                } else {
+                    // All done — push final array, no clone needed
+                    self.push(Value::Array(results))?;
+                    Ok(true)
+                }
+            }
+            Continuation::ArrayForEach {
+                callback,
+                source,
+                next_index,
+                caller_frame_depth,
+                ..
+            } => {
+                let next = next_index + 1;
+
+                if next < source.len() {
+                    let item = source[next].clone();
+                    let closure = match &callback {
+                        Value::Function(c) => c.clone(),
+                        _ => unreachable!("callback validated at start"),
+                    };
+                    self.push_call_frame(&closure, &[item, Value::Int(next as i64)], None)?;
+                    let new_frame_index = self.frames.len() - 1;
+                    self.continuations.push(Continuation::ArrayForEach {
+                        callback,
+                        source,
+                        next_index: next,
+                        caller_frame_depth,
+                        callback_frame_index: new_frame_index,
+                    });
+                    Ok(true)
+                } else {
+                    self.push(Value::Undefined)?;
+                    Ok(true)
                 }
             }
         }
@@ -438,126 +605,233 @@ impl Vm {
         self.call_function_internal(callback, vec![item.clone(), Value::Int(index as i64)])
     }
 
+    /// Check if a callback value is an async function that might suspend.
+    fn is_async_callback(&self, callback: &Value) -> bool {
+        if let Value::Function(closure) = callback {
+            if let Some(func) = self.program.functions.get(closure.func_id.0) {
+                return func.is_async;
+            }
+        }
+        false
+    }
+
+    /// Start a continuation-based `.map()` call: push the continuation and set up
+    /// the first callback invocation. Returns `None` to signal that the main
+    /// `execute()` loop should drive the iteration.
+    fn start_continuation_map(
+        &mut self,
+        callback: Value,
+        arr: Vec<Value>,
+    ) -> Result<Option<Value>> {
+        if arr.is_empty() {
+            return Ok(Some(Value::Array(Vec::new())));
+        }
+
+        // Validate callback type BEFORE pushing continuation
+        let closure = match &callback {
+            Value::Function(c) => c.clone(),
+            _ => {
+                return Err(ZapcodeError::TypeError(
+                    "map callback is not a function".to_string(),
+                ))
+            }
+        };
+
+        let caller_frame_depth = self.frames.len();
+        let first_item = arr[0].clone();
+
+        self.push_call_frame(&closure, &[first_item, Value::Int(0)], None)?;
+        let callback_frame_index = self.frames.len() - 1;
+
+        self.continuations.push(Continuation::ArrayMap {
+            callback,
+            source: arr,
+            results: Vec::new(),
+            next_index: 0,
+            caller_frame_depth,
+            callback_frame_index,
+        });
+
+        Ok(None) // Signal: continuation in progress
+    }
+
+    /// Start a continuation-based `.forEach()` call.
+    fn start_continuation_foreach(
+        &mut self,
+        callback: Value,
+        arr: Vec<Value>,
+    ) -> Result<Option<Value>> {
+        if arr.is_empty() {
+            return Ok(Some(Value::Undefined));
+        }
+
+        // Validate callback type BEFORE pushing continuation
+        let closure = match &callback {
+            Value::Function(c) => c.clone(),
+            _ => {
+                return Err(ZapcodeError::TypeError(
+                    "forEach callback is not a function".to_string(),
+                ))
+            }
+        };
+
+        let caller_frame_depth = self.frames.len();
+        let first_item = arr[0].clone();
+
+        self.push_call_frame(&closure, &[first_item, Value::Int(0)], None)?;
+        let callback_frame_index = self.frames.len() - 1;
+
+        self.continuations.push(Continuation::ArrayForEach {
+            callback,
+            source: arr,
+            next_index: 0,
+            caller_frame_depth,
+            callback_frame_index,
+        });
+
+        Ok(None)
+    }
+
     /// Execute an array callback method (map, filter, reduce, forEach, etc.)
+    /// Returns `Ok(Some(value))` if the method completed synchronously, or
+    /// `Ok(None)` if a continuation was started (async callback).
     fn execute_array_callback_method(
         &mut self,
         arr: Vec<Value>,
         method: &str,
         all_args: Vec<Value>,
-    ) -> Result<Value> {
+    ) -> Result<Option<Value>> {
         let callback = all_args.first().cloned().unwrap_or(Value::Undefined);
 
         match method {
             "map" => {
+                // Use continuation-based execution for async callbacks
+                if self.is_async_callback(&callback) {
+                    return self.start_continuation_map(callback, arr);
+                }
                 let mut result = Vec::with_capacity(arr.len());
                 for (i, item) in arr.iter().enumerate() {
                     result.push(self.call_element_callback(&callback, item, i)?);
                 }
-                Ok(Value::Array(result))
+                Ok(Some(Value::Array(result)))
             }
-            "filter" => {
-                let mut result = Vec::new();
-                for (i, item) in arr.iter().enumerate() {
-                    if self.call_element_callback(&callback, item, i)?.is_truthy() {
-                        result.push(item.clone());
-                    }
+            "filter" | "find" | "findIndex" | "every" | "some" | "reduce" | "sort" | "flatMap" => {
+                // Async callbacks are not supported for these methods
+                if self.is_async_callback(&callback) {
+                    return Err(ZapcodeError::RuntimeError(format!(
+                        ".{}() does not support async callbacks — use .map() or a for-of loop instead",
+                        method
+                    )));
                 }
-                Ok(Value::Array(result))
+                match method {
+                    "filter" => {
+                        let mut result = Vec::new();
+                        for (i, item) in arr.iter().enumerate() {
+                            if self.call_element_callback(&callback, item, i)?.is_truthy() {
+                                result.push(item.clone());
+                            }
+                        }
+                        Ok(Some(Value::Array(result)))
+                    }
+                    "find" => {
+                        for (i, item) in arr.iter().enumerate() {
+                            if self.call_element_callback(&callback, item, i)?.is_truthy() {
+                                return Ok(Some(item.clone()));
+                            }
+                        }
+                        Ok(Some(Value::Undefined))
+                    }
+                    "findIndex" => {
+                        for (i, item) in arr.iter().enumerate() {
+                            if self.call_element_callback(&callback, item, i)?.is_truthy() {
+                                return Ok(Some(Value::Int(i as i64)));
+                            }
+                        }
+                        Ok(Some(Value::Int(-1)))
+                    }
+                    "every" => {
+                        for (i, item) in arr.iter().enumerate() {
+                            if !self.call_element_callback(&callback, item, i)?.is_truthy() {
+                                return Ok(Some(Value::Bool(false)));
+                            }
+                        }
+                        Ok(Some(Value::Bool(true)))
+                    }
+                    "some" => {
+                        for (i, item) in arr.iter().enumerate() {
+                            if self.call_element_callback(&callback, item, i)?.is_truthy() {
+                                return Ok(Some(Value::Bool(true)));
+                            }
+                        }
+                        Ok(Some(Value::Bool(false)))
+                    }
+                    "reduce" => {
+                        let mut acc = match all_args.get(1).cloned() {
+                            Some(init) => Some(init),
+                            None if !arr.is_empty() => Some(arr[0].clone()),
+                            None => {
+                                return Err(ZapcodeError::TypeError(
+                                    "Reduce of empty array with no initial value".to_string(),
+                                ));
+                            }
+                        };
+                        let start = if all_args.get(1).is_some() { 0 } else { 1 };
+                        for (i, item) in arr.iter().enumerate().skip(start) {
+                            acc = Some(self.call_function_internal(
+                                &callback,
+                                vec![acc.unwrap(), item.clone(), Value::Int(i as i64)],
+                            )?);
+                        }
+                        Ok(Some(acc.unwrap_or(Value::Undefined)))
+                    }
+                    "sort" => {
+                        let mut result = arr;
+                        if matches!(callback, Value::Function(_)) {
+                            let len = result.len();
+                            for i in 1..len {
+                                let mut j = i;
+                                while j > 0 {
+                                    let cmp = self
+                                        .call_function_internal(
+                                            &callback,
+                                            vec![result[j - 1].clone(), result[j].clone()],
+                                        )?
+                                        .to_number();
+                                    if cmp > 0.0 {
+                                        result.swap(j - 1, j);
+                                        j -= 1;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                        } else {
+                            result.sort_by_key(|a| a.to_js_string());
+                        }
+                        Ok(Some(Value::Array(result)))
+                    }
+                    "flatMap" => {
+                        let mut result = Vec::new();
+                        for (i, item) in arr.iter().enumerate() {
+                            match self.call_element_callback(&callback, item, i)? {
+                                Value::Array(inner) => result.extend(inner),
+                                other => result.push(other),
+                            }
+                        }
+                        Ok(Some(Value::Array(result)))
+                    }
+                    _ => unreachable!(),
+                }
             }
             "forEach" => {
+                // Use continuation-based execution for async callbacks
+                if self.is_async_callback(&callback) {
+                    return self.start_continuation_foreach(callback, arr);
+                }
                 for (i, item) in arr.iter().enumerate() {
                     self.call_element_callback(&callback, item, i)?;
                 }
-                Ok(Value::Undefined)
-            }
-            "find" => {
-                for (i, item) in arr.iter().enumerate() {
-                    if self.call_element_callback(&callback, item, i)?.is_truthy() {
-                        return Ok(item.clone());
-                    }
-                }
-                Ok(Value::Undefined)
-            }
-            "findIndex" => {
-                for (i, item) in arr.iter().enumerate() {
-                    if self.call_element_callback(&callback, item, i)?.is_truthy() {
-                        return Ok(Value::Int(i as i64));
-                    }
-                }
-                Ok(Value::Int(-1))
-            }
-            "every" => {
-                for (i, item) in arr.iter().enumerate() {
-                    if !self.call_element_callback(&callback, item, i)?.is_truthy() {
-                        return Ok(Value::Bool(false));
-                    }
-                }
-                Ok(Value::Bool(true))
-            }
-            "some" => {
-                for (i, item) in arr.iter().enumerate() {
-                    if self.call_element_callback(&callback, item, i)?.is_truthy() {
-                        return Ok(Value::Bool(true));
-                    }
-                }
-                Ok(Value::Bool(false))
-            }
-            "reduce" => {
-                let mut acc = match all_args.get(1).cloned() {
-                    Some(init) => Some(init),
-                    None if !arr.is_empty() => Some(arr[0].clone()),
-                    None => {
-                        return Err(ZapcodeError::TypeError(
-                            "Reduce of empty array with no initial value".to_string(),
-                        ));
-                    }
-                };
-                let start = if all_args.get(1).is_some() { 0 } else { 1 };
-                for (i, item) in arr.iter().enumerate().skip(start) {
-                    acc = Some(self.call_function_internal(
-                        &callback,
-                        vec![acc.unwrap(), item.clone(), Value::Int(i as i64)],
-                    )?);
-                }
-                Ok(acc.unwrap_or(Value::Undefined))
-            }
-            "sort" => {
-                let mut result = arr;
-                if matches!(callback, Value::Function(_)) {
-                    // Insertion sort — O(n²) worst case but stable, and sort
-                    // with a VM callback can't use Rust's built-in sort
-                    let len = result.len();
-                    for i in 1..len {
-                        let mut j = i;
-                        while j > 0 {
-                            let cmp = self
-                                .call_function_internal(
-                                    &callback,
-                                    vec![result[j - 1].clone(), result[j].clone()],
-                                )?
-                                .to_number();
-                            if cmp > 0.0 {
-                                result.swap(j - 1, j);
-                                j -= 1;
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                } else {
-                    result.sort_by_key(|a| a.to_js_string());
-                }
-                Ok(Value::Array(result))
-            }
-            "flatMap" => {
-                let mut result = Vec::new();
-                for (i, item) in arr.iter().enumerate() {
-                    match self.call_element_callback(&callback, item, i)? {
-                        Value::Array(inner) => result.extend(inner),
-                        other => result.push(other),
-                    }
-                }
-                Ok(Value::Array(result))
+                Ok(Some(Value::Undefined))
             }
             _ => Err(ZapcodeError::TypeError(format!(
                 "Unknown array callback method: {}",
@@ -1338,12 +1612,19 @@ impl Vm {
                                     match method_name.as_ref() {
                                         "map" | "filter" | "forEach" | "find" | "findIndex"
                                         | "every" | "some" | "reduce" | "sort" | "flatMap" => {
-                                            let result = self.execute_array_callback_method(
+                                            match self.execute_array_callback_method(
                                                 arr.clone(),
                                                 &method_name,
                                                 args,
-                                            )?;
-                                            Some(result)
+                                            )? {
+                                                Some(val) => Some(val),
+                                                None => {
+                                                    // Continuation started — the main execute()
+                                                    // loop will drive the callbacks. Don't push
+                                                    // a result; just return Ok(None).
+                                                    return Ok(None);
+                                                }
+                                            }
                                         }
                                         _ => builtins::call_builtin(
                                             &Value::Array(arr.clone()),

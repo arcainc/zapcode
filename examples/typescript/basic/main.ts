@@ -95,3 +95,34 @@ const classExample = new Zapcode(`
     [c.increment(), c.increment(), c.increment()]
 `);
 console.log(classExample.run().output); // [11, 12, 13]
+
+// --- 7. Async map with multiple external calls ---
+// arr.map(async fn => await external()) now works —
+// each external call suspends/resumes sequentially.
+const asyncMapExample = new Zapcode(
+  `
+    const cities = ["London", "Tokyo", "Paris"];
+    const results = cities.map(async (city) => {
+        const weather = await getWeather(city);
+        return weather;
+    });
+    results
+  `,
+  { externalFunctions: ["getWeather"] }
+);
+
+const mockWeatherData: Record<string, unknown> = {
+  London: { condition: "Rainy", temp: 12 },
+  Tokyo: { condition: "Clear", temp: 26 },
+  Paris: { condition: "Sunny", temp: 22 },
+};
+
+let mapState = asyncMapExample.start();
+while (!mapState.completed) {
+  const city = mapState.args![0] as string;
+  console.log(`  -> getWeather(${city})`);
+  const snap = ZapcodeSnapshotHandle.load(mapState.snapshot!);
+  mapState = snap.resume(mockWeatherData[city]);
+}
+console.log("Async map result:", mapState.output);
+// [{condition: "Rainy", temp: 12}, {condition: "Clear", temp: 26}, ...]

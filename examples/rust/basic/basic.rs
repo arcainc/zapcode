@@ -109,5 +109,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // --- 5. Async map with multiple external calls ---
+    // arr.map(async fn => await external()) now works —
+    // each external call suspends/resumes sequentially.
+    let runner = ZapcodeRun::new(
+        r#"
+            const cities = ["London", "Tokyo", "Paris"];
+            const results = cities.map(async (city) => {
+                const weather = await getWeather(city);
+                return weather;
+            });
+            results
+        "#
+        .to_string(),
+        vec![],
+        vec!["getWeather".to_string()],
+        ResourceLimits::default(),
+    )?;
+
+    let mut state = runner.start(vec![])?;
+
+    // The VM suspends once per city — resolve each one
+    let mock_data = vec![
+        ("London", "Rainy, 12°C"),
+        ("Tokyo", "Clear, 26°C"),
+        ("Paris", "Sunny, 22°C"),
+    ];
+
+    for (expected_city, weather) in &mock_data {
+        match state {
+            VmState::Suspended {
+                function_name,
+                args,
+                snapshot,
+            } => {
+                println!(
+                    "  -> {}({}) = {}",
+                    function_name,
+                    args[0].to_js_string(),
+                    weather
+                );
+                assert_eq!(function_name, "getWeather");
+                assert_eq!(args[0].to_js_string(), *expected_city);
+                state = snapshot.resume(Value::String((*weather).into()))?;
+            }
+            VmState::Complete(_) => panic!("expected suspension for {}", expected_city),
+        }
+    }
+
+    match state {
+        VmState::Complete(value) => {
+            println!("Async map result: {:?}", value);
+            // Array(["Rainy, 12°C", "Clear, 26°C", "Sunny, 22°C"])
+        }
+        _ => println!("Unexpected suspension after all cities resolved"),
+    }
+
     Ok(())
 }

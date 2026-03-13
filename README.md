@@ -70,6 +70,7 @@ All benchmarks run the full pipeline: parse → compile → execute. No caching,
 | Promise.then (single) | **5.6 µs** | — | — |
 | Promise.then chain (×3) | **9.9 µs** | — | — |
 | Promise.all (3 promises) | **7.4 µs** | — | — |
+| Async `.map()` (3 elements) | **11.6 µs** | — | — |
 | Loop (100 iterations) | **77.8 µs** | — | — |
 | Fibonacci (n=10, 177 calls) | **138.4 µs** | — | — |
 | Snapshot size (typical agent) | **< 2 KB** | N/A | N/A |
@@ -519,12 +520,13 @@ For detailed logging of generated code, tool calls, and output, see the debug-tr
 - Call from Rust, Node.js, Python, or WebAssembly
 - Track and limit resources — memory, allocations, stack depth, and wall-clock time
 - 30+ string methods, 25+ array methods, plus Math, JSON, Object, and Promise builtins
+- Async callbacks in `.map()` and `.forEach()` — each `await` suspends and resumes the VM sequentially
 
 **Cannot do:**
 
 - Run arbitrary npm packages or the full Node.js standard library
 - Execute regular expressions (parsing supported, execution is a no-op)
-- Provide full `Promise` semantics (`.then()` chains, `Promise.race`, etc.)
+- Provide full `Promise` semantics (`Promise.race`, etc.) — `.then()`, `.catch()`, `.finally()`, and `Promise.all` are supported
 - Run code that requires `this` in non-class contexts
 
 These are intentional constraints, not bugs. Zapcode targets one use case: **running code written by AI agents** inside a secure, embeddable sandbox.
@@ -549,6 +551,7 @@ These are intentional constraints, not bugs. Zapcode targets one use case: **run
 | Type annotations, interfaces, type aliases | Stripped at parse time |
 | String methods (30+) | Supported |
 | Array methods (25+, including `map`, `filter`, `reduce`) | Supported |
+| Async callbacks in `.map()`, `.forEach()` | Supported |
 | Math, JSON, Object, Promise | Supported |
 | `import` / `require` / `eval` | Blocked (sandbox) |
 | Regular expressions | Parsed, not executed |

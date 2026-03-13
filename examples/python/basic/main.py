@@ -85,3 +85,35 @@ if state.get("suspended"):
     restored = ZapcodeSnapshot.load(snapshot_bytes)
     final = restored.resume("hello world")
     print(f"Restored result: {final['output']}")  # 11
+
+# --- 7. Async map with multiple external calls ---
+# arr.map(async fn => await external()) now works —
+# each external call suspends/resumes sequentially.
+b = Zapcode(
+    """
+    const cities = ["London", "Tokyo", "Paris"];
+    const results = cities.map(async (city) => {
+        const weather = await getWeather(city);
+        return weather;
+    });
+    results
+    """,
+    external_functions=["getWeather"],
+)
+
+mock_weather = {
+    "London": {"condition": "Rainy", "temp": 12},
+    "Tokyo": {"condition": "Clear", "temp": 26},
+    "Paris": {"condition": "Sunny", "temp": 22},
+}
+
+state = b.start()
+for expected_city in ["London", "Tokyo", "Paris"]:
+    assert state.get("suspended"), f"expected suspension for {expected_city}"
+    city_arg = state["args"][0]
+    print(f"  -> getWeather({city_arg})")
+    snapshot = state["snapshot"]
+    state = snapshot.resume(mock_weather[city_arg])
+
+print("Async map result:", state["output"])
+# [{'condition': 'Rainy', 'temp': 12}, {'condition': 'Clear', ...}, ...]
