@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/TheUncharted/zapcode/master/assets/logo.png" alt="Zapcode" width="160" />
 </p>
 <h1 align="center">Zapcode</h1>
-<p align="center"><strong>Run AI code. Safely. Instantly.</strong></p>
+<p align="center"><strong>Run AI-generated code. Safely. Instantly.</strong></p>
 <p align="center">A minimal, secure TypeScript interpreter written in Rust for use by AI agents</p>
 
 <p align="center">
