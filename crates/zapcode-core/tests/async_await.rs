@@ -1012,7 +1012,10 @@ fn test_callback_result_user_object_not_unwrapped() {
                     assert_eq!(map.get("status"), Some(&Value::String("resolved".into())));
                     assert_eq!(map.get("value"), Some(&Value::Int(42)));
                     // Must NOT have been unwrapped — it's still an object, not Int(42)
-                    assert!(map.get("__promise__").is_none(), "user object should not have __promise__");
+                    assert!(
+                        map.get("__promise__").is_none(),
+                        "user object should not have __promise__"
+                    );
                 }
                 other => panic!("expected object, got {:?}", other),
             }

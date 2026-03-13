@@ -431,21 +431,23 @@ impl Vm {
             if !matches!(map.get("__promise__"), Some(Value::Bool(true))) {
                 // Not an internal promise — leave untouched
                 callback_result
-            } else { match map.get("status") {
-                Some(Value::String(s)) if s.as_ref() == "resolved" => {
-                    map.get("value").cloned().unwrap_or(Value::Undefined)
+            } else {
+                match map.get("status") {
+                    Some(Value::String(s)) if s.as_ref() == "resolved" => {
+                        map.get("value").cloned().unwrap_or(Value::Undefined)
+                    }
+                    Some(Value::String(s)) if s.as_ref() == "rejected" => {
+                        let reason = map.get("reason").cloned().unwrap_or(Value::Undefined);
+                        // Clean up the continuation before returning error
+                        self.continuations.pop();
+                        return Err(ZapcodeError::RuntimeError(format!(
+                            "Unhandled promise rejection: {}",
+                            reason.to_js_string()
+                        )));
+                    }
+                    _ => callback_result,
                 }
-                Some(Value::String(s)) if s.as_ref() == "rejected" => {
-                    let reason = map.get("reason").cloned().unwrap_or(Value::Undefined);
-                    // Clean up the continuation before returning error
-                    self.continuations.pop();
-                    return Err(ZapcodeError::RuntimeError(format!(
-                        "Unhandled promise rejection: {}",
-                        reason.to_js_string()
-                    )));
-                }
-                _ => callback_result,
-            }}
+            }
         } else {
             callback_result
         };
