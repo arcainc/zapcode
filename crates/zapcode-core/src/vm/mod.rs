@@ -397,15 +397,17 @@ impl Vm {
         // Check if the callback's specific frame has been popped — only then
         // has the callback returned. This avoids false triggers when inner
         // helper functions return to the same depth.
-        let callback_frame_index = match cont {
+        let (callback_frame_index, caller_frame_depth) = match cont {
             Continuation::ArrayMap {
                 callback_frame_index,
+                caller_frame_depth,
                 ..
-            } => *callback_frame_index,
+            } => (*callback_frame_index, *caller_frame_depth),
             Continuation::ArrayForEach {
                 callback_frame_index,
+                caller_frame_depth,
                 ..
-            } => *callback_frame_index,
+            } => (*callback_frame_index, *caller_frame_depth),
         };
 
         // The callback frame is still active — not done yet
@@ -413,13 +415,23 @@ impl Vm {
             return Ok(false);
         }
 
+        // Guard against stale continuations on stack unwinds — we must be
+        // back at the original caller's frame depth.
+        if self.frames.len() != caller_frame_depth {
+            return Ok(false);
+        }
+
         // The callback just returned — collect its result from the stack
         let callback_result = self.pop().unwrap_or(Value::Undefined);
 
-        // Unwrap promise values: async callbacks return {status: "resolved", value: X}
-        // or {status: "rejected", reason: X}
+        // Unwrap internal promise values: async callbacks return
+        // {__promise__: true, status: "resolved", value: X} or {status: "rejected", ...}.
+        // Only unwrap objects with the __promise__ marker to avoid mangling user objects.
         let callback_result = if let Value::Object(ref map) = callback_result {
-            match map.get("status") {
+            if !matches!(map.get("__promise__"), Some(Value::Bool(true))) {
+                // Not an internal promise — leave untouched
+                callback_result
+            } else { match map.get("status") {
                 Some(Value::String(s)) if s.as_ref() == "resolved" => {
                     map.get("value").cloned().unwrap_or(Value::Undefined)
                 }
@@ -433,7 +445,7 @@ impl Vm {
                     )));
                 }
                 _ => callback_result,
-            }
+            }}
         } else {
             callback_result
         };

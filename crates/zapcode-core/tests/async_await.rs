@@ -863,3 +863,160 @@ fn test_array_map_async_single_element() {
         other => panic!("expected array with one element, got {:?}", other),
     }
 }
+
+#[test]
+fn test_array_for_each_async_callback_with_external() {
+    // forEach with async callback should suspend for each external call
+    // and complete with undefined (forEach's return value)
+    let code = r#"
+        const items = ["a", "b", "c"];
+        items.forEach(async (item) => {
+            await processItem(item);
+        });
+        "done"
+    "#;
+
+    let mut state = start_with_externals(code, vec!["processItem"], Vec::new());
+
+    for expected in &["a", "b", "c"] {
+        match state {
+            VmState::Suspended {
+                function_name,
+                args,
+                snapshot,
+            } => {
+                assert_eq!(function_name, "processItem");
+                assert_eq!(args[0].to_js_string(), *expected);
+                state = snapshot
+                    .resume(Value::String(format!("processed_{}", expected).into()))
+                    .unwrap();
+            }
+            VmState::Complete(_) => panic!("expected suspension for {}", expected),
+        }
+    }
+
+    match state {
+        VmState::Complete(val) => {
+            assert_eq!(val, Value::String("done".into()));
+        }
+        other => panic!("expected completion with 'done', got {:?}", other),
+    }
+}
+
+#[test]
+fn test_array_for_each_async_empty() {
+    // Empty array forEach should complete immediately
+    let code = r#"
+        const items: string[] = [];
+        items.forEach(async (item) => {
+            await processItem(item);
+        });
+        "done"
+    "#;
+
+    let state = start_with_externals(code, vec!["processItem"], Vec::new());
+    match state {
+        VmState::Complete(val) => {
+            assert_eq!(val, Value::String("done".into()));
+        }
+        VmState::Suspended { .. } => panic!("expected immediate completion for empty array"),
+    }
+}
+
+#[test]
+fn test_array_async_unsupported_methods_filter() {
+    // .filter() with async callback should return a clear error
+    let code = r#"
+        const items = [1, 2, 3];
+        items.filter(async (item) => {
+            const result = await check(item);
+            return result;
+        })
+    "#;
+
+    let runner = ZapcodeRun::new(
+        code.to_string(),
+        Vec::new(),
+        vec!["check".to_string()],
+        ResourceLimits::default(),
+    )
+    .unwrap();
+    let result = runner.start(Vec::new());
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("does not support async callbacks"),
+        "expected async guard error, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_array_async_unsupported_methods_reduce() {
+    // .reduce() with async callback should return a clear error
+    let code = r#"
+        const items = [1, 2, 3];
+        items.reduce(async (acc, item) => {
+            const result = await transform(item);
+            return acc + result;
+        }, 0)
+    "#;
+
+    let runner = ZapcodeRun::new(
+        code.to_string(),
+        Vec::new(),
+        vec!["transform".to_string()],
+        ResourceLimits::default(),
+    )
+    .unwrap();
+    let result = runner.start(Vec::new());
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("does not support async callbacks"),
+        "expected async guard error, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_callback_result_user_object_not_unwrapped() {
+    // A user object with {status: "resolved", value: ...} should NOT be
+    // unwrapped as if it were an internal promise.
+    let code = r#"
+        const items = ["x"];
+        items.map(async (item) => {
+            const data = await fetchData(item);
+            return data;
+        })
+    "#;
+
+    let state = start_with_externals(code, vec!["fetchData"], Vec::new());
+    let snap = match state {
+        VmState::Suspended { snapshot, .. } => snapshot,
+        VmState::Complete(_) => panic!("expected suspension"),
+    };
+
+    // Return a user object that looks like a promise but lacks __promise__
+    let user_obj = Value::Object(indexmap::indexmap! {
+        "status".into() => Value::String("resolved".into()),
+        "value".into() => Value::Int(42),
+    });
+    let final_state = snap.resume(user_obj).unwrap();
+    match final_state {
+        VmState::Complete(Value::Array(arr)) => {
+            assert_eq!(arr.len(), 1);
+            // The user object should be preserved as-is, not unwrapped to 42
+            match &arr[0] {
+                Value::Object(map) => {
+                    assert_eq!(map.get("status"), Some(&Value::String("resolved".into())));
+                    assert_eq!(map.get("value"), Some(&Value::Int(42)));
+                    // Must NOT have been unwrapped — it's still an object, not Int(42)
+                    assert!(map.get("__promise__").is_none(), "user object should not have __promise__");
+                }
+                other => panic!("expected object, got {:?}", other),
+            }
+        }
+        other => panic!("expected array with user object, got {:?}", other),
+    }
+}
