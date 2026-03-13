@@ -421,8 +421,10 @@ impl Vm {
             return Ok(false);
         }
 
-        // The callback just returned — collect its result from the stack
-        let callback_result = self.pop().unwrap_or(Value::Undefined);
+        // The callback just returned — collect its result from the stack.
+        // The compiler always emits PushUndefined+Return for implicit returns,
+        // so an empty stack here indicates a VM bug.
+        let callback_result = self.pop()?;
 
         // Unwrap internal promise values: async callbacks return
         // {__promise__: true, status: "resolved", value: X} or {status: "rejected", ...}.
