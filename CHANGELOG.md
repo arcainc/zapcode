@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.5.1](https://github.com/TheUncharted/zapcode/compare/v1.5.0...v1.5.1) (2026-03-21)
+
+
+### Bug Fixes
+
+* ensure for-of loops with external calls terminate correctly ([8c2f28a](https://github.com/TheUncharted/zapcode/commit/8c2f28aab6cc4e22d4c5088705bc53cb6422adde))
+* Fixed iterator state handling in for...of loops to properly update and advance through iterations ([ad287ae](https://github.com/TheUncharted/zapcode/commit/ad287ae51ee2395a9da8bef6b21b6d58d410ed99))
+
 ## [1.5.0](https://github.com/TheUncharted/zapcode/compare/v1.4.0...v1.5.0) (2026-03-13)
 
 
