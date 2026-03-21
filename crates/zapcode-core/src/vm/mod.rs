@@ -1941,8 +1941,10 @@ impl Vm {
                             self.push(new_iter)?;
                             self.push(value)?;
                         } else {
-                            // Done
-                            self.push(iter)?;
+                            // Done — increment index past the end so IteratorDone sees idx > len
+                            let new_iter =
+                                Value::Array(vec![items[0].clone(), Value::Int((idx + 1) as i64)]);
+                            self.push(new_iter)?;
                             self.push(Value::Undefined)?;
                         }
                     }

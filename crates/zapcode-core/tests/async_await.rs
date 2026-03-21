@@ -1023,3 +1023,161 @@ fn test_callback_result_user_object_not_unwrapped() {
         other => panic!("expected array with user object, got {:?}", other),
     }
 }
+
+// ── for-of loop with external function calls ─────────────────────────
+
+#[test]
+fn test_for_of_sync_counter() {
+    // Simplest for-of: just count iterations
+    let result = eval_ts(
+        r#"
+        const items = [10, 20, 30];
+        let sum = 0;
+        for (const x of items) {
+            sum = sum + x;
+        }
+        sum
+    "#,
+    )
+    .unwrap();
+    assert_eq!(result, Value::Int(60));
+}
+
+#[test]
+#[ignore = "pre-existing bug: array.push() inside for-of doesn't mutate the array (value semantics vs reference)"]
+fn test_for_of_sync_push() {
+    let result = eval_ts(
+        r#"
+        const cities = ["a", "b", "c"];
+        const results: string[] = [];
+        for (const city of cities) {
+            results.push(city);
+        }
+        results
+    "#,
+    )
+    .unwrap();
+    match result {
+        Value::Array(arr) => {
+            assert_eq!(arr.len(), 3);
+        }
+        other => panic!("expected array, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_for_of_with_external_calls_terminates() {
+    // Regression test: for-of loop must terminate after iterating all elements
+    // when the loop body contains external function calls (suspend/resume).
+    // Previously, IteratorNext didn't increment the index when the array was
+    // exhausted, so IteratorDone (idx > len) never became true — infinite loop.
+    let code = r#"
+        const cities = ["London", "Tokyo", "Paris"];
+        let count = 0;
+        let last = "";
+        for (const city of cities) {
+            const weather = await getWeather(city);
+            last = weather;
+            count = count + 1;
+        }
+        last + ":" + count
+    "#;
+
+    let mut state = start_with_externals(code, vec!["getWeather"], Vec::new());
+
+    for expected_city in &["London", "Tokyo", "Paris"] {
+        match state {
+            VmState::Suspended {
+                function_name,
+                args,
+                snapshot,
+            } => {
+                assert_eq!(function_name, "getWeather");
+                assert_eq!(args[0], Value::String((*expected_city).into()));
+                state = snapshot
+                    .resume(Value::String(format!("weather_{}", expected_city).into()))
+                    .unwrap();
+            }
+            VmState::Complete(ref v) => panic!(
+                "expected suspension for {} but got completion: {:?}",
+                expected_city, v
+            ),
+        }
+    }
+
+    // Must complete — not suspend again
+    match state {
+        VmState::Complete(val) => {
+            assert_eq!(val, Value::String("weather_Paris:3".into()));
+        }
+        VmState::Suspended {
+            function_name,
+            args,
+            ..
+        } => panic!(
+            "expected completion but got suspension: {}({:?})",
+            function_name, args
+        ),
+    }
+}
+
+#[test]
+fn test_for_of_with_multiple_externals_per_iteration() {
+    // for-of with multiple external calls per iteration
+    let code = r#"
+        const cities = ["London", "Paris"];
+        let total = 0;
+        for (const city of cities) {
+            const w = await getWeather(city);
+            const f = await getFlights(city);
+            total = total + 1;
+        }
+        total
+    "#;
+
+    let mut state = start_with_externals(code, vec!["getWeather", "getFlights"], Vec::new());
+
+    for city in &["London", "Paris"] {
+        // getWeather suspension
+        match state {
+            VmState::Suspended {
+                function_name,
+                snapshot,
+                ..
+            } => {
+                assert_eq!(function_name, "getWeather");
+                state = snapshot
+                    .resume(Value::String(format!("w_{}", city).into()))
+                    .unwrap();
+            }
+            other => panic!(
+                "expected getWeather suspension for {}, got {:?}",
+                city, other
+            ),
+        }
+        // getFlights suspension
+        match state {
+            VmState::Suspended {
+                function_name,
+                snapshot,
+                ..
+            } => {
+                assert_eq!(function_name, "getFlights");
+                state = snapshot
+                    .resume(Value::String(format!("f_{}", city).into()))
+                    .unwrap();
+            }
+            other => panic!(
+                "expected getFlights suspension for {}, got {:?}",
+                city, other
+            ),
+        }
+    }
+
+    match state {
+        VmState::Complete(val) => {
+            assert_eq!(val, Value::Int(2));
+        }
+        other => panic!("expected Int(2), got {:?}", other),
+    }
+}
