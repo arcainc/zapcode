@@ -52,6 +52,8 @@ pub struct JsTraceSpan {
 
 #[napi(object)]
 pub struct ZapcodeResult {
+    /// Discriminant for agent-friendly result handling. Always "complete".
+    pub kind: String,
     /// Whether execution completed. Always true for this type.
     pub completed: bool,
     /// The output value, converted to a JSON-compatible serde_json::Value.
@@ -64,6 +66,8 @@ pub struct ZapcodeResult {
 
 #[napi(object)]
 pub struct ZapcodeSuspension {
+    /// Discriminant for agent-friendly result handling. Always "suspended".
+    pub kind: String,
     /// Whether execution completed. Always false for this type.
     pub completed: bool,
     /// Name of the external function that caused suspension.
@@ -76,6 +80,8 @@ pub struct ZapcodeSuspension {
 
 #[napi(object)]
 pub struct ZapcodeSessionResult {
+    /// Discriminant for agent-friendly result handling. Always "complete".
+    pub kind: String,
     /// Whether execution completed. Always true for this type.
     pub completed: bool,
     /// The output value, converted to a JSON-compatible serde_json::Value.
@@ -88,6 +94,8 @@ pub struct ZapcodeSessionResult {
 
 #[napi(object)]
 pub struct ZapcodeSessionSuspension {
+    /// Discriminant for agent-friendly result handling. Always "suspended".
+    pub kind: String,
     /// Whether execution completed. Always false for this type.
     pub completed: bool,
     /// Name of the external function that caused suspension.
@@ -283,6 +291,7 @@ impl Zapcode {
 
         match result.state {
             VmState::Complete(v) => Ok(ZapcodeResult {
+                kind: "complete".to_string(),
                 completed: true,
                 output: value_to_json(&v),
                 stdout: result.stdout,
@@ -436,6 +445,7 @@ fn vm_state_to_either(
 ) -> napi::Result<Either<ZapcodeResult, ZapcodeSuspension>> {
     match state {
         VmState::Complete(v) => Ok(Either::A(ZapcodeResult {
+            kind: "complete".to_string(),
             completed: true,
             output: value_to_json(&v),
             stdout,
@@ -450,6 +460,7 @@ fn vm_state_to_either(
                 .dump()
                 .map_err(|e| napi::Error::from_reason(e.to_string()))?;
             Ok(Either::B(ZapcodeSuspension {
+                kind: "suspended".to_string(),
                 completed: false,
                 function_name,
                 args: args.iter().map(value_to_json).collect(),
@@ -472,6 +483,7 @@ fn session_state_to_either(
                 .dump()
                 .map_err(|e| napi::Error::from_reason(e.to_string()))?;
             Ok(Either::A(ZapcodeSessionResult {
+                kind: "complete".to_string(),
                 completed: true,
                 output: value_to_json(&output),
                 stdout,
@@ -488,6 +500,7 @@ fn session_state_to_either(
                 .dump()
                 .map_err(|e| napi::Error::from_reason(e.to_string()))?;
             Ok(Either::B(ZapcodeSessionSuspension {
+                kind: "suspended".to_string(),
                 completed: false,
                 function_name,
                 args: args.iter().map(value_to_json).collect(),

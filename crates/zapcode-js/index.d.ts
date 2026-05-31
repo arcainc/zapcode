@@ -12,12 +12,14 @@ export interface ZapcodeSessionOptions {
 }
 
 export interface ZapcodeResult {
+  kind: "complete";
   completed: true;
   output: unknown;
   stdout: string;
 }
 
 export interface ZapcodeSuspension {
+  kind: "suspended";
   completed: false;
   functionName: string;
   args: unknown[];
@@ -25,6 +27,7 @@ export interface ZapcodeSuspension {
 }
 
 export interface ZapcodeSessionResult {
+  kind: "complete";
   completed: true;
   output: unknown;
   stdout: string;
@@ -32,6 +35,7 @@ export interface ZapcodeSessionResult {
 }
 
 export interface ZapcodeSessionSuspension {
+  kind: "suspended";
   completed: false;
   functionName: string;
   args: unknown[];

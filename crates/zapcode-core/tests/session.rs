@@ -19,6 +19,14 @@ fn suspended_session(state: ZapcodeSessionState) -> ZapcodeSessionSnapshot {
     }
 }
 
+fn assert_error_contains(err: ZapcodeError, expected: &str) {
+    let message = err.to_string();
+    assert!(
+        message.contains(expected),
+        "expected error containing {expected:?}, got {message:?}"
+    );
+}
+
 #[test]
 fn session_persists_top_level_bindings_across_dump_load() {
     let state = session()
@@ -252,6 +260,219 @@ fn session_persists_nested_destructuring_and_object_rest() {
     match state {
         ZapcodeSessionState::Complete { output, .. } => {
             assert_eq!(output, Value::Int(12));
+        }
+        ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
+    }
+}
+
+#[test]
+fn session_rejects_invalid_or_reserved_external_function_names() {
+    let err = ZapcodeSessionSnapshot::new(
+        vec!["lookup".to_string(), "lookup".to_string()],
+        ResourceLimits::default(),
+    )
+    .unwrap_err();
+    assert_error_contains(err, "duplicate external function 'lookup'");
+
+    let err = ZapcodeSessionSnapshot::new(vec!["foo-bar".to_string()], ResourceLimits::default())
+        .unwrap_err();
+    assert_error_contains(
+        err,
+        "external function 'foo-bar' is not a valid JavaScript identifier",
+    );
+
+    let err = ZapcodeSessionSnapshot::new(vec!["console".to_string()], ResourceLimits::default())
+        .unwrap_err();
+    assert_error_contains(
+        err,
+        "external function 'console' conflicts with reserved global 'console'",
+    );
+}
+
+#[test]
+fn session_rejects_top_level_bindings_that_shadow_agent_interfaces() {
+    let session =
+        ZapcodeSessionSnapshot::new(vec!["lookup".to_string()], ResourceLimits::default()).unwrap();
+
+    let err = session
+        .run_chunk("const lookup = 1; lookup".to_string(), Vec::new())
+        .unwrap_err();
+    assert_error_contains(
+        err,
+        "top-level binding 'lookup' conflicts with external function 'lookup'",
+    );
+
+    let err = session
+        .run_chunk("const console = 1; console".to_string(), Vec::new())
+        .unwrap_err();
+    assert_error_contains(
+        err,
+        "top-level binding 'console' conflicts with reserved global 'console'",
+    );
+
+    let state = session
+        .run_chunk("const ok = 1; ok".to_string(), Vec::new())
+        .unwrap();
+    match state {
+        ZapcodeSessionState::Complete { output, .. } => assert_eq!(output, Value::Int(1)),
+        ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
+    }
+}
+
+#[test]
+fn session_input_conflict_errors_are_specific() {
+    let state = session()
+        .run_chunk("let count = 1; count".to_string(), Vec::new())
+        .unwrap();
+    let session = match state {
+        ZapcodeSessionState::Complete { session, .. } => session,
+        ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
+    };
+
+    let err = session
+        .run_chunk(
+            "count".to_string(),
+            vec![("count".to_string(), Value::Int(99))],
+        )
+        .unwrap_err();
+    assert_error_contains(
+        err,
+        "chunk input 'count' conflicts with existing session binding 'count'",
+    );
+
+    let err = session
+        .run_chunk(
+            "foo".to_string(),
+            vec![("foo-bar".to_string(), Value::Int(99))],
+        )
+        .unwrap_err();
+    assert_error_contains(
+        err,
+        "chunk input 'foo-bar' is not a valid JavaScript identifier",
+    );
+
+    let session =
+        ZapcodeSessionSnapshot::new(vec!["lookup".to_string()], ResourceLimits::default()).unwrap();
+    let err = session
+        .run_chunk(
+            "lookup".to_string(),
+            vec![("lookup".to_string(), Value::Int(99))],
+        )
+        .unwrap_err();
+    assert_error_contains(
+        err,
+        "chunk input 'lookup' conflicts with external function 'lookup'",
+    );
+}
+
+#[test]
+fn session_stress_many_chunks_dump_load_and_cross_chunk_calls() {
+    let mut session = session();
+    let state = session
+        .run_chunk(
+            r#"
+            let total = 0;
+            function add(value) {
+                total = total + value;
+                return total;
+            }
+            total
+            "#
+            .to_string(),
+            Vec::new(),
+        )
+        .unwrap();
+    session = match state {
+        ZapcodeSessionState::Complete {
+            output, session, ..
+        } => {
+            assert_eq!(output, Value::Int(0));
+            session
+        }
+        ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
+    };
+
+    for i in 1..=30 {
+        if i % 5 == 0 {
+            let dumped = session.dump().unwrap();
+            session = ZapcodeSessionSnapshot::load(&dumped).unwrap();
+        }
+
+        let state = session.run_chunk(format!("add({i})"), Vec::new()).unwrap();
+        session = match state {
+            ZapcodeSessionState::Complete {
+                output, session, ..
+            } => {
+                let expected = (i * (i + 1)) / 2;
+                assert_eq!(output, Value::Int(expected));
+                session
+            }
+            ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
+        };
+    }
+
+    let state = session.run_chunk("total".to_string(), Vec::new()).unwrap();
+    match state {
+        ZapcodeSessionState::Complete { output, .. } => assert_eq!(output, Value::Int(465)),
+        ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
+    }
+}
+
+#[test]
+fn session_stdout_is_step_local_across_suspend_resume_and_next_chunk() {
+    let session =
+        ZapcodeSessionSnapshot::new(vec!["lookup".to_string()], ResourceLimits::default()).unwrap();
+    let state = session
+        .run_chunk(
+            r#"
+            console.log("before");
+            const result = await lookup("key");
+            console.log("after", result);
+            result
+            "#
+            .to_string(),
+            Vec::new(),
+        )
+        .unwrap();
+
+    let session = match state {
+        ZapcodeSessionState::Suspended {
+            stdout, session, ..
+        } => {
+            assert_eq!(stdout, "before\n");
+            session
+        }
+        ZapcodeSessionState::Complete { .. } => panic!("expected suspension"),
+    };
+
+    let state = session.resume(Value::String("value".into())).unwrap();
+    let session = match state {
+        ZapcodeSessionState::Complete {
+            output,
+            stdout,
+            session,
+        } => {
+            assert_eq!(output, Value::String("value".into()));
+            assert_eq!(stdout, "after value\n");
+            session
+        }
+        ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
+    };
+
+    let state = session
+        .run_chunk(
+            r#"
+            console.log("next");
+            result
+            "#
+            .to_string(),
+            Vec::new(),
+        )
+        .unwrap();
+    match state {
+        ZapcodeSessionState::Complete { output, stdout, .. } => {
+            assert_eq!(output, Value::String("value".into()));
+            assert_eq!(stdout, "next\n");
         }
         ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
     }

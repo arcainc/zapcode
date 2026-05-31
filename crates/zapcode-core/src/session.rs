@@ -9,6 +9,50 @@ use crate::snapshot::VmSnapshot;
 use crate::value::Value;
 use crate::vm::{Vm, VmState};
 
+const RESERVED_SESSION_GLOBALS: &[&str] = Vm::BUILTIN_GLOBAL_NAMES;
+
+const RESERVED_JS_WORDS: &[&str] = &[
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "debugger",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "function",
+    "if",
+    "import",
+    "in",
+    "instanceof",
+    "let",
+    "new",
+    "null",
+    "return",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "undefined",
+    "var",
+    "void",
+    "while",
+    "with",
+    "yield",
+];
+
 #[derive(Debug)]
 pub enum ZapcodeSessionState {
     Complete {
@@ -55,6 +99,7 @@ struct SuspendedSessionState {
 
 impl ZapcodeSessionSnapshot {
     pub fn new(external_functions: Vec<String>, limits: ResourceLimits) -> Result<Self> {
+        validate_external_functions(&external_functions)?;
         Ok(Self {
             data: SessionSnapshotData::Idle(IdleSessionState {
                 programs: Vec::new(),
@@ -100,6 +145,7 @@ impl ZapcodeSessionSnapshot {
             idle.top_level_bindings.iter().cloned().collect();
         let (compiled, top_level_bindings) =
             compile_session_chunk(&parsed, ext_set.clone(), existing_bindings)?;
+        validate_new_top_level_bindings(&idle, &top_level_bindings)?;
 
         let mut programs = idle.programs;
         programs.push(compiled);
@@ -188,6 +234,58 @@ fn build_session_state(
     }
 }
 
+fn validate_external_functions(external_functions: &[String]) -> Result<()> {
+    let mut seen = HashSet::new();
+    for name in external_functions {
+        validate_identifier("external function", name)?;
+        if !seen.insert(name.as_str()) {
+            return Err(ZapcodeError::RuntimeError(format!(
+                "duplicate external function '{}'",
+                name
+            )));
+        }
+        if RESERVED_SESSION_GLOBALS.contains(&name.as_str()) {
+            return Err(ZapcodeError::RuntimeError(format!(
+                "external function '{}' conflicts with reserved global '{}'",
+                name, name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_new_top_level_bindings(
+    idle: &IdleSessionState,
+    top_level_bindings: &HashMap<String, TopLevelBindingKind>,
+) -> Result<()> {
+    let existing_bindings: HashSet<&str> = idle
+        .top_level_bindings
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let external_functions: HashSet<&str> =
+        idle.external_functions.iter().map(String::as_str).collect();
+
+    for name in top_level_bindings.keys() {
+        if existing_bindings.contains(name.as_str()) {
+            continue;
+        }
+        if RESERVED_SESSION_GLOBALS.contains(&name.as_str()) {
+            return Err(ZapcodeError::CompileError(format!(
+                "top-level binding '{}' conflicts with reserved global '{}'",
+                name, name
+            )));
+        }
+        if external_functions.contains(name.as_str()) {
+            return Err(ZapcodeError::CompileError(format!(
+                "top-level binding '{}' conflicts with external function '{}'",
+                name, name
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn user_globals_from_vm(
     vm: &Vm,
     top_level_bindings: &HashMap<String, TopLevelBindingKind>,
@@ -225,6 +323,8 @@ fn validate_input_values(
     let mut names = Vec::with_capacity(input_values.len());
 
     for (name, _) in input_values {
+        validate_identifier("chunk input", name)?;
+
         if !seen.insert(name.as_str()) {
             return Err(ZapcodeError::RuntimeError(format!(
                 "duplicate chunk input '{}'",
@@ -232,14 +332,22 @@ fn validate_input_values(
             )));
         }
 
-        if persisted_bindings.contains(name.as_str())
-            || persisted_globals.contains(name.as_str())
-            || reserved_builtins.contains(name.as_str())
-            || external_functions.contains(name.as_str())
-        {
+        if persisted_bindings.contains(name.as_str()) || persisted_globals.contains(name.as_str()) {
             return Err(ZapcodeError::RuntimeError(format!(
-                "chunk input '{}' conflicts with an existing session or reserved binding",
-                name
+                "chunk input '{}' conflicts with existing session binding '{}'",
+                name, name
+            )));
+        }
+        if reserved_builtins.contains(name.as_str()) {
+            return Err(ZapcodeError::RuntimeError(format!(
+                "chunk input '{}' conflicts with reserved global '{}'",
+                name, name
+            )));
+        }
+        if external_functions.contains(name.as_str()) {
+            return Err(ZapcodeError::RuntimeError(format!(
+                "chunk input '{}' conflicts with external function '{}'",
+                name, name
             )));
         }
 
@@ -247,6 +355,30 @@ fn validate_input_values(
     }
 
     Ok(names)
+}
+
+fn validate_identifier(label: &str, name: &str) -> Result<()> {
+    if is_valid_identifier(name) {
+        return Ok(());
+    }
+    Err(ZapcodeError::RuntimeError(format!(
+        "{} '{}' is not a valid JavaScript identifier",
+        label, name
+    )))
+}
+
+fn is_valid_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first == '$' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    if !chars.all(|c| c == '_' || c == '$' || c.is_ascii_alphanumeric()) {
+        return false;
+    }
+    !RESERVED_JS_WORDS.contains(&name)
 }
 
 fn ensure_serializable_globals(globals: &HashMap<String, Value>) -> Result<()> {
