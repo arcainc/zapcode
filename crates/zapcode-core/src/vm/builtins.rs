@@ -210,9 +210,10 @@ fn call_math_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
             }
         }
         "random" => {
-            // Deterministic for sandbox reproducibility — use a simple LCG
-            // In production this should be configurable
-            Value::Float(0.5) // TODO: proper PRNG
+            // Math.random is served by the VM's seeded PRNG (see Vm::next_random)
+            // so the sequence is deterministic across replay yet varied. This
+            // stateless fallback is only reached if called without a VM.
+            Value::Float(0.5)
         }
         "PI" => Value::Float(std::f64::consts::PI),
         "E" => Value::Float(std::f64::consts::E),

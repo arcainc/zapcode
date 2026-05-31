@@ -142,6 +142,11 @@ pub struct Vm {
     pub(crate) next_call_id: u64,
     /// The batch currently awaiting host resolution (set at the batch await).
     pub(crate) pending_batch: Option<PendingBatch>,
+    /// Deterministic PRNG state for `Math.random`. Seeded to a fixed value and
+    /// carried in the snapshot, so a replayed program produces the same random
+    /// sequence (required for durable/Temporal replay) while still varying call
+    /// to call.
+    pub(crate) rng_state: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -190,6 +195,7 @@ impl Vm {
             resolved: BTreeMap::new(),
             next_call_id: 0,
             pending_batch: None,
+            rng_state: 0,
         }
     }
 
@@ -246,7 +252,19 @@ impl Vm {
             resolved: BTreeMap::new(),
             next_call_id: 0,
             pending_batch: None,
+            rng_state: 0,
         }
+    }
+
+    /// Advance the deterministic PRNG (splitmix64) and return a float in [0, 1).
+    pub(crate) fn next_random(&mut self) -> f64 {
+        self.rng_state = self.rng_state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.rng_state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        // Use the top 53 bits for a uniform double in [0, 1).
+        (z >> 11) as f64 / ((1u64 << 53) as f64)
     }
 
     /// Resume execution after a snapshot restore. The return value from
@@ -1979,6 +1997,11 @@ impl Vm {
                                 } else {
                                     None
                                 }
+                            }
+                            // Math.random is stateful — served by the VM's
+                            // deterministic PRNG rather than the stateless builtin.
+                            "Math" if method_name.as_ref() == "random" => {
+                                Some(Value::Float(self.next_random()))
                             }
                             global_name => builtins::call_global_method(
                                 global_name,

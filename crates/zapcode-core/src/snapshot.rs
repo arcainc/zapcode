@@ -37,6 +37,10 @@ pub(crate) struct VmSnapshot {
     /// Cumulative allocation count, carried across resumes so a long-running
     /// suspend/resume chain can't evade `max_allocations` by resetting it.
     pub(crate) allocations: usize,
+    /// Deterministic PRNG state for `Math.random`, carried so the random
+    /// sequence is stable across a dump/load/resume.
+    #[serde(default)]
+    pub(crate) rng_state: u64,
 }
 
 impl VmSnapshot {
@@ -78,6 +82,7 @@ impl VmSnapshot {
             next_call_id: vm.next_call_id,
             pending_batch: vm.pending_batch.clone(),
             allocations: vm.tracker.allocations,
+            rng_state: vm.rng_state,
         }
     }
 
@@ -107,6 +112,7 @@ impl VmSnapshot {
         vm.next_call_id = self.next_call_id;
         vm.pending_batch = self.pending_batch;
         vm.tracker.allocations = self.allocations;
+        vm.rng_state = self.rng_state;
         vm
     }
 }

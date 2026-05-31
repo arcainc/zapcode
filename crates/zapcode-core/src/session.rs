@@ -99,6 +99,9 @@ struct IdleSessionState {
     /// of chunks can't evade `max_allocations` by resetting per chunk.
     #[serde(default)]
     allocations: usize,
+    /// Deterministic PRNG state for `Math.random`, carried across chunks.
+    #[serde(default)]
+    rng_state: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +124,7 @@ impl ZapcodeSessionSnapshot {
                 external_functions,
                 next_generator_id: 0,
                 allocations: 0,
+                rng_state: 0,
             }),
         })
     }
@@ -182,8 +186,9 @@ impl ZapcodeSessionSnapshot {
             vm.globals.insert(name, value);
         }
         vm.next_generator_id = idle.next_generator_id;
-        // Carry the cumulative allocation budget forward into this chunk.
+        // Carry the cumulative allocation budget and PRNG state forward.
         vm.tracker.allocations = idle.allocations;
+        vm.rng_state = idle.rng_state;
 
         let state = vm.run_program(program_index)?;
         build_session_state(state, vm, top_level_bindings, 0, transient_input_names)
@@ -260,6 +265,7 @@ fn build_session_state(
                     limits: vm.limits.clone(),
                     next_generator_id: vm.next_generator_id,
                     allocations: vm.tracker.allocations,
+                    rng_state: vm.rng_state,
                 }),
             },
         }),
