@@ -47,6 +47,12 @@ export class ZapcodeSnapshotHandle {
   static load(bytes: Buffer): ZapcodeSnapshotHandle;
   dump(): Buffer;
   resume(returnValue: unknown): ZapcodeResult | ZapcodeSuspension;
+  /**
+   * Resume by raising an error at the suspended external call instead of
+   * returning a value (a failed tool / activity). Catchable by a surrounding
+   * try/catch in the guest; otherwise it propagates as an execution error.
+   */
+  resumeError(error: unknown): ZapcodeResult | ZapcodeSuspension;
 }
 
 export class ZapcodeSessionHandle {
@@ -58,6 +64,12 @@ export class ZapcodeSessionHandle {
     inputs?: Record<string, unknown>,
   ): ZapcodeSessionResult | ZapcodeSessionSuspension;
   resume(returnValue: unknown): ZapcodeSessionResult | ZapcodeSessionSuspension;
+  /**
+   * Resume by raising an error at the suspended external call instead of
+   * returning a value (a failed tool / activity). Catchable by a surrounding
+   * try/catch in the chunk; otherwise it propagates.
+   */
+  resumeError(error: unknown): ZapcodeSessionResult | ZapcodeSessionSuspension;
 }
 
 export class Zapcode {

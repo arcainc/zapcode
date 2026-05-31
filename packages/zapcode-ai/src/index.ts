@@ -106,6 +106,11 @@ export interface ExecutionResult {
     /** Schema-validated named input passed to the host tool. */
     input: Record<string, unknown>;
     result: unknown;
+    /**
+     * Present when the tool threw. The error was raised back into the sandbox
+     * (catchable by guest `try`/`catch`); `result` is undefined in that case.
+     */
+    error?: string;
   }>;
   /** Present when autoFix is enabled and execution failed. */
   error?: string;
@@ -526,25 +531,12 @@ async function executeCode(
         "zapcode.tool.args": JSON.stringify(args),
       }) : undefined;
 
+      // A malformed call (wrong/missing/extra args) is a code bug the model
+      // should fix — abort (or autoFix), don't hand it back as a catchable
+      // runtime error.
       let namedArgs: Record<string, unknown>;
       try {
         namedArgs = buildNamedArgs(functionName, toolDef, args);
-        if (toolSpan) {
-          toolSpan.attributes["zapcode.tool.input"] = JSON.stringify(namedArgs);
-        }
-
-        const result = await toolDef.execute(namedArgs);
-        toolCalls.push({ name: functionName, args, input: namedArgs, result });
-
-        if (toolSpan) {
-          toolSpan.attributes["zapcode.tool.result"] = JSON.stringify(result);
-          endSpan(toolSpan);
-          execSpan!.children.push(toolSpan);
-        }
-
-        // Resume the VM with the tool's return value
-        const snapshot = ZapcodeSnapshotHandle.load(state.snapshot);
-        state = snapshot.resume(result);
       } catch (err: any) {
         if (toolSpan) {
           toolSpan.attributes["zapcode.tool.error"] = err.message ?? String(err);
@@ -553,6 +545,46 @@ async function executeCode(
         }
         throw err;
       }
+      if (toolSpan) {
+        toolSpan.attributes["zapcode.tool.input"] = JSON.stringify(namedArgs);
+      }
+
+      // A failing tool / activity is a *runtime* condition. Raise it back into
+      // the sandbox so the agent's code can `try`/`catch` it (retry, fall back,
+      // branch). If the guest doesn't catch it, resumeError propagates and the
+      // execution aborts — same as before this path existed.
+      let result: unknown;
+      try {
+        result = await toolDef.execute(namedArgs);
+      } catch (err: any) {
+        const message = err?.message ?? String(err);
+        toolCalls.push({
+          name: functionName,
+          args,
+          input: namedArgs,
+          result: undefined,
+          error: message,
+        });
+        if (toolSpan) {
+          toolSpan.attributes["zapcode.tool.error"] = message;
+          endSpan(toolSpan, "error");
+          execSpan!.children.push(toolSpan);
+        }
+        const snapshot = ZapcodeSnapshotHandle.load(state.snapshot);
+        state = snapshot.resumeError(message);
+        continue;
+      }
+
+      toolCalls.push({ name: functionName, args, input: namedArgs, result });
+      if (toolSpan) {
+        toolSpan.attributes["zapcode.tool.result"] = JSON.stringify(result);
+        endSpan(toolSpan);
+        execSpan!.children.push(toolSpan);
+      }
+
+      // Resume the VM with the tool's return value
+      const snapshot = ZapcodeSnapshotHandle.load(state.snapshot);
+      state = snapshot.resume(result);
     }
 
     if (state.stdout) {

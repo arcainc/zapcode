@@ -166,6 +166,35 @@ impl ZapcodeSnapshotHandle {
         };
         vm_state_to_either(state, String::new(), trace)
     }
+
+    /// Resume execution by *raising* an error at the suspended external call,
+    /// instead of returning a value. Use when the host tool / activity failed.
+    /// The error is catchable by a surrounding `try`/`catch` in the guest;
+    /// otherwise it propagates out as an execution error.
+    #[napi(ts_return_type = "ZapcodeResult | ZapcodeSuspension")]
+    pub fn resume_error(
+        &self,
+        error: serde_json::Value,
+    ) -> napi::Result<Either<ZapcodeResult, ZapcodeSuspension>> {
+        let value = json_to_value(&error);
+        let state = self
+            .inner
+            .clone()
+            .resume_with_error(value)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let trace = ExecutionTrace {
+            root: TraceSpan {
+                name: "resume_error".to_string(),
+                start_time_ms: 0,
+                end_time_ms: 0,
+                duration_us: 0,
+                status: TraceStatus::Ok,
+                attributes: Vec::new(),
+                children: Vec::new(),
+            },
+        };
+        vm_state_to_either(state, String::new(), trace)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -235,6 +264,23 @@ impl ZapcodeSessionHandle {
         let state = self
             .inner
             .resume(value)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+        session_state_to_either(state)
+    }
+
+    /// Resume a suspended session by *raising* an error at the external call
+    /// site instead of returning a value (a failed tool / activity). Catchable
+    /// by a surrounding `try`/`catch` in the chunk; otherwise it propagates.
+    #[napi(ts_return_type = "ZapcodeSessionResult | ZapcodeSessionSuspension")]
+    pub fn resume_error(
+        &self,
+        error: serde_json::Value,
+    ) -> napi::Result<Either<ZapcodeSessionResult, ZapcodeSessionSuspension>> {
+        let value = json_to_value(&error);
+        let state = self
+            .inner
+            .resume_with_error(value)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
         session_state_to_either(state)

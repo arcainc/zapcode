@@ -65,4 +65,33 @@ test("suspend on a tool call, then dump/load/resume across a boundary", () => {
   assert.equal(done.output, "A/B");
 });
 
+test("resumeError raises a catchable error at the suspension point", () => {
+  const session = ZapcodeSessionHandle.create({ externalFunctions: ["callTool"] });
+  const suspended = session.runChunk(`
+    let outcome;
+    try {
+      const v = await callTool("x");
+      outcome = "ok:" + v;
+    } catch (e) {
+      outcome = "caught:" + e;
+    }
+    outcome
+  `);
+  assert.equal(suspended.completed, false);
+
+  // The host tool failed — feed the error back across the boundary.
+  const done = ZapcodeSessionHandle.load(suspended.session).resumeError("upstream 500");
+  assert.equal(done.completed, true);
+  assert.equal(done.output, "caught:upstream 500");
+});
+
+test("uncaught resumeError propagates to the host", () => {
+  const session = ZapcodeSessionHandle.create({ externalFunctions: ["callTool"] });
+  const suspended = session.runChunk(`const v = await callTool("x"); v`);
+  assert.throws(
+    () => ZapcodeSessionHandle.load(suspended.session).resumeError("upstream 500"),
+    /upstream 500/
+  );
+});
+
 console.log(`\n${passed} durable-session checks passed.`);

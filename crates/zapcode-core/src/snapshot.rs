@@ -138,4 +138,13 @@ impl ZapcodeSnapshot {
 
         vm.resume_execution()
     }
+
+    /// Resume execution by raising `error` at the suspended external call,
+    /// instead of returning a value. The error is catchable by a surrounding
+    /// `try`/`catch` in the guest; if uncaught it propagates to the host. Use
+    /// this when a host tool / Temporal activity failed.
+    pub fn resume_with_error(self, error: Value) -> Result<VmState> {
+        let mut vm = self.snapshot.restore_vm();
+        vm.resume_with_error(error)
+    }
 }

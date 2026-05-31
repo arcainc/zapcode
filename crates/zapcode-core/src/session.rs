@@ -168,6 +168,24 @@ impl ZapcodeSessionSnapshot {
     }
 
     pub fn resume(&self, return_value: Value) -> Result<ZapcodeSessionState> {
+        self.drive_resume(|vm| {
+            vm.stack.push(return_value);
+            vm.resume_execution()
+        })
+    }
+
+    /// Resume a suspended session by raising `error` at the external call site
+    /// instead of returning a value. Catchable by a surrounding `try`/`catch`
+    /// in the chunk; otherwise it propagates to the host. Use when a tool /
+    /// Temporal activity failed.
+    pub fn resume_with_error(&self, error: Value) -> Result<ZapcodeSessionState> {
+        self.drive_resume(|vm| vm.resume_with_error(error))
+    }
+
+    fn drive_resume(
+        &self,
+        run: impl FnOnce(&mut Vm) -> Result<VmState>,
+    ) -> Result<ZapcodeSessionState> {
         let suspended = match self.data.clone() {
             SessionSnapshotData::Suspended(suspended) => *suspended,
             SessionSnapshotData::Idle(_) => {
@@ -178,8 +196,7 @@ impl ZapcodeSessionSnapshot {
         };
 
         let mut vm = suspended.vm.restore_vm();
-        vm.stack.push(return_value);
-        let state = vm.resume_execution()?;
+        let state = run(&mut vm)?;
         let top_level_bindings: HashMap<String, TopLevelBindingKind> =
             suspended.top_level_bindings.into_iter().collect();
         build_session_state(

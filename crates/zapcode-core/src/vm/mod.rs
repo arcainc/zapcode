@@ -206,6 +206,31 @@ impl Vm {
         self.execute()
     }
 
+    /// Resume a suspended external call by making it *throw* `error` instead of
+    /// returning a value. The error surfaces inside guest code at the await/call
+    /// site: if it is inside a `try`, the `catch` block runs (receiving `error`);
+    /// otherwise it propagates out to the host as `ExternalError`. This mirrors
+    /// how a real failing tool/activity should look to agent-written code.
+    pub(crate) fn resume_with_error(&mut self, error: Value) -> Result<VmState> {
+        self.tracker.start();
+        match self.try_stack.pop() {
+            Some(try_info) => {
+                // Unwind frames and stack to the nearest enclosing try block,
+                // exactly as the execute loop does for a runtime error.
+                while self.frames.len() > try_info.frame_depth {
+                    self.frames.pop();
+                    self.tracker.pop_frame();
+                }
+                self.stack.truncate(try_info.stack_depth);
+                self.push(error)?;
+                self.current_frame_mut().ip = try_info.catch_ip;
+                self.execute()
+            }
+            // No handler — the failure is the program's failure.
+            None => Err(ZapcodeError::ExternalError(error.to_js_string())),
+        }
+    }
+
     fn push(&mut self, value: Value) -> Result<()> {
         self.tracker.track_allocation(&self.limits)?;
         self.stack.push(value);
