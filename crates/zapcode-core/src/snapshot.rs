@@ -31,13 +31,21 @@ pub(crate) struct VmSnapshot {
 impl VmSnapshot {
     pub(crate) fn capture(vm: &Vm) -> Self {
         // Filter out builtin globals — they'll be re-registered on resume.
+        // Sort by name: globals live in a HashMap whose iteration order is
+        // randomized per-instance, so without sorting two captures of the same
+        // logical state would produce different bytes. Deterministic bytes are
+        // required for content-addressing, dedup, and snapshot-equality tests.
         let builtin_names: HashSet<&str> = Vm::BUILTIN_GLOBAL_NAMES.iter().copied().collect();
-        let user_globals: Vec<(String, Value)> = vm
+        let mut user_globals: Vec<(String, Value)> = vm
             .globals
             .iter()
             .filter(|(k, _)| !builtin_names.contains(k.as_str()))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        user_globals.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut external_functions: Vec<String> = vm.external_functions.iter().cloned().collect();
+        external_functions.sort();
 
         Self {
             programs: vm.programs.clone(),
@@ -48,7 +56,7 @@ impl VmSnapshot {
             continuations: vm.continuations.clone(),
             stdout: vm.stdout.clone(),
             limits: vm.limits.clone(),
-            external_functions: vm.external_functions.iter().cloned().collect(),
+            external_functions,
             next_generator_id: vm.next_generator_id,
             last_receiver: vm.last_receiver.clone(),
             last_receiver_source: vm.last_receiver_source.clone(),

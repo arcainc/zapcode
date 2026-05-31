@@ -210,9 +210,9 @@ fn build_session_state(
                 data: SessionSnapshotData::Idle(IdleSessionState {
                     programs: vm.programs.clone(),
                     globals: user_globals_from_vm(&vm, &top_level_bindings, &transient_input_names),
-                    top_level_bindings: top_level_bindings.into_iter().collect(),
+                    external_functions: sorted_external_functions(&vm),
+                    top_level_bindings: sorted_bindings(top_level_bindings),
                     limits: vm.limits.clone(),
-                    external_functions: vm.external_functions.iter().cloned().collect(),
                     next_generator_id: vm.next_generator_id,
                 }),
             },
@@ -229,7 +229,7 @@ fn build_session_state(
                 data: SessionSnapshotData::Suspended(Box::new(SuspendedSessionState {
                     vm: VmSnapshot::capture(&vm),
                     stdout_len: vm.stdout.len(),
-                    top_level_bindings: top_level_bindings.into_iter().collect(),
+                    top_level_bindings: sorted_bindings(top_level_bindings),
                     transient_input_names,
                 })),
             },
@@ -297,7 +297,8 @@ fn user_globals_from_vm(
     let builtin_names: HashSet<&str> = Vm::BUILTIN_GLOBAL_NAMES.iter().copied().collect();
     let transient_inputs: HashSet<&str> =
         transient_input_names.iter().map(String::as_str).collect();
-    vm.globals
+    let mut globals: Vec<(String, Value)> = vm
+        .globals
         .iter()
         .filter(|(name, _)| !builtin_names.contains(name.as_str()))
         .filter(|(name, _)| {
@@ -305,7 +306,27 @@ fn user_globals_from_vm(
                 || top_level_bindings.contains_key(name.as_str())
         })
         .map(|(name, value)| (name.clone(), value.clone()))
-        .collect()
+        .collect();
+    // Sort for deterministic bytes — see VmSnapshot::capture.
+    globals.sort_by(|a, b| a.0.cmp(&b.0));
+    globals
+}
+
+/// Collect persisted top-level bindings in a stable order so identical session
+/// state serializes to identical bytes.
+fn sorted_bindings(
+    top_level_bindings: HashMap<String, TopLevelBindingKind>,
+) -> Vec<(String, TopLevelBindingKind)> {
+    let mut bindings: Vec<(String, TopLevelBindingKind)> = top_level_bindings.into_iter().collect();
+    bindings.sort_by(|a, b| a.0.cmp(&b.0));
+    bindings
+}
+
+/// External-function names in a stable order (the live set is a HashSet).
+fn sorted_external_functions(vm: &Vm) -> Vec<String> {
+    let mut names: Vec<String> = vm.external_functions.iter().cloned().collect();
+    names.sort();
+    names
 }
 
 fn validate_input_values(
