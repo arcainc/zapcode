@@ -26,7 +26,7 @@
  * ```
  */
 
-import { Zapcode, ZapcodeSnapshotHandle } from "@unchartedfr/zapcode";
+import { Zapcode, ZapcodeSnapshotHandle, ZapcodeSessionHandle } from "@unchartedfr/zapcode";
 import { jsonSchema, tool, type ToolSet } from "ai";
 
 // ---------------------------------------------------------------------------
@@ -919,4 +919,142 @@ export async function execute(
   options?: { memoryLimitMb?: number; timeLimitMs?: number; debug?: boolean; autoFix?: boolean }
 ): Promise<ExecutionResult> {
   return executeCode(code, tools, options ?? {});
+}
+
+// ---------------------------------------------------------------------------
+// Durable sessions
+// ---------------------------------------------------------------------------
+
+/** Outcome of resolving a single tool call inside a session driver. */
+type ToolOutcome = { ok: true; result: unknown } | { ok: false; message: string };
+
+/**
+ * Validate + run one tool call, recording a toolCalls entry. Throws on a
+ * *malformed* call (a code bug → abort). Returns a discriminated outcome for a
+ * *runtime* tool failure so the caller can raise it back into the sandbox.
+ */
+async function invokeToolCall(
+  toolDefs: Record<string, ToolDefinition>,
+  toolNames: string[],
+  name: string,
+  rawArgs: unknown[],
+  toolCalls: ExecutionResult["toolCalls"]
+): Promise<ToolOutcome> {
+  const toolDef = toolDefs[name];
+  if (!toolDef) {
+    throw new Error(
+      `Guest code called unknown function '${name}'. Available: ${toolNames.join(", ")}`
+    );
+  }
+  const namedArgs = buildNamedArgs(name, toolDef, rawArgs); // throws → abort
+  try {
+    const result = await toolDef.execute(namedArgs);
+    toolCalls.push({ name, args: rawArgs, input: namedArgs, result });
+    return { ok: true, result };
+  } catch (err: any) {
+    const message = err?.message ?? String(err);
+    toolCalls.push({ name, args: rawArgs, input: namedArgs, result: undefined, error: message });
+    return { ok: false, message };
+  }
+}
+
+/** Options for {@link createSession} / {@link loadSession}. */
+export interface SessionOptions {
+  /** Tools available to guest code across the whole session. */
+  tools: Record<string, ToolDefinition>;
+  /** Memory limit in MB (default: 32). */
+  memoryLimitMb?: number;
+  /** Execution time limit per chunk in ms (default: 10000). */
+  timeLimitMs?: number;
+}
+
+/** Result of running one session chunk. */
+export interface SessionChunkResult {
+  output: unknown;
+  stdout: string;
+  toolCalls: ExecutionResult["toolCalls"];
+}
+
+/**
+ * A durable, multi-chunk Zapcode session. Top-level bindings, functions, and
+ * classes declared in one chunk are available to later chunks. The entire VM
+ * state serializes to compact bytes via {@link ZapcodeSession.dump}, so a
+ * workflow an agent defines now can be stored and resumed later — in another
+ * process, a Temporal activity, or after a restart — with {@link loadSession}.
+ *
+ * Tool *implementations* are not serialized (only the VM state is), so the same
+ * `tools` must be provided again when reloading.
+ *
+ * @example
+ * ```typescript
+ * const session = createSession({ tools: { fetchRow: {...} } });
+ * await session.runChunk(`async function step(id) { return await fetchRow(id); }`);
+ * const bytes = session.dump();              // hand to a Temporal activity
+ * // ...later, elsewhere...
+ * const resumed = loadSession(bytes, { tools: { fetchRow: {...} } });
+ * const out = await resumed.runChunk(`await step("42")`);
+ * ```
+ */
+export interface ZapcodeSession {
+  /** Run a chunk to completion, resolving tool calls (incl. parallel batches). */
+  runChunk(code: string, inputs?: Record<string, unknown>): Promise<SessionChunkResult>;
+  /** Serialize the whole session state to bytes for storage / transport. */
+  dump(): Buffer;
+}
+
+function makeSession(
+  initialBytes: Buffer,
+  toolDefs: Record<string, ToolDefinition>
+): ZapcodeSession {
+  validateToolDefinitions(toolDefs);
+  const toolNames = Object.keys(toolDefs);
+  let sessionBytes = initialBytes;
+
+  const runChunk = async (
+    code: string,
+    inputs?: Record<string, unknown>
+  ): Promise<SessionChunkResult> => {
+    const toolCalls: ExecutionResult["toolCalls"] = [];
+    let state = ZapcodeSessionHandle.load(sessionBytes).runChunk(code, inputs ?? {});
+
+    while (!state.completed) {
+      const handle = ZapcodeSessionHandle.load(state.session);
+      if (state.kind === "suspended_many") {
+        const outcomes = await Promise.all(
+          state.calls.map(call => invokeToolCall(toolDefs, toolNames, call.name, call.args, toolCalls))
+        );
+        const failure = outcomes.find((o): o is { ok: false; message: string } => !o.ok);
+        state = failure
+          ? handle.resumeError(failure.message)
+          : handle.resumeMany(outcomes.map(o => (o as { ok: true; result: unknown }).result));
+      } else {
+        const outcome = await invokeToolCall(toolDefs, toolNames, state.functionName, state.args, toolCalls);
+        state = outcome.ok ? handle.resume(outcome.result) : handle.resumeError(outcome.message);
+      }
+    }
+
+    // Persist the new idle state for the next chunk / dump().
+    sessionBytes = state.session;
+    return { output: state.output, stdout: state.stdout ?? "", toolCalls };
+  };
+
+  return { runChunk, dump: () => sessionBytes };
+}
+
+/** Create a new durable session. */
+export function createSession(options: SessionOptions): ZapcodeSession {
+  validateToolDefinitions(options.tools);
+  const handle = ZapcodeSessionHandle.create({
+    externalFunctions: Object.keys(options.tools),
+    memoryLimitMb: options.memoryLimitMb,
+    timeLimitMs: options.timeLimitMs,
+  });
+  return makeSession(handle.dump(), options.tools);
+}
+
+/** Reload a durable session from bytes produced by {@link ZapcodeSession.dump}. */
+export function loadSession(bytes: Buffer, options: SessionOptions): ZapcodeSession {
+  // Validate the bytes are loadable up front (throws on a bad/incompatible blob).
+  ZapcodeSessionHandle.load(bytes);
+  return makeSession(bytes, options.tools);
 }
