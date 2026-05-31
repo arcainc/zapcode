@@ -95,6 +95,10 @@ struct IdleSessionState {
     limits: ResourceLimits,
     external_functions: Vec<String>,
     next_generator_id: u64,
+    /// Cumulative allocation count across the whole session, so a long sequence
+    /// of chunks can't evade `max_allocations` by resetting per chunk.
+    #[serde(default)]
+    allocations: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +120,7 @@ impl ZapcodeSessionSnapshot {
                 limits,
                 external_functions,
                 next_generator_id: 0,
+                allocations: 0,
             }),
         })
     }
@@ -123,7 +128,15 @@ impl ZapcodeSessionSnapshot {
     pub fn dump(&self) -> Result<Vec<u8>> {
         let payload = postcard::to_allocvec(self)
             .map_err(|e| ZapcodeError::SnapshotError(format!("dump failed: {}", e)))?;
+        crate::wire::check_state_size(payload.len(), self.memory_limit_bytes())?;
         Ok(crate::wire::encode_frame(FrameKind::Session, &payload))
+    }
+
+    fn memory_limit_bytes(&self) -> usize {
+        match &self.data {
+            SessionSnapshotData::Idle(idle) => idle.limits.memory_limit_bytes,
+            SessionSnapshotData::Suspended(s) => s.vm.limits.memory_limit_bytes,
+        }
     }
 
     pub fn load(bytes: &[u8]) -> Result<Self> {
@@ -169,6 +182,8 @@ impl ZapcodeSessionSnapshot {
             vm.globals.insert(name, value);
         }
         vm.next_generator_id = idle.next_generator_id;
+        // Carry the cumulative allocation budget forward into this chunk.
+        vm.tracker.allocations = idle.allocations;
 
         let state = vm.run_program(program_index)?;
         build_session_state(state, vm, top_level_bindings, 0, transient_input_names)
@@ -244,6 +259,7 @@ fn build_session_state(
                     top_level_bindings: sorted_bindings(top_level_bindings),
                     limits: vm.limits.clone(),
                     next_generator_id: vm.next_generator_id,
+                    allocations: vm.tracker.allocations,
                 }),
             },
         }),

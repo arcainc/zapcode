@@ -69,6 +69,20 @@ impl FrameKind {
     }
 }
 
+/// Reject serialized VM state that exceeds the memory budget — a backstop
+/// against a runaway session producing a snapshot too big to move between
+/// processes / Temporal activities.
+pub(crate) fn check_state_size(payload_len: usize, max_bytes: usize) -> Result<()> {
+    if payload_len > max_bytes {
+        return Err(ZapcodeError::SnapshotError(format!(
+            "serialized state is {} bytes, exceeding the {}-byte limit; \
+             the session state has grown too large to persist",
+            payload_len, max_bytes
+        )));
+    }
+    Ok(())
+}
+
 /// Wrap a postcard payload in a versioned, hashed, optionally-compressed frame.
 pub(crate) fn encode_frame(kind: FrameKind, payload: &[u8]) -> Vec<u8> {
     // Compress, but only keep it if it actually shrinks the payload — small

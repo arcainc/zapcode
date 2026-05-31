@@ -34,6 +34,9 @@ pub(crate) struct VmSnapshot {
     pub(crate) resolved: BTreeMap<u64, Value>,
     pub(crate) next_call_id: u64,
     pub(crate) pending_batch: Option<PendingBatch>,
+    /// Cumulative allocation count, carried across resumes so a long-running
+    /// suspend/resume chain can't evade `max_allocations` by resetting it.
+    pub(crate) allocations: usize,
 }
 
 impl VmSnapshot {
@@ -74,6 +77,7 @@ impl VmSnapshot {
             resolved: vm.resolved.clone(),
             next_call_id: vm.next_call_id,
             pending_batch: vm.pending_batch.clone(),
+            allocations: vm.tracker.allocations,
         }
     }
 
@@ -102,6 +106,7 @@ impl VmSnapshot {
         vm.resolved = self.resolved;
         vm.next_call_id = self.next_call_id;
         vm.pending_batch = self.pending_batch;
+        vm.tracker.allocations = self.allocations;
         vm
     }
 }
@@ -132,6 +137,9 @@ impl ZapcodeSnapshot {
     pub fn dump(&self) -> Result<Vec<u8>> {
         let payload = postcard::to_allocvec(&self.snapshot)
             .map_err(|e| ZapcodeError::SnapshotError(format!("dump failed: {}", e)))?;
+        // Guard against unbounded serialized state — a runaway session shouldn't
+        // produce a snapshot too large to pass between activities.
+        crate::wire::check_state_size(payload.len(), self.snapshot.limits.memory_limit_bytes)?;
         Ok(crate::wire::encode_frame(FrameKind::Snapshot, &payload))
     }
 
