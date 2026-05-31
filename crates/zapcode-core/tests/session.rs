@@ -16,6 +16,7 @@ fn suspended_session(state: ZapcodeSessionState) -> ZapcodeSessionSnapshot {
         ZapcodeSessionState::Complete { output, .. } => {
             panic!("expected suspension, completed with {output:?}")
         }
+        ZapcodeSessionState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }
 
@@ -52,6 +53,7 @@ fn session_persists_top_level_bindings_across_dump_load() {
             session
         }
         ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
+        ZapcodeSessionState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
     let dumped = session.dump().unwrap();
@@ -64,6 +66,7 @@ fn session_persists_top_level_bindings_across_dump_load() {
             assert_eq!(stdout, "");
         }
         ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
+        ZapcodeSessionState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }
 
@@ -97,6 +100,7 @@ fn session_persists_classes_and_mutated_instances() {
             session
         }
         ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
+        ZapcodeSessionState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
     let state = session
@@ -107,6 +111,7 @@ fn session_persists_classes_and_mutated_instances() {
             assert_eq!(output, Value::Int(12));
         }
         ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
+        ZapcodeSessionState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }
 
@@ -143,6 +148,7 @@ fn session_resume_then_continue_with_new_chunk() {
             session
         }
         ZapcodeSessionState::Complete { .. } => panic!("expected suspension"),
+        ZapcodeSessionState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
     let dumped = session.dump().unwrap();
@@ -157,6 +163,7 @@ fn session_resume_then_continue_with_new_chunk() {
             session
         }
         ZapcodeSessionState::Suspended { .. } => panic!("expected completion after resume"),
+        ZapcodeSessionState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
     let state = session
@@ -167,6 +174,7 @@ fn session_resume_then_continue_with_new_chunk() {
             assert_eq!(output, Value::String("hello world!".into()));
         }
         ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
+        ZapcodeSessionState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }
 
@@ -199,6 +207,7 @@ fn session_preserves_hardened_external_call_patterns() {
             session
         }
         ZapcodeSessionState::Suspended { .. } => panic!("expected completion after both lookups"),
+        ZapcodeSessionState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
     let state = session
@@ -227,6 +236,7 @@ fn session_preserves_hardened_external_call_patterns() {
             assert_eq!(output, Value::String("AA,BB".into()));
         }
         ZapcodeSessionState::Suspended { .. } => panic!("expected completion after both lookups"),
+        ZapcodeSessionState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }
 
@@ -252,6 +262,7 @@ fn session_persists_nested_destructuring_and_object_rest() {
             session
         }
         ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
+        ZapcodeSessionState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
     let state = session
@@ -262,6 +273,7 @@ fn session_persists_nested_destructuring_and_object_rest() {
             assert_eq!(output, Value::Int(12));
         }
         ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
+        ZapcodeSessionState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }
 
@@ -316,6 +328,7 @@ fn session_rejects_top_level_bindings_that_shadow_agent_interfaces() {
     match state {
         ZapcodeSessionState::Complete { output, .. } => assert_eq!(output, Value::Int(1)),
         ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
+        ZapcodeSessionState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }
 
@@ -327,6 +340,7 @@ fn session_input_conflict_errors_are_specific() {
     let session = match state {
         ZapcodeSessionState::Complete { session, .. } => session,
         ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
+        ZapcodeSessionState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
     let err = session
@@ -390,6 +404,7 @@ fn session_stress_many_chunks_dump_load_and_cross_chunk_calls() {
             session
         }
         ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
+        ZapcodeSessionState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
     for i in 1..=30 {
@@ -408,6 +423,7 @@ fn session_stress_many_chunks_dump_load_and_cross_chunk_calls() {
                 session
             }
             ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
+            ZapcodeSessionState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
         };
     }
 
@@ -415,6 +431,7 @@ fn session_stress_many_chunks_dump_load_and_cross_chunk_calls() {
     match state {
         ZapcodeSessionState::Complete { output, .. } => assert_eq!(output, Value::Int(465)),
         ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
+        ZapcodeSessionState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }
 
@@ -443,6 +460,7 @@ fn session_stdout_is_step_local_across_suspend_resume_and_next_chunk() {
             session
         }
         ZapcodeSessionState::Complete { .. } => panic!("expected suspension"),
+        ZapcodeSessionState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
     let state = session.resume(Value::String("value".into())).unwrap();
@@ -457,6 +475,7 @@ fn session_stdout_is_step_local_across_suspend_resume_and_next_chunk() {
             session
         }
         ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
+        ZapcodeSessionState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
     let state = session
@@ -475,6 +494,7 @@ fn session_stdout_is_step_local_across_suspend_resume_and_next_chunk() {
             assert_eq!(stdout, "next\n");
         }
         ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
+        ZapcodeSessionState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }
 
@@ -487,6 +507,7 @@ fn session_rejects_top_level_redeclaration() {
     let session = match state {
         ZapcodeSessionState::Complete { session, .. } => session,
         ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
+        ZapcodeSessionState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
     let err = session
@@ -510,6 +531,7 @@ fn session_rejects_inputs_that_shadow_session_or_reserved_bindings() {
     let session = match state {
         ZapcodeSessionState::Complete { session, .. } => session,
         ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
+        ZapcodeSessionState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
     let err = session
@@ -540,6 +562,7 @@ fn session_survives_failed_chunk_attempts() {
     let session = match state {
         ZapcodeSessionState::Complete { session, .. } => session,
         ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
+        ZapcodeSessionState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
     let err = session
@@ -555,6 +578,7 @@ fn session_survives_failed_chunk_attempts() {
             assert_eq!(output, Value::Int(2));
         }
         ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
+        ZapcodeSessionState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }
 

@@ -1047,6 +1047,12 @@ impl Compiler {
                 }
             }
             Expr::Call { callee, args, .. } => {
+                // Check for `Promise.all([ ...direct external calls... ])` — when
+                // any element is a direct external call, compile the elements as
+                // deferred calls so the host can run them in parallel.
+                if self.try_compile_promise_all_batch(callee, args)? {
+                    return Ok(());
+                }
                 // Check if this is a super() call
                 if let Expr::Ident(name) = callee.as_ref() {
                     if name == "super" {
@@ -1123,6 +1129,73 @@ impl Compiler {
             }
         }
         Ok(())
+    }
+
+    /// If `callee(args)` is `Promise.all([...])` and at least one array element
+    /// is a direct call to an external function, compile it as a parallel batch:
+    /// each direct external-call element becomes a deferred call (no suspend),
+    /// other elements compile normally, then `MakeBatchPromise` wraps them.
+    /// Returns `true` if it handled the call.
+    fn try_compile_promise_all_batch(&mut self, callee: &Expr, args: &[Expr]) -> Result<bool> {
+        // callee must be `Promise.all`
+        let is_promise_all = matches!(
+            callee,
+            Expr::Member { object, property, .. }
+                if property == "all" && matches!(object.as_ref(), Expr::Ident(n) if n == "Promise")
+        );
+        if !is_promise_all || args.len() != 1 {
+            return Ok(false);
+        }
+        let Expr::Array(elements) = &args[0] else {
+            return Ok(false);
+        };
+        // Only take the batch path if there's at least one direct external call;
+        // otherwise fall through to the normal Promise.all builtin so existing
+        // behavior (resolved promises, plain values, rejection) is unchanged.
+        let has_external_call = elements
+            .iter()
+            .flatten()
+            .any(|el| self.external_call_target(el).is_some());
+        if !has_external_call {
+            return Ok(false);
+        }
+
+        for element in elements {
+            match element {
+                Some(expr) => {
+                    if let Some((name, call_args)) = self.external_call_target(expr) {
+                        let name = name.to_string();
+                        let argc = call_args.len();
+                        // clone args out before mutably borrowing self
+                        let call_args: Vec<Expr> = call_args.to_vec();
+                        for arg in &call_args {
+                            self.compile_expr(arg)?;
+                        }
+                        self.emit(Instruction::CallExternalDeferred(name, argc));
+                    } else {
+                        self.compile_expr(expr)?;
+                    }
+                }
+                None => {
+                    self.emit(Instruction::Push(Constant::Undefined));
+                }
+            }
+        }
+        self.emit(Instruction::MakeBatchPromise(elements.len()));
+        Ok(true)
+    }
+
+    /// If `expr` is a direct call to a registered external function, return its
+    /// name and argument expressions.
+    fn external_call_target<'e>(&self, expr: &'e Expr) -> Option<(&'e str, &'e [Expr])> {
+        if let Expr::Call { callee, args, .. } = expr {
+            if let Expr::Ident(name) = callee.as_ref() {
+                if self.external_functions.contains(name) {
+                    return Some((name.as_str(), args.as_slice()));
+                }
+            }
+        }
+        None
     }
 
     fn compile_class(

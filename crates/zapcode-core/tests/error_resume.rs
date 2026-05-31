@@ -20,6 +20,7 @@ fn snapshot(state: VmState) -> zapcode_core::ZapcodeSnapshot {
     match state {
         VmState::Suspended { snapshot, .. } => snapshot,
         VmState::Complete(_) => panic!("expected suspension"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }
 
@@ -45,6 +46,7 @@ fn error_is_catchable_in_guest_try_catch() {
     match resumed {
         VmState::Complete(v) => assert_eq!(v, Value::String("caught:upstream 500".into())),
         VmState::Suspended { .. } => panic!("expected completion"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }
 
@@ -94,10 +96,12 @@ fn execution_continues_normally_after_a_caught_error() {
             snapshot
         }
         VmState::Complete(_) => panic!("expected a second suspension on retry"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
     match retry.resume(Value::String("recovered".into())).unwrap() {
         VmState::Complete(v) => assert_eq!(v, Value::String("recovered".into())),
         VmState::Suspended { .. } => panic!("expected completion"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }

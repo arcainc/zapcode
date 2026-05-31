@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -22,6 +22,39 @@ pub enum VmState {
         args: Vec<Value>,
         snapshot: ZapcodeSnapshot,
     },
+    /// Suspended on a batch of external calls (`Promise.all([...])`) that the
+    /// host can run in parallel. Resume with `resume_many` passing one result
+    /// per call, in order.
+    SuspendedMany {
+        calls: Vec<ExternalCall>,
+        snapshot: ZapcodeSnapshot,
+    },
+}
+
+/// One pending external call exposed to the host in a batch suspension.
+#[derive(Debug, Clone)]
+pub struct ExternalCall {
+    pub name: String,
+    pub args: Vec<Value>,
+}
+
+/// A deferred external call recorded by `CallExternalDeferred`, awaiting batch
+/// resolution.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PendingExternalCall {
+    pub(crate) id: u64,
+    pub(crate) name: String,
+    pub(crate) args: Vec<Value>,
+}
+
+/// The structure of an in-flight `Promise.all` batch, captured at the await so
+/// resume can rebuild the result array in element order.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PendingBatch {
+    /// Original array elements (some are `Value::Pending`).
+    pub(crate) items: Vec<Value>,
+    /// Call ids being awaited, in the order presented to the host.
+    pub(crate) call_ids: Vec<u64>,
 }
 
 /// Tracks where a method receiver originated so that mutations to `this`
@@ -100,6 +133,15 @@ pub struct Vm {
     pub(crate) last_load_source: Option<ReceiverSource>,
     /// Counter for assigning unique generator IDs.
     pub(crate) next_generator_id: u64,
+    /// External calls deferred by `CallExternalDeferred`, pending batch resolution.
+    pub(crate) pending_calls: Vec<PendingExternalCall>,
+    /// Results delivered by `resume_many`, keyed by call id (BTreeMap for
+    /// deterministic snapshot bytes).
+    pub(crate) resolved: BTreeMap<u64, Value>,
+    /// Counter for assigning unique deferred-call IDs.
+    pub(crate) next_call_id: u64,
+    /// The batch currently awaiting host resolution (set at the batch await).
+    pub(crate) pending_batch: Option<PendingBatch>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -144,6 +186,10 @@ impl Vm {
             last_global_name: None,
             last_load_source: None,
             next_generator_id: 0,
+            pending_calls: Vec::new(),
+            resolved: BTreeMap::new(),
+            next_call_id: 0,
+            pending_batch: None,
         }
     }
 
@@ -196,6 +242,10 @@ impl Vm {
             last_global_name,
             last_load_source,
             next_generator_id,
+            pending_calls: Vec::new(),
+            resolved: BTreeMap::new(),
+            next_call_id: 0,
+            pending_batch: None,
         }
     }
 
@@ -229,6 +279,94 @@ impl Vm {
             // No handler — the failure is the program's failure.
             None => Err(ZapcodeError::ExternalError(error.to_js_string())),
         }
+    }
+
+    /// Resume a batch suspension (`Promise.all([...])`) with one result per
+    /// pending call, in the order the calls were presented to the host. The
+    /// resolved array is pushed and execution continues after the await.
+    pub(crate) fn resume_many(&mut self, results: Vec<Value>) -> Result<VmState> {
+        self.tracker.start();
+        let batch = self.pending_batch.take().ok_or_else(|| {
+            ZapcodeError::RuntimeError(
+                "resume_many called but the VM is not suspended on a batch".to_string(),
+            )
+        })?;
+        if results.len() != batch.call_ids.len() {
+            return Err(ZapcodeError::RuntimeError(format!(
+                "resume_many expected {} results but got {}",
+                batch.call_ids.len(),
+                results.len()
+            )));
+        }
+        for (id, value) in batch.call_ids.iter().zip(results) {
+            self.resolved.insert(*id, value);
+        }
+        // Rebuild the result array in element order, substituting resolved values.
+        let mut array = Vec::with_capacity(batch.items.len());
+        for item in batch.items {
+            match item {
+                Value::Pending(id) => {
+                    let value = self.resolved.remove(&id).ok_or_else(|| {
+                        ZapcodeError::RuntimeError(format!("missing result for call {}", id))
+                    })?;
+                    array.push(value);
+                }
+                other => array.push(other),
+            }
+        }
+        // Drop the now-resolved pending calls.
+        let resolved_ids: HashSet<u64> = batch.call_ids.iter().copied().collect();
+        self.pending_calls.retain(|c| !resolved_ids.contains(&c.id));
+        self.push(Value::Array(array))?;
+        self.execute()
+    }
+
+    /// Await a `Promise.all` batch. If any element is an unresolved deferred
+    /// call, suspend once with the whole batch so the host can run the calls in
+    /// parallel; otherwise build and push the result array inline.
+    fn await_batch(&mut self, items: Vec<Value>) -> Result<Option<VmState>> {
+        let mut call_ids = Vec::new();
+        for item in &items {
+            if let Value::Pending(id) = item {
+                if !self.resolved.contains_key(id) {
+                    call_ids.push(*id);
+                }
+            }
+        }
+
+        if call_ids.is_empty() {
+            let mut array = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Value::Pending(id) => {
+                        array.push(self.resolved.remove(&id).unwrap_or(Value::Undefined))
+                    }
+                    other => array.push(other),
+                }
+            }
+            self.push(Value::Array(array))?;
+            return Ok(None);
+        }
+
+        // Present the calls to the host in element order.
+        let mut calls = Vec::with_capacity(call_ids.len());
+        for id in &call_ids {
+            let pc = self
+                .pending_calls
+                .iter()
+                .find(|c| c.id == *id)
+                .ok_or_else(|| {
+                    ZapcodeError::RuntimeError(format!("unknown pending call {}", id))
+                })?;
+            calls.push(ExternalCall {
+                name: pc.name.clone(),
+                args: pc.args.clone(),
+            });
+        }
+
+        self.pending_batch = Some(PendingBatch { items, call_ids });
+        let snapshot = ZapcodeSnapshot::capture(self)?;
+        Ok(Some(VmState::SuspendedMany { calls, snapshot }))
     }
 
     fn push(&mut self, value: Value) -> Result<()> {
@@ -657,7 +795,7 @@ impl Vm {
                     // This shouldn't happen inside a callback but handle gracefully.
                     return Ok(val);
                 }
-                Ok(Some(VmState::Suspended { .. })) => {
+                Ok(Some(VmState::Suspended { .. })) | Ok(Some(VmState::SuspendedMany { .. })) => {
                     return Err(ZapcodeError::RuntimeError(
                         "cannot suspend inside array callback".to_string(),
                     ));
@@ -1171,7 +1309,7 @@ impl Vm {
             let result = self.dispatch(instr);
             match result {
                 Ok(Some(VmState::Complete(val))) => return Ok(val),
-                Ok(Some(VmState::Suspended { .. })) => {
+                Ok(Some(VmState::Suspended { .. })) | Ok(Some(VmState::SuspendedMany { .. })) => {
                     return Err(ZapcodeError::RuntimeError(
                         "cannot suspend inside a generator".to_string(),
                     ));
@@ -1923,6 +2061,34 @@ impl Vm {
                     snapshot,
                 }));
             }
+            Instruction::CallExternalDeferred(name, arg_count) => {
+                if !self.external_functions.contains(&name) {
+                    return Err(ZapcodeError::UnknownExternalFunction(name));
+                }
+                let mut args = Vec::with_capacity(arg_count);
+                for _ in 0..arg_count {
+                    args.push(self.pop()?);
+                }
+                args.reverse();
+                let id = self.next_call_id;
+                self.next_call_id += 1;
+                self.pending_calls
+                    .push(PendingExternalCall { id, name, args });
+                self.push(Value::Pending(id))?;
+            }
+            Instruction::MakeBatchPromise(n) => {
+                let mut items = Vec::with_capacity(n);
+                for _ in 0..n {
+                    items.push(self.pop()?);
+                }
+                items.reverse();
+                // Mark as a pending-all batch promise; the await resolves it.
+                let mut obj = IndexMap::new();
+                obj.insert(Arc::from("__promise__"), Value::Bool(true));
+                obj.insert(Arc::from("status"), Value::String(Arc::from("pending_all")));
+                obj.insert(Arc::from("items"), Value::Array(items));
+                self.push(Value::Object(obj))?;
+            }
 
             // Control flow
             Instruction::Jump(target) => {
@@ -2221,6 +2387,13 @@ impl Vm {
                 // If resolved, unwrap its value. If rejected, throw its reason.
                 // If it's a regular (non-promise) value, leave it as-is.
                 let val = self.pop()?;
+                if matches!(val, Value::Pending(_)) {
+                    // A deferred call only ever lives inside a Promise.all batch;
+                    // awaiting one bare is a compiler invariant violation.
+                    return Err(ZapcodeError::RuntimeError(
+                        "internal error: awaited a deferred call outside Promise.all".to_string(),
+                    ));
+                }
                 if builtins::is_promise(&val) {
                     if let Value::Object(map) = &val {
                         let status = map.get("status").cloned().unwrap_or(Value::Undefined);
@@ -2235,6 +2408,15 @@ impl Vm {
                                     "Unhandled promise rejection: {}",
                                     reason.to_js_string()
                                 )));
+                            }
+                            Value::String(s) if s.as_ref() == "pending_all" => {
+                                let items = match map.get("items") {
+                                    Some(Value::Array(a)) => a.clone(),
+                                    _ => Vec::new(),
+                                };
+                                // Suspend on the whole batch (or resolve inline if
+                                // every element is already available).
+                                return self.await_batch(items);
                             }
                             _ => {
                                 // Unknown status — pass through
@@ -2927,6 +3109,20 @@ impl ZapcodeRun {
                             trace,
                         });
                     }
+                    VmState::SuspendedMany { calls, .. } => {
+                        let mut span = execute_span;
+                        span.set_attr("zapcode.suspended_on", "Promise.all batch");
+                        span.set_attr("zapcode.args_count", calls.len());
+                        root_span.add_child(span.finish(TraceStatus::Ok));
+                        let trace = ExecutionTrace {
+                            root: root_span.finish_ok(),
+                        };
+                        return Ok(RunResult {
+                            state: s,
+                            stdout: vm.stdout,
+                            trace,
+                        });
+                    }
                 };
                 root_span.add_child(execute_span.finish(status));
                 s
@@ -2967,6 +3163,9 @@ impl ZapcodeRun {
                 "execution suspended on external function '{}' — use run() instead",
                 function_name
             ))),
+            VmState::SuspendedMany { .. } => Err(ZapcodeError::RuntimeError(
+                "execution suspended on a Promise.all batch — use run() instead".to_string(),
+            )),
         }
     }
 }
@@ -3005,5 +3204,8 @@ pub fn eval_ts_with_output(source: &str) -> Result<(Value, String)> {
             "execution suspended on external function '{}'",
             function_name
         ))),
+        VmState::SuspendedMany { .. } => Err(ZapcodeError::RuntimeError(
+            "execution suspended on a Promise.all batch".to_string(),
+        )),
     }
 }

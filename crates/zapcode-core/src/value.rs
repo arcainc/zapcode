@@ -16,6 +16,10 @@ pub enum Value {
     Function(Closure),
     /// A generator object — calling function* creates one of these.
     Generator(GeneratorObject),
+    /// A deferred external call result, used to batch parallel calls inside a
+    /// `Promise.all([...])`. Holds the call id; resolved by the host on resume.
+    /// Only ever lives transiently inside a batch — never escapes to user code.
+    Pending(u64),
     /// Internal: a bound method on a built-in object (e.g., console.log, Math.floor).
     /// Not visible to user code — used to dispatch builtin calls. These handles
     /// must be serializable because argument evaluation can suspend after a
@@ -75,6 +79,7 @@ impl Value {
             Value::Object(_) => "object",
             Value::Function(_) | Value::BuiltinMethod { .. } => "function",
             Value::Generator(_) => "object",
+            Value::Pending(_) => "object",
         }
     }
 
@@ -89,7 +94,8 @@ impl Value {
             | Value::Object(_)
             | Value::Function(_)
             | Value::BuiltinMethod { .. }
-            | Value::Generator(_) => true,
+            | Value::Generator(_)
+            | Value::Pending(_) => true,
         }
     }
 
@@ -134,6 +140,7 @@ impl Value {
             Value::Object(_) => "[object Object]".to_string(),
             Value::Function(_) | Value::BuiltinMethod { .. } => "function".to_string(),
             Value::Generator(_) => "[object Generator]".to_string(),
+            Value::Pending(_) => "[object Promise]".to_string(),
         }
     }
 

@@ -18,6 +18,7 @@ fn lookup_snapshot(state: VmState) -> ZapcodeSnapshot {
         VmState::Complete(output) => {
             panic!("expected suspension on lookup, completed with {output:?}")
         }
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }
 
@@ -41,6 +42,7 @@ fn promise_all_can_snapshot_external_calls() {
     match state {
         VmState::Complete(output) => assert_eq!(output, Value::String("A,B".into())),
         VmState::Suspended { .. } => panic!("expected completion after both lookups"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }
 
@@ -67,6 +69,7 @@ fn for_of_can_snapshot_awaited_external_calls() {
     match state {
         VmState::Complete(output) => assert_eq!(output, Value::String("A,B".into())),
         VmState::Suspended { .. } => panic!("expected completion after both lookups"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }
 
@@ -169,6 +172,7 @@ fn indexed_for_loop_can_sequence_external_calls() {
     match state {
         VmState::Complete(output) => assert_eq!(output, Value::String("A,B".into())),
         VmState::Suspended { .. } => panic!("expected completion after both lookups"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }
 
@@ -192,5 +196,6 @@ fn direct_sequential_external_calls_can_snapshot_today() {
     match state {
         VmState::Complete(output) => assert_eq!(output, Value::String("A,B".into())),
         VmState::Suspended { .. } => panic!("expected completion after both lookups"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }

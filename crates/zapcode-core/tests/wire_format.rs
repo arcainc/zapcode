@@ -14,6 +14,7 @@ fn suspended_snapshot() -> ZapcodeSnapshot {
     match runner.start(Vec::new()).unwrap() {
         VmState::Suspended { snapshot, .. } => snapshot,
         VmState::Complete(_) => panic!("expected suspension"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }
 
@@ -33,6 +34,7 @@ fn load_roundtrips_a_real_snapshot() {
     match loaded.resume(Value::Int(7)).unwrap() {
         VmState::Complete(_) => {}
         VmState::Suspended { .. } => panic!("expected completion after resume"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }
 
@@ -97,6 +99,9 @@ fn large_compressible_state_is_compressed_on_the_wire() {
     let bytes = match state {
         zapcode_core::ZapcodeSessionState::Complete { session, .. } => session.dump().unwrap(),
         zapcode_core::ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
+        zapcode_core::ZapcodeSessionState::SuspendedMany { .. } => {
+            panic!("unexpected batch suspension")
+        }
     };
     // The global alone is 50 KB; a compressed dump of a run of 'a' is tiny.
     assert!(

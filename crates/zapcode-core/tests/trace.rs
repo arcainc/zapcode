@@ -164,6 +164,7 @@ fn trace_suspension_state_matches() {
             assert_eq!(function_name, "myFunc");
         }
         VmState::Complete(_) => panic!("expected suspension"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 
     // And the trace captured it

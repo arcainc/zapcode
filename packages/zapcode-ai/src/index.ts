@@ -514,77 +514,85 @@ async function executeCode(
     let state = sandbox.start();
     let stdout = "";
 
-    // Snapshot/resume loop — resolve each tool call as the VM suspends
-    while (!state.completed) {
-      const { functionName, args } = state;
-
-      const toolDef = toolDefs[functionName];
+    // Validate + run one tool call, recording its span and a toolCalls entry.
+    // Throws on a *malformed* call (a code bug → abort/autoFix). Returns a
+    // discriminated outcome for a *runtime* tool failure so the caller can raise
+    // it back into the sandbox as a catchable error.
+    type ToolOutcome = { ok: true; result: unknown } | { ok: false; message: string };
+    const invokeTool = async (name: string, rawArgs: unknown[]): Promise<ToolOutcome> => {
+      const toolDef = toolDefs[name];
       if (!toolDef) {
         throw new Error(
-          `Guest code called unknown function '${functionName}'. ` +
-          `Available: ${toolNames.join(", ")}`
+          `Guest code called unknown function '${name}'. Available: ${toolNames.join(", ")}`
         );
       }
+      const toolSpan = tracing
+        ? createSpan("tool_call", {
+            "zapcode.tool.name": name,
+            "zapcode.tool.args": JSON.stringify(rawArgs),
+          })
+        : undefined;
 
-      const toolSpan = tracing ? createSpan("tool_call", {
-        "zapcode.tool.name": functionName,
-        "zapcode.tool.args": JSON.stringify(args),
-      }) : undefined;
-
-      // A malformed call (wrong/missing/extra args) is a code bug the model
-      // should fix — abort (or autoFix), don't hand it back as a catchable
-      // runtime error.
       let namedArgs: Record<string, unknown>;
       try {
-        namedArgs = buildNamedArgs(functionName, toolDef, args);
+        namedArgs = buildNamedArgs(name, toolDef, rawArgs);
       } catch (err: any) {
         if (toolSpan) {
           toolSpan.attributes["zapcode.tool.error"] = err.message ?? String(err);
           endSpan(toolSpan, "error");
           execSpan!.children.push(toolSpan);
         }
-        throw err;
+        throw err; // malformed call — not catchable by the guest
       }
       if (toolSpan) {
         toolSpan.attributes["zapcode.tool.input"] = JSON.stringify(namedArgs);
       }
 
-      // A failing tool / activity is a *runtime* condition. Raise it back into
-      // the sandbox so the agent's code can `try`/`catch` it (retry, fall back,
-      // branch). If the guest doesn't catch it, resumeError propagates and the
-      // execution aborts — same as before this path existed.
-      let result: unknown;
       try {
-        result = await toolDef.execute(namedArgs);
+        const result = await toolDef.execute(namedArgs);
+        toolCalls.push({ name, args: rawArgs, input: namedArgs, result });
+        if (toolSpan) {
+          toolSpan.attributes["zapcode.tool.result"] = JSON.stringify(result);
+          endSpan(toolSpan);
+          execSpan!.children.push(toolSpan);
+        }
+        return { ok: true, result };
       } catch (err: any) {
         const message = err?.message ?? String(err);
-        toolCalls.push({
-          name: functionName,
-          args,
-          input: namedArgs,
-          result: undefined,
-          error: message,
-        });
+        toolCalls.push({ name, args: rawArgs, input: namedArgs, result: undefined, error: message });
         if (toolSpan) {
           toolSpan.attributes["zapcode.tool.error"] = message;
           endSpan(toolSpan, "error");
           execSpan!.children.push(toolSpan);
         }
-        const snapshot = ZapcodeSnapshotHandle.load(state.snapshot);
-        state = snapshot.resumeError(message);
+        return { ok: false, message };
+      }
+    };
+
+    // Snapshot/resume loop — resolve tool calls as the VM suspends.
+    while (!state.completed) {
+      const snapshot = ZapcodeSnapshotHandle.load(state.snapshot);
+
+      if (state.kind === "suspended_many") {
+        // Parallel batch (Promise.all). Run every call concurrently. A failing
+        // tool surfaces like a Promise.all rejection: the first failure is
+        // raised back into the guest (catchable); otherwise resume with all
+        // results. A malformed call throws and aborts the whole execution.
+        const outcomes = await Promise.all(
+          state.calls.map(call => invokeTool(call.name, call.args))
+        );
+        const firstFailure = outcomes.find((o): o is { ok: false; message: string } => !o.ok);
+        if (firstFailure) {
+          state = snapshot.resumeError(firstFailure.message);
+        } else {
+          state = snapshot.resumeMany(outcomes.map(o => (o as { ok: true; result: unknown }).result));
+        }
         continue;
       }
 
-      toolCalls.push({ name: functionName, args, input: namedArgs, result });
-      if (toolSpan) {
-        toolSpan.attributes["zapcode.tool.result"] = JSON.stringify(result);
-        endSpan(toolSpan);
-        execSpan!.children.push(toolSpan);
-      }
-
-      // Resume the VM with the tool's return value
-      const snapshot = ZapcodeSnapshotHandle.load(state.snapshot);
-      state = snapshot.resume(result);
+      // Single external call.
+      const outcome = await invokeTool(state.functionName, state.args);
+      state = outcome.ok ? snapshot.resume(outcome.result) : snapshot.resumeError(outcome.message);
     }
 
     if (state.stdout) {

@@ -271,9 +271,10 @@ fn value_to_json(val: &Value) -> String {
                 .collect();
             format!("{{{}}}", pairs.join(","))
         }
-        Value::Function(_) | Value::BuiltinMethod { .. } | Value::Generator(_) => {
-            "undefined".to_string()
-        }
+        Value::Function(_)
+        | Value::BuiltinMethod { .. }
+        | Value::Generator(_)
+        | Value::Pending(_) => "undefined".to_string(),
     }
 }
 

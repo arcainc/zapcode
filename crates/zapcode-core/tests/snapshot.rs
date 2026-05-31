@@ -29,6 +29,7 @@ fn test_snapshot_dump_load_roundtrip() {
     let snapshot = match state {
         VmState::Suspended { snapshot, .. } => snapshot,
         VmState::Complete(_) => panic!("expected suspension"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
     // Dump to bytes
@@ -73,9 +74,11 @@ fn test_snapshot_resume_simple() {
                     assert_eq!(v, Value::String("response body".into()));
                 }
                 VmState::Suspended { .. } => panic!("expected completion after resume"),
+                VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
             }
         }
         VmState::Complete(_) => panic!("expected suspension"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }
 
@@ -98,9 +101,11 @@ fn test_snapshot_resume_with_computation_after() {
                     assert_eq!(v, Value::String("data processed".into()));
                 }
                 VmState::Suspended { .. } => panic!("expected completion"),
+                VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
             }
         }
         VmState::Complete(_) => panic!("expected suspension"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }
 

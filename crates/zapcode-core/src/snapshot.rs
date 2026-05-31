@@ -1,11 +1,14 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, ZapcodeError};
 use crate::sandbox::ResourceLimits;
 use crate::value::Value;
-use crate::vm::{CallFrame, Continuation, ReceiverSource, TryInfo, Vm, VmState};
+use crate::vm::{
+    CallFrame, Continuation, PendingBatch, PendingExternalCall, ReceiverSource, TryInfo, Vm,
+    VmState,
+};
 use crate::wire::FrameKind;
 
 /// Internal serializable representation of VM state at a suspension point.
@@ -26,6 +29,11 @@ pub(crate) struct VmSnapshot {
     pub(crate) last_receiver_source: Option<ReceiverSource>,
     pub(crate) last_global_name: Option<String>,
     pub(crate) last_load_source: Option<ReceiverSource>,
+    /// Deferred external calls awaiting batch resolution (`Promise.all`).
+    pub(crate) pending_calls: Vec<PendingExternalCall>,
+    pub(crate) resolved: BTreeMap<u64, Value>,
+    pub(crate) next_call_id: u64,
+    pub(crate) pending_batch: Option<PendingBatch>,
 }
 
 impl VmSnapshot {
@@ -62,6 +70,10 @@ impl VmSnapshot {
             last_receiver_source: vm.last_receiver_source.clone(),
             last_global_name: vm.last_global_name.clone(),
             last_load_source: vm.last_load_source.clone(),
+            pending_calls: vm.pending_calls.clone(),
+            resolved: vm.resolved.clone(),
+            next_call_id: vm.next_call_id,
+            pending_batch: vm.pending_batch.clone(),
         }
     }
 
@@ -69,7 +81,7 @@ impl VmSnapshot {
         let user_globals: HashMap<String, Value> = self.globals.into_iter().collect();
         let ext_set: HashSet<String> = self.external_functions.into_iter().collect();
 
-        Vm::from_snapshot(
+        let mut vm = Vm::from_snapshot(
             self.programs,
             self.stack,
             self.frames,
@@ -84,7 +96,13 @@ impl VmSnapshot {
             self.last_receiver_source,
             self.last_global_name,
             self.last_load_source,
-        )
+        );
+        // Restore batched-call state (kept off the long from_snapshot signature).
+        vm.pending_calls = self.pending_calls;
+        vm.resolved = self.resolved;
+        vm.next_call_id = self.next_call_id;
+        vm.pending_batch = self.pending_batch;
+        vm
     }
 }
 
@@ -146,5 +164,13 @@ impl ZapcodeSnapshot {
     pub fn resume_with_error(self, error: Value) -> Result<VmState> {
         let mut vm = self.snapshot.restore_vm();
         vm.resume_with_error(error)
+    }
+
+    /// Resume a batch suspension (`VmState::SuspendedMany`) with one result per
+    /// call, in the order the calls were presented. The host can run those
+    /// calls in parallel and pass back all results at once.
+    pub fn resume_many(self, results: Vec<Value>) -> Result<VmState> {
+        let mut vm = self.snapshot.restore_vm();
+        vm.resume_many(results)
     }
 }

@@ -7,7 +7,7 @@ use crate::error::{Result, ZapcodeError};
 use crate::sandbox::ResourceLimits;
 use crate::snapshot::VmSnapshot;
 use crate::value::Value;
-use crate::vm::{Vm, VmState};
+use crate::vm::{ExternalCall, Vm, VmState};
 use crate::wire::FrameKind;
 
 const RESERVED_SESSION_GLOBALS: &[&str] = Vm::BUILTIN_GLOBAL_NAMES;
@@ -64,6 +64,13 @@ pub enum ZapcodeSessionState {
     Suspended {
         function_name: String,
         args: Vec<Value>,
+        stdout: String,
+        session: ZapcodeSessionSnapshot,
+    },
+    /// Suspended on a batch of external calls (`Promise.all([...])`) the host
+    /// can run in parallel. Resume with `resume_many`.
+    SuspendedMany {
+        calls: Vec<ExternalCall>,
         stdout: String,
         session: ZapcodeSessionSnapshot,
     },
@@ -182,6 +189,12 @@ impl ZapcodeSessionSnapshot {
         self.drive_resume(|vm| vm.resume_with_error(error))
     }
 
+    /// Resume a session suspended on a `Promise.all` batch with one result per
+    /// call, in order. Use when the host ran the batched calls in parallel.
+    pub fn resume_many(&self, results: Vec<Value>) -> Result<ZapcodeSessionState> {
+        self.drive_resume(|vm| vm.resume_many(results))
+    }
+
     fn drive_resume(
         &self,
         run: impl FnOnce(&mut Vm) -> Result<VmState>,
@@ -241,6 +254,18 @@ fn build_session_state(
         } => Ok(ZapcodeSessionState::Suspended {
             function_name,
             args,
+            stdout,
+            session: ZapcodeSessionSnapshot {
+                data: SessionSnapshotData::Suspended(Box::new(SuspendedSessionState {
+                    vm: VmSnapshot::capture(&vm),
+                    stdout_len: vm.stdout.len(),
+                    top_level_bindings: sorted_bindings(top_level_bindings),
+                    transient_input_names,
+                })),
+            },
+        }),
+        VmState::SuspendedMany { calls, snapshot: _ } => Ok(ZapcodeSessionState::SuspendedMany {
+            calls,
             stdout,
             session: ZapcodeSessionSnapshot {
                 data: SessionSnapshotData::Suspended(Box::new(SuspendedSessionState {
@@ -463,6 +488,9 @@ fn ensure_serializable_value(value: &Value) -> Result<()> {
         Value::Generator(_) => Err(ZapcodeError::SnapshotError(
             "generators cannot be persisted in ongoing sessions".to_string(),
         )),
+        // A deferred call only exists transiently inside an in-flight batch; it
+        // never lands in a persisted global.
+        Value::Pending(_) => Ok(()),
         Value::BuiltinMethod { .. } => Err(ZapcodeError::SnapshotError(
             "builtin methods cannot be persisted in ongoing sessions".to_string(),
         )),

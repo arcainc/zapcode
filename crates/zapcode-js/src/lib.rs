@@ -78,6 +78,27 @@ pub struct ZapcodeSuspension {
     pub snapshot: Buffer,
 }
 
+/// One external call in a parallel batch (`Promise.all([...])`).
+#[napi(object)]
+pub struct JsExternalCall {
+    pub name: String,
+    pub args: Vec<serde_json::Value>,
+}
+
+/// Suspension on a batch of external calls the host can run in parallel.
+/// Resume with `resumeMany(results)` passing one result per call, in order.
+#[napi(object)]
+pub struct ZapcodeBatchSuspension {
+    /// Discriminant. Always "suspended_many".
+    pub kind: String,
+    /// Whether execution completed. Always false for this type.
+    pub completed: bool,
+    /// The batched external calls, in order.
+    pub calls: Vec<JsExternalCall>,
+    /// Opaque snapshot bytes -- pass to `ZapcodeSnapshotHandle.load()` to resume.
+    pub snapshot: Buffer,
+}
+
 #[napi(object)]
 pub struct ZapcodeSessionResult {
     /// Discriminant for agent-friendly result handling. Always "complete".
@@ -102,6 +123,22 @@ pub struct ZapcodeSessionSuspension {
     pub function_name: String,
     /// Arguments passed to the external function.
     pub args: Vec<serde_json::Value>,
+    /// Captured stdout output for this chunk/resume step.
+    pub stdout: String,
+    /// Opaque session bytes -- pass to `ZapcodeSessionHandle.load()` to continue.
+    pub session: Buffer,
+}
+
+/// Session suspended on a batch of external calls (`Promise.all([...])`).
+/// Resume with `resumeMany(results)`.
+#[napi(object)]
+pub struct ZapcodeSessionBatchSuspension {
+    /// Discriminant. Always "suspended_many".
+    pub kind: String,
+    /// Whether execution completed. Always false for this type.
+    pub completed: bool,
+    /// The batched external calls, in order.
+    pub calls: Vec<JsExternalCall>,
     /// Captured stdout output for this chunk/resume step.
     pub stdout: String,
     /// Opaque session bytes -- pass to `ZapcodeSessionHandle.load()` to continue.
@@ -141,11 +178,11 @@ impl ZapcodeSnapshotHandle {
     ///
     /// Returns either a `ZapcodeResult` (complete) or a `ZapcodeSuspension`
     /// (suspended again on another external call).
-    #[napi(ts_return_type = "ZapcodeResult | ZapcodeSuspension")]
+    #[napi(ts_return_type = "ZapcodeResult | ZapcodeSuspension | ZapcodeBatchSuspension")]
     pub fn resume(
         &self,
         return_value: serde_json::Value,
-    ) -> napi::Result<Either<ZapcodeResult, ZapcodeSuspension>> {
+    ) -> napi::Result<Either3<ZapcodeResult, ZapcodeSuspension, ZapcodeBatchSuspension>> {
         let value = json_to_value(&return_value);
         let state = self
             .inner
@@ -171,11 +208,11 @@ impl ZapcodeSnapshotHandle {
     /// instead of returning a value. Use when the host tool / activity failed.
     /// The error is catchable by a surrounding `try`/`catch` in the guest;
     /// otherwise it propagates out as an execution error.
-    #[napi(ts_return_type = "ZapcodeResult | ZapcodeSuspension")]
+    #[napi(ts_return_type = "ZapcodeResult | ZapcodeSuspension | ZapcodeBatchSuspension")]
     pub fn resume_error(
         &self,
         error: serde_json::Value,
-    ) -> napi::Result<Either<ZapcodeResult, ZapcodeSuspension>> {
+    ) -> napi::Result<Either3<ZapcodeResult, ZapcodeSuspension, ZapcodeBatchSuspension>> {
         let value = json_to_value(&error);
         let state = self
             .inner
@@ -185,6 +222,34 @@ impl ZapcodeSnapshotHandle {
         let trace = ExecutionTrace {
             root: TraceSpan {
                 name: "resume_error".to_string(),
+                start_time_ms: 0,
+                end_time_ms: 0,
+                duration_us: 0,
+                status: TraceStatus::Ok,
+                attributes: Vec::new(),
+                children: Vec::new(),
+            },
+        };
+        vm_state_to_either(state, String::new(), trace)
+    }
+
+    /// Resume a batch suspension (`ZapcodeBatchSuspension`) with one result per
+    /// call, in the order the calls were presented. The host can run the calls
+    /// in parallel and pass back all results at once.
+    #[napi(ts_return_type = "ZapcodeResult | ZapcodeSuspension | ZapcodeBatchSuspension")]
+    pub fn resume_many(
+        &self,
+        results: Vec<serde_json::Value>,
+    ) -> napi::Result<Either3<ZapcodeResult, ZapcodeSuspension, ZapcodeBatchSuspension>> {
+        let values: Vec<Value> = results.iter().map(json_to_value).collect();
+        let state = self
+            .inner
+            .clone()
+            .resume_many(values)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let trace = ExecutionTrace {
+            root: TraceSpan {
+                name: "resume_many".to_string(),
                 start_time_ms: 0,
                 end_time_ms: 0,
                 duration_us: 0,
@@ -240,12 +305,14 @@ impl ZapcodeSessionHandle {
         Ok(Buffer::from(bytes))
     }
 
-    #[napi(ts_return_type = "ZapcodeSessionResult | ZapcodeSessionSuspension")]
+    #[napi(
+        ts_return_type = "ZapcodeSessionResult | ZapcodeSessionSuspension | ZapcodeSessionBatchSuspension"
+    )]
     pub fn run_chunk(
         &self,
         code: String,
         inputs: Option<HashMap<String, serde_json::Value>>,
-    ) -> napi::Result<Either<ZapcodeSessionResult, ZapcodeSessionSuspension>> {
+    ) -> napi::Result<SessionEither> {
         let input_values = inputs_to_vec(inputs);
         let state = self
             .inner
@@ -255,11 +322,10 @@ impl ZapcodeSessionHandle {
         session_state_to_either(state)
     }
 
-    #[napi(ts_return_type = "ZapcodeSessionResult | ZapcodeSessionSuspension")]
-    pub fn resume(
-        &self,
-        return_value: serde_json::Value,
-    ) -> napi::Result<Either<ZapcodeSessionResult, ZapcodeSessionSuspension>> {
+    #[napi(
+        ts_return_type = "ZapcodeSessionResult | ZapcodeSessionSuspension | ZapcodeSessionBatchSuspension"
+    )]
+    pub fn resume(&self, return_value: serde_json::Value) -> napi::Result<SessionEither> {
         let value = json_to_value(&return_value);
         let state = self
             .inner
@@ -272,15 +338,29 @@ impl ZapcodeSessionHandle {
     /// Resume a suspended session by *raising* an error at the external call
     /// site instead of returning a value (a failed tool / activity). Catchable
     /// by a surrounding `try`/`catch` in the chunk; otherwise it propagates.
-    #[napi(ts_return_type = "ZapcodeSessionResult | ZapcodeSessionSuspension")]
-    pub fn resume_error(
-        &self,
-        error: serde_json::Value,
-    ) -> napi::Result<Either<ZapcodeSessionResult, ZapcodeSessionSuspension>> {
+    #[napi(
+        ts_return_type = "ZapcodeSessionResult | ZapcodeSessionSuspension | ZapcodeSessionBatchSuspension"
+    )]
+    pub fn resume_error(&self, error: serde_json::Value) -> napi::Result<SessionEither> {
         let value = json_to_value(&error);
         let state = self
             .inner
             .resume_with_error(value)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+        session_state_to_either(state)
+    }
+
+    /// Resume a session suspended on a `Promise.all` batch with one result per
+    /// call, in order. Use when the host ran the batched calls in parallel.
+    #[napi(
+        ts_return_type = "ZapcodeSessionResult | ZapcodeSessionSuspension | ZapcodeSessionBatchSuspension"
+    )]
+    pub fn resume_many(&self, results: Vec<serde_json::Value>) -> napi::Result<SessionEither> {
+        let values: Vec<Value> = results.iter().map(json_to_value).collect();
+        let state = self
+            .inner
+            .resume_many(values)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
         session_state_to_either(state)
@@ -347,17 +427,20 @@ impl Zapcode {
                 "execution suspended on external function '{}' -- use start() instead",
                 function_name
             ))),
+            VmState::SuspendedMany { .. } => Err(napi::Error::from_reason(
+                "execution suspended on a Promise.all batch -- use start() instead".to_string(),
+            )),
         }
     }
 
     /// Start execution. Returns either a completed result or a suspension.
     ///
     /// Check the `completed` field to determine which type was returned.
-    #[napi(ts_return_type = "ZapcodeResult | ZapcodeSuspension")]
+    #[napi(ts_return_type = "ZapcodeResult | ZapcodeSuspension | ZapcodeBatchSuspension")]
     pub fn start(
         &self,
         inputs: Option<HashMap<String, serde_json::Value>>,
-    ) -> napi::Result<Either<ZapcodeResult, ZapcodeSuspension>> {
+    ) -> napi::Result<Either3<ZapcodeResult, ZapcodeSuspension, ZapcodeBatchSuspension>> {
         let input_values = inputs_to_vec(inputs);
         let result = self
             .inner
@@ -457,6 +540,8 @@ fn value_to_json(value: &Value) -> serde_json::Value {
             serde_json::Value::Null
         }
         Value::Generator(_) => serde_json::Value::Null,
+        // A deferred batch call never escapes to JS as a result value.
+        Value::Pending(_) => serde_json::Value::Null,
     }
 }
 
@@ -483,14 +568,14 @@ fn trace_to_js(trace: &ExecutionTrace) -> JsTraceSpan {
     trace_span_to_js(&trace.root)
 }
 
-/// Package a `VmState` into either a `ZapcodeResult` or `ZapcodeSuspension`.
+/// Package a `VmState` into a complete / single-suspension / batch-suspension result.
 fn vm_state_to_either(
     state: VmState,
     stdout: String,
     trace: ExecutionTrace,
-) -> napi::Result<Either<ZapcodeResult, ZapcodeSuspension>> {
+) -> napi::Result<Either3<ZapcodeResult, ZapcodeSuspension, ZapcodeBatchSuspension>> {
     match state {
-        VmState::Complete(v) => Ok(Either::A(ZapcodeResult {
+        VmState::Complete(v) => Ok(Either3::A(ZapcodeResult {
             kind: "complete".to_string(),
             completed: true,
             output: value_to_json(&v),
@@ -505,7 +590,7 @@ fn vm_state_to_either(
             let snap_bytes = snapshot
                 .dump()
                 .map_err(|e| napi::Error::from_reason(e.to_string()))?;
-            Ok(Either::B(ZapcodeSuspension {
+            Ok(Either3::B(ZapcodeSuspension {
                 kind: "suspended".to_string(),
                 completed: false,
                 function_name,
@@ -513,12 +598,34 @@ fn vm_state_to_either(
                 snapshot: Buffer::from(snap_bytes),
             }))
         }
+        VmState::SuspendedMany { calls, snapshot } => {
+            let snap_bytes = snapshot
+                .dump()
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            Ok(Either3::C(ZapcodeBatchSuspension {
+                kind: "suspended_many".to_string(),
+                completed: false,
+                calls: external_calls_to_js(&calls),
+                snapshot: Buffer::from(snap_bytes),
+            }))
+        }
     }
 }
 
-fn session_state_to_either(
-    state: ZapcodeSessionState,
-) -> napi::Result<Either<ZapcodeSessionResult, ZapcodeSessionSuspension>> {
+fn external_calls_to_js(calls: &[zapcode_core::ExternalCall]) -> Vec<JsExternalCall> {
+    calls
+        .iter()
+        .map(|c| JsExternalCall {
+            name: c.name.clone(),
+            args: c.args.iter().map(value_to_json).collect(),
+        })
+        .collect()
+}
+
+type SessionEither =
+    Either3<ZapcodeSessionResult, ZapcodeSessionSuspension, ZapcodeSessionBatchSuspension>;
+
+fn session_state_to_either(state: ZapcodeSessionState) -> napi::Result<SessionEither> {
     match state {
         ZapcodeSessionState::Complete {
             output,
@@ -528,7 +635,7 @@ fn session_state_to_either(
             let bytes = session
                 .dump()
                 .map_err(|e| napi::Error::from_reason(e.to_string()))?;
-            Ok(Either::A(ZapcodeSessionResult {
+            Ok(Either3::A(ZapcodeSessionResult {
                 kind: "complete".to_string(),
                 completed: true,
                 output: value_to_json(&output),
@@ -545,11 +652,27 @@ fn session_state_to_either(
             let bytes = session
                 .dump()
                 .map_err(|e| napi::Error::from_reason(e.to_string()))?;
-            Ok(Either::B(ZapcodeSessionSuspension {
+            Ok(Either3::B(ZapcodeSessionSuspension {
                 kind: "suspended".to_string(),
                 completed: false,
                 function_name,
                 args: args.iter().map(value_to_json).collect(),
+                stdout,
+                session: Buffer::from(bytes),
+            }))
+        }
+        ZapcodeSessionState::SuspendedMany {
+            calls,
+            stdout,
+            session,
+        } => {
+            let bytes = session
+                .dump()
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            Ok(Either3::C(ZapcodeSessionBatchSuspension {
+                kind: "suspended_many".to_string(),
+                completed: false,
+                calls: external_calls_to_js(&calls),
                 stdout,
                 session: Buffer::from(bytes),
             }))

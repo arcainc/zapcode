@@ -56,4 +56,4 @@ pub use session::{ZapcodeSessionSnapshot, ZapcodeSessionState};
 pub use snapshot::ZapcodeSnapshot;
 pub use trace::{ExecutionTrace, TraceSpan, TraceStatus};
 pub use value::Value;
-pub use vm::{RunResult, VmState, ZapcodeRun};
+pub use vm::{ExternalCall, RunResult, VmState, ZapcodeRun};

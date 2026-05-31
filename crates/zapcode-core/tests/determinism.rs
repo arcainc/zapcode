@@ -41,6 +41,9 @@ fn idle_session_dump() -> Vec<u8> {
     match state {
         zapcode_core::ZapcodeSessionState::Complete { session, .. } => session.dump().unwrap(),
         zapcode_core::ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
+        zapcode_core::ZapcodeSessionState::SuspendedMany { .. } => {
+            panic!("unexpected batch suspension")
+        }
     }
 }
 
@@ -65,6 +68,7 @@ fn suspended_snapshot_dump() -> Vec<u8> {
     match runner.start(Vec::new()).unwrap() {
         VmState::Suspended { snapshot, .. } => snapshot.dump().unwrap(),
         VmState::Complete(_) => panic!("expected suspension"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }
 
@@ -88,5 +92,6 @@ fn resume_still_works_after_sorting() {
     match resumed {
         VmState::Complete(v) => assert_eq!(v, Value::Int(99)),
         VmState::Suspended { .. } => panic!("expected completion"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }
