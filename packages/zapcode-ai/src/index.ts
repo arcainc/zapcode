@@ -113,6 +113,24 @@ export interface ExecutionResult {
   trace?: TraceSpan;
 }
 
+const RESERVED_TOOL_NAMES = new Set([
+  "console",
+  "JSON",
+  "Object",
+  "Array",
+  "Math",
+  "Promise",
+  "Map",
+  "Date",
+  "eval",
+  "Function",
+  "process",
+  "globalThis",
+  "global",
+  "require",
+  "execute_code",
+]);
+
 /** What `zapcode()` returns — adapters for every major AI SDK. */
 export interface ZapcodeAIResult {
   /** System prompt instructing the LLM to write TypeScript. */
@@ -216,6 +234,21 @@ function generateNamedObjectSignature(name: string, def: ToolDefinition): string
   return `${name}({ ${params} })`;
 }
 
+function generateDeclaration(name: string, def: ToolDefinition): string {
+  const entries = Object.entries(def.parameters);
+  if (entries.length > 1) {
+    const fields = entries
+      .map(([pName, pDef]) => `${pName}${pDef.optional ? "?" : ""}: ${pDef.type}`)
+      .join("; ");
+    return `declare function ${name}(input: { ${fields} }): Promise<unknown>;`;
+  }
+
+  const params = entries
+    .map(([pName, pDef]) => `${pName}${pDef.optional ? "?" : ""}: ${pDef.type}`)
+    .join(", ");
+  return `declare function ${name}(${params}): Promise<unknown>;`;
+}
+
 function buildSystemPrompt(
   tools: Record<string, ToolDefinition>,
   userSystem?: string
@@ -226,7 +259,7 @@ function buildSystemPrompt(
         Object.keys(def.parameters).length > 1
           ? generateNamedObjectSignature(name, def)
           : generateSignature(name, def);
-      return `- await ${signature}\n  ${def.description}`;
+      return `- ${generateDeclaration(name, def)}\n  Call shape: await ${signature}\n  ${def.description}`;
     })
     .join("\n");
 
@@ -246,7 +279,7 @@ Rules:
 - The last expression in your code is the return value.
 - You can use variables, loops, conditionals, array methods, etc.
 - All tool calls must use \`await\`.
-- For tools with more than one parameter, call them with one named object argument, e.g. \`await toolName({ key: value })\`.
+- Prefer the declared function signatures above exactly. For tools with more than one parameter, call them with one named object argument, e.g. \`await toolName({ key: value })\`.
 - When a tool returns a structured object, access its properties directly instead of reparsing the result as text.
 - If the user's question doesn't need tools, you can compute the answer directly.`);
 
@@ -313,6 +346,21 @@ function printTrace(span: TraceSpan, indent = 0): void {
   }
 }
 
+function isValidIdentifier(name: string): boolean {
+  return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name);
+}
+
+function validateToolDefinitions(toolDefs: Record<string, ToolDefinition>): void {
+  for (const name of Object.keys(toolDefs)) {
+    if (!isValidIdentifier(name)) {
+      throw new Error(`Invalid tool name '${name}': tool names must be valid JavaScript identifiers.`);
+    }
+    if (RESERVED_TOOL_NAMES.has(name)) {
+      throw new Error(`Invalid tool name '${name}': this name is reserved by Zapcode.`);
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Tool argument validation
 // ---------------------------------------------------------------------------
@@ -361,10 +409,13 @@ function buildNamedArgs(
   const singleObjectArg = args.length === 1 && isPlainObject(args[0]) ? args[0] : undefined;
   const usesNamedObject =
     singleObjectArg !== undefined &&
-    (paramEntries.length > 1 ||
-      paramEntries.some(
-        ([name, param]) => param.type !== "object" && Object.hasOwn(singleObjectArg, name)
-      ));
+    (paramEntries.length > 1 || shouldTreatSingleObjectArgAsNamed(toolDef, singleObjectArg));
+  if (paramEntries.length > 1 && !usesNamedObject) {
+    throw new Error(
+      `Invalid arguments for tool '${functionName}': expected one named object argument. ` +
+        `Use ${formatToolSignature(functionName, toolDef)}.`
+    );
+  }
   const namedArgs =
     usesNamedObject
       ? { ...singleObjectArg }
@@ -412,6 +463,24 @@ function buildNamedArgs(
   return namedArgs;
 }
 
+function shouldTreatSingleObjectArgAsNamed(
+  toolDef: ToolDefinition,
+  arg: Record<string, unknown>
+): boolean {
+  const entries = Object.entries(toolDef.parameters);
+  if (entries.length !== 1) return false;
+
+  const [[name, param]] = entries;
+  if (!Object.hasOwn(arg, name)) return false;
+
+  // Non-object single params are unambiguous: foo({ id }) means named input.
+  if (param.type !== "object") return true;
+
+  // For a single object param, support foo({ payload: {...} }) as named input,
+  // but keep foo({ arbitrary: "shape" }) as the payload value itself.
+  return Object.keys(arg).length === 1 || Object.keys(arg).some(key => !toolDef.parameters[key]);
+}
+
 // ---------------------------------------------------------------------------
 // Execution engine
 // ---------------------------------------------------------------------------
@@ -421,6 +490,7 @@ async function executeCode(
   toolDefs: Record<string, ToolDefinition>,
   options: { memoryLimitMb?: number; timeLimitMs?: number; debug?: boolean; autoFix?: boolean }
 ): Promise<ExecutionResult> {
+  validateToolDefinitions(toolDefs);
   const toolNames = Object.keys(toolDefs);
   const toolCalls: ExecutionResult["toolCalls"] = [];
   const debug = options.debug ?? false;
@@ -451,26 +521,38 @@ async function executeCode(
         );
       }
 
-      const namedArgs = buildNamedArgs(functionName, toolDef, args);
-
       const toolSpan = tracing ? createSpan("tool_call", {
         "zapcode.tool.name": functionName,
         "zapcode.tool.args": JSON.stringify(args),
-        "zapcode.tool.input": JSON.stringify(namedArgs),
       }) : undefined;
 
-      const result = await toolDef.execute(namedArgs);
-      toolCalls.push({ name: functionName, args, input: namedArgs, result });
+      let namedArgs: Record<string, unknown>;
+      try {
+        namedArgs = buildNamedArgs(functionName, toolDef, args);
+        if (toolSpan) {
+          toolSpan.attributes["zapcode.tool.input"] = JSON.stringify(namedArgs);
+        }
 
-      if (toolSpan) {
-        toolSpan.attributes["zapcode.tool.result"] = JSON.stringify(result);
-        endSpan(toolSpan);
-        execSpan!.children.push(toolSpan);
+        const result = await toolDef.execute(namedArgs);
+        toolCalls.push({ name: functionName, args, input: namedArgs, result });
+
+        if (toolSpan) {
+          toolSpan.attributes["zapcode.tool.result"] = JSON.stringify(result);
+          endSpan(toolSpan);
+          execSpan!.children.push(toolSpan);
+        }
+
+        // Resume the VM with the tool's return value
+        const snapshot = ZapcodeSnapshotHandle.load(state.snapshot);
+        state = snapshot.resume(result);
+      } catch (err: any) {
+        if (toolSpan) {
+          toolSpan.attributes["zapcode.tool.error"] = err.message ?? String(err);
+          endSpan(toolSpan, "error");
+          execSpan!.children.push(toolSpan);
+        }
+        throw err;
       }
-
-      // Resume the VM with the tool's return value
-      const snapshot = ZapcodeSnapshotHandle.load(state.snapshot);
-      state = snapshot.resume(result);
     }
 
     if (state.stdout) {
@@ -561,6 +643,7 @@ async function executeCode(
  */
 export function zapcode(options: ZapcodeAIOptions): ZapcodeAIResult {
   const { tools: toolDefs, system: userSystem, memoryLimitMb, timeLimitMs, adapters, debug, autoFix } = options;
+  validateToolDefinitions(toolDefs);
 
   const system = buildSystemPrompt(toolDefs, userSystem);
 
@@ -587,12 +670,40 @@ export function zapcode(options: ZapcodeAIOptions): ZapcodeAIResult {
     return result;
   };
 
+  const handleExecuteCodeInput = async (args: unknown): Promise<ExecutionResult> => {
+    if (!isPlainObject(args) || typeof args.code !== "string") {
+      const actual = !isPlainObject(args) ? jsTypeName(args) : jsTypeName(args.code);
+      const message = `Invalid execute_code input: expected object with code: string, got ${actual}.`;
+      if (!autoFix) {
+        throw new Error(message);
+      }
+
+      const trace = createSpan("attempt_0", { "zapcode.code": "" });
+      trace.attributes["zapcode.error"] = message;
+      endSpan(trace, "error");
+      if (sessionTrace) {
+        sessionTrace.children.push(trace);
+      }
+
+      return {
+        code: "",
+        output: null,
+        stdout: "",
+        toolCalls: [],
+        error: `Execution failed: ${message}. Please fix your code and try again.`,
+        trace,
+      };
+    }
+
+    return handleToolCall(args.code);
+  };
+
   // AI SDK format — use tool() + jsonSchema() for proper integration
   const tools: ToolSet = {
     execute_code: tool({
       description: CODE_TOOL_DESCRIPTION,
       inputSchema: jsonSchema(CODE_TOOL_SCHEMA),
-      execute: async (args: unknown) => handleToolCall((args as { code: string }).code),
+      execute: handleExecuteCodeInput,
     }),
   };
 
