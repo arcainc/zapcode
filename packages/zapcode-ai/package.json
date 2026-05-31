@@ -14,7 +14,10 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "test:agent-scenarios": "npm run build && node tests/agent-scenarios.mjs"
+    "sync-local-binding": "node scripts/sync-local-binding.mjs",
+    "test:agent-scenarios": "npm run build && node tests/agent-scenarios.mjs",
+    "test:e2e": "npm run sync-local-binding && npm run build && node tests/agent-scenarios.mjs && node tests/durable-sessions.mjs",
+    "test": "npm run test:e2e"
   },
   "dependencies": {
     "@unchartedfr/zapcode": "^1.0.0"
