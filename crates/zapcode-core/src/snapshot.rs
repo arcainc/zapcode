@@ -6,6 +6,7 @@ use crate::error::{Result, ZapcodeError};
 use crate::sandbox::ResourceLimits;
 use crate::value::Value;
 use crate::vm::{CallFrame, Continuation, ReceiverSource, TryInfo, Vm, VmState};
+use crate::wire::FrameKind;
 
 /// Internal serializable representation of VM state at a suspension point.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,14 +99,20 @@ impl ZapcodeSnapshot {
     }
 
     /// Serialize the snapshot to bytes for storage / transport.
+    ///
+    /// The bytes are wrapped in a versioned, integrity-checked frame (see
+    /// [`crate::wire`]) so a snapshot persisted by one build is safely rejected
+    /// by an incompatible build instead of being silently misinterpreted.
     pub fn dump(&self) -> Result<Vec<u8>> {
-        postcard::to_allocvec(self)
-            .map_err(|e| ZapcodeError::SnapshotError(format!("dump failed: {}", e)))
+        let payload = postcard::to_allocvec(self)
+            .map_err(|e| ZapcodeError::SnapshotError(format!("dump failed: {}", e)))?;
+        Ok(crate::wire::encode_frame(FrameKind::Snapshot, &payload))
     }
 
-    /// Deserialize a snapshot from bytes.
+    /// Deserialize a snapshot from bytes produced by [`Self::dump`].
     pub fn load(bytes: &[u8]) -> Result<Self> {
-        postcard::from_bytes(bytes)
+        let payload = crate::wire::decode_frame(FrameKind::Snapshot, bytes)?;
+        postcard::from_bytes(payload)
             .map_err(|e| ZapcodeError::SnapshotError(format!("load failed: {}", e)))
     }
 

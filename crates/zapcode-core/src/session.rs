@@ -8,6 +8,7 @@ use crate::sandbox::ResourceLimits;
 use crate::snapshot::VmSnapshot;
 use crate::value::Value;
 use crate::vm::{Vm, VmState};
+use crate::wire::FrameKind;
 
 const RESERVED_SESSION_GLOBALS: &[&str] = Vm::BUILTIN_GLOBAL_NAMES;
 
@@ -113,12 +114,14 @@ impl ZapcodeSessionSnapshot {
     }
 
     pub fn dump(&self) -> Result<Vec<u8>> {
-        postcard::to_allocvec(self)
-            .map_err(|e| ZapcodeError::SnapshotError(format!("dump failed: {}", e)))
+        let payload = postcard::to_allocvec(self)
+            .map_err(|e| ZapcodeError::SnapshotError(format!("dump failed: {}", e)))?;
+        Ok(crate::wire::encode_frame(FrameKind::Session, &payload))
     }
 
     pub fn load(bytes: &[u8]) -> Result<Self> {
-        postcard::from_bytes(bytes)
+        let payload = crate::wire::decode_frame(FrameKind::Session, bytes)?;
+        postcard::from_bytes(payload)
             .map_err(|e| ZapcodeError::SnapshotError(format!("load failed: {}", e)))
     }
 

@@ -48,6 +48,7 @@ pub mod snapshot;
 pub mod trace;
 pub mod value;
 pub mod vm;
+pub(crate) mod wire;
 
 pub use error::ZapcodeError;
 pub use sandbox::ResourceLimits;
