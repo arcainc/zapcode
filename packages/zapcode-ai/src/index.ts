@@ -4,7 +4,7 @@
  * Works with any AI SDK:
  *
  * ```typescript
- * // Vercel AI SDK (recommended)
+ * // AI SDK (recommended)
  * import { zapcode } from "@unchartedfr/zapcode-ai";
  * const { system, tools } = zapcode({ tools: { ... } });
  * await generateText({ model, system, tools, messages });
@@ -27,7 +27,7 @@
  */
 
 import { Zapcode, ZapcodeSnapshotHandle } from "@unchartedfr/zapcode";
-import { jsonSchema, tool } from "ai";
+import { jsonSchema, tool, type ToolSet } from "ai";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -112,10 +112,10 @@ export interface ZapcodeAIResult {
   system: string;
 
   /**
-   * Vercel AI SDK tool format.
+   * AI SDK tool format.
    * Use with `generateText({ tools })` or `streamText({ tools })`.
    */
-  tools: Record<string, VercelAITool>;
+  tools: ToolSet;
 
   /**
    * OpenAI SDK tool format.
@@ -159,17 +159,6 @@ export interface ZapcodeAIResult {
 // ---------------------------------------------------------------------------
 // SDK-specific tool shapes
 // ---------------------------------------------------------------------------
-
-/** Vercel AI SDK tool shape. */
-export interface VercelAITool {
-  description: string;
-  parameters: {
-    type: "object";
-    properties: Record<string, unknown>;
-    required: string[];
-  };
-  execute: (args: { code: string }) => Promise<ExecutionResult>;
-}
 
 /** OpenAI SDK tool shape. */
 export interface OpenAITool {
@@ -479,11 +468,11 @@ export function zapcode(options: ZapcodeAIOptions): ZapcodeAIResult {
     return result;
   };
 
-  // Vercel AI SDK format — use tool() + jsonSchema() for proper integration
-  const tools: Record<string, any> = {
+  // AI SDK format — use tool() + jsonSchema() for proper integration
+  const tools: ToolSet = {
     execute_code: tool({
       description: CODE_TOOL_DESCRIPTION,
-      parameters: jsonSchema(CODE_TOOL_SCHEMA),
+      inputSchema: jsonSchema(CODE_TOOL_SCHEMA),
       execute: async (args: unknown) => handleToolCall((args as { code: string }).code),
     }),
   };
