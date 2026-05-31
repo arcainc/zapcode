@@ -19,6 +19,7 @@ oxc_syntax.workspace = true
 serde.workspace = true
 postcard.workspace = true
 sha2.workspace = true
+miniz_oxide.workspace = true
 indexmap.workspace = true
 thiserror.workspace = true
 

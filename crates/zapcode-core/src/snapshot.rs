@@ -90,29 +90,29 @@ impl VmSnapshot {
 
 /// A snapshot of VM state at a suspension point.
 /// Can be serialized to bytes and resumed later in any process.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ZapcodeSnapshot {
-    data: Vec<u8>,
+    // Boxed so `VmState::Suspended` stays small relative to `Complete` — the
+    // captured VM state is large (programs, stack, frames).
+    snapshot: Box<VmSnapshot>,
 }
 
 impl ZapcodeSnapshot {
     /// Capture the current VM state as a snapshot.
     pub(crate) fn capture(vm: &Vm) -> Result<Self> {
-        let snapshot = VmSnapshot::capture(vm);
-
-        let data = postcard::to_allocvec(&snapshot)
-            .map_err(|e| ZapcodeError::SnapshotError(format!("capture failed: {}", e)))?;
-
-        Ok(Self { data })
+        Ok(Self {
+            snapshot: Box::new(VmSnapshot::capture(vm)),
+        })
     }
 
     /// Serialize the snapshot to bytes for storage / transport.
     ///
-    /// The bytes are wrapped in a versioned, integrity-checked frame (see
-    /// [`crate::wire`]) so a snapshot persisted by one build is safely rejected
-    /// by an incompatible build instead of being silently misinterpreted.
+    /// The bytes are wrapped in a versioned, integrity-checked, compressed frame
+    /// (see [`crate::wire`]) so a snapshot persisted by one build is safely
+    /// rejected by an incompatible build instead of being silently
+    /// misinterpreted.
     pub fn dump(&self) -> Result<Vec<u8>> {
-        let payload = postcard::to_allocvec(self)
+        let payload = postcard::to_allocvec(&self.snapshot)
             .map_err(|e| ZapcodeError::SnapshotError(format!("dump failed: {}", e)))?;
         Ok(crate::wire::encode_frame(FrameKind::Snapshot, &payload))
     }
@@ -120,17 +120,17 @@ impl ZapcodeSnapshot {
     /// Deserialize a snapshot from bytes produced by [`Self::dump`].
     pub fn load(bytes: &[u8]) -> Result<Self> {
         let payload = crate::wire::decode_frame(FrameKind::Snapshot, bytes)?;
-        postcard::from_bytes(payload)
-            .map_err(|e| ZapcodeError::SnapshotError(format!("load failed: {}", e)))
+        let snapshot: VmSnapshot = postcard::from_bytes(&payload)
+            .map_err(|e| ZapcodeError::SnapshotError(format!("load failed: {}", e)))?;
+        Ok(Self {
+            snapshot: Box::new(snapshot),
+        })
     }
 
     /// Resume execution with a return value from the external function.
     /// Returns a `VmState` which may be `Complete` or another `Suspended`.
     pub fn resume(self, return_value: Value) -> Result<VmState> {
-        let vm_snap: VmSnapshot = postcard::from_bytes(&self.data)
-            .map_err(|e| ZapcodeError::SnapshotError(format!("resume decode failed: {}", e)))?;
-
-        let mut vm = vm_snap.restore_vm();
+        let mut vm = self.snapshot.restore_vm();
 
         // Push the return value onto the stack — this is the result the
         // `CallExternal` instruction was waiting for.

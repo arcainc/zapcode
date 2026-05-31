@@ -21,8 +21,8 @@ fn suspended_snapshot() -> ZapcodeSnapshot {
 fn dump_emits_magic_header() {
     let bytes = suspended_snapshot().dump().unwrap();
     assert_eq!(&bytes[0..4], b"ZPC1", "frame should start with magic bytes");
-    // 4 magic + 2 version + 1 kind + 32 sha256 = 39-byte header.
-    assert!(bytes.len() > 39);
+    // 4 magic + 2 version + 1 kind + 1 compression + 32 sha256 = 40-byte header.
+    assert!(bytes.len() > 40);
 }
 
 #[test]
@@ -62,7 +62,7 @@ fn load_rejects_version_mismatch() {
 #[test]
 fn load_rejects_tampered_payload() {
     let mut bytes = suspended_snapshot().dump().unwrap();
-    // Flip a byte in the payload (after the 39-byte header) — hash must fail.
+    // Flip the last byte of the stored payload — the sha256 must fail.
     let last = bytes.len() - 1;
     bytes[last] ^= 0x01;
     let err = ZapcodeSnapshot::load(&bytes).unwrap_err().to_string();
@@ -81,4 +81,29 @@ fn load_rejects_wrong_kind() {
         err.contains("expected a snapshot blob but got a session blob"),
         "unexpected error: {err}"
     );
+}
+
+#[test]
+fn large_compressible_state_is_compressed_on_the_wire() {
+    // A session holding a big, highly-repetitive string global should dump to
+    // far fewer bytes than the raw payload — proving DEFLATE engaged.
+    let session = ZapcodeSessionSnapshot::new(Vec::new(), ResourceLimits::default()).unwrap();
+    let state = session
+        .run_chunk(
+            r#"const big = "a".repeat(50000); big.length"#.to_string(),
+            Vec::new(),
+        )
+        .unwrap();
+    let bytes = match state {
+        zapcode_core::ZapcodeSessionState::Complete { session, .. } => session.dump().unwrap(),
+        zapcode_core::ZapcodeSessionState::Suspended { .. } => panic!("expected completion"),
+    };
+    // The global alone is 50 KB; a compressed dump of a run of 'a' is tiny.
+    assert!(
+        bytes.len() < 5000,
+        "expected compressed dump well under 5KB, got {} bytes",
+        bytes.len()
+    );
+    // And it still round-trips.
+    ZapcodeSessionSnapshot::load(&bytes).unwrap();
 }

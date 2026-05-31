@@ -121,7 +121,7 @@ impl ZapcodeSessionSnapshot {
 
     pub fn load(bytes: &[u8]) -> Result<Self> {
         let payload = crate::wire::decode_frame(FrameKind::Session, bytes)?;
-        postcard::from_bytes(payload)
+        postcard::from_bytes(&payload)
             .map_err(|e| ZapcodeError::SnapshotError(format!("load failed: {}", e)))
     }
 

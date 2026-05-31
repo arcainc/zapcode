@@ -4,8 +4,13 @@
 //! activities, durable queues, disk) is wrapped in a self-describing frame:
 //!
 //! ```text
-//! [ MAGIC "ZPC1" (4) ][ format_version u16 LE (2) ][ kind u8 (1) ][ sha256 (32) ][ postcard payload ]
+//! [ MAGIC "ZPC1" (4) ][ format_version u16 LE (2) ][ kind u8 (1) ][ compression u8 (1) ][ sha256 (32) ][ stored payload ]
 //! ```
+//!
+//! The `stored payload` is the postcard bytes, optionally DEFLATE-compressed
+//! (the `compression` byte says which). The sha256 covers the stored bytes, so
+//! integrity is verified *before* decompression. Compression is only applied
+//! when it actually shrinks the payload, so tiny snapshots never grow.
 //!
 //! This buys three things we need for durable execution:
 //!
@@ -21,6 +26,8 @@
 //!    a plain *snapshot* (or vice versa) fails with a clear error rather than a
 //!    confusing postcard decode error deep in the wrong type.
 
+use miniz_oxide::deflate::compress_to_vec;
+use miniz_oxide::inflate::decompress_to_vec;
 use sha2::{Digest, Sha256};
 
 use crate::error::{Result, ZapcodeError};
@@ -31,7 +38,12 @@ const MAGIC: &[u8; 4] = b"ZPC1";
 /// `CompiledProgram`, the VM frame/continuation types, or the snapshot structs.
 pub(crate) const FORMAT_VERSION: u16 = 1;
 
-const HEADER_LEN: usize = 4 + 2 + 1 + 32;
+const HEADER_LEN: usize = 4 + 2 + 1 + 1 + 32;
+
+const COMPRESSION_NONE: u8 = 0;
+const COMPRESSION_DEFLATE: u8 = 1;
+// DEFLATE level 6 — solid ratio without the cost of max compression.
+const DEFLATE_LEVEL: u8 = 6;
 
 /// Distinguishes the kind of payload carried in a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,22 +69,33 @@ impl FrameKind {
     }
 }
 
-/// Wrap a postcard payload in a versioned, hashed frame.
+/// Wrap a postcard payload in a versioned, hashed, optionally-compressed frame.
 pub(crate) fn encode_frame(kind: FrameKind, payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
+    // Compress, but only keep it if it actually shrinks the payload — small
+    // snapshots shouldn't pay DEFLATE overhead.
+    let compressed = compress_to_vec(payload, DEFLATE_LEVEL);
+    let (compression, stored): (u8, &[u8]) = if compressed.len() < payload.len() {
+        (COMPRESSION_DEFLATE, &compressed)
+    } else {
+        (COMPRESSION_NONE, payload)
+    };
+
+    let mut out = Vec::with_capacity(HEADER_LEN + stored.len());
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
     out.push(kind as u8);
-    out.extend_from_slice(&Sha256::digest(payload));
-    out.extend_from_slice(payload);
+    out.push(compression);
+    out.extend_from_slice(&Sha256::digest(stored));
+    out.extend_from_slice(stored);
     out
 }
 
-/// Validate a frame and return the inner postcard payload.
+/// Validate a frame and return the inner (decompressed) postcard payload.
 ///
 /// Rejects (with actionable errors) a bad magic, a format-version mismatch, a
-/// wrong payload kind, or a payload whose SHA-256 doesn't match the header.
-pub(crate) fn decode_frame(expected: FrameKind, bytes: &[u8]) -> Result<&[u8]> {
+/// wrong payload kind, a payload whose SHA-256 doesn't match the header, or an
+/// undecompressable payload. The hash is checked before decompression.
+pub(crate) fn decode_frame(expected: FrameKind, bytes: &[u8]) -> Result<Vec<u8>> {
     if bytes.len() < HEADER_LEN {
         return Err(ZapcodeError::SnapshotError(format!(
             "{} blob is too short to contain a header ({} bytes)",
@@ -110,8 +133,9 @@ pub(crate) fn decode_frame(expected: FrameKind, bytes: &[u8]) -> Result<&[u8]> {
         )));
     }
 
-    let (expected_hash, payload) = rest.split_at(32);
-    let actual_hash = Sha256::digest(payload);
+    let (compression_byte, rest) = rest.split_at(1);
+    let (expected_hash, stored) = rest.split_at(32);
+    let actual_hash = Sha256::digest(stored);
     if actual_hash.as_slice() != expected_hash {
         return Err(ZapcodeError::SnapshotError(
             "snapshot integrity check failed (sha256 mismatch); the bytes are corrupted or tampered"
@@ -119,5 +143,14 @@ pub(crate) fn decode_frame(expected: FrameKind, bytes: &[u8]) -> Result<&[u8]> {
         ));
     }
 
-    Ok(payload)
+    match compression_byte[0] {
+        COMPRESSION_NONE => Ok(stored.to_vec()),
+        COMPRESSION_DEFLATE => decompress_to_vec(stored).map_err(|e| {
+            ZapcodeError::SnapshotError(format!("snapshot decompression failed: {}", e))
+        }),
+        other => Err(ZapcodeError::SnapshotError(format!(
+            "unknown snapshot compression byte {}",
+            other
+        ))),
+    }
 }
