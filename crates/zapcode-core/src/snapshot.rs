@@ -6,7 +6,7 @@ use crate::compiler::CompiledProgram;
 use crate::error::{Result, ZapcodeError};
 use crate::sandbox::ResourceLimits;
 use crate::value::Value;
-use crate::vm::{CallFrame, Continuation, TryInfo, Vm, VmState};
+use crate::vm::{CallFrame, Continuation, ReceiverSource, TryInfo, Vm, VmState};
 
 /// Internal serializable representation of VM state at a suspension point.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +21,10 @@ struct VmSnapshot {
     stdout: String,
     limits: ResourceLimits,
     external_functions: Vec<String>,
+    last_receiver: Option<Value>,
+    last_receiver_source: Option<ReceiverSource>,
+    last_global_name: Option<String>,
+    last_load_source: Option<ReceiverSource>,
 }
 
 /// A snapshot of VM state at a suspension point.
@@ -52,6 +56,10 @@ impl ZapcodeSnapshot {
             stdout: vm.stdout.clone(),
             limits: vm.limits.clone(),
             external_functions: vm.external_functions.iter().cloned().collect(),
+            last_receiver: vm.last_receiver.clone(),
+            last_receiver_source: vm.last_receiver_source.clone(),
+            last_global_name: vm.last_global_name.clone(),
+            last_load_source: vm.last_load_source.clone(),
         };
 
         let data = postcard::to_allocvec(&snapshot)
@@ -91,6 +99,10 @@ impl ZapcodeSnapshot {
             vm_snap.stdout,
             vm_snap.limits,
             ext_set,
+            vm_snap.last_receiver,
+            vm_snap.last_receiver_source,
+            vm_snap.last_global_name,
+            vm_snap.last_load_source,
         );
 
         // Push the return value onto the stack — this is the result the

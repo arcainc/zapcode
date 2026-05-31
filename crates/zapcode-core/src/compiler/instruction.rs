@@ -47,6 +47,7 @@ pub enum Instruction {
     // Objects & Arrays
     CreateArray(usize),
     CreateObject(usize),
+    ObjectRest(Vec<String>),
     GetProperty(String),
     SetProperty(String),
     GetIndex,

@@ -1044,7 +1044,6 @@ fn test_for_of_sync_counter() {
 }
 
 #[test]
-#[ignore = "pre-existing bug: array.push() inside for-of doesn't mutate the array (value semantics vs reference)"]
 fn test_for_of_sync_push() {
     let result = eval_ts(
         r#"

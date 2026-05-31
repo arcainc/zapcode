@@ -135,10 +135,7 @@ impl Compiler {
                     }
                 }
                 ParamPattern::ObjectDestructure(fields) => {
-                    for field in fields {
-                        let name = field.alias.as_ref().unwrap_or(&field.key);
-                        func_compiler.declare_local(name);
-                    }
+                    func_compiler.declare_destructure_locals(fields);
                 }
                 ParamPattern::ArrayDestructure(elems) => {
                     for elem in elems.iter().flatten() {
@@ -537,13 +534,7 @@ impl Compiler {
                 } else {
                     self.emit(Instruction::Push(Constant::Undefined));
                 }
-                for field in fields {
-                    self.emit(Instruction::Dup);
-                    self.emit(Instruction::GetProperty(field.key.clone()));
-                    let name = field.alias.as_ref().unwrap_or(&field.key);
-                    let idx = self.declare_local(name);
-                    self.emit(Instruction::StoreLocal(idx));
-                }
+                self.compile_object_destructure(fields)?;
                 self.emit(Instruction::Pop); // pop source object
             }
             AssignTarget::ArrayDestructure(elems) => {
@@ -569,6 +560,49 @@ impl Compiler {
                     }
                 }
                 self.emit(Instruction::Pop); // pop source array
+            }
+        }
+        Ok(())
+    }
+
+    fn declare_destructure_locals(&mut self, fields: &[DestructureField]) {
+        for field in fields {
+            if field.rest {
+                let name = field.alias.as_ref().unwrap_or(&field.key);
+                self.declare_local(name);
+            } else if let Some(nested) = &field.nested {
+                self.declare_destructure_locals(nested);
+            } else {
+                let name = field.alias.as_ref().unwrap_or(&field.key);
+                self.declare_local(name);
+            }
+        }
+    }
+
+    fn compile_object_destructure(&mut self, fields: &[DestructureField]) -> Result<()> {
+        let excluded_keys: Vec<String> = fields
+            .iter()
+            .filter(|field| !field.rest)
+            .map(|field| field.key.clone())
+            .collect();
+
+        for field in fields {
+            self.emit(Instruction::Dup);
+            if field.rest {
+                self.emit(Instruction::ObjectRest(excluded_keys.clone()));
+                let name = field.alias.as_ref().unwrap_or(&field.key);
+                let idx = self.declare_local(name);
+                self.emit(Instruction::StoreLocal(idx));
+            } else {
+                self.emit(Instruction::GetProperty(field.key.clone()));
+                if let Some(nested) = &field.nested {
+                    self.compile_object_destructure(nested)?;
+                    self.emit(Instruction::Pop);
+                } else {
+                    let name = field.alias.as_ref().unwrap_or(&field.key);
+                    let idx = self.declare_local(name);
+                    self.emit(Instruction::StoreLocal(idx));
+                }
             }
         }
         Ok(())
@@ -613,9 +647,16 @@ impl Compiler {
                     self.emit(Instruction::ConcatStrings(parts));
                 }
             }
-            Expr::RegExpLit { .. } => {
-                // RegExp not fully supported — push as string for now
-                self.emit(Instruction::Push(Constant::Undefined));
+            Expr::RegExpLit { pattern, flags } => {
+                self.emit(Instruction::Push(Constant::String(
+                    "__regexp__".to_string(),
+                )));
+                self.emit(Instruction::Push(Constant::Bool(true)));
+                self.emit(Instruction::Push(Constant::String("pattern".to_string())));
+                self.emit(Instruction::Push(Constant::String(pattern.clone())));
+                self.emit(Instruction::Push(Constant::String("flags".to_string())));
+                self.emit(Instruction::Push(Constant::String(flags.clone())));
+                self.emit(Instruction::CreateObject(3));
             }
             Expr::Ident(name) => {
                 if name == "this" {

@@ -15,12 +15,11 @@ pub enum Value {
     Object(IndexMap<Arc<str>, Value>),
     Function(Closure),
     /// A generator object — calling function* creates one of these.
-    /// Generators are stateful and cannot be serialized mid-yield.
-    #[serde(skip)]
     Generator(GeneratorObject),
     /// Internal: a bound method on a built-in object (e.g., console.log, Math.floor).
-    /// Not visible to user code — used to dispatch builtin calls.
-    #[serde(skip)]
+    /// Not visible to user code — used to dispatch builtin calls. These handles
+    /// must be serializable because argument evaluation can suspend after a
+    /// method is loaded but before it is called.
     BuiltinMethod {
         object_name: Arc<str>,
         method_name: Arc<str>,
@@ -39,7 +38,7 @@ pub struct Closure {
 }
 
 /// The state of a generator object.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeneratorObject {
     /// Unique ID for this generator instance (used as key in VM generator registry).
     pub id: u64,
@@ -54,7 +53,7 @@ pub struct GeneratorObject {
 }
 
 /// Saved execution state of a suspended generator.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SuspendedFrame {
     pub ip: usize,
     pub locals: Vec<Value>,

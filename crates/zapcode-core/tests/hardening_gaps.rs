@@ -22,7 +22,6 @@ fn lookup_snapshot(state: VmState) -> ZapcodeSnapshot {
 }
 
 #[test]
-#[ignore = "current snapshot capture fails when Promise.all contains external suspensions"]
 fn promise_all_can_snapshot_external_calls() {
     let state = start_with_lookup(
         r#"
@@ -46,7 +45,6 @@ fn promise_all_can_snapshot_external_calls() {
 }
 
 #[test]
-#[ignore = "current snapshot capture fails when for-of contains awaited external calls"]
 fn for_of_can_snapshot_awaited_external_calls() {
     let state = start_with_lookup(
         r#"
@@ -73,7 +71,6 @@ fn for_of_can_snapshot_awaited_external_calls() {
 }
 
 #[test]
-#[ignore = "nested object destructuring currently evaluates to null instead of binding nested values"]
 fn nested_object_destructuring_binds_nested_values() {
     let result = eval_ts(
         r#"
@@ -88,7 +85,6 @@ fn nested_object_destructuring_binds_nested_values() {
 }
 
 #[test]
-#[ignore = "object rest currently leaves the rest binding undefined"]
 fn object_rest_destructuring_binds_remaining_properties() {
     let result = eval_ts(
         r#"
@@ -103,7 +99,6 @@ fn object_rest_destructuring_binds_remaining_properties() {
 }
 
 #[test]
-#[ignore = "Map is not currently implemented as a safe builtin"]
 fn map_builtin_supports_basic_get_set() {
     let result = eval_ts(
         r#"
@@ -118,7 +113,6 @@ fn map_builtin_supports_basic_get_set() {
 }
 
 #[test]
-#[ignore = "Date is not currently implemented as a deterministic safe builtin"]
 fn date_builtin_supports_epoch_iso_string() {
     let result = eval_ts("new Date(0).toISOString()").unwrap();
 
@@ -126,7 +120,6 @@ fn date_builtin_supports_epoch_iso_string() {
 }
 
 #[test]
-#[ignore = "regex literals parse, but string regex methods are not executable yet"]
 fn string_match_supports_regex_literals() {
     let result = eval_ts(r#""abc".match(/b/)[0]"#).unwrap();
 
@@ -134,7 +127,6 @@ fn string_match_supports_regex_literals() {
 }
 
 #[test]
-#[ignore = "infinite loops currently surface as allocation limit failures"]
 fn infinite_loop_reports_time_limit() {
     let runner = ZapcodeRun::new(
         "while (true) {}".to_string(),
@@ -155,7 +147,6 @@ fn infinite_loop_reports_time_limit() {
 }
 
 #[test]
-#[ignore = "indexed loops with awaited external calls currently hit snapshot serialization failures"]
 fn indexed_for_loop_can_sequence_external_calls() {
     let state = start_with_lookup(
         r#"

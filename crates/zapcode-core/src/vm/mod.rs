@@ -90,13 +90,13 @@ pub struct Vm {
     /// Active continuations for array callback methods that may suspend.
     pub(crate) continuations: Vec<Continuation>,
     /// The last object a property was accessed on — used for method dispatch.
-    last_receiver: Option<Value>,
+    pub(crate) last_receiver: Option<Value>,
     /// Where the last receiver came from — used to write back `this` mutations.
-    last_receiver_source: Option<ReceiverSource>,
+    pub(crate) last_receiver_source: Option<ReceiverSource>,
     /// The name of the last global loaded — used to identify known globals.
-    last_global_name: Option<String>,
+    pub(crate) last_global_name: Option<String>,
     /// Tracks the source of the most recent Load instruction for receiver tracking.
-    last_load_source: Option<ReceiverSource>,
+    pub(crate) last_load_source: Option<ReceiverSource>,
     /// Counter for assigning unique generator IDs.
     next_generator_id: u64,
 }
@@ -139,8 +139,9 @@ impl Vm {
     }
 
     /// Names of all builtin globals registered by `register_globals`.
-    pub(crate) const BUILTIN_GLOBAL_NAMES: &'static [&'static str] =
-        &["console", "JSON", "Object", "Array", "Math", "Promise"];
+    pub(crate) const BUILTIN_GLOBAL_NAMES: &'static [&'static str] = &[
+        "console", "JSON", "Object", "Array", "Math", "Promise", "Map", "Date",
+    ];
 
     /// Restore a VM from snapshot state and continue execution.
     /// Builtins are re-registered after restoring user globals.
@@ -156,6 +157,10 @@ impl Vm {
         stdout: String,
         limits: ResourceLimits,
         external_functions: HashSet<String>,
+        last_receiver: Option<Value>,
+        last_receiver_source: Option<ReceiverSource>,
+        last_global_name: Option<String>,
+        last_load_source: Option<ReceiverSource>,
     ) -> Self {
         let mut globals = HashMap::new();
         // Re-register builtins first
@@ -176,10 +181,10 @@ impl Vm {
             external_functions,
             try_stack,
             continuations,
-            last_receiver: None,
-            last_receiver_source: None,
-            last_global_name: None,
-            last_load_source: None,
+            last_receiver,
+            last_receiver_source,
+            last_global_name,
+            last_load_source,
             next_generator_id: 0,
         }
     }
@@ -195,6 +200,22 @@ impl Vm {
         self.tracker.track_allocation(&self.limits)?;
         self.stack.push(value);
         Ok(())
+    }
+
+    fn write_receiver_source(&mut self, source: &ReceiverSource, value: Value) {
+        match source {
+            ReceiverSource::Global(name) => {
+                self.globals.insert(name.clone(), value);
+            }
+            ReceiverSource::Local { frame_index, slot } => {
+                if let Some(target_frame) = self.frames.get_mut(*frame_index) {
+                    while target_frame.locals.len() <= *slot {
+                        target_frame.locals.push(Value::Undefined);
+                    }
+                    target_frame.locals[*slot] = value;
+                }
+            }
+        }
     }
 
     fn pop(&mut self) -> Result<Value> {
@@ -1394,6 +1415,19 @@ impl Vm {
                 }
                 self.push(Value::Object(obj))?;
             }
+            Instruction::ObjectRest(excluded) => {
+                let source = self.pop()?;
+                let rest = match source {
+                    Value::Object(map) => map
+                        .into_iter()
+                        .filter(|(key, _)| {
+                            !excluded.iter().any(|excluded| excluded == key.as_ref())
+                        })
+                        .collect(),
+                    _ => IndexMap::new(),
+                };
+                self.push(Value::Object(rest))?;
+            }
             Instruction::GetProperty(name) => {
                 let obj = self.pop()?;
                 let result = self.get_property(&obj, &name)?;
@@ -1550,9 +1584,8 @@ impl Vm {
                     }
                 }
                 // Also capture all globals that are user-defined (not builtins)
-                let builtins = ["console", "Math", "JSON", "Object", "Array"];
                 for (name, val) in &self.globals {
-                    if !builtins.contains(&name.as_str()) {
+                    if !Self::BUILTIN_GLOBAL_NAMES.contains(&name.as_str()) {
                         captured.push((name.clone(), val.clone()));
                     }
                 }
@@ -1624,8 +1657,10 @@ impl Vm {
                         let result = match object_name.as_ref() {
                             "__array__" => {
                                 if let Some(Value::Array(arr)) = &receiver {
+                                    let receiver_update =
+                                        mutated_array_receiver(&method_name, arr, &args);
                                     // Check if this is a callback method first
-                                    match method_name.as_ref() {
+                                    let result = match method_name.as_ref() {
                                         "map" | "filter" | "forEach" | "find" | "findIndex"
                                         | "every" | "some" | "reduce" | "sort" | "flatMap" => {
                                             match self.execute_array_callback_method(
@@ -1648,7 +1683,13 @@ impl Vm {
                                             &args,
                                             &mut self.stdout,
                                         )?,
+                                    };
+                                    if let (Some(source), Some(updated)) =
+                                        (self.last_receiver_source.clone(), receiver_update)
+                                    {
+                                        self.write_receiver_source(&source, Value::Array(updated));
                                     }
+                                    result
                                 } else {
                                     None
                                 }
@@ -1715,6 +1756,27 @@ impl Vm {
                                     None
                                 }
                             }
+                            "__map__" => {
+                                if let Some(Value::Object(map)) = receiver {
+                                    let (result, updated) =
+                                        execute_map_method(map, &method_name, &args);
+                                    if let (Some(source), Some(updated)) =
+                                        (self.last_receiver_source.clone(), updated)
+                                    {
+                                        self.write_receiver_source(&source, Value::Object(updated));
+                                    }
+                                    result
+                                } else {
+                                    None
+                                }
+                            }
+                            "__date__" => {
+                                if let Some(Value::Object(date)) = receiver {
+                                    execute_date_method(&date, &method_name)
+                                } else {
+                                    None
+                                }
+                            }
                             global_name => builtins::call_global_method(
                                 global_name,
                                 &method_name,
@@ -1765,19 +1827,7 @@ impl Vm {
                     // value-type semantics work correctly for method calls
                     // that mutate `this` properties (e.g., this.count += 1).
                     if let Some(ref source) = frame.receiver_source {
-                        match source {
-                            ReceiverSource::Global(name) => {
-                                self.globals.insert(name.clone(), this_val.clone());
-                            }
-                            ReceiverSource::Local { frame_index, slot } => {
-                                if let Some(target_frame) = self.frames.get_mut(*frame_index) {
-                                    while target_frame.locals.len() <= *slot {
-                                        target_frame.locals.push(Value::Undefined);
-                                    }
-                                    target_frame.locals[*slot] = this_val.clone();
-                                }
-                            }
-                        }
+                        self.write_receiver_source(source, this_val.clone());
                     }
                     if matches!(return_val, Value::Undefined) {
                         this_val.clone()
@@ -2216,6 +2266,24 @@ impl Vm {
 
                 let callee = self.pop()?;
 
+                if let Value::Object(obj) = &callee {
+                    if let Some(Value::String(name)) = obj.get("__builtin_constructor__") {
+                        match name.as_ref() {
+                            "Map" => {
+                                self.push(make_map_object(Vec::new()))?;
+                                return Ok(None);
+                            }
+                            "Date" => {
+                                let millis =
+                                    args.first().map_or(0, |value| value.to_number() as i64);
+                                self.push(make_date_object(millis))?;
+                                return Ok(None);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
                 match &callee {
                     Value::Object(class_obj) if class_obj.contains_key("__class_name__") => {
                         // Create a new instance object
@@ -2355,10 +2423,21 @@ impl Vm {
                         method_name: Arc::from(name),
                     });
                 }
+                if is_map_object(obj) && is_map_method(name) {
+                    return Ok(Value::BuiltinMethod {
+                        object_name: Arc::from("__map__"),
+                        method_name: Arc::from(name),
+                    });
+                }
+                if is_date_object(obj) && is_date_method(name) {
+                    return Ok(Value::BuiltinMethod {
+                        object_name: Arc::from("__date__"),
+                        method_name: Arc::from(name),
+                    });
+                }
                 // Check if this is a known global object — return builtin method handle
                 if let Some(global_name) = &self.last_global_name {
-                    let known_globals = ["console", "Math", "JSON", "Object", "Array", "Promise"];
-                    if known_globals.contains(&global_name.as_str()) {
+                    if Self::BUILTIN_GLOBAL_NAMES.contains(&global_name.as_str()) {
                         return Ok(Value::BuiltinMethod {
                             object_name: Arc::from(global_name.as_str()),
                             method_name: Arc::from(name),
@@ -2403,6 +2482,223 @@ impl Vm {
 
 // Re-export for the ParamPattern type used in function calls
 use crate::parser::ir::ParamPattern;
+
+fn mutated_array_receiver(method: &str, arr: &[Value], args: &[Value]) -> Option<Vec<Value>> {
+    match method {
+        "push" => {
+            let mut updated = arr.to_vec();
+            updated.extend(args.iter().cloned());
+            Some(updated)
+        }
+        "pop" => {
+            let mut updated = arr.to_vec();
+            updated.pop();
+            Some(updated)
+        }
+        "shift" => {
+            let mut updated = arr.to_vec();
+            if !updated.is_empty() {
+                updated.remove(0);
+            }
+            Some(updated)
+        }
+        "unshift" => {
+            let mut updated = args.to_vec();
+            updated.extend_from_slice(arr);
+            Some(updated)
+        }
+        "reverse" => {
+            let mut updated = arr.to_vec();
+            updated.reverse();
+            Some(updated)
+        }
+        "fill" => {
+            let fill_val = args.first().cloned().unwrap_or(Value::Undefined);
+            let len = arr.len() as i64;
+            let start = if args.len() > 1 {
+                normalize_array_index(args[1].to_number() as i64, len)
+            } else {
+                0
+            };
+            let end = if args.len() > 2 {
+                normalize_array_index(args[2].to_number() as i64, len)
+            } else {
+                arr.len()
+            };
+            let mut updated = arr.to_vec();
+            for item in updated.iter_mut().take(end.min(arr.len())).skip(start) {
+                *item = fill_val.clone();
+            }
+            Some(updated)
+        }
+        "splice" => {
+            let len = arr.len() as i64;
+            let raw_start = args.first().map_or(0, |value| value.to_number() as i64);
+            let start = if raw_start < 0 {
+                (len + raw_start).max(0) as usize
+            } else {
+                (raw_start as usize).min(arr.len())
+            };
+            let delete_count = if args.len() > 1 {
+                ((args[1].to_number() as i64).max(0) as usize).min(arr.len() - start)
+            } else {
+                arr.len() - start
+            };
+            let mut updated = arr.to_vec();
+            updated.splice(start..start + delete_count, args.iter().skip(2).cloned());
+            Some(updated)
+        }
+        _ => None,
+    }
+}
+
+fn normalize_array_index(idx: i64, len: i64) -> usize {
+    if idx < 0 {
+        (len + idx).max(0) as usize
+    } else {
+        (idx as usize).min(len as usize)
+    }
+}
+
+fn make_map_object(entries: Vec<Value>) -> Value {
+    let mut obj = IndexMap::new();
+    obj.insert(Arc::from("__map__"), Value::Bool(true));
+    obj.insert(Arc::from("__entries__"), Value::Array(entries));
+    Value::Object(obj)
+}
+
+fn is_map_object(value: &Value) -> bool {
+    matches!(value, Value::Object(map) if matches!(map.get("__map__"), Some(Value::Bool(true))))
+}
+
+fn is_map_method(name: &str) -> bool {
+    matches!(name, "get" | "set" | "has" | "delete")
+}
+
+fn execute_map_method(
+    mut map: IndexMap<Arc<str>, Value>,
+    method: &str,
+    args: &[Value],
+) -> (Option<Value>, Option<IndexMap<Arc<str>, Value>>) {
+    let entries = match map.get("__entries__") {
+        Some(Value::Array(entries)) => entries.clone(),
+        _ => Vec::new(),
+    };
+    let key = args.first().cloned().unwrap_or(Value::Undefined);
+
+    match method {
+        "get" => {
+            let value = entries
+                .iter()
+                .find_map(|entry| match entry {
+                    Value::Object(entry)
+                        if entry.get("key").is_some_and(|item| item.strict_eq(&key)) =>
+                    {
+                        entry.get("value").cloned()
+                    }
+                    _ => None,
+                })
+                .unwrap_or(Value::Undefined);
+            (Some(value), None)
+        }
+        "has" => {
+            let has_key = entries.iter().any(|entry| match entry {
+                Value::Object(entry) => entry.get("key").is_some_and(|item| item.strict_eq(&key)),
+                _ => false,
+            });
+            (Some(Value::Bool(has_key)), None)
+        }
+        "set" => {
+            let value = args.get(1).cloned().unwrap_or(Value::Undefined);
+            let mut updated_entries = entries;
+            let mut replaced = false;
+            for entry in &mut updated_entries {
+                if let Value::Object(entry) = entry {
+                    if entry.get("key").is_some_and(|item| item.strict_eq(&key)) {
+                        entry.insert(Arc::from("value"), value.clone());
+                        replaced = true;
+                        break;
+                    }
+                }
+            }
+            if !replaced {
+                let mut entry = IndexMap::new();
+                entry.insert(Arc::from("key"), key);
+                entry.insert(Arc::from("value"), value);
+                updated_entries.push(Value::Object(entry));
+            }
+            map.insert(Arc::from("__entries__"), Value::Array(updated_entries));
+            (Some(Value::Object(map.clone())), Some(map))
+        }
+        "delete" => {
+            let mut updated_entries = entries;
+            let before = updated_entries.len();
+            updated_entries.retain(|entry| match entry {
+                Value::Object(entry) => !entry.get("key").is_some_and(|item| item.strict_eq(&key)),
+                _ => true,
+            });
+            let deleted = updated_entries.len() != before;
+            map.insert(Arc::from("__entries__"), Value::Array(updated_entries));
+            (Some(Value::Bool(deleted)), Some(map))
+        }
+        _ => (None, None),
+    }
+}
+
+fn make_date_object(millis: i64) -> Value {
+    let mut obj = IndexMap::new();
+    obj.insert(Arc::from("__date_ms__"), Value::Int(millis));
+    Value::Object(obj)
+}
+
+fn is_date_object(value: &Value) -> bool {
+    matches!(value, Value::Object(map) if map.contains_key("__date_ms__"))
+}
+
+fn is_date_method(name: &str) -> bool {
+    matches!(name, "toISOString" | "getTime")
+}
+
+fn execute_date_method(map: &IndexMap<Arc<str>, Value>, method: &str) -> Option<Value> {
+    let millis = match map.get("__date_ms__") {
+        Some(Value::Int(millis)) => *millis,
+        Some(Value::Float(millis)) => *millis as i64,
+        _ => 0,
+    };
+    match method {
+        "getTime" => Some(Value::Int(millis)),
+        "toISOString" => Some(Value::String(Arc::from(
+            unix_millis_to_iso(millis).as_str(),
+        ))),
+        _ => None,
+    }
+}
+
+fn unix_millis_to_iso(millis: i64) -> String {
+    let seconds = millis.div_euclid(1000);
+    let ms = millis.rem_euclid(1000);
+    let days = seconds.div_euclid(86_400);
+    let second_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = second_of_day / 3_600;
+    let minute = (second_of_day % 3_600) / 60;
+    let second = second_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{ms:03}Z")
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+    (year, month as u32, day as u32)
+}
 
 fn is_array_method(name: &str) -> bool {
     matches!(

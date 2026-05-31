@@ -61,7 +61,9 @@ pub enum ParamPattern {
 pub struct DestructureField {
     pub key: String,
     pub alias: Option<String>,
+    pub nested: Option<Vec<DestructureField>>,
     pub default: Option<Expr>,
+    pub rest: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
