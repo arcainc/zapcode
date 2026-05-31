@@ -99,7 +99,14 @@ export interface ExecutionResult {
   code: string;
   output: unknown;
   stdout: string;
-  toolCalls: Array<{ name: string; args: unknown[]; result: unknown }>;
+  toolCalls: Array<{
+    name: string;
+    /** Raw positional arguments emitted by the sandboxed code. */
+    args: unknown[];
+    /** Schema-validated named input passed to the host tool. */
+    input: Record<string, unknown>;
+    result: unknown;
+  }>;
   /** Present when autoFix is enabled and execution failed. */
   error?: string;
   /** Execution trace. Present when debug or autoFix is enabled. */
@@ -199,12 +206,28 @@ function generateSignature(name: string, def: ToolDefinition): string {
   return `${name}(${params})`;
 }
 
+function generateNamedObjectSignature(name: string, def: ToolDefinition): string {
+  const params = Object.entries(def.parameters)
+    .map(([pName, pDef]) => {
+      const opt = pDef.optional ? "?" : "";
+      return `${pName}${opt}: ${pDef.type}`;
+    })
+    .join(", ");
+  return `${name}({ ${params} })`;
+}
+
 function buildSystemPrompt(
   tools: Record<string, ToolDefinition>,
   userSystem?: string
 ): string {
   const toolDocs = Object.entries(tools)
-    .map(([name, def]) => `- await ${generateSignature(name, def)}\n  ${def.description}`)
+    .map(([name, def]) => {
+      const signature =
+        Object.keys(def.parameters).length > 1
+          ? generateNamedObjectSignature(name, def)
+          : generateSignature(name, def);
+      return `- await ${signature}\n  ${def.description}`;
+    })
     .join("\n");
 
   const parts: string[] = [];
@@ -223,6 +246,7 @@ Rules:
 - The last expression in your code is the return value.
 - You can use variables, loops, conditionals, array methods, etc.
 - All tool calls must use \`await\`.
+- For tools with more than one parameter, call them with one named object argument, e.g. \`await toolName({ key: value })\`.
 - When a tool returns a structured object, access its properties directly instead of reparsing the result as text.
 - If the user's question doesn't need tools, you can compute the answer directly.`);
 
@@ -290,6 +314,105 @@ function printTrace(span: TraceSpan, indent = 0): void {
 }
 
 // ---------------------------------------------------------------------------
+// Tool argument validation
+// ---------------------------------------------------------------------------
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function jsTypeName(value: unknown): string {
+  if (Array.isArray(value)) return "array";
+  if (value === null) return "null";
+  return typeof value;
+}
+
+function matchesParamType(value: unknown, param: ParamDef): boolean {
+  switch (param.type) {
+    case "array":
+      return Array.isArray(value);
+    case "object":
+      return isPlainObject(value);
+    case "number":
+      return typeof value === "number" && Number.isFinite(value);
+    case "string":
+      return typeof value === "string";
+    case "boolean":
+      return typeof value === "boolean";
+  }
+}
+
+function formatToolSignature(name: string, def: ToolDefinition): string {
+  const params = Object.entries(def.parameters)
+    .map(([paramName, param]) => `${paramName}${param.optional ? "?" : ""}: ${param.type}`)
+    .join(", ");
+  return Object.keys(def.parameters).length > 1
+    ? `${name}({ ${params} })`
+    : `${name}(${params})`;
+}
+
+function buildNamedArgs(
+  functionName: string,
+  toolDef: ToolDefinition,
+  args: unknown[]
+): Record<string, unknown> {
+  const paramEntries = Object.entries(toolDef.parameters);
+  const paramNames = paramEntries.map(([name]) => name);
+  const singleObjectArg = args.length === 1 && isPlainObject(args[0]) ? args[0] : undefined;
+  const usesNamedObject =
+    singleObjectArg !== undefined &&
+    (paramEntries.length > 1 ||
+      paramEntries.some(
+        ([name, param]) => param.type !== "object" && Object.hasOwn(singleObjectArg, name)
+      ));
+  const namedArgs =
+    usesNamedObject
+      ? { ...singleObjectArg }
+      : Object.fromEntries(paramNames.map((name, index) => [name, args[index]]));
+
+  if (!usesNamedObject) {
+    const extraCount = args.length - paramNames.length;
+    if (extraCount > 0) {
+      throw new Error(
+        `Invalid arguments for tool '${functionName}': received ${args.length} positional ` +
+          `arguments but expected ${paramNames.length}. Use ${formatToolSignature(functionName, toolDef)}.`
+      );
+    }
+  }
+
+  const unexpected = Object.keys(namedArgs).filter(name => !toolDef.parameters[name]);
+  if (unexpected.length > 0) {
+    throw new Error(
+      `Invalid arguments for tool '${functionName}': unexpected parameter '${unexpected[0]}'. ` +
+        `Expected ${formatToolSignature(functionName, toolDef)}.`
+    );
+  }
+
+  for (const [paramName, paramDef] of paramEntries) {
+    const value = namedArgs[paramName];
+    if (value === undefined) {
+      if (!paramDef.optional) {
+        throw new Error(
+          `Invalid arguments for tool '${functionName}': missing required parameter '${paramName}'. ` +
+            `Expected ${formatToolSignature(functionName, toolDef)}.`
+        );
+      }
+      delete namedArgs[paramName];
+      continue;
+    }
+
+    if (!matchesParamType(value, paramDef)) {
+      throw new Error(
+        `Invalid arguments for tool '${functionName}': parameter '${paramName}' expected ` +
+          `${paramDef.type}, got ${jsTypeName(value)}. Expected ${formatToolSignature(functionName, toolDef)}.`
+      );
+    }
+  }
+
+  return namedArgs;
+}
+
+// ---------------------------------------------------------------------------
 // Execution engine
 // ---------------------------------------------------------------------------
 
@@ -328,20 +451,16 @@ async function executeCode(
         );
       }
 
-      // Build named args from positional args using the parameter schema
-      const paramNames = Object.keys(toolDef.parameters);
-      const namedArgs: Record<string, unknown> = {};
-      for (let i = 0; i < paramNames.length && i < args.length; i++) {
-        namedArgs[paramNames[i]] = args[i];
-      }
+      const namedArgs = buildNamedArgs(functionName, toolDef, args);
 
       const toolSpan = tracing ? createSpan("tool_call", {
         "zapcode.tool.name": functionName,
         "zapcode.tool.args": JSON.stringify(args),
+        "zapcode.tool.input": JSON.stringify(namedArgs),
       }) : undefined;
 
       const result = await toolDef.execute(namedArgs);
-      toolCalls.push({ name: functionName, args, result });
+      toolCalls.push({ name: functionName, args, input: namedArgs, result });
 
       if (toolSpan) {
         toolSpan.attributes["zapcode.tool.result"] = JSON.stringify(result);

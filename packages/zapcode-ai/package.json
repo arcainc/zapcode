@@ -13,7 +13,8 @@
   },
   "scripts": {
     "build": "tsc",
-    "dev": "tsc --watch"
+    "dev": "tsc --watch",
+    "test:agent-scenarios": "npm run build && node tests/agent-scenarios.mjs"
   },
   "dependencies": {
     "@unchartedfr/zapcode": "^1.0.0"
