@@ -5,7 +5,11 @@
  * Run with: npx tsx main.ts
  */
 
-import { Zapcode, ZapcodeSnapshotHandle } from "@unchartedfr/zapcode";
+import {
+  Zapcode,
+  ZapcodeSessionHandle,
+  ZapcodeSnapshotHandle,
+} from "@unchartedfr/zapcode";
 
 // --- 1. Simple expression ---
 const simple = new Zapcode("1 + 2 * 3");
@@ -126,3 +130,28 @@ while (!mapState.completed) {
 }
 console.log("Async map result:", mapState.output);
 // [{condition: "Rainy", temp: 12}, {condition: "Clear", temp: 26}, ...]
+
+// --- 8. Ongoing session chunks ---
+let session = ZapcodeSessionHandle.create({ externalFunctions: ["getWeather"] });
+let sessionState = session.runChunk(
+  `
+    const cities = ["London", "Tokyo"];
+    const reports = [];
+    for (const city of cities) {
+        reports.push(await getWeather(city));
+    }
+    reports.map(report => report.condition).join(",")
+  `
+);
+
+while (!sessionState.completed) {
+  const city = sessionState.args[0] as string;
+  session = ZapcodeSessionHandle.load(sessionState.session);
+  sessionState = session.resume(mockWeatherData[city]);
+}
+
+console.log("Session chunk result:", sessionState.output);
+
+session = ZapcodeSessionHandle.load(sessionState.session);
+const continued = session.runChunk("reports.length");
+console.log("Session continued:", continued.output); // 2

@@ -14,6 +14,25 @@ pub struct CompiledProgram {
     pub local_names: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TopLevelBindingKind {
+    Const,
+    Let,
+    Var,
+    Function,
+    Class,
+}
+
+impl TopLevelBindingKind {
+    fn from_var_kind(kind: VarKind) -> Self {
+        match kind {
+            VarKind::Const => Self::Const,
+            VarKind::Let => Self::Let,
+            VarKind::Var => Self::Var,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompiledFunction {
     pub name: Option<String>,
@@ -32,6 +51,14 @@ struct Compiler {
     functions: Vec<CompiledFunction>,
     loop_stack: Vec<LoopInfo>,
     external_functions: HashSet<String>,
+    mode: CompilerMode,
+    top_level_bindings: HashMap<String, TopLevelBindingKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompilerMode {
+    Standard,
+    SessionChunk,
 }
 
 struct LoopInfo {
@@ -48,6 +75,24 @@ impl Compiler {
             functions: Vec::new(),
             loop_stack: Vec::new(),
             external_functions,
+            mode: CompilerMode::Standard,
+            top_level_bindings: HashMap::new(),
+        }
+    }
+
+    fn new_session_chunk(
+        external_functions: HashSet<String>,
+        top_level_bindings: HashMap<String, TopLevelBindingKind>,
+    ) -> Self {
+        Self {
+            instructions: Vec::new(),
+            locals: Vec::new(),
+            local_indices: HashMap::new(),
+            functions: Vec::new(),
+            loop_stack: Vec::new(),
+            external_functions,
+            mode: CompilerMode::SessionChunk,
+            top_level_bindings,
         }
     }
 
@@ -88,6 +133,34 @@ impl Compiler {
 
     fn resolve_local(&self, name: &str) -> Option<usize> {
         self.local_indices.get(name).copied()
+    }
+
+    fn is_session_chunk(&self) -> bool {
+        self.mode == CompilerMode::SessionChunk
+    }
+
+    fn record_top_level_binding(&mut self, name: &str, kind: TopLevelBindingKind) -> Result<()> {
+        if !self.is_session_chunk() {
+            return Ok(());
+        }
+
+        if self.top_level_bindings.contains_key(name) {
+            return Err(ZapcodeError::CompileError(format!(
+                "top-level binding '{}' has already been declared in this session",
+                name
+            )));
+        }
+
+        self.top_level_bindings.insert(name.to_string(), kind);
+        Ok(())
+    }
+
+    fn top_level_store_instruction(&self, name: &str, idx: usize) -> Instruction {
+        if self.is_session_chunk() {
+            Instruction::StoreGlobal(name.to_string())
+        } else {
+            Instruction::StoreLocal(idx)
+        }
     }
 
     fn compile_program(&mut self, program: &Program) -> Result<()> {
@@ -168,9 +241,11 @@ impl Compiler {
 
     fn compile_statement(&mut self, stmt: &Statement) -> Result<()> {
         match stmt {
-            Statement::VariableDecl { declarations, .. } => {
+            Statement::VariableDecl {
+                kind, declarations, ..
+            } => {
                 for decl in declarations {
-                    self.compile_var_declarator(decl)?;
+                    self.compile_var_declarator(decl, *kind)?;
                 }
             }
             Statement::Expression { expr, .. } => {
@@ -429,11 +504,16 @@ impl Compiler {
                     None
                 };
                 if let Some(name) = name {
-                    // Store as both local and global so recursion works
-                    self.emit(Instruction::Dup);
-                    let idx = self.declare_local(&name);
-                    self.emit(Instruction::StoreLocal(idx));
-                    self.emit(Instruction::StoreGlobal(name));
+                    if self.is_session_chunk() {
+                        self.record_top_level_binding(&name, TopLevelBindingKind::Function)?;
+                        self.emit(Instruction::StoreGlobal(name));
+                    } else {
+                        // Store as both local and global so recursion works
+                        self.emit(Instruction::Dup);
+                        let idx = self.declare_local(&name);
+                        self.emit(Instruction::StoreLocal(idx));
+                        self.emit(Instruction::StoreGlobal(name));
+                    }
                 } else {
                     self.emit(Instruction::Pop);
                 }
@@ -453,11 +533,16 @@ impl Compiler {
                     methods,
                     static_methods,
                 )?;
-                // Store the class as both local and global
-                self.emit(Instruction::Dup);
-                let idx = self.declare_local(name);
-                self.emit(Instruction::StoreLocal(idx));
-                self.emit(Instruction::StoreGlobal(name.clone()));
+                if self.is_session_chunk() {
+                    self.record_top_level_binding(name, TopLevelBindingKind::Class)?;
+                    self.emit(Instruction::StoreGlobal(name.clone()));
+                } else {
+                    // Store the class as both local and global
+                    self.emit(Instruction::Dup);
+                    let idx = self.declare_local(name);
+                    self.emit(Instruction::StoreLocal(idx));
+                    self.emit(Instruction::StoreGlobal(name.clone()));
+                }
             }
             Statement::Switch {
                 discriminant,
@@ -513,18 +598,29 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_var_declarator(&mut self, decl: &VarDeclarator) -> Result<()> {
+    fn compile_var_declarator(&mut self, decl: &VarDeclarator, kind: VarKind) -> Result<()> {
         match &decl.pattern {
             AssignTarget::Ident(name) => {
-                let idx = self.declare_local(name);
+                let idx = if self.is_session_chunk() {
+                    self.record_top_level_binding(name, TopLevelBindingKind::from_var_kind(kind))?;
+                    None
+                } else {
+                    Some(self.declare_local(name))
+                };
                 match &decl.init {
                     Some(expr) => {
                         self.compile_expr(expr)?;
-                        self.emit(Instruction::StoreLocal(idx));
+                        self.emit(match idx {
+                            Some(idx) => self.top_level_store_instruction(name, idx),
+                            None => Instruction::StoreGlobal(name.to_string()),
+                        });
                     }
                     None => {
                         self.emit(Instruction::Push(Constant::Undefined));
-                        self.emit(Instruction::StoreLocal(idx));
+                        self.emit(match idx {
+                            Some(idx) => self.top_level_store_instruction(name, idx),
+                            None => Instruction::StoreGlobal(name.to_string()),
+                        });
                     }
                 }
             }
@@ -534,7 +630,7 @@ impl Compiler {
                 } else {
                     self.emit(Instruction::Push(Constant::Undefined));
                 }
-                self.compile_object_destructure(fields)?;
+                self.compile_object_destructure(fields, kind)?;
                 self.emit(Instruction::Pop); // pop source object
             }
             AssignTarget::ArrayDestructure(elems) => {
@@ -550,8 +646,7 @@ impl Compiler {
                         self.emit(Instruction::GetIndex);
                         match target {
                             AssignTarget::Ident(name) => {
-                                let idx = self.declare_local(name);
-                                self.emit(Instruction::StoreLocal(idx));
+                                self.store_binding(name, kind)?;
                             }
                             _ => {
                                 self.emit(Instruction::Pop); // TODO: nested destructure
@@ -579,7 +674,22 @@ impl Compiler {
         }
     }
 
-    fn compile_object_destructure(&mut self, fields: &[DestructureField]) -> Result<()> {
+    fn store_binding(&mut self, name: &str, kind: VarKind) -> Result<()> {
+        if self.is_session_chunk() {
+            self.record_top_level_binding(name, TopLevelBindingKind::from_var_kind(kind))?;
+            self.emit(Instruction::StoreGlobal(name.to_string()));
+        } else {
+            let idx = self.declare_local(name);
+            self.emit(self.top_level_store_instruction(name, idx));
+        }
+        Ok(())
+    }
+
+    fn compile_object_destructure(
+        &mut self,
+        fields: &[DestructureField],
+        kind: VarKind,
+    ) -> Result<()> {
         let excluded_keys: Vec<String> = fields
             .iter()
             .filter(|field| !field.rest)
@@ -591,17 +701,15 @@ impl Compiler {
             if field.rest {
                 self.emit(Instruction::ObjectRest(excluded_keys.clone()));
                 let name = field.alias.as_ref().unwrap_or(&field.key);
-                let idx = self.declare_local(name);
-                self.emit(Instruction::StoreLocal(idx));
+                self.store_binding(name, kind)?;
             } else {
                 self.emit(Instruction::GetProperty(field.key.clone()));
                 if let Some(nested) = &field.nested {
-                    self.compile_object_destructure(nested)?;
+                    self.compile_object_destructure(nested, kind)?;
                     self.emit(Instruction::Pop);
                 } else {
                     let name = field.alias.as_ref().unwrap_or(&field.key);
-                    let idx = self.declare_local(name);
-                    self.emit(Instruction::StoreLocal(idx));
+                    self.store_binding(name, kind)?;
                 }
             }
         }
@@ -1129,4 +1237,22 @@ pub fn compile_with_externals(
         functions: compiler.functions,
         local_names: compiler.locals,
     })
+}
+
+pub fn compile_session_chunk(
+    program: &Program,
+    external_functions: HashSet<String>,
+    existing_bindings: HashMap<String, TopLevelBindingKind>,
+) -> Result<(CompiledProgram, HashMap<String, TopLevelBindingKind>)> {
+    let mut compiler = Compiler::new_session_chunk(external_functions, existing_bindings);
+    compiler.compile_program(program)?;
+
+    Ok((
+        CompiledProgram {
+            instructions: compiler.instructions,
+            functions: compiler.functions,
+            local_names: compiler.locals,
+        },
+        compiler.top_level_bindings,
+    ))
 }

@@ -9,7 +9,7 @@ use crate::error::{Result, ZapcodeError};
 use crate::sandbox::{ResourceLimits, ResourceTracker};
 use crate::snapshot::ZapcodeSnapshot;
 use crate::trace::{ExecutionTrace, SpanBuilder, TraceStatus};
-use crate::value::{Closure, FunctionId, GeneratorObject, SuspendedFrame, Value};
+use crate::value::{Closure, FunctionRef, GeneratorObject, SuspendedFrame, Value};
 
 mod builtins;
 
@@ -38,6 +38,7 @@ pub(crate) enum ReceiverSource {
 /// A call frame in the VM stack.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CallFrame {
+    pub(crate) program_index: usize,
     pub(crate) func_index: Option<usize>,
     pub(crate) ip: usize,
     pub(crate) locals: Vec<Value>,
@@ -78,7 +79,7 @@ pub(crate) enum Continuation {
 
 /// The Zapcode VM.
 pub struct Vm {
-    pub(crate) program: CompiledProgram,
+    pub(crate) programs: Vec<CompiledProgram>,
     pub(crate) stack: Vec<Value>,
     pub(crate) frames: Vec<CallFrame>,
     pub(crate) globals: HashMap<String, Value>,
@@ -98,7 +99,7 @@ pub struct Vm {
     /// Tracks the source of the most recent Load instruction for receiver tracking.
     pub(crate) last_load_source: Option<ReceiverSource>,
     /// Counter for assigning unique generator IDs.
-    next_generator_id: u64,
+    pub(crate) next_generator_id: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -114,13 +115,21 @@ impl Vm {
         limits: ResourceLimits,
         external_functions: HashSet<String>,
     ) -> Self {
+        Self::with_programs(vec![program], limits, external_functions)
+    }
+
+    pub(crate) fn with_programs(
+        programs: Vec<CompiledProgram>,
+        limits: ResourceLimits,
+        external_functions: HashSet<String>,
+    ) -> Self {
         let mut globals = HashMap::new();
 
         // Register built-in globals
         builtins::register_globals(&mut globals);
 
         Self {
-            program,
+            programs,
             stack: Vec::new(),
             frames: Vec::new(),
             globals,
@@ -148,7 +157,7 @@ impl Vm {
     /// The return_value is pushed onto the stack (result of the external call).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_snapshot(
-        program: CompiledProgram,
+        programs: Vec<CompiledProgram>,
         stack: Vec<Value>,
         frames: Vec<CallFrame>,
         user_globals: HashMap<String, Value>,
@@ -157,6 +166,7 @@ impl Vm {
         stdout: String,
         limits: ResourceLimits,
         external_functions: HashSet<String>,
+        next_generator_id: u64,
         last_receiver: Option<Value>,
         last_receiver_source: Option<ReceiverSource>,
         last_global_name: Option<String>,
@@ -171,7 +181,7 @@ impl Vm {
         }
 
         Self {
-            program,
+            programs,
             stack,
             frames,
             globals,
@@ -185,7 +195,7 @@ impl Vm {
             last_receiver_source,
             last_global_name,
             last_load_source,
-            next_generator_id: 0,
+            next_generator_id,
         }
     }
 
@@ -242,11 +252,28 @@ impl Vm {
             .expect("internal error: no active frame")
     }
 
+    fn program(&self, program_index: usize) -> &CompiledProgram {
+        self.programs
+            .get(program_index)
+            .expect("internal error: invalid program index")
+    }
+
+    fn current_program(&self) -> &CompiledProgram {
+        self.program(self.current_frame().program_index)
+    }
+
+    fn current_function(&self, func_ref: FunctionRef) -> &crate::compiler::CompiledFunction {
+        self.program(func_ref.program_id)
+            .functions
+            .get(func_ref.function_id)
+            .expect("internal error: invalid function reference")
+    }
+
     #[allow(dead_code)]
     fn instructions(&self) -> &[Instruction] {
         match self.current_frame().func_index {
-            Some(idx) => &self.program.functions[idx].instructions,
-            None => &self.program.instructions,
+            Some(idx) => &self.current_program().functions[idx].instructions,
+            None => &self.current_program().instructions,
         }
     }
 
@@ -293,7 +320,7 @@ impl Vm {
             }
         }
 
-        let func = &self.program.functions[closure.func_id.0];
+        let func = self.current_function(closure.func_ref);
         let locals = Self::bind_params(&func.params, args, func.local_count);
 
         // If this is a method call (has this_value from a receiver), transfer
@@ -306,7 +333,8 @@ impl Vm {
         };
 
         self.frames.push(CallFrame {
-            func_index: Some(closure.func_id.0),
+            program_index: closure.func_ref.program_id,
+            func_index: Some(closure.func_ref.function_id),
             ip: 0,
             locals,
             stack_base: self.stack.len(),
@@ -317,10 +345,15 @@ impl Vm {
     }
 
     fn run(&mut self) -> Result<VmState> {
+        self.run_program(0)
+    }
+
+    pub(crate) fn run_program(&mut self, program_index: usize) -> Result<VmState> {
         self.tracker.start();
 
         // Set up top-level frame
         self.frames.push(CallFrame {
+            program_index,
             func_index: None,
             ip: 0,
             locals: Vec::new(),
@@ -339,8 +372,8 @@ impl Vm {
 
             let frame = self.frames.last().unwrap();
             let instructions = match frame.func_index {
-                Some(idx) => &self.program.functions[idx].instructions,
-                None => &self.program.instructions,
+                Some(idx) => &self.program(frame.program_index).functions[idx].instructions,
+                None => &self.program(frame.program_index).instructions,
             };
 
             if frame.ip >= instructions.len() {
@@ -570,8 +603,8 @@ impl Vm {
 
             let frame = self.frames.last().unwrap();
             let instructions = match frame.func_index {
-                Some(idx) => &self.program.functions[idx].instructions,
-                None => &self.program.instructions,
+                Some(idx) => &self.program(frame.program_index).functions[idx].instructions,
+                None => &self.program(frame.program_index).instructions,
             };
 
             if frame.ip >= instructions.len() {
@@ -645,9 +678,7 @@ impl Vm {
     /// Check if a callback value is an async function that might suspend.
     fn is_async_callback(&self, callback: &Value) -> bool {
         if let Value::Function(closure) = callback {
-            if let Some(func) = self.program.functions.get(closure.func_id.0) {
-                return func.is_async;
-            }
+            return self.current_function(closure.func_ref).is_async;
         }
         false
     }
@@ -964,13 +995,16 @@ impl Vm {
                 self.globals.insert(name.clone(), val.clone());
             }
         }
-        let func_idx = gen_obj.func_id.0;
+        let func_ref = gen_obj.func_ref;
         match gen_obj.suspended.take() {
             None => {
-                let func = &self.program.functions[func_idx];
+                let (params, local_count) = {
+                    let func = self.current_function(func_ref);
+                    (func.params.clone(), func.local_count)
+                };
                 self.tracker.push_frame();
-                let mut locals = Vec::with_capacity(func.local_count);
-                for param in func.params.iter() {
+                let mut locals = Vec::with_capacity(local_count);
+                for param in params.iter() {
                     match param {
                         ParamPattern::Ident(name) => {
                             let val = gen_obj
@@ -997,7 +1031,8 @@ impl Vm {
                 }
                 let stack_base = self.stack.len();
                 self.frames.push(CallFrame {
-                    func_index: Some(func_idx),
+                    program_index: func_ref.program_id,
+                    func_index: Some(func_ref.function_id),
                     ip: 0,
                     locals,
                     stack_base,
@@ -1014,7 +1049,8 @@ impl Vm {
                 }
                 self.push(arg)?;
                 self.frames.push(CallFrame {
-                    func_index: Some(func_idx),
+                    program_index: func_ref.program_id,
+                    func_index: Some(func_ref.function_id),
                     ip: suspended.ip,
                     locals: suspended.locals,
                     stack_base,
@@ -1054,8 +1090,8 @@ impl Vm {
             self.tracker.check_time(&self.limits)?;
             let frame = self.frames.last().unwrap();
             let instructions = match frame.func_index {
-                Some(idx) => &self.program.functions[idx].instructions,
-                None => &self.program.instructions,
+                Some(idx) => &self.program(frame.program_index).functions[idx].instructions,
+                None => &self.program(frame.program_index).instructions,
             };
             if frame.ip >= instructions.len() {
                 if self.frames.len() > target_frame_depth + 1 {
@@ -1573,9 +1609,9 @@ impl Vm {
                 // Capture all locals from all active frames using local_names
                 for frame in &self.frames {
                     let local_names = if let Some(fidx) = frame.func_index {
-                        &self.program.functions[fidx].local_names
+                        &self.program(frame.program_index).functions[fidx].local_names
                     } else {
-                        &self.program.local_names
+                        &self.program(frame.program_index).local_names
                     };
                     for (i, val) in frame.locals.iter().enumerate() {
                         if let Some(name) = local_names.get(i) {
@@ -1590,7 +1626,10 @@ impl Vm {
                     }
                 }
                 let closure = Closure {
-                    func_id: FunctionId(func_idx),
+                    func_ref: FunctionRef {
+                        program_id: self.current_frame().program_index,
+                        function_id: func_idx,
+                    },
                     captured,
                 };
                 self.push(Value::Function(closure))?;
@@ -1605,12 +1644,13 @@ impl Vm {
                 let callee = self.pop()?;
                 match callee {
                     Value::Function(closure) => {
-                        let func_idx = closure.func_id.0;
-                        let is_generator = self.program.functions[func_idx].is_generator;
+                        let func_ref = closure.func_ref;
+                        let function = self.current_function(func_ref);
+                        let is_generator = function.is_generator;
 
                         // Generator function: create a Generator object instead of running
                         if is_generator {
-                            let params = self.program.functions[func_idx].params.clone();
+                            let params = function.params.clone();
                             let gen_id = self.alloc_generator_id();
                             // Capture args as named params so generator_next can restore them
                             let mut captured = closure.captured.clone();
@@ -1631,7 +1671,7 @@ impl Vm {
                             }
                             let gen_obj = GeneratorObject {
                                 id: gen_id,
-                                func_id: closure.func_id,
+                                func_ref,
                                 captured,
                                 suspended: None,
                                 done: false,
