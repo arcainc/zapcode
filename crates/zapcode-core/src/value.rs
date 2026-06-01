@@ -27,7 +27,44 @@ pub enum Value {
     BuiltinMethod {
         object_name: Arc<str>,
         method_name: Arc<str>,
+        /// The receiver this method is bound to, captured at property-load time
+        /// so argument evaluation can't clobber it. `None` for unbound markers.
+        #[serde(default)]
+        recv: Option<Box<Value>>,
+        /// Where to write the receiver back after a mutating method (push, etc.),
+        /// supporting nested paths like `obj.items` or `rows[i].tags`.
+        #[serde(default)]
+        place: Option<Place>,
     },
+}
+
+/// The root variable a [`Place`] resolves from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PlaceRoot {
+    Global(String),
+    Local {
+        frame_index: usize,
+        slot: usize,
+    },
+    /// A shared upvalue cell (captured variable) by arena id.
+    Cell(u64),
+    /// The nearest enclosing `this` (for `this.items.push(...)` in a method).
+    This,
+}
+
+/// One step in a [`Place`] path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PlaceSeg {
+    Prop(String),
+    Index(usize),
+}
+
+/// A write-back location: a root variable plus a path of property/index steps,
+/// e.g. `obj.items` is `{ root: obj, path: [Prop("items")] }`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Place {
+    pub root: PlaceRoot,
+    pub path: Vec<PlaceSeg>,
 }
 
 /// Identifies a function in the compiled program.
@@ -41,7 +78,13 @@ pub struct FunctionRef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Closure {
     pub func_ref: FunctionRef,
+    /// Free variables captured by value (functions, top-level user globals).
     pub captured: Vec<(String, Value)>,
+    /// Free variables captured by reference: name -> shared upvalue cell id.
+    /// Mutations through the cell are visible to every scope sharing it, which
+    /// is what makes accumulators, factory state, and callback side effects work.
+    #[serde(default)]
+    pub env: Vec<(String, u64)>,
 }
 
 /// The state of a generator object.
@@ -53,6 +96,9 @@ pub struct GeneratorObject {
     pub func_ref: FunctionRef,
     /// Captured closure variables.
     pub captured: Vec<(String, Value)>,
+    /// Free variables captured by reference (shared upvalue cells).
+    #[serde(default)]
+    pub env: Vec<(String, u64)>,
     /// Suspended execution state. None = not yet started.
     pub suspended: Option<SuspendedFrame>,
     /// Whether the generator has completed.
@@ -107,7 +153,15 @@ impl Value {
             Value::Bool(false) => 0.0,
             Value::Int(n) => *n as f64,
             Value::Float(n) => *n,
-            Value::String(s) => s.parse::<f64>().unwrap_or(f64::NAN),
+            Value::String(s) => {
+                // JS: empty / whitespace-only string coerces to 0, not NaN.
+                let t = s.trim();
+                if t.is_empty() {
+                    0.0
+                } else {
+                    t.parse::<f64>().unwrap_or(f64::NAN)
+                }
+            }
             _ => f64::NAN,
         }
     }
@@ -137,7 +191,26 @@ impl Value {
                 let items: Vec<String> = arr.iter().map(|v| v.to_js_string()).collect();
                 items.join(",")
             }
-            Value::Object(_) => "[object Object]".to_string(),
+            Value::Object(map) => {
+                // Error objects stringify as "Name: message" (like JS).
+                if matches!(map.get("__error__"), Some(Value::Bool(true))) {
+                    let name = map
+                        .get("name")
+                        .map(|v| v.to_js_string())
+                        .unwrap_or_else(|| "Error".to_string());
+                    let message = map
+                        .get("message")
+                        .map(|v| v.to_js_string())
+                        .unwrap_or_default();
+                    if message.is_empty() {
+                        name
+                    } else {
+                        format!("{}: {}", name, message)
+                    }
+                } else {
+                    "[object Object]".to_string()
+                }
+            }
             Value::Function(_) | Value::BuiltinMethod { .. } => "function".to_string(),
             Value::Generator(_) => "[object Generator]".to_string(),
             Value::Pending(_) => "[object Promise]".to_string(),
@@ -156,6 +229,36 @@ impl Value {
             (Value::String(a), Value::String(b)) => a == b,
             // Reference equality for arrays/objects
             _ => false,
+        }
+    }
+
+    /// JS abstract (loose) equality (`==`). Performs type coercion between
+    /// numbers, strings, and booleans; `null`/`undefined` are loosely equal to
+    /// each other and to nothing else. Object/array operands fall back to
+    /// reference equality (no `toPrimitive` coercion).
+    pub fn loose_eq(&self, other: &Value) -> bool {
+        match (self, other) {
+            // null and undefined are loosely equal to each other only.
+            (Value::Null | Value::Undefined, Value::Null | Value::Undefined) => true,
+            (Value::Null | Value::Undefined, _) | (_, Value::Null | Value::Undefined) => false,
+            // Same-type primitives.
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::String(a), Value::String(b)) => a == b,
+            (Value::Int(_) | Value::Float(_), Value::Int(_) | Value::Float(_)) => {
+                self.strict_eq(other)
+            }
+            // number == string: compare numerically (NaN never equal).
+            (Value::Int(_) | Value::Float(_), Value::String(_))
+            | (Value::String(_), Value::Int(_) | Value::Float(_)) => {
+                let a = self.to_number();
+                let b = other.to_number();
+                !a.is_nan() && !b.is_nan() && a == b
+            }
+            // boolean coerces to number, then compare.
+            (Value::Bool(_), _) => Value::Float(self.to_number()).loose_eq(other),
+            (_, Value::Bool(_)) => self.loose_eq(&Value::Float(other.to_number())),
+            // Arrays/objects: reference equality only.
+            _ => self.strict_eq(other),
         }
     }
 }

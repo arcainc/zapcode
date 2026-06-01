@@ -16,7 +16,8 @@
     "dev": "tsc --watch",
     "sync-local-binding": "node scripts/sync-local-binding.mjs",
     "test:agent-scenarios": "npm run build && node tests/agent-scenarios.mjs",
-    "test:e2e": "npm run sync-local-binding && npm run build && node tests/agent-scenarios.mjs && node tests/durable-sessions.mjs && node tests/tool-errors.mjs && node tests/parallel.mjs && node tests/ai-session.mjs && node tests/type-check.mjs",
+    "test:e2e": "npm run sync-local-binding && npm run build && node tests/agent-scenarios.mjs && node tests/durable-sessions.mjs && node tests/tool-errors.mjs && node tests/parallel.mjs && node tests/ai-session.mjs && node tests/type-check.mjs && node tests/stress.mjs && node tests/workflow.mjs",
+    "test:scenarios": "npm run build && for f in data datetime text errors sessions; do echo \"# scenarios-$f\"; node tests/scenarios-$f.mjs || true; done",
     "test": "npm run test:e2e"
   },
   "dependencies": {

@@ -52,7 +52,23 @@ pub enum Instruction {
     SetProperty(String),
     GetIndex,
     SetIndex,
+    /// Remove a property by name from the object on the stack: `[obj] -> [obj']`.
+    DeleteProperty(String),
+    /// Remove a property by computed key: `[obj, key] -> [obj']`.
+    DeleteIndex,
+    /// Per-iteration rebinding for `for (let i ...)`: if the local slot has been
+    /// captured (boxed) into a shared cell, copy its value into a fresh cell so
+    /// closures created in the just-finished iteration keep their own binding.
+    FreshenBinding(usize),
     Spread,
+    /// Append one value to an accumulator array on the stack: `[acc, value] -> [acc']`.
+    ArrayAppend,
+    /// Spread an iterable into an accumulator array: `[acc, iterable] -> [acc']`.
+    ArraySpreadAppend,
+    /// Insert a key/value into an accumulator object: `[acc, key, value] -> [acc']`.
+    ObjectInsert,
+    /// Merge a source object's entries into an accumulator object: `[acc, src] -> [acc']`.
+    ObjectSpreadAssign,
     In,
     InstanceOf,
 
@@ -61,6 +77,11 @@ pub enum Instruction {
     Call(usize),
     Return,
     CallExternal(String, usize),
+    /// Call with spread args: stack is `[callee, args_array]`. The flattened
+    /// args array (built like an array literal) is expanded and the call runs.
+    CallSpread,
+    /// External call with spread args: stack is `[args_array]`.
+    CallExternalSpread(String),
     /// Like `CallExternal` but does not suspend: pops the args, registers a
     /// deferred external call, and pushes a `Value::Pending`. Emitted only for
     /// direct external calls that are elements of a `Promise.all([...])` literal,

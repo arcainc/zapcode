@@ -470,7 +470,13 @@ fn is_valid_identifier(name: &str) -> bool {
 }
 
 fn ensure_serializable_globals(globals: &HashMap<String, Value>) -> Result<()> {
+    let builtin_names: HashSet<&str> = Vm::BUILTIN_GLOBAL_NAMES.iter().copied().collect();
     for (name, value) in globals {
+        // Builtins (including the String/Number/Boolean BuiltinMethod globals)
+        // are re-registered on resume, never persisted — don't validate them.
+        if builtin_names.contains(name.as_str()) {
+            continue;
+        }
         ensure_serializable_value(value).map_err(|err| {
             ZapcodeError::SnapshotError(format!(
                 "cannot persist session global '{}': {}",

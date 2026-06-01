@@ -82,8 +82,10 @@ fn wrap_trailing_object(source: &str) -> String {
     let before = trimmed[..open_pos].trim_end();
     if !before.is_empty() {
         let last_char = before.chars().last().unwrap();
-        // If preceded by =, (, return, =>, etc. — it's already in expression context
-        if matches!(last_char, '=' | '(' | ',' | ':' | '>' | '[') {
+        // If preceded by =, (, return, =>, etc. — it's already in expression context.
+        // `)` means the `{` is a control-flow / function block (if/for/while/catch/
+        // switch/function with params), never an object literal — don't wrap it.
+        if matches!(last_char, '=' | '(' | ',' | ':' | '>' | '[' | ')') {
             return source.to_string();
         }
         // If preceded by a keyword that takes a block, don't wrap
@@ -214,9 +216,7 @@ impl<'a> AstLowerer<'a> {
                 Ok(Statement::DoWhile { body, test, span })
             }
             ast::Statement::ForStatement(for_stmt) => self.lower_for(for_stmt),
-            ast::Statement::ForInStatement(s) => {
-                Err(self.unsupported(s.span, "for...in loops are not supported, use for...of"))
-            }
+            ast::Statement::ForInStatement(s) => self.lower_for_in(s),
             ast::Statement::ForOfStatement(for_of) => self.lower_for_of(for_of),
             ast::Statement::BlockStatement(block) => {
                 let span = self.span(block.span);
@@ -230,9 +230,11 @@ impl<'a> AstLowerer<'a> {
             }
             ast::Statement::TryStatement(try_stmt) => self.lower_try(try_stmt),
             ast::Statement::BreakStatement(s) => Ok(Statement::Break {
+                label: s.label.as_ref().map(|l| l.name.to_string()),
                 span: self.span(s.span),
             }),
             ast::Statement::ContinueStatement(s) => Ok(Statement::Continue {
+                label: s.label.as_ref().map(|l| l.name.to_string()),
                 span: self.span(s.span),
             }),
             ast::Statement::FunctionDeclaration(func) => self.lower_func_decl(func),
@@ -242,7 +244,11 @@ impl<'a> AstLowerer<'a> {
                 expr: Expr::UndefinedLit,
                 span: Span { start: 0, end: 0 },
             }),
-            ast::Statement::LabeledStatement(labeled) => self.lower_statement(&labeled.body),
+            ast::Statement::LabeledStatement(labeled) => Ok(Statement::Labeled {
+                label: labeled.label.name.to_string(),
+                body: Box::new(self.lower_statement(&labeled.body)?),
+                span: self.span(labeled.span),
+            }),
             ast::Statement::TSTypeAliasDeclaration(s) => Ok(Statement::Expression {
                 expr: Expr::UndefinedLit,
                 span: self.span(s.span),
@@ -511,6 +517,49 @@ impl<'a> AstLowerer<'a> {
         })
     }
 
+    /// `for (const k in obj)` iterates the object's own enumerable keys. We
+    /// lower it to a for-of over `Object.keys(obj)`, which yields string keys
+    /// for objects and index strings for arrays — matching for-in semantics.
+    fn lower_for_in(&mut self, for_in: &ast::ForInStatement<'_>) -> Result<Statement> {
+        let span = self.span(for_in.span);
+        let binding = match &for_in.left {
+            ast::ForStatementLeft::VariableDeclaration(decl) => {
+                if let Some(declarator) = decl.declarations.first() {
+                    match &declarator.id {
+                        ast::BindingPattern::BindingIdentifier(id) => {
+                            ForBinding::Ident(id.name.to_string())
+                        }
+                        _ => {
+                            return Err(
+                                self.unsupported(for_in.span, "destructuring for-in binding")
+                            )
+                        }
+                    }
+                } else {
+                    return Err(self.unsupported(for_in.span, "empty for-in binding"));
+                }
+            }
+            _ => return Err(self.unsupported(for_in.span, "unsupported for-in left-hand side")),
+        };
+        let source = self.lower_expr(&for_in.right)?;
+        let iterable = Expr::Call {
+            callee: Box::new(Expr::Member {
+                object: Box::new(Expr::Ident("Object".to_string())),
+                property: "keys".to_string(),
+                optional: false,
+            }),
+            args: vec![source],
+            optional: false,
+        };
+        let body = self.lower_statement_as_block(&for_in.body)?;
+        Ok(Statement::ForOf {
+            binding,
+            iterable,
+            body,
+            span,
+        })
+    }
+
     fn lower_for_of(&mut self, for_of: &ast::ForOfStatement<'_>) -> Result<Statement> {
         let span = self.span(for_of.span);
         let binding = match &for_of.left {
@@ -601,6 +650,15 @@ impl<'a> AstLowerer<'a> {
         let mut result = Vec::new();
         for param in &params.items {
             let pat = self.lower_binding_pattern_to_param(&param.pattern)?;
+            // A defaulted parameter (`function f(x = 42)`) stores its default in
+            // `FormalParameter::initializer`, not as an `AssignmentPattern`.
+            let pat = match &param.initializer {
+                Some(init) => ParamPattern::DefaultValue {
+                    pattern: Box::new(pat),
+                    default: self.lower_expr(init)?,
+                },
+                None => pat,
+            };
             result.push(pat);
         }
         if let Some(rest) = &params.rest {
@@ -856,6 +914,14 @@ impl<'a> AstLowerer<'a> {
                         ast::ObjectPropertyKind::ObjectProperty(p) => {
                             let key = self.lower_property_key(&p.key)?;
                             let computed = p.computed;
+                            let key_expr = if computed {
+                                match p.key.as_expression() {
+                                    Some(e) => Some(Box::new(self.lower_expr(e)?)),
+                                    None => None,
+                                }
+                            } else {
+                                None
+                            };
 
                             if p.shorthand {
                                 props.push(ObjProperty {
@@ -863,6 +929,7 @@ impl<'a> AstLowerer<'a> {
                                     key: key.clone(),
                                     value: Expr::Ident(key),
                                     computed: false,
+                                    key_expr: None,
                                 });
                             } else if p.method {
                                 let value = self.lower_expr(&p.value)?;
@@ -871,6 +938,7 @@ impl<'a> AstLowerer<'a> {
                                     key,
                                     value,
                                     computed,
+                                    key_expr,
                                 });
                             } else {
                                 let value = self.lower_expr(&p.value)?;
@@ -879,6 +947,7 @@ impl<'a> AstLowerer<'a> {
                                     key,
                                     value,
                                     computed,
+                                    key_expr,
                                 });
                             }
                         }
@@ -889,6 +958,7 @@ impl<'a> AstLowerer<'a> {
                                 key: String::new(),
                                 value: expr,
                                 computed: false,
+                                key_expr: None,
                             });
                         }
                     }
@@ -911,7 +981,8 @@ impl<'a> AstLowerer<'a> {
                     return Ok(Expr::TypeOf(Box::new(operand)));
                 }
                 if matches!(unary.operator, ast::UnaryOperator::Delete) {
-                    return Err(self.unsupported(unary.span, "delete operator is not supported"));
+                    let operand = self.lower_expr(&unary.argument)?;
+                    return Ok(Expr::Delete(Box::new(operand)));
                 }
                 let op = match unary.operator {
                     ast::UnaryOperator::UnaryNegation => UnaryOp::Neg,

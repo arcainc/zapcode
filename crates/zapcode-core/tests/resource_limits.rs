@@ -1,7 +1,9 @@
 //! Resource budgets must be cumulative across a session's lifetime, and a
 //! runaway session must not produce an unbounded snapshot.
 
-use zapcode_core::{ResourceLimits, ZapcodeError, ZapcodeSessionSnapshot, ZapcodeSessionState};
+use zapcode_core::{
+    ResourceLimits, Value, ZapcodeError, ZapcodeRun, ZapcodeSessionSnapshot, ZapcodeSessionState,
+};
 
 #[test]
 fn allocation_budget_accumulates_across_chunks() {
@@ -64,4 +66,35 @@ fn dump_rejects_oversized_state() {
         }
         other => panic!("expected SnapshotError, got {other:?}"),
     }
+}
+
+#[test]
+fn huge_array_constructor_is_rejected_before_host_allocation() {
+    let err = run_with_tiny_memory("new Array(1000000000)").unwrap_err();
+    assert!(
+        matches!(err, ZapcodeError::MemoryLimitExceeded(_)),
+        "expected memory limit error, got {err:?}"
+    );
+}
+
+#[test]
+fn huge_string_repeat_is_rejected_before_host_allocation() {
+    let err = run_with_tiny_memory(r#""a".repeat(1000000000)"#).unwrap_err();
+    assert!(
+        matches!(err, ZapcodeError::MemoryLimitExceeded(_)),
+        "expected memory limit error, got {err:?}"
+    );
+}
+
+fn run_with_tiny_memory(source: &str) -> Result<Value, ZapcodeError> {
+    let runner = ZapcodeRun::new(
+        source.to_string(),
+        Vec::new(),
+        Vec::new(),
+        ResourceLimits {
+            memory_limit_bytes: 1024 * 1024,
+            ..ResourceLimits::default()
+        },
+    )?;
+    runner.run_simple()
 }

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::mem::size_of;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -9,7 +10,9 @@ use crate::error::{Result, ZapcodeError};
 use crate::sandbox::{ResourceLimits, ResourceTracker};
 use crate::snapshot::ZapcodeSnapshot;
 use crate::trace::{ExecutionTrace, SpanBuilder, TraceStatus};
-use crate::value::{Closure, FunctionRef, GeneratorObject, SuspendedFrame, Value};
+use crate::value::{
+    Closure, FunctionRef, GeneratorObject, Place, PlaceRoot, PlaceSeg, SuspendedFrame, Value,
+};
 
 mod builtins;
 
@@ -66,6 +69,8 @@ pub(crate) enum ReceiverSource {
     /// The receiver was loaded from a local variable at the given slot index
     /// in the frame at the given depth (index into `self.frames`).
     Local { frame_index: usize, slot: usize },
+    /// The receiver was loaded from a captured variable held in a shared cell.
+    Cell(u64),
 }
 
 /// A call frame in the VM stack.
@@ -80,6 +85,16 @@ pub(crate) struct CallFrame {
     pub(crate) this_value: Option<Value>,
     /// Where the method receiver came from, so we can write back mutations.
     pub(crate) receiver_source: Option<ReceiverSource>,
+    /// Local slots that have been promoted to shared upvalue cells (captured by
+    /// a nested closure): slot -> cell id. Reads/writes of these slots route
+    /// through the cell arena so the closure and this frame stay in sync.
+    #[serde(default)]
+    pub(crate) boxed: HashMap<usize, u64>,
+    /// Free-variable bindings for a closure frame: name -> cell id. A name found
+    /// here shadows the global of the same name (LoadGlobal/StoreGlobal consult
+    /// it first), connecting captured names to their shared cells.
+    #[serde(default)]
+    pub(crate) env: HashMap<String, u64>,
 }
 
 /// A continuation for array callback methods that may suspend (e.g., `.map()` with async callbacks).
@@ -116,6 +131,10 @@ pub struct Vm {
     pub(crate) stack: Vec<Value>,
     pub(crate) frames: Vec<CallFrame>,
     pub(crate) globals: HashMap<String, Value>,
+    /// Arena of shared upvalue cells, indexed by id. A captured variable lives
+    /// here once boxed; every closure and frame referencing it shares the id, so
+    /// the sharing survives serialization (ids are reconstructed on load).
+    pub(crate) cells: Vec<Value>,
     pub(crate) stdout: String,
     pub(crate) limits: ResourceLimits,
     pub(crate) tracker: ResourceTracker,
@@ -131,6 +150,10 @@ pub struct Vm {
     pub(crate) last_global_name: Option<String>,
     /// Tracks the source of the most recent Load instruction for receiver tracking.
     pub(crate) last_load_source: Option<ReceiverSource>,
+    /// Write-back place (root + path) of the most recently loaded/accessed value,
+    /// captured onto a builtin method so mutating calls persist to the right
+    /// location (incl. nested `obj.items.push(...)`). Transient; not serialized.
+    pub(crate) last_place: Option<Place>,
     /// Counter for assigning unique generator IDs.
     pub(crate) next_generator_id: u64,
     /// External calls deferred by `CallExternalDeferred`, pending batch resolution.
@@ -147,6 +170,10 @@ pub struct Vm {
     /// sequence (required for durable/Temporal replay) while still varying call
     /// to call.
     pub(crate) rng_state: u64,
+    /// The value of an in-flight guest `throw`, so `catch` receives the original
+    /// value (string, object, …) rather than a stringified error. Transient —
+    /// set by `Throw`, consumed by the catch handler; never crosses a suspension.
+    pub(crate) pending_throw: Option<Value>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -180,6 +207,7 @@ impl Vm {
             stack: Vec::new(),
             frames: Vec::new(),
             globals,
+            cells: Vec::new(),
             stdout: String::new(),
             limits,
             tracker: ResourceTracker::default(),
@@ -190,18 +218,41 @@ impl Vm {
             last_receiver_source: None,
             last_global_name: None,
             last_load_source: None,
+            last_place: None,
             next_generator_id: 0,
             pending_calls: Vec::new(),
             resolved: BTreeMap::new(),
             next_call_id: 0,
             pending_batch: None,
             rng_state: 0,
+            pending_throw: None,
         }
     }
 
     /// Names of all builtin globals registered by `register_globals`.
     pub(crate) const BUILTIN_GLOBAL_NAMES: &'static [&'static str] = &[
-        "console", "JSON", "Object", "Array", "Math", "Promise", "Map", "Date",
+        "console",
+        "JSON",
+        "Object",
+        "Array",
+        "Math",
+        "Promise",
+        "Map",
+        "Date",
+        "String",
+        "Number",
+        "Boolean",
+        "parseInt",
+        "parseFloat",
+        "isNaN",
+        "isFinite",
+        "Set",
+        "Error",
+        "TypeError",
+        "RangeError",
+        "SyntaxError",
+        "ReferenceError",
+        "structuredClone",
     ];
 
     /// Restore a VM from snapshot state and continue execution.
@@ -237,6 +288,7 @@ impl Vm {
             stack,
             frames,
             globals,
+            cells: Vec::new(),
             stdout,
             limits,
             tracker: ResourceTracker::default(),
@@ -247,12 +299,14 @@ impl Vm {
             last_receiver_source,
             last_global_name,
             last_load_source,
+            last_place: None,
             next_generator_id,
             pending_calls: Vec::new(),
             resolved: BTreeMap::new(),
             next_call_id: 0,
             pending_batch: None,
             rng_state: 0,
+            pending_throw: None,
         }
     }
 
@@ -320,8 +374,21 @@ impl Vm {
             self.resolved.insert(*id, value);
         }
         // Rebuild the result array in element order, substituting resolved values.
-        let mut array = Vec::with_capacity(batch.items.len());
-        for item in batch.items {
+        let array = self.build_batch_array(batch.items)?;
+        // Drop the now-resolved pending calls.
+        let resolved_ids: HashSet<u64> = batch.call_ids.iter().copied().collect();
+        self.pending_calls.retain(|c| !resolved_ids.contains(&c.id));
+        self.push(Value::Array(array))?;
+        self.execute()
+    }
+
+    /// Build a `Promise.all` result array from its elements: deferred calls are
+    /// replaced by their resolved value, and any plain promise element is
+    /// unwrapped (resolved → value, rejected → propagate) exactly like the
+    /// non-batched `Promise.all` builtin. Plain values pass through unchanged.
+    fn build_batch_array(&mut self, items: Vec<Value>) -> Result<Vec<Value>> {
+        let mut array = Vec::with_capacity(items.len());
+        for item in items {
             match item {
                 Value::Pending(id) => {
                     let value = self.resolved.remove(&id).ok_or_else(|| {
@@ -329,14 +396,23 @@ impl Vm {
                     })?;
                     array.push(value);
                 }
+                Value::Object(ref map) if builtins::is_promise(&item) => match map.get("status") {
+                    Some(Value::String(s)) if s.as_ref() == "resolved" => {
+                        array.push(map.get("value").cloned().unwrap_or(Value::Undefined));
+                    }
+                    Some(Value::String(s)) if s.as_ref() == "rejected" => {
+                        let reason = map.get("reason").cloned().unwrap_or(Value::Undefined);
+                        return Err(ZapcodeError::RuntimeError(format!(
+                            "Unhandled promise rejection: {}",
+                            reason.to_js_string()
+                        )));
+                    }
+                    _ => array.push(item),
+                },
                 other => array.push(other),
             }
         }
-        // Drop the now-resolved pending calls.
-        let resolved_ids: HashSet<u64> = batch.call_ids.iter().copied().collect();
-        self.pending_calls.retain(|c| !resolved_ids.contains(&c.id));
-        self.push(Value::Array(array))?;
-        self.execute()
+        Ok(array)
     }
 
     /// Await a `Promise.all` batch. If any element is an unresolved deferred
@@ -353,15 +429,7 @@ impl Vm {
         }
 
         if call_ids.is_empty() {
-            let mut array = Vec::with_capacity(items.len());
-            for item in items {
-                match item {
-                    Value::Pending(id) => {
-                        array.push(self.resolved.remove(&id).unwrap_or(Value::Undefined))
-                    }
-                    other => array.push(other),
-                }
-            }
+            let array = self.build_batch_array(items)?;
             self.push(Value::Array(array))?;
             return Ok(None);
         }
@@ -393,19 +461,86 @@ impl Vm {
         Ok(())
     }
 
+    fn track_array_capacity(&mut self, len: usize) -> Result<()> {
+        self.tracker
+            .track_memory(len.saturating_mul(size_of::<Value>()), &self.limits)
+    }
+
+    /// The value a `catch` block should bind: the original guest-thrown value if
+    /// this came from `throw`, otherwise the stringified runtime error.
+    fn caught_error_value(&mut self, err: &ZapcodeError) -> Value {
+        self.pending_throw
+            .take()
+            .unwrap_or_else(|| Value::String(Arc::from(err.to_string().as_str())))
+    }
+
     fn write_receiver_source(&mut self, source: &ReceiverSource, value: Value) {
         match source {
             ReceiverSource::Global(name) => {
                 self.globals.insert(name.clone(), value);
             }
             ReceiverSource::Local { frame_index, slot } => {
-                if let Some(target_frame) = self.frames.get_mut(*frame_index) {
-                    while target_frame.locals.len() <= *slot {
-                        target_frame.locals.push(Value::Undefined);
-                    }
-                    target_frame.locals[*slot] = value;
+                self.write_local(*frame_index, *slot, value);
+            }
+            ReceiverSource::Cell(id) => {
+                if let Some(slot_ref) = self.cells.get_mut(*id as usize) {
+                    *slot_ref = value;
                 }
             }
+        }
+    }
+
+    /// Read the root variable of a [`Place`].
+    fn read_place_root(&self, root: &PlaceRoot) -> Option<Value> {
+        match root {
+            PlaceRoot::Global(name) => self.globals.get(name).cloned(),
+            PlaceRoot::Local { frame_index, slot } => {
+                if self.frames.get(*frame_index).is_some() {
+                    Some(self.read_local(*frame_index, *slot))
+                } else {
+                    None
+                }
+            }
+            PlaceRoot::Cell(id) => self.cells.get(*id as usize).cloned(),
+            PlaceRoot::This => self.frames.iter().rev().find_map(|f| f.this_value.clone()),
+        }
+    }
+
+    fn write_place_root(&mut self, root: &PlaceRoot, value: Value) {
+        let source = match root {
+            PlaceRoot::Global(name) => ReceiverSource::Global(name.clone()),
+            PlaceRoot::Local { frame_index, slot } => ReceiverSource::Local {
+                frame_index: *frame_index,
+                slot: *slot,
+            },
+            PlaceRoot::Cell(id) => ReceiverSource::Cell(*id),
+            PlaceRoot::This => {
+                // Update the nearest enclosing `this`; the method-return path then
+                // persists it to the original receiver.
+                for frame in self.frames.iter_mut().rev() {
+                    if frame.this_value.is_some() {
+                        frame.this_value = Some(value);
+                        break;
+                    }
+                }
+                return;
+            }
+        };
+        self.write_receiver_source(&source, value);
+    }
+
+    /// Persist a mutated receiver back to its place: the root variable, navigated
+    /// through the property/index path. Handles nested `obj.items.push(...)`.
+    fn write_place(&mut self, place: &Place, value: Value) {
+        if place.path.is_empty() {
+            self.write_place_root(&place.root, value);
+            return;
+        }
+        let Some(mut root_val) = self.read_place_root(&place.root) else {
+            return;
+        };
+        if set_in_place(&mut root_val, &place.path, value) {
+            self.write_place_root(&place.root, root_val);
         }
     }
 
@@ -419,6 +554,116 @@ impl Vm {
         self.stack
             .last()
             .ok_or_else(|| ZapcodeError::RuntimeError("stack underflow".to_string()))
+    }
+
+    /// Promote frame `frame_index`'s local `slot` to a shared cell, returning its
+    /// id. Idempotent: a slot already boxed returns its existing cell.
+    fn box_local(&mut self, frame_index: usize, slot: usize) -> u64 {
+        if let Some(&cell) = self
+            .frames
+            .get(frame_index)
+            .and_then(|f| f.boxed.get(&slot))
+        {
+            return cell;
+        }
+        let val = self
+            .frames
+            .get(frame_index)
+            .and_then(|f| f.locals.get(slot).cloned())
+            .unwrap_or(Value::Undefined);
+        let cell_id = self.cells.len() as u64;
+        self.cells.push(val);
+        if let Some(f) = self.frames.get_mut(frame_index) {
+            f.boxed.insert(slot, cell_id);
+        }
+        cell_id
+    }
+
+    /// Build a closure over the current scope. Free variables that name a frame
+    /// local (or an enclosing closure's captured variable) are bound by reference
+    /// through shared cells (`env`); user globals are captured by value. The
+    /// innermost binding of a name wins, matching lexical scoping.
+    fn create_closure(&mut self, func_idx: usize) -> Closure {
+        let mut seen: HashSet<String> = HashSet::new();
+        // Names to box (frame_index, slot, name) and cells inherited from
+        // enclosing closure frames, gathered innermost -> outermost.
+        let mut to_box: Vec<(usize, usize, String)> = Vec::new();
+        let mut inherited: Vec<(String, u64)> = Vec::new();
+        for fi in (0..self.frames.len()).rev() {
+            let frame = &self.frames[fi];
+            // Cells this frame already references (it is itself a closure body).
+            for (name, cell) in &frame.env {
+                if seen.insert(name.clone()) {
+                    inherited.push((name.clone(), *cell));
+                }
+            }
+            let local_names = if let Some(fidx) = frame.func_index {
+                &self.program(frame.program_index).functions[fidx].local_names
+            } else {
+                &self.program(frame.program_index).local_names
+            };
+            for (slot, name) in local_names.iter().enumerate() {
+                if seen.insert(name.clone()) {
+                    to_box.push((fi, slot, name.clone()));
+                }
+            }
+        }
+        let mut env: Vec<(String, u64)> = Vec::with_capacity(to_box.len() + inherited.len());
+        for (fi, slot, name) in to_box {
+            let cell = self.box_local(fi, slot);
+            env.push((name, cell));
+        }
+        env.extend(inherited);
+        // User globals (functions, top-level consts) are captured by value.
+        let mut captured = Vec::new();
+        for (name, val) in &self.globals {
+            if !Self::BUILTIN_GLOBAL_NAMES.contains(&name.as_str()) && !seen.contains(name) {
+                captured.push((name.clone(), val.clone()));
+            }
+        }
+        Closure {
+            func_ref: FunctionRef {
+                program_id: self.current_frame().program_index,
+                function_id: func_idx,
+            },
+            captured,
+            env,
+        }
+    }
+
+    /// Read a local, routing through its cell if the slot has been boxed.
+    fn read_local(&self, frame_index: usize, slot: usize) -> Value {
+        let Some(frame) = self.frames.get(frame_index) else {
+            return Value::Undefined;
+        };
+        if let Some(&cell) = frame.boxed.get(&slot) {
+            self.cells
+                .get(cell as usize)
+                .cloned()
+                .unwrap_or(Value::Undefined)
+        } else {
+            frame.locals.get(slot).cloned().unwrap_or(Value::Undefined)
+        }
+    }
+
+    /// Write a local, routing through its cell if the slot has been boxed.
+    fn write_local(&mut self, frame_index: usize, slot: usize, value: Value) {
+        let cell = self
+            .frames
+            .get(frame_index)
+            .and_then(|f| f.boxed.get(&slot).copied());
+        if let Some(cell) = cell {
+            if let Some(slot_ref) = self.cells.get_mut(cell as usize) {
+                *slot_ref = value;
+            }
+            return;
+        }
+        if let Some(f) = self.frames.get_mut(frame_index) {
+            while f.locals.len() <= slot {
+                f.locals.push(Value::Undefined);
+            }
+            f.locals[slot] = value;
+        }
     }
 
     fn current_frame(&self) -> &CallFrame {
@@ -468,7 +713,7 @@ impl Vm {
                     locals.push(args.get(i).cloned().unwrap_or(Value::Undefined));
                 }
                 ParamPattern::Rest(_) => {
-                    let rest: Vec<Value> = args[i..].to_vec();
+                    let rest: Vec<Value> = args.get(i..).map(|s| s.to_vec()).unwrap_or_default();
                     locals.push(Value::Array(rest));
                 }
                 ParamPattern::DefaultValue { .. } => {
@@ -476,8 +721,11 @@ impl Vm {
                     // Keep Undefined so the compiler-emitted default init can fire
                     locals.push(val);
                 }
-                _ => {
-                    locals.push(args.get(i).cloned().unwrap_or(Value::Undefined));
+                // Destructuring params bind multiple locals in declaration order;
+                // extract the fields from the argument into those slots.
+                ParamPattern::ObjectDestructure(_) | ParamPattern::ArrayDestructure(_) => {
+                    let arg = args.get(i).cloned().unwrap_or(Value::Undefined);
+                    extract_pattern(param, &arg, &mut locals);
                 }
             }
         }
@@ -494,7 +742,7 @@ impl Vm {
         self.tracker.push_frame();
         self.tracker.check_stack(&self.limits)?;
 
-        // Inject captured variables as globals
+        // Inject captured-by-value variables as globals
         for (name, val) in &closure.captured {
             if !self.globals.contains_key(name) {
                 self.globals.insert(name.clone(), val.clone());
@@ -513,6 +761,10 @@ impl Vm {
             None
         };
 
+        // Captured-by-reference variables: the frame's env maps each name to its
+        // shared cell so LoadGlobal/StoreGlobal in the body see and mutate it.
+        let env: HashMap<String, u64> = closure.env.iter().cloned().collect();
+
         self.frames.push(CallFrame {
             program_index: closure.func_ref.program_id,
             func_index: Some(closure.func_ref.function_id),
@@ -521,6 +773,8 @@ impl Vm {
             stack_base: self.stack.len(),
             this_value,
             receiver_source,
+            boxed: HashMap::new(),
+            env,
         });
         Ok(())
     }
@@ -541,6 +795,8 @@ impl Vm {
             stack_base: 0,
             this_value: None,
             receiver_source: None,
+            boxed: HashMap::new(),
+            env: HashMap::new(),
         });
 
         self.execute()
@@ -607,7 +863,7 @@ impl Vm {
                         self.stack.truncate(try_info.stack_depth);
 
                         // Push error value
-                        let error_val = Value::String(Arc::from(err.to_string()));
+                        let error_val = self.caught_error_value(&err);
                         self.push(error_val)?;
 
                         // Jump to catch
@@ -815,7 +1071,11 @@ impl Vm {
                 }
                 Ok(Some(VmState::Suspended { .. })) | Ok(Some(VmState::SuspendedMany { .. })) => {
                     return Err(ZapcodeError::RuntimeError(
-                        "cannot suspend inside array callback".to_string(),
+                        "cannot call an external function inside an array-callback method \
+                         (.map/.filter/.forEach/.reduce/...). Use a `for...of` loop with `await`, \
+                         or `await Promise.all([toolA(), toolB(), ...])` with the calls written \
+                         directly as array elements."
+                            .to_string(),
                     ));
                 }
                 Ok(None) => {
@@ -833,7 +1093,7 @@ impl Vm {
                             self.tracker.pop_frame();
                         }
                         self.stack.truncate(try_info.stack_depth);
-                        let error_val = Value::String(Arc::from(err.to_string()));
+                        let error_val = self.caught_error_value(&err);
                         self.push(error_val)?;
                         self.current_frame_mut().ip = try_info.catch_ip;
                     } else {
@@ -964,7 +1224,8 @@ impl Vm {
                 }
                 Ok(Some(Value::Array(result)))
             }
-            "filter" | "find" | "findIndex" | "every" | "some" | "reduce" | "sort" | "flatMap" => {
+            "filter" | "find" | "findIndex" | "findLast" | "findLastIndex" | "every" | "some"
+            | "reduce" | "reduceRight" | "sort" | "flatMap" => {
                 // Async callbacks are not supported for these methods
                 if self.is_async_callback(&callback) {
                     return Err(ZapcodeError::RuntimeError(format!(
@@ -992,6 +1253,22 @@ impl Vm {
                     }
                     "findIndex" => {
                         for (i, item) in arr.iter().enumerate() {
+                            if self.call_element_callback(&callback, item, i)?.is_truthy() {
+                                return Ok(Some(Value::Int(i as i64)));
+                            }
+                        }
+                        Ok(Some(Value::Int(-1)))
+                    }
+                    "findLast" => {
+                        for (i, item) in arr.iter().enumerate().rev() {
+                            if self.call_element_callback(&callback, item, i)?.is_truthy() {
+                                return Ok(Some(item.clone()));
+                            }
+                        }
+                        Ok(Some(Value::Undefined))
+                    }
+                    "findLastIndex" => {
+                        for (i, item) in arr.iter().enumerate().rev() {
                             if self.call_element_callback(&callback, item, i)?.is_truthy() {
                                 return Ok(Some(Value::Int(i as i64)));
                             }
@@ -1026,6 +1303,31 @@ impl Vm {
                         };
                         let start = if all_args.get(1).is_some() { 0 } else { 1 };
                         for (i, item) in arr.iter().enumerate().skip(start) {
+                            acc = Some(self.call_function_internal(
+                                &callback,
+                                vec![acc.unwrap(), item.clone(), Value::Int(i as i64)],
+                            )?);
+                        }
+                        Ok(Some(acc.unwrap_or(Value::Undefined)))
+                    }
+                    "reduceRight" => {
+                        let n = arr.len();
+                        let mut acc = match all_args.get(1).cloned() {
+                            Some(init) => Some(init),
+                            None if n > 0 => Some(arr[n - 1].clone()),
+                            None => {
+                                return Err(ZapcodeError::TypeError(
+                                    "Reduce of empty array with no initial value".to_string(),
+                                ));
+                            }
+                        };
+                        // Iterate from the end; skip the seed element when no
+                        // initial value was supplied.
+                        let skip_last = all_args.get(1).is_none();
+                        for (i, item) in arr.iter().enumerate().rev() {
+                            if skip_last && i == n - 1 {
+                                continue;
+                            }
                             acc = Some(self.call_function_internal(
                                 &callback,
                                 vec![acc.unwrap(), item.clone(), Value::Int(i as i64)],
@@ -1211,6 +1513,7 @@ impl Vm {
                     }
                 }
                 let stack_base = self.stack.len();
+                let env: HashMap<String, u64> = gen_obj.env.iter().cloned().collect();
                 self.frames.push(CallFrame {
                     program_index: func_ref.program_id,
                     func_index: Some(func_ref.function_id),
@@ -1219,6 +1522,8 @@ impl Vm {
                     stack_base,
                     this_value: None,
                     receiver_source: None,
+                    boxed: HashMap::new(),
+                    env,
                 });
                 self.run_generator_until_yield_or_return(gen_obj)
             }
@@ -1229,6 +1534,7 @@ impl Vm {
                     self.push(val.clone())?;
                 }
                 self.push(arg)?;
+                let env: HashMap<String, u64> = gen_obj.env.iter().cloned().collect();
                 self.frames.push(CallFrame {
                     program_index: func_ref.program_id,
                     func_index: Some(func_ref.function_id),
@@ -1237,6 +1543,8 @@ impl Vm {
                     stack_base,
                     this_value: None,
                     receiver_source: None,
+                    boxed: HashMap::new(),
+                    env,
                 });
                 self.run_generator_until_yield_or_return(gen_obj)
             }
@@ -1346,7 +1654,7 @@ impl Vm {
                             self.tracker.pop_frame();
                         }
                         self.stack.truncate(try_info.stack_depth);
-                        let error_val = Value::String(Arc::from(err.to_string()));
+                        let error_val = self.caught_error_value(&err);
                         self.push(error_val)?;
                         self.current_frame_mut().ip = try_info.catch_ip;
                     } else {
@@ -1388,23 +1696,53 @@ impl Vm {
             }
             Instruction::LoadLocal(idx) => {
                 let frame_index = self.frames.len() - 1;
-                let frame = self.current_frame();
-                let val = frame.locals.get(idx).cloned().unwrap_or(Value::Undefined);
-                self.last_load_source = Some(ReceiverSource::Local {
-                    frame_index,
-                    slot: idx,
-                });
+                let val = self.read_local(frame_index, idx);
+                // If the slot is boxed, write-back must target the cell so the
+                // owning frame and capturing closures stay in sync.
+                if let Some(&cell) = self.current_frame().boxed.get(&idx) {
+                    self.last_load_source = Some(ReceiverSource::Cell(cell));
+                    self.last_place = Some(Place {
+                        root: PlaceRoot::Cell(cell),
+                        path: Vec::new(),
+                    });
+                } else {
+                    self.last_load_source = Some(ReceiverSource::Local {
+                        frame_index,
+                        slot: idx,
+                    });
+                    self.last_place = Some(Place {
+                        root: PlaceRoot::Local {
+                            frame_index,
+                            slot: idx,
+                        },
+                        path: Vec::new(),
+                    });
+                }
                 self.push(val)?;
             }
             Instruction::StoreLocal(idx) => {
                 let val = self.pop()?;
-                let frame = self.current_frame_mut();
-                while frame.locals.len() <= idx {
-                    frame.locals.push(Value::Undefined);
-                }
-                frame.locals[idx] = val;
+                let frame_index = self.frames.len() - 1;
+                self.write_local(frame_index, idx, val);
             }
             Instruction::LoadGlobal(name) => {
+                // A captured free variable resolves to its shared cell via the
+                // current frame's env overlay before falling back to true globals.
+                if let Some(&cell) = self.current_frame().env.get(name.as_str()) {
+                    let val = self
+                        .cells
+                        .get(cell as usize)
+                        .cloned()
+                        .unwrap_or(Value::Undefined);
+                    self.last_global_name = Some(name.clone());
+                    self.last_load_source = Some(ReceiverSource::Cell(cell));
+                    self.last_place = Some(Place {
+                        root: PlaceRoot::Cell(cell),
+                        path: Vec::new(),
+                    });
+                    self.push(val)?;
+                    return Ok(None);
+                }
                 let val = self.globals.get(&name).cloned().unwrap_or(Value::Undefined);
                 self.last_global_name = Some(name.clone());
                 // Only track receiver source for user-defined globals — builtins
@@ -1412,14 +1750,26 @@ impl Vm {
                 // values that would break snapshot serialization if written back.
                 if Self::BUILTIN_GLOBAL_NAMES.contains(&name.as_str()) {
                     self.last_load_source = None;
+                    self.last_place = None;
                 } else {
-                    self.last_load_source = Some(ReceiverSource::Global(name));
+                    self.last_load_source = Some(ReceiverSource::Global(name.clone()));
+                    self.last_place = Some(Place {
+                        root: PlaceRoot::Global(name),
+                        path: Vec::new(),
+                    });
                 }
                 self.push(val)?;
             }
             Instruction::StoreGlobal(name) => {
                 let val = self.pop()?;
-                self.globals.insert(name, val);
+                // Route writes to a captured variable through its shared cell.
+                if let Some(&cell) = self.current_frame().env.get(name.as_str()) {
+                    if let Some(slot_ref) = self.cells.get_mut(cell as usize) {
+                        *slot_ref = val;
+                    }
+                } else {
+                    self.globals.insert(name, val);
+                }
             }
             Instruction::DeclareLocal(_) => {
                 let frame = self.current_frame_mut();
@@ -1556,17 +1906,30 @@ impl Vm {
                 let right = self.pop()?;
                 let left = self.pop()?;
                 let shift = (right.to_number() as u32) & 0x1f;
-                let result = (left.to_number() as u32) >> shift;
+                // ToUint32: cast through i64 so negative operands wrap (JS
+                // semantics) rather than saturating to 0 as a direct f64->u32
+                // cast would (e.g. -1 >>> 0 === 4294967295).
+                let result = (left.to_number() as i64 as u32) >> shift;
                 self.push(Value::Int(result as i64))?;
             }
 
             // Comparison
-            Instruction::Eq | Instruction::StrictEq => {
+            Instruction::Eq => {
+                let right = self.pop()?;
+                let left = self.pop()?;
+                self.push(Value::Bool(left.loose_eq(&right)))?;
+            }
+            Instruction::StrictEq => {
                 let right = self.pop()?;
                 let left = self.pop()?;
                 self.push(Value::Bool(left.strict_eq(&right)))?;
             }
-            Instruction::Neq | Instruction::StrictNeq => {
+            Instruction::Neq => {
+                let right = self.pop()?;
+                let left = self.pop()?;
+                self.push(Value::Bool(!left.loose_eq(&right)))?;
+            }
+            Instruction::StrictNeq => {
                 let right = self.pop()?;
                 let left = self.pop()?;
                 self.push(Value::Bool(!left.strict_eq(&right)))?;
@@ -1600,6 +1963,7 @@ impl Vm {
 
             // Objects & Arrays
             Instruction::CreateArray(count) => {
+                self.track_array_capacity(count)?;
                 self.tracker.track_allocation(&self.limits)?;
                 let mut arr = Vec::with_capacity(count);
                 for _ in 0..count {
@@ -1647,15 +2011,42 @@ impl Vm {
             }
             Instruction::GetProperty(name) => {
                 let obj = self.pop()?;
+                // Place of the object we're reading the property from.
+                let obj_place = self.last_place.take();
                 let result = self.get_property(&obj, &name)?;
-                // Store receiver for method calls
-                if matches!(result, Value::BuiltinMethod { .. } | Value::Function(_)) {
-                    self.last_receiver = Some(obj);
-                    self.last_receiver_source = self.last_load_source.take();
-                } else {
-                    self.last_receiver_source = None;
+                match result {
+                    Value::BuiltinMethod {
+                        object_name,
+                        method_name,
+                        ..
+                    } => {
+                        // Bind the receiver + write-back place onto the method so
+                        // argument evaluation can't clobber it.
+                        self.last_receiver_source = None;
+                        self.push(Value::BuiltinMethod {
+                            object_name,
+                            method_name,
+                            recv: Some(Box::new(obj)),
+                            place: obj_place,
+                        })?;
+                    }
+                    Value::Function(_) => {
+                        // User method: keep the existing `this`-binding mechanism.
+                        self.last_receiver = Some(obj);
+                        self.last_receiver_source = self.last_load_source.take();
+                        self.push(result)?;
+                    }
+                    other => {
+                        // Plain value: extend the place path so a later method on
+                        // it (e.g. `obj.items.push`) writes back to the right spot.
+                        self.last_receiver_source = None;
+                        self.last_place = obj_place.map(|mut p| {
+                            p.path.push(PlaceSeg::Prop(name.to_string()));
+                            p
+                        });
+                        self.push(other)?;
+                    }
                 }
-                self.push(result)?;
             }
             Instruction::SetProperty(name) => {
                 // Stack: [value_to_store, object] with object on top
@@ -1680,6 +2071,19 @@ impl Vm {
             Instruction::GetIndex => {
                 let index = self.pop()?;
                 let obj = self.pop()?;
+                let obj_place = self.last_place.take();
+                // The path step for this index access (for write-back chains).
+                let seg = match (&obj, &index) {
+                    (Value::Array(_), Value::Int(i)) if *i >= 0 => {
+                        Some(PlaceSeg::Index(*i as usize))
+                    }
+                    (Value::Array(_), Value::Float(f)) if *f >= 0.0 => {
+                        Some(PlaceSeg::Index(*f as usize))
+                    }
+                    (Value::Object(_), Value::String(key)) => Some(PlaceSeg::Prop(key.to_string())),
+                    (Value::Object(_), _) => Some(PlaceSeg::Prop(index.to_js_string())),
+                    _ => None,
+                };
                 let result = match (&obj, &index) {
                     (Value::Array(arr), Value::Int(i)) => {
                         arr.get(*i as usize).cloned().unwrap_or(Value::Undefined)
@@ -1701,7 +2105,37 @@ impl Vm {
                         .unwrap_or(Value::Undefined),
                     _ => Value::Undefined,
                 };
-                self.push(result)?;
+                match result {
+                    Value::BuiltinMethod {
+                        object_name,
+                        method_name,
+                        ..
+                    } => {
+                        let place = match (obj_place, seg) {
+                            (Some(mut p), Some(s)) => {
+                                p.path.push(s);
+                                Some(p)
+                            }
+                            _ => None,
+                        };
+                        self.push(Value::BuiltinMethod {
+                            object_name,
+                            method_name,
+                            recv: Some(Box::new(obj)),
+                            place,
+                        })?;
+                    }
+                    other => {
+                        self.last_place = match (obj_place, seg) {
+                            (Some(mut p), Some(s)) => {
+                                p.path.push(s);
+                                Some(p)
+                            }
+                            _ => None,
+                        };
+                        self.push(other)?;
+                    }
+                }
             }
             Instruction::SetIndex => {
                 let index = self.pop()?;
@@ -1742,8 +2176,136 @@ impl Vm {
                 // Push modified object back so compile_store can store it to the variable
                 self.push(obj)?;
             }
+            Instruction::FreshenBinding(slot) => {
+                let frame_index = self.frames.len() - 1;
+                // Only meaningful if a closure captured this slot this iteration.
+                if let Some(&cell) = self.current_frame().boxed.get(&slot) {
+                    let val = self
+                        .cells
+                        .get(cell as usize)
+                        .cloned()
+                        .unwrap_or(Value::Undefined);
+                    let new_cell = self.cells.len() as u64;
+                    self.cells.push(val);
+                    self.frames[frame_index].boxed.insert(slot, new_cell);
+                }
+            }
+            Instruction::DeleteProperty(name) => {
+                let mut obj = self.pop()?;
+                if let Value::Object(map) = &mut obj {
+                    map.shift_remove(name.as_str());
+                }
+                self.push(obj)?;
+            }
+            Instruction::DeleteIndex => {
+                let key = self.pop()?;
+                let mut obj = self.pop()?;
+                match &mut obj {
+                    Value::Object(map) => {
+                        let k = key.to_js_string();
+                        map.shift_remove(k.as_str());
+                    }
+                    Value::Array(arr) => {
+                        // `delete arr[i]` leaves a hole (undefined) without
+                        // changing length, matching JS.
+                        if let Value::Int(i) = &key {
+                            if *i >= 0 && (*i as usize) < arr.len() {
+                                arr[*i as usize] = Value::Undefined;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                self.push(obj)?;
+            }
             Instruction::Spread => {
-                // Handled contextually in CreateArray/CreateObject
+                // No-op marker; spread is expanded by the dedicated
+                // Array/Object append instructions below.
+            }
+            Instruction::ArrayAppend => {
+                self.tracker.track_allocation(&self.limits)?;
+                let value = self.pop()?;
+                let mut acc = match self.pop()? {
+                    Value::Array(a) => a,
+                    other => {
+                        return Err(ZapcodeError::TypeError(format!(
+                            "internal: ArrayAppend on {}",
+                            other.type_name()
+                        )))
+                    }
+                };
+                acc.push(value);
+                self.push(Value::Array(acc))?;
+            }
+            Instruction::ArraySpreadAppend => {
+                self.tracker.track_allocation(&self.limits)?;
+                let iterable = self.pop()?;
+                let mut acc = match self.pop()? {
+                    Value::Array(a) => a,
+                    other => {
+                        return Err(ZapcodeError::TypeError(format!(
+                            "internal: ArraySpreadAppend on {}",
+                            other.type_name()
+                        )))
+                    }
+                };
+                match iterable {
+                    Value::Array(items) => acc.extend(items),
+                    Value::String(s) => acc.extend(
+                        s.chars()
+                            .map(|c| Value::String(Arc::from(c.to_string().as_str()))),
+                    ),
+                    Value::Object(ref m) if is_set_object(&iterable) => acc.extend(set_items(m)),
+                    other => {
+                        return Err(ZapcodeError::TypeError(format!(
+                            "{} is not iterable (spread)",
+                            other.type_name()
+                        )))
+                    }
+                }
+                self.push(Value::Array(acc))?;
+            }
+            Instruction::ObjectInsert => {
+                let value = self.pop()?;
+                let key = self.pop()?;
+                let mut acc = match self.pop()? {
+                    Value::Object(o) => o,
+                    other => {
+                        return Err(ZapcodeError::TypeError(format!(
+                            "internal: ObjectInsert on {}",
+                            other.type_name()
+                        )))
+                    }
+                };
+                let key: Arc<str> = match key {
+                    Value::String(k) => k,
+                    other => Arc::from(other.to_js_string().as_str()),
+                };
+                acc.insert(key, value);
+                self.push(Value::Object(acc))?;
+            }
+            Instruction::ObjectSpreadAssign => {
+                let source = self.pop()?;
+                let mut acc = match self.pop()? {
+                    Value::Object(o) => o,
+                    other => {
+                        return Err(ZapcodeError::TypeError(format!(
+                            "internal: ObjectSpreadAssign on {}",
+                            other.type_name()
+                        )))
+                    }
+                };
+                match source {
+                    Value::Object(map) => {
+                        for (k, v) in map {
+                            acc.insert(k, v);
+                        }
+                    }
+                    // Spreading null/undefined is a no-op in JS; ignore others.
+                    Value::Null | Value::Undefined => {}
+                    _ => {}
+                }
+                self.push(Value::Object(acc))?;
             }
             Instruction::In => {
                 let right = self.pop()?;
@@ -1768,51 +2330,45 @@ impl Vm {
                 let right = self.pop()?;
                 let left = self.pop()?;
                 // Check if left's __class__ matches right's __class_name__
-                let result = match (&left, &right) {
-                    (Value::Object(instance), Value::Object(class_obj)) => {
-                        if let (Some(inst_class), Some(class_name)) =
-                            (instance.get("__class__"), class_obj.get("__class_name__"))
-                        {
-                            inst_class == class_name
-                        } else {
-                            false
+                let result = if let Value::Object(class_obj) = &right {
+                    if let Some(Value::String(ctor)) = class_obj.get("__builtin_constructor__") {
+                        // Builtin constructors. Object matches any object/array/function;
+                        // Array matches arrays; Error matches any error object; a specific
+                        // error type matches by name; Map/Set by marker.
+                        match ctor.as_ref() {
+                            "Object" => matches!(
+                                left,
+                                Value::Object(_) | Value::Array(_) | Value::Function(_)
+                            ),
+                            "Array" => matches!(left, Value::Array(_)),
+                            "Error" => {
+                                matches!(&left, Value::Object(i) if i.contains_key("__error__"))
+                            }
+                            "TypeError" | "RangeError" | "SyntaxError" | "ReferenceError" => {
+                                matches!(&left, Value::Object(i)
+                                    if i.get("name")
+                                        == Some(&Value::String(Arc::from(ctor.as_ref()))))
+                            }
+                            "Map" => matches!(&left, Value::Object(i) if i.contains_key("__map__")),
+                            "Set" => matches!(&left, Value::Object(i) if i.contains_key("__set__")),
+                            _ => false,
                         }
+                    } else if let (Value::Object(instance), Some(class_name)) =
+                        (&left, class_obj.get("__class_name__"))
+                    {
+                        instance.get("__class__") == Some(class_name)
+                    } else {
+                        false
                     }
-                    _ => false,
+                } else {
+                    false
                 };
                 self.push(Value::Bool(result))?;
             }
 
             // Functions
             Instruction::CreateClosure(func_idx) => {
-                // Capture current scope for closure
-                let mut captured = Vec::new();
-                // Capture all locals from all active frames using local_names
-                for frame in &self.frames {
-                    let local_names = if let Some(fidx) = frame.func_index {
-                        &self.program(frame.program_index).functions[fidx].local_names
-                    } else {
-                        &self.program(frame.program_index).local_names
-                    };
-                    for (i, val) in frame.locals.iter().enumerate() {
-                        if let Some(name) = local_names.get(i) {
-                            captured.push((name.clone(), val.clone()));
-                        }
-                    }
-                }
-                // Also capture all globals that are user-defined (not builtins)
-                for (name, val) in &self.globals {
-                    if !Self::BUILTIN_GLOBAL_NAMES.contains(&name.as_str()) {
-                        captured.push((name.clone(), val.clone()));
-                    }
-                }
-                let closure = Closure {
-                    func_ref: FunctionRef {
-                        program_id: self.current_frame().program_index,
-                        function_id: func_idx,
-                    },
-                    captured,
-                };
+                let closure = self.create_closure(func_idx);
                 self.push(Value::Function(closure))?;
             }
             Instruction::Call(arg_count) => {
@@ -1854,6 +2410,7 @@ impl Vm {
                                 id: gen_id,
                                 func_ref,
                                 captured,
+                                env: closure.env.clone(),
                                 suspended: None,
                                 done: false,
                             };
@@ -1873,8 +2430,12 @@ impl Vm {
                     Value::BuiltinMethod {
                         object_name,
                         method_name,
+                        recv,
+                        place,
                     } => {
-                        let receiver = self.last_receiver.take();
+                        // Receiver is carried on the method (immune to arg eval);
+                        // fall back to the legacy slot for any unbound handle.
+                        let receiver = recv.map(|b| *b).or_else(|| self.last_receiver.take());
                         let result = match object_name.as_ref() {
                             "__array__" => {
                                 if let Some(Value::Array(arr)) = &receiver {
@@ -1883,7 +2444,8 @@ impl Vm {
                                     // Check if this is a callback method first
                                     let result = match method_name.as_ref() {
                                         "map" | "filter" | "forEach" | "find" | "findIndex"
-                                        | "every" | "some" | "reduce" | "sort" | "flatMap" => {
+                                        | "findLast" | "findLastIndex" | "every" | "some"
+                                        | "reduce" | "reduceRight" | "sort" | "flatMap" => {
                                             match self.execute_array_callback_method(
                                                 arr.clone(),
                                                 &method_name,
@@ -1902,13 +2464,12 @@ impl Vm {
                                             &Value::Array(arr.clone()),
                                             &method_name,
                                             &args,
+                                            &self.limits,
                                             &mut self.stdout,
                                         )?,
                                     };
-                                    if let (Some(source), Some(updated)) =
-                                        (self.last_receiver_source.clone(), receiver_update)
-                                    {
-                                        self.write_receiver_source(&source, Value::Array(updated));
+                                    if let (Some(p), Some(updated)) = (&place, receiver_update) {
+                                        self.write_place(p, Value::Array(updated));
                                     }
                                     result
                                 } else {
@@ -1921,10 +2482,35 @@ impl Vm {
                                         &Value::String(s.clone()),
                                         &method_name,
                                         &args,
+                                        &self.limits,
                                         &mut self.stdout,
                                     )?
                                 } else {
                                     None
+                                }
+                            }
+                            "__number__" => {
+                                let n =
+                                    receiver.as_ref().map(|v| v.to_number()).unwrap_or(f64::NAN);
+                                builtins::call_number_method(n, &method_name, &args)?
+                            }
+                            "__object__" => match (&receiver, method_name.as_ref()) {
+                                (Some(Value::Object(map)), "hasOwnProperty") => {
+                                    let key =
+                                        args.first().map(|v| v.to_js_string()).unwrap_or_default();
+                                    Some(Value::Bool(map.contains_key(key.as_str())))
+                                }
+                                _ => None,
+                            },
+                            "__regexp__" => {
+                                match receiver.as_ref().and_then(builtins::regexp_parts) {
+                                    Some((pat, flags)) => builtins::call_regexp_method(
+                                        &pat,
+                                        &flags,
+                                        &method_name,
+                                        &args,
+                                    )?,
+                                    None => None,
                                 }
                             }
                             "__generator__" => {
@@ -1979,14 +2565,67 @@ impl Vm {
                             }
                             "__map__" => {
                                 if let Some(Value::Object(map)) = receiver {
-                                    let (result, updated) =
-                                        execute_map_method(map, &method_name, &args);
-                                    if let (Some(source), Some(updated)) =
-                                        (self.last_receiver_source.clone(), updated)
-                                    {
-                                        self.write_receiver_source(&source, Value::Object(updated));
+                                    if method_name.as_ref() == "forEach" {
+                                        // cb(value, key, map) — needs guest closure.
+                                        let cb = args.first().cloned().unwrap_or(Value::Undefined);
+                                        let entries = match map.get("__entries__") {
+                                            Some(Value::Array(e)) => e.clone(),
+                                            _ => Vec::new(),
+                                        };
+                                        for entry in &entries {
+                                            if let Value::Object(e) = entry {
+                                                let v = e
+                                                    .get("value")
+                                                    .cloned()
+                                                    .unwrap_or(Value::Undefined);
+                                                let k = e
+                                                    .get("key")
+                                                    .cloned()
+                                                    .unwrap_or(Value::Undefined);
+                                                self.call_function_internal(
+                                                    &cb,
+                                                    vec![v, k, Value::Object(map.clone())],
+                                                )?;
+                                            }
+                                        }
+                                        Some(Value::Undefined)
+                                    } else {
+                                        let (result, updated) =
+                                            execute_map_method(map, &method_name, &args);
+                                        if let (Some(p), Some(updated)) = (&place, updated) {
+                                            self.write_place(p, Value::Object(updated));
+                                        }
+                                        result
                                     }
-                                    result
+                                } else {
+                                    None
+                                }
+                            }
+                            "__set__" => {
+                                if let Some(Value::Object(map)) = receiver {
+                                    if method_name.as_ref() == "forEach" {
+                                        // cb(value, value, set) — needs guest closure.
+                                        let cb = args.first().cloned().unwrap_or(Value::Undefined);
+                                        let items = set_items(&map);
+                                        for item in items {
+                                            self.call_function_internal(
+                                                &cb,
+                                                vec![
+                                                    item.clone(),
+                                                    item.clone(),
+                                                    Value::Object(map.clone()),
+                                                ],
+                                            )?;
+                                        }
+                                        Some(Value::Undefined)
+                                    } else {
+                                        let (result, updated) =
+                                            execute_set_method(map, &method_name, &args);
+                                        if let (Some(p), Some(updated)) = (&place, updated) {
+                                            self.write_place(p, Value::Object(updated));
+                                        }
+                                        result
+                                    }
                                 } else {
                                     None
                                 }
@@ -2002,6 +2641,23 @@ impl Vm {
                             // deterministic PRNG rather than the stateless builtin.
                             "Math" if method_name.as_ref() == "random" => {
                                 Some(Value::Float(self.next_random()))
+                            }
+                            // Array.from(source, mapFn): mapFn may be a guest
+                            // closure, so apply it here rather than in the pure
+                            // builtin.
+                            "Array"
+                                if method_name.as_ref() == "from"
+                                    && matches!(args.get(1), Some(Value::Function(_))) =>
+                            {
+                                let src = builtins::array_from_source(
+                                    args.first().unwrap_or(&Value::Undefined),
+                                );
+                                let map_fn = args[1].clone();
+                                let mut out = Vec::with_capacity(src.len());
+                                for (i, item) in src.iter().enumerate() {
+                                    out.push(self.call_element_callback(&map_fn, item, i)?);
+                                }
+                                Some(Value::Array(out))
                             }
                             global_name => builtins::call_global_method(
                                 global_name,
@@ -2019,6 +2675,16 @@ impl Vm {
                                 )));
                             }
                         }
+                    }
+                    // Bare type-conversion functions: String(x)/Number(x)/Boolean(x),
+                    // represented as objects carrying a "__global_fn__" marker.
+                    Value::Object(ref map) if map.contains_key("__global_fn__") => {
+                        let kind = match map.get("__global_fn__") {
+                            Some(Value::String(s)) => s.clone(),
+                            _ => Arc::from(""),
+                        };
+                        let value = builtins::call_global_fn(kind.as_ref(), &args)?;
+                        self.push(value)?;
                     }
                     _ => {
                         return Err(ZapcodeError::TypeError(format!(
@@ -2083,6 +2749,33 @@ impl Vm {
                     args,
                     snapshot,
                 }));
+            }
+            // Spread calls: expand the flattened args array onto the stack, then
+            // re-dispatch the normal call. The `ip -= 1` compensates for the ip
+            // increment the re-dispatched instruction performs.
+            Instruction::CallSpread => {
+                let items = match self.pop()? {
+                    Value::Array(a) => a,
+                    _ => Vec::new(),
+                };
+                let n = items.len();
+                for item in items {
+                    self.push(item)?;
+                }
+                self.current_frame_mut().ip -= 1;
+                return self.dispatch(Instruction::Call(n));
+            }
+            Instruction::CallExternalSpread(name) => {
+                let items = match self.pop()? {
+                    Value::Array(a) => a,
+                    _ => Vec::new(),
+                };
+                let n = items.len();
+                for item in items {
+                    self.push(item)?;
+                }
+                self.current_frame_mut().ip -= 1;
+                return self.dispatch(Instruction::CallExternal(name, n));
             }
             Instruction::CallExternalDeferred(name, arg_count) => {
                 if !self.external_functions.contains(&name) {
@@ -2165,6 +2858,29 @@ impl Vm {
                             Value::Int(gen_obj.id as i64),
                             Value::Bool(false),
                         ]);
+                        self.push(iter_obj)?;
+                    }
+                    // Map iterates as [key, value] pairs; Set as its items.
+                    Value::Object(ref m) if is_set_object(&val) => {
+                        let iter_obj =
+                            Value::Array(vec![Value::Array(set_items(m)), Value::Int(0)]);
+                        self.push(iter_obj)?;
+                    }
+                    Value::Object(ref m) if is_map_object(&val) => {
+                        let pairs: Vec<Value> = match m.get("__entries__") {
+                            Some(Value::Array(entries)) => entries
+                                .iter()
+                                .filter_map(|e| match e {
+                                    Value::Object(e) => Some(Value::Array(vec![
+                                        e.get("key").cloned().unwrap_or(Value::Undefined),
+                                        e.get("value").cloned().unwrap_or(Value::Undefined),
+                                    ])),
+                                    _ => None,
+                                })
+                                .collect(),
+                            _ => Vec::new(),
+                        };
+                        let iter_obj = Value::Array(vec![Value::Array(pairs), Value::Int(0)]);
                         self.push(iter_obj)?;
                     }
                     _ => {
@@ -2319,6 +3035,9 @@ impl Vm {
             Instruction::Throw => {
                 let val = self.pop()?;
                 let msg = val.to_js_string();
+                // Preserve the thrown value so a `catch` binding sees it verbatim
+                // (string/object/…), while uncaught throws still report `msg`.
+                self.pending_throw = Some(val);
                 return Err(ZapcodeError::RuntimeError(msg));
             }
             Instruction::EndTry => {
@@ -2328,7 +3047,12 @@ impl Vm {
             // Typeof
             Instruction::TypeOf => {
                 let val = self.pop()?;
-                let type_str = val.type_name();
+                // `typeof null === "object"` (a long-standing JS quirk).
+                // Everything else matches type_name().
+                let type_str = match val {
+                    Value::Null => "object",
+                    other => other.type_name(),
+                };
                 self.push(Value::String(Arc::from(type_str)))?;
             }
 
@@ -2540,13 +3264,78 @@ impl Vm {
                     if let Some(Value::String(name)) = obj.get("__builtin_constructor__") {
                         match name.as_ref() {
                             "Map" => {
-                                self.push(make_map_object(Vec::new()))?;
+                                // new Map([[k, v], ...]) seeds {key,value} entries.
+                                let entries = match args.first() {
+                                    Some(Value::Array(pairs)) => pairs
+                                        .iter()
+                                        .map(|p| {
+                                            let (k, v) = match p {
+                                                Value::Array(kv) => (
+                                                    kv.first().cloned().unwrap_or(Value::Undefined),
+                                                    kv.get(1).cloned().unwrap_or(Value::Undefined),
+                                                ),
+                                                _ => (Value::Undefined, Value::Undefined),
+                                            };
+                                            let mut e = IndexMap::new();
+                                            e.insert(Arc::from("key"), k);
+                                            e.insert(Arc::from("value"), v);
+                                            Value::Object(e)
+                                        })
+                                        .collect(),
+                                    _ => Vec::new(),
+                                };
+                                self.push(make_map_object(entries))?;
+                                return Ok(None);
+                            }
+                            "Set" => {
+                                let items = match args.first() {
+                                    Some(Value::Array(items)) => items.clone(),
+                                    _ => Vec::new(),
+                                };
+                                self.push(make_set_object(items))?;
                                 return Ok(None);
                             }
                             "Date" => {
                                 let millis =
                                     args.first().map_or(0, |value| value.to_number() as i64);
                                 self.push(make_date_object(millis))?;
+                                return Ok(None);
+                            }
+                            "Error" | "TypeError" | "RangeError" | "SyntaxError"
+                            | "ReferenceError" => {
+                                let msg =
+                                    args.first().map(|v| v.to_js_string()).unwrap_or_default();
+                                self.push(make_error_object(name.as_ref(), &msg))?;
+                                return Ok(None);
+                            }
+                            "Array" => {
+                                // new Array(n): n empty slots; new Array(a, b, ...): [a, b, ...].
+                                let arr = match args.as_slice() {
+                                    [single] => match single {
+                                        Value::Int(n) if *n >= 0 => {
+                                            let len = *n as usize;
+                                            self.track_array_capacity(len)?;
+                                            vec![Value::Undefined; len]
+                                        }
+                                        Value::Float(f) if f.fract() == 0.0 && *f >= 0.0 => {
+                                            let len = *f as usize;
+                                            self.track_array_capacity(len)?;
+                                            vec![Value::Undefined; len]
+                                        }
+                                        other => vec![other.clone()],
+                                    },
+                                    other => other.to_vec(),
+                                };
+                                self.push(Value::Array(arr))?;
+                                return Ok(None);
+                            }
+                            "Object" => {
+                                match args.first() {
+                                    Some(v @ (Value::Object(_) | Value::Array(_))) => {
+                                        self.push(v.clone())?
+                                    }
+                                    _ => self.push(Value::Object(IndexMap::new()))?,
+                                }
                                 return Ok(None);
                             }
                             _ => {}
@@ -2612,6 +3401,12 @@ impl Vm {
                     .rev()
                     .find_map(|f| f.this_value.clone())
                     .unwrap_or(Value::Undefined);
+                // Establish a place so `this.items.push(...)` writes back to the
+                // instance (persisted to the receiver when the method returns).
+                self.last_place = Some(Place {
+                    root: PlaceRoot::This,
+                    path: Vec::new(),
+                });
                 self.push(this_val)?;
             }
             Instruction::StoreThis => {
@@ -2688,40 +3483,56 @@ impl Vm {
                 }
                 // Check if this is a promise instance — expose .then/.catch/.finally
                 if builtins::is_promise(obj) && is_promise_method(name) {
-                    return Ok(Value::BuiltinMethod {
-                        object_name: Arc::from("__promise__"),
-                        method_name: Arc::from(name),
-                    });
+                    return Ok(builtin_method("__promise__", name));
                 }
-                if is_map_object(obj) && is_map_method(name) {
-                    return Ok(Value::BuiltinMethod {
-                        object_name: Arc::from("__map__"),
-                        method_name: Arc::from(name),
-                    });
+                if is_map_object(obj) {
+                    if name == "size" {
+                        let n = match obj {
+                            Value::Object(m) => match m.get("__entries__") {
+                                Some(Value::Array(e)) => e.len(),
+                                _ => 0,
+                            },
+                            _ => 0,
+                        };
+                        return Ok(Value::Int(n as i64));
+                    }
+                    if is_map_method(name) {
+                        return Ok(builtin_method("__map__", name));
+                    }
+                }
+                if is_set_object(obj) {
+                    if name == "size" {
+                        let n = match obj {
+                            Value::Object(m) => set_items(m).len(),
+                            _ => 0,
+                        };
+                        return Ok(Value::Int(n as i64));
+                    }
+                    if is_set_method(name) {
+                        return Ok(builtin_method("__set__", name));
+                    }
                 }
                 if is_date_object(obj) && is_date_method(name) {
-                    return Ok(Value::BuiltinMethod {
-                        object_name: Arc::from("__date__"),
-                        method_name: Arc::from(name),
-                    });
+                    return Ok(builtin_method("__date__", name));
+                }
+                if builtins::regexp_parts(obj).is_some() && matches!(name, "test" | "exec") {
+                    return Ok(builtin_method("__regexp__", name));
                 }
                 // Check if this is a known global object — return builtin method handle
                 if let Some(global_name) = &self.last_global_name {
                     if Self::BUILTIN_GLOBAL_NAMES.contains(&global_name.as_str()) {
-                        return Ok(Value::BuiltinMethod {
-                            object_name: Arc::from(global_name.as_str()),
-                            method_name: Arc::from(name),
-                        });
+                        return Ok(builtin_method(global_name.as_str(), name));
                     }
+                }
+                // Object.prototype instance methods.
+                if matches!(name, "hasOwnProperty") {
+                    return Ok(builtin_method("__object__", name));
                 }
                 Ok(Value::Undefined)
             }
             Value::Array(arr) => match name {
                 "length" => Ok(Value::Int(arr.len() as i64)),
-                _ if is_array_method(name) => Ok(Value::BuiltinMethod {
-                    object_name: Arc::from("__array__"),
-                    method_name: Arc::from(name),
-                }),
+                _ if is_array_method(name) => Ok(builtin_method("__array__", name)),
                 _ => {
                     if let Ok(idx) = name.parse::<usize>() {
                         Ok(arr.get(idx).cloned().unwrap_or(Value::Undefined))
@@ -2732,26 +3543,133 @@ impl Vm {
             },
             Value::String(s) => match name {
                 "length" => Ok(Value::Int(s.chars().count() as i64)),
-                _ if is_string_method(name) => Ok(Value::BuiltinMethod {
-                    object_name: Arc::from("__string__"),
-                    method_name: Arc::from(name),
-                }),
+                _ if is_string_method(name) => Ok(builtin_method("__string__", name)),
                 _ => Ok(Value::Undefined),
             },
             Value::Generator(_) => match name {
-                "next" | "return" | "throw" => Ok(Value::BuiltinMethod {
-                    object_name: Arc::from("__generator__"),
-                    method_name: Arc::from(name),
-                }),
+                "next" | "return" | "throw" => Ok(builtin_method("__generator__", name)),
                 _ => Ok(Value::Undefined),
             },
+            Value::Int(_) | Value::Float(_) if builtins::is_number_method(name) => {
+                Ok(builtin_method("__number__", name))
+            }
             _ => Ok(Value::Undefined),
         }
     }
 }
 
+/// Construct an unbound builtin-method handle. The receiver and write-back place
+/// are attached by the `GetProperty`/`GetIndex` handlers.
+fn builtin_method(object_name: &str, method_name: &str) -> Value {
+    Value::BuiltinMethod {
+        object_name: Arc::from(object_name),
+        method_name: Arc::from(method_name),
+        recv: None,
+        place: None,
+    }
+}
+
 // Re-export for the ParamPattern type used in function calls
-use crate::parser::ir::ParamPattern;
+use crate::parser::ir::{DestructureField, ParamPattern};
+
+/// Read a named field from `value` (Undefined if missing / not an object).
+fn field_of(value: &Value, key: &str) -> Value {
+    match value {
+        Value::Object(map) => map.get(key).cloned().unwrap_or(Value::Undefined),
+        _ => Value::Undefined,
+    }
+}
+
+/// Extract the locals bound by a (possibly nested) destructuring pattern from
+/// `value`, pushing them in declaration order to mirror `declare_destructure_locals`.
+fn extract_pattern(pattern: &ParamPattern, value: &Value, out: &mut Vec<Value>) {
+    match pattern {
+        ParamPattern::Ident(_) | ParamPattern::Rest(_) => out.push(value.clone()),
+        ParamPattern::DefaultValue { pattern, .. } => extract_pattern(pattern, value, out),
+        ParamPattern::ObjectDestructure(fields) => extract_object_fields(fields, value, out),
+        ParamPattern::ArrayDestructure(elems) => {
+            for (i, elem) in elems.iter().enumerate() {
+                if let Some(p) = elem {
+                    let item = match value {
+                        Value::Array(a) => a.get(i).cloned().unwrap_or(Value::Undefined),
+                        _ => Value::Undefined,
+                    };
+                    extract_pattern(p, &item, out);
+                }
+            }
+        }
+    }
+}
+
+fn extract_object_fields(fields: &[DestructureField], value: &Value, out: &mut Vec<Value>) {
+    let mut consumed: Vec<String> = Vec::new();
+    for field in fields {
+        if field.rest {
+            let rest = match value {
+                Value::Object(map) => Value::Object(
+                    map.iter()
+                        .filter(|(k, _)| !consumed.iter().any(|c| c == k.as_ref()))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                ),
+                _ => Value::Object(IndexMap::new()),
+            };
+            out.push(rest);
+        } else if let Some(nested) = &field.nested {
+            consumed.push(field.key.clone());
+            let child = field_of(value, &field.key);
+            extract_object_fields(nested, &child, out);
+        } else {
+            consumed.push(field.key.clone());
+            out.push(field_of(value, &field.key));
+        }
+    }
+}
+
+/// Navigate `path` within `target` and store `value` at the leaf. Returns whether
+/// the write succeeded (false if the path doesn't resolve).
+fn set_in_place(target: &mut Value, path: &[PlaceSeg], value: Value) -> bool {
+    let Some((last, prefix)) = path.split_last() else {
+        return false;
+    };
+    let mut cur = target;
+    for seg in prefix {
+        cur = match nav_mut(cur, seg) {
+            Some(c) => c,
+            None => return false,
+        };
+    }
+    set_seg(cur, last, value)
+}
+
+fn nav_mut<'a>(v: &'a mut Value, seg: &PlaceSeg) -> Option<&'a mut Value> {
+    match (v, seg) {
+        (Value::Object(map), PlaceSeg::Prop(k)) => map.get_mut(k.as_str()),
+        (Value::Array(arr), PlaceSeg::Index(i)) => arr.get_mut(*i),
+        _ => None,
+    }
+}
+
+fn set_seg(v: &mut Value, seg: &PlaceSeg, value: Value) -> bool {
+    match (v, seg) {
+        (Value::Object(map), PlaceSeg::Prop(k)) => {
+            map.insert(Arc::from(k.as_str()), value);
+            true
+        }
+        (Value::Array(arr), PlaceSeg::Index(i)) => {
+            if *i < arr.len() {
+                arr[*i] = value;
+                true
+            } else if *i == arr.len() {
+                arr.push(value);
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
 
 fn mutated_array_receiver(method: &str, arr: &[Value], args: &[Value]) -> Option<Vec<Value>> {
     match method {
@@ -2818,6 +3736,35 @@ fn mutated_array_receiver(method: &str, arr: &[Value], args: &[Value]) -> Option
             updated.splice(start..start + delete_count, args.iter().skip(2).cloned());
             Some(updated)
         }
+        "copyWithin" => {
+            let len = arr.len() as i64;
+            let target =
+                normalize_array_index(args.first().map_or(0, |v| v.to_number() as i64), len);
+            let start = if args.len() > 1 {
+                normalize_array_index(args[1].to_number() as i64, len)
+            } else {
+                0
+            };
+            let end = if args.len() > 2 {
+                normalize_array_index(args[2].to_number() as i64, len)
+            } else {
+                arr.len()
+            };
+            let mut updated = arr.to_vec();
+            let slice: Vec<Value> = updated
+                .get(start..end.min(updated.len()))
+                .map(|s| s.to_vec())
+                .unwrap_or_default();
+            for (offset, val) in slice.into_iter().enumerate() {
+                let dst = target + offset;
+                if dst < updated.len() {
+                    updated[dst] = val;
+                } else {
+                    break;
+                }
+            }
+            Some(updated)
+        }
         _ => None,
     }
 }
@@ -2842,7 +3789,93 @@ fn is_map_object(value: &Value) -> bool {
 }
 
 fn is_map_method(name: &str) -> bool {
-    matches!(name, "get" | "set" | "has" | "delete")
+    matches!(
+        name,
+        "get" | "set" | "has" | "delete" | "clear" | "keys" | "values" | "entries" | "forEach"
+    )
+}
+
+fn is_set_object(value: &Value) -> bool {
+    matches!(value, Value::Object(map) if matches!(map.get("__set__"), Some(Value::Bool(true))))
+}
+
+fn is_set_method(name: &str) -> bool {
+    matches!(
+        name,
+        "add" | "has" | "delete" | "clear" | "values" | "keys" | "forEach"
+    )
+}
+
+/// Build a Set object from items, de-duplicating by strict equality.
+fn make_set_object(items: Vec<Value>) -> Value {
+    let mut unique: Vec<Value> = Vec::new();
+    for item in items {
+        if !unique.iter().any(|u| u.strict_eq(&item)) {
+            unique.push(item);
+        }
+    }
+    let mut obj = IndexMap::new();
+    obj.insert(Arc::from("__set__"), Value::Bool(true));
+    obj.insert(Arc::from("__items__"), Value::Array(unique));
+    Value::Object(obj)
+}
+
+fn set_items(map: &IndexMap<Arc<str>, Value>) -> Vec<Value> {
+    match map.get("__items__") {
+        Some(Value::Array(items)) => items.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// Execute a Set method, returning (result, updated-set-for-write-back).
+fn execute_set_method(
+    map: IndexMap<Arc<str>, Value>,
+    method: &str,
+    args: &[Value],
+) -> (Option<Value>, Option<IndexMap<Arc<str>, Value>>) {
+    let mut items = set_items(&map);
+    let arg = args.first().cloned().unwrap_or(Value::Undefined);
+    match method {
+        "has" => (
+            Some(Value::Bool(items.iter().any(|i| i.strict_eq(&arg)))),
+            None,
+        ),
+        "add" => {
+            if !items.iter().any(|i| i.strict_eq(&arg)) {
+                items.push(arg);
+            }
+            let mut m = map;
+            m.insert(Arc::from("__items__"), Value::Array(items));
+            (Some(Value::Object(m.clone())), Some(m))
+        }
+        "delete" => {
+            let before = items.len();
+            items.retain(|i| !i.strict_eq(&arg));
+            let removed = items.len() != before;
+            let mut m = map;
+            m.insert(Arc::from("__items__"), Value::Array(items));
+            (Some(Value::Bool(removed)), Some(m))
+        }
+        "clear" => {
+            let mut m = map;
+            m.insert(Arc::from("__items__"), Value::Array(Vec::new()));
+            (Some(Value::Undefined), Some(m))
+        }
+        "values" | "keys" => (Some(Value::Array(items)), None),
+        _ => (None, None),
+    }
+}
+
+fn make_error_object(name: &str, message: &str) -> Value {
+    let mut obj = IndexMap::new();
+    obj.insert(Arc::from("__error__"), Value::Bool(true));
+    obj.insert(Arc::from("name"), Value::String(Arc::from(name)));
+    obj.insert(Arc::from("message"), Value::String(Arc::from(message)));
+    obj.insert(
+        Arc::from("stack"),
+        Value::String(Arc::from(format!("{}: {}", name, message).as_str())),
+    );
+    Value::Object(obj)
 }
 
 fn execute_map_method(
@@ -2911,6 +3944,43 @@ fn execute_map_method(
             map.insert(Arc::from("__entries__"), Value::Array(updated_entries));
             (Some(Value::Bool(deleted)), Some(map))
         }
+        "clear" => {
+            map.insert(Arc::from("__entries__"), Value::Array(Vec::new()));
+            (Some(Value::Undefined), Some(map))
+        }
+        "keys" => {
+            let keys = entries
+                .iter()
+                .filter_map(|e| match e {
+                    Value::Object(e) => e.get("key").cloned(),
+                    _ => None,
+                })
+                .collect();
+            (Some(Value::Array(keys)), None)
+        }
+        "values" => {
+            let vals = entries
+                .iter()
+                .filter_map(|e| match e {
+                    Value::Object(e) => e.get("value").cloned(),
+                    _ => None,
+                })
+                .collect();
+            (Some(Value::Array(vals)), None)
+        }
+        "entries" => {
+            let pairs = entries
+                .iter()
+                .filter_map(|e| match e {
+                    Value::Object(e) => Some(Value::Array(vec![
+                        e.get("key").cloned().unwrap_or(Value::Undefined),
+                        e.get("value").cloned().unwrap_or(Value::Undefined),
+                    ])),
+                    _ => None,
+                })
+                .collect();
+            (Some(Value::Array(pairs)), None)
+        }
         _ => (None, None),
     }
 }
@@ -2926,7 +3996,28 @@ fn is_date_object(value: &Value) -> bool {
 }
 
 fn is_date_method(name: &str) -> bool {
-    matches!(name, "toISOString" | "getTime")
+    matches!(
+        name,
+        "toISOString"
+            | "getTime"
+            | "valueOf"
+            | "getUTCFullYear"
+            | "getFullYear"
+            | "getUTCMonth"
+            | "getMonth"
+            | "getUTCDate"
+            | "getDate"
+            | "getUTCDay"
+            | "getDay"
+            | "getUTCHours"
+            | "getHours"
+            | "getUTCMinutes"
+            | "getMinutes"
+            | "getUTCSeconds"
+            | "getSeconds"
+            | "getUTCMilliseconds"
+            | "getMilliseconds"
+    )
 }
 
 fn execute_date_method(map: &IndexMap<Arc<str>, Value>, method: &str) -> Option<Value> {
@@ -2935,11 +4026,27 @@ fn execute_date_method(map: &IndexMap<Arc<str>, Value>, method: &str) -> Option<
         Some(Value::Float(millis)) => *millis as i64,
         _ => 0,
     };
+    let seconds = millis.div_euclid(1000);
+    let ms = millis.rem_euclid(1000);
+    let days = seconds.div_euclid(86_400);
+    let sod = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    // 1970-01-01 was a Thursday (4); 0 = Sunday.
+    let dow = (days + 4).rem_euclid(7);
     match method {
-        "getTime" => Some(Value::Int(millis)),
+        "getTime" | "valueOf" => Some(Value::Int(millis)),
         "toISOString" => Some(Value::String(Arc::from(
             unix_millis_to_iso(millis).as_str(),
         ))),
+        // No timezone in the sandbox — local getters alias the UTC ones.
+        "getUTCFullYear" | "getFullYear" => Some(Value::Int(year)),
+        "getUTCMonth" | "getMonth" => Some(Value::Int((month as i64) - 1)), // 0-indexed
+        "getUTCDate" | "getDate" => Some(Value::Int(day as i64)),
+        "getUTCDay" | "getDay" => Some(Value::Int(dow)),
+        "getUTCHours" | "getHours" => Some(Value::Int(sod / 3_600)),
+        "getUTCMinutes" | "getMinutes" => Some(Value::Int((sod % 3_600) / 60)),
+        "getUTCSeconds" | "getSeconds" => Some(Value::Int(sod % 60)),
+        "getUTCMilliseconds" | "getMilliseconds" => Some(Value::Int(ms)),
         _ => None,
     }
 }
@@ -2988,15 +4095,19 @@ fn is_array_method(name: &str) -> bool {
             | "includes"
             | "find"
             | "findIndex"
+            | "findLast"
+            | "findLastIndex"
             | "map"
             | "filter"
             | "reduce"
+            | "reduceRight"
             | "forEach"
             | "every"
             | "some"
             | "flat"
             | "flatMap"
             | "fill"
+            | "copyWithin"
             | "at"
             | "entries"
             | "keys"
@@ -3033,8 +4144,10 @@ fn is_string_method(name: &str) -> bool {
             | "concat"
             | "at"
             | "match"
+            | "matchAll"
             | "search"
             | "normalize"
+            | "localeCompare"
     )
 }
 

@@ -121,9 +121,17 @@ pub enum Statement {
         span: Span,
     },
     Break {
+        label: Option<String>,
         span: Span,
     },
     Continue {
+        label: Option<String>,
+        span: Span,
+    },
+    /// A labeled statement, e.g. `outer: for (...) { ... }`.
+    Labeled {
+        label: String,
+        body: Box<Statement>,
         span: Span,
     },
     FunctionDecl {
@@ -288,6 +296,9 @@ pub enum Expr {
     // Typeof
     TypeOf(Box<Expr>),
 
+    // `delete obj.prop` / `delete obj[key]`. Yields a boolean.
+    Delete(Box<Expr>),
+
     // Classes
     ClassExpr {
         name: Option<String>,
@@ -304,6 +315,8 @@ pub struct ObjProperty {
     pub key: String,
     pub value: Expr,
     pub computed: bool,
+    /// For computed keys (`{[expr]: v}`), the key expression to evaluate at runtime.
+    pub key_expr: Option<Box<Expr>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

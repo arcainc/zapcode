@@ -53,6 +53,8 @@ struct Compiler {
     external_functions: HashSet<String>,
     mode: CompilerMode,
     top_level_bindings: HashMap<String, TopLevelBindingKind>,
+    /// Label attached to the next loop (from a `label:` statement), if any.
+    pending_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +66,7 @@ enum CompilerMode {
 struct LoopInfo {
     break_patches: Vec<usize>,
     continue_patches: Vec<usize>,
+    label: Option<String>,
 }
 
 impl Compiler {
@@ -77,6 +80,7 @@ impl Compiler {
             external_functions,
             mode: CompilerMode::Standard,
             top_level_bindings: HashMap::new(),
+            pending_label: None,
         }
     }
 
@@ -93,6 +97,7 @@ impl Compiler {
             external_functions,
             mode: CompilerMode::SessionChunk,
             top_level_bindings,
+            pending_label: None,
         }
     }
 
@@ -220,6 +225,30 @@ impl Compiler {
             }
         }
 
+        // Apply default parameter values: `if (param === undefined) param = <default>`.
+        for param in &func.params {
+            match param {
+                ParamPattern::DefaultValue { pattern, default } => match pattern.as_ref() {
+                    ParamPattern::Ident(name) => {
+                        if let Some(slot) = func_compiler.resolve_local(name) {
+                            func_compiler.emit_slot_default(slot, default)?;
+                        }
+                    }
+                    // `function f({a = 5} = {})`: a missing argument leaves the
+                    // destructured fields undefined, so the field defaults below
+                    // already cover it.
+                    ParamPattern::ObjectDestructure(fields) => {
+                        func_compiler.emit_object_param_defaults(fields)?;
+                    }
+                    _ => {}
+                },
+                ParamPattern::ObjectDestructure(fields) => {
+                    func_compiler.emit_object_param_defaults(fields)?;
+                }
+                _ => {}
+            }
+        }
+
         for stmt in &func.body {
             func_compiler.compile_statement(stmt)?;
         }
@@ -294,6 +323,7 @@ impl Compiler {
                 self.loop_stack.push(LoopInfo {
                     break_patches: Vec::new(),
                     continue_patches: Vec::new(),
+                    label: self.pending_label.take(),
                 });
 
                 self.compile_expr(test)?;
@@ -320,6 +350,7 @@ impl Compiler {
                 self.loop_stack.push(LoopInfo {
                     break_patches: Vec::new(),
                     continue_patches: Vec::new(),
+                    label: self.pending_label.take(),
                 });
 
                 for s in body {
@@ -350,10 +381,29 @@ impl Compiler {
                     self.compile_statement(init)?;
                 }
 
+                // `for (let i ...)` gives each iteration a fresh binding of the
+                // loop variables. Collect the let/const-declared slots so we can
+                // re-bind any captured ones per iteration (see FreshenBinding).
+                let per_iter_slots: Vec<usize> = match init.as_deref() {
+                    Some(Statement::VariableDecl {
+                        kind: VarKind::Let | VarKind::Const,
+                        declarations,
+                        ..
+                    }) => declarations
+                        .iter()
+                        .filter_map(|d| match &d.pattern {
+                            AssignTarget::Ident(name) => self.resolve_local(name),
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+
                 let loop_start = self.current_offset();
                 self.loop_stack.push(LoopInfo {
                     break_patches: Vec::new(),
                     continue_patches: Vec::new(),
+                    label: self.pending_label.take(),
                 });
 
                 let exit_jump = if let Some(test) = test {
@@ -368,6 +418,12 @@ impl Compiler {
                 }
 
                 let continue_target = self.current_offset();
+                // Freshen captured let-loop bindings before the update runs, so a
+                // closure created this iteration keeps the value it saw rather
+                // than sharing the updated binding with later iterations.
+                for &slot in &per_iter_slots {
+                    self.emit(Instruction::FreshenBinding(slot));
+                }
                 if let Some(update) = update {
                     self.compile_expr(update)?;
                     self.emit(Instruction::Pop);
@@ -401,6 +457,7 @@ impl Compiler {
                 self.loop_stack.push(LoopInfo {
                     break_patches: Vec::new(),
                     continue_patches: Vec::new(),
+                    label: self.pending_label.take(),
                 });
 
                 self.emit(Instruction::Dup);
@@ -414,8 +471,11 @@ impl Compiler {
                         let idx = self.declare_local(name);
                         self.emit(Instruction::StoreLocal(idx));
                     }
-                    ForBinding::Destructure(_) => {
-                        self.emit(Instruction::Pop); // TODO: destructure
+                    ForBinding::Destructure(pattern) => {
+                        // Destructure the iterated value into the bound names, then
+                        // pop the value the pattern was read from.
+                        self.compile_destructure_pattern(pattern, VarKind::Let)?;
+                        self.emit(Instruction::Pop);
                     }
                 }
 
@@ -484,17 +544,40 @@ impl Compiler {
                     }
                 }
             }
-            Statement::Break { .. } => {
+            Statement::Break { label, .. } => {
                 let idx = self.emit(Instruction::Jump(0));
-                if let Some(loop_info) = self.loop_stack.last_mut() {
+                let target = match label {
+                    Some(l) => self
+                        .loop_stack
+                        .iter_mut()
+                        .rev()
+                        .find(|li| li.label.as_deref() == Some(l.as_str())),
+                    None => self.loop_stack.last_mut(),
+                };
+                if let Some(loop_info) = target {
                     loop_info.break_patches.push(idx);
                 }
             }
-            Statement::Continue { .. } => {
+            Statement::Continue { label, .. } => {
                 let idx = self.emit(Instruction::Jump(0));
-                if let Some(loop_info) = self.loop_stack.last_mut() {
+                let target = match label {
+                    Some(l) => self
+                        .loop_stack
+                        .iter_mut()
+                        .rev()
+                        .find(|li| li.label.as_deref() == Some(l.as_str())),
+                    None => self.loop_stack.last_mut(),
+                };
+                if let Some(loop_info) = target {
                     loop_info.continue_patches.push(idx);
                 }
+            }
+            Statement::Labeled { label, body, .. } => {
+                // The next loop/switch picks up this label; clear it afterward in
+                // case the labeled statement wasn't a loop.
+                self.pending_label = Some(label.clone());
+                self.compile_statement(body)?;
+                self.pending_label = None;
             }
             Statement::FunctionDecl { func_index, .. } => {
                 self.emit(Instruction::CreateClosure(*func_index));
@@ -569,6 +652,14 @@ impl Compiler {
 
                 let jump_end = self.emit(Instruction::Jump(0));
 
+                // Establish a `break` target for the switch so `break;` jumps to
+                // the end (an unpatched break would loop to instruction 0).
+                self.loop_stack.push(LoopInfo {
+                    break_patches: Vec::new(),
+                    continue_patches: Vec::new(),
+                    label: self.pending_label.take(),
+                });
+
                 // Compile case bodies
                 let mut body_starts = Vec::new();
                 for case in cases {
@@ -580,6 +671,17 @@ impl Compiler {
 
                 let end = self.current_offset();
                 self.emit(Instruction::Pop); // pop discriminant
+
+                let switch_info = self.loop_stack.pop().unwrap();
+                // `break` exits the switch.
+                for patch in switch_info.break_patches {
+                    self.patch_jump(patch, end);
+                }
+                // `continue` inside a switch targets the *enclosing* loop, not the
+                // switch — forward it to the parent loop if there is one.
+                if let Some(parent) = self.loop_stack.last_mut() {
+                    parent.continue_patches.extend(switch_info.continue_patches);
+                }
 
                 // Patch jumps
                 for (i, &jump) in case_jumps.iter().enumerate() {
@@ -685,6 +787,57 @@ impl Compiler {
         Ok(())
     }
 
+    /// Build a single flattened arguments array on the stack from call args that
+    /// include a spread (`f(a, ...xs, b)`), reusing the array-append instructions.
+    fn compile_spread_args(&mut self, args: &[Expr]) -> Result<()> {
+        self.emit(Instruction::CreateArray(0));
+        for arg in args {
+            if let Expr::Spread(inner) = arg {
+                self.compile_expr(inner)?;
+                self.emit(Instruction::ArraySpreadAppend);
+            } else {
+                self.compile_expr(arg)?;
+                self.emit(Instruction::ArrayAppend);
+            }
+        }
+        Ok(())
+    }
+
+    /// Destructure the value on top of the stack into the names of a parameter
+    /// pattern (object or array, nested), storing each via `store_binding`. The
+    /// source value is left on the stack for the caller to pop.
+    fn compile_destructure_pattern(&mut self, pattern: &ParamPattern, kind: VarKind) -> Result<()> {
+        match pattern {
+            ParamPattern::ObjectDestructure(fields) => {
+                self.compile_object_destructure(fields, kind)
+            }
+            ParamPattern::ArrayDestructure(elems) => {
+                for (i, elem) in elems.iter().enumerate() {
+                    let Some(p) = elem else { continue };
+                    self.emit(Instruction::Dup);
+                    self.emit(Instruction::Push(Constant::Int(i as i64)));
+                    self.emit(Instruction::GetIndex);
+                    match p {
+                        ParamPattern::Ident(name) => self.store_binding(name, kind)?,
+                        ParamPattern::ObjectDestructure(_) | ParamPattern::ArrayDestructure(_) => {
+                            self.compile_destructure_pattern(p, kind)?;
+                            self.emit(Instruction::Pop);
+                        }
+                        _ => {
+                            self.emit(Instruction::Pop);
+                        }
+                    }
+                }
+                Ok(())
+            }
+            ParamPattern::Ident(name) => self.store_binding(name, kind),
+            _ => {
+                self.emit(Instruction::Pop);
+                Ok(())
+            }
+        }
+    }
+
     fn compile_object_destructure(
         &mut self,
         fields: &[DestructureField],
@@ -704,6 +857,7 @@ impl Compiler {
                 self.store_binding(name, kind)?;
             } else {
                 self.emit(Instruction::GetProperty(field.key.clone()));
+                self.emit_apply_default(field.default.as_ref())?;
                 if let Some(nested) = &field.nested {
                     self.compile_object_destructure(nested, kind)?;
                     self.emit(Instruction::Pop);
@@ -713,6 +867,51 @@ impl Compiler {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Emit `if (localslot === undefined) localslot = <default>`.
+    fn emit_slot_default(&mut self, slot: usize, default: &Expr) -> Result<()> {
+        self.emit(Instruction::LoadLocal(slot));
+        self.emit(Instruction::Push(Constant::Undefined));
+        self.emit(Instruction::StrictEq);
+        let skip = self.emit(Instruction::JumpIfFalse(0));
+        self.compile_expr(default)?;
+        self.emit(Instruction::StoreLocal(slot));
+        let after = self.current_offset();
+        self.patch_jump(skip, after);
+        Ok(())
+    }
+
+    /// Apply field defaults for a destructured object parameter (`function
+    /// f({a = 5})`), whose fields were bound positionally by `bind_params`.
+    fn emit_object_param_defaults(&mut self, fields: &[DestructureField]) -> Result<()> {
+        for field in fields {
+            if field.rest {
+                continue;
+            }
+            let name = field.alias.as_ref().unwrap_or(&field.key);
+            if let (Some(def), Some(slot)) = (&field.default, self.resolve_local(name)) {
+                self.emit_slot_default(slot, def)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// If the top-of-stack value is `undefined`, replace it with the evaluated
+    /// default expression. Used for destructuring defaults (`{a = 10}` / `[x = 1]`).
+    fn emit_apply_default(&mut self, default: Option<&Expr>) -> Result<()> {
+        let Some(default) = default else {
+            return Ok(());
+        };
+        self.emit(Instruction::Dup);
+        self.emit(Instruction::Push(Constant::Undefined));
+        self.emit(Instruction::StrictEq);
+        let skip = self.emit(Instruction::JumpIfFalse(0));
+        self.emit(Instruction::Pop);
+        self.compile_expr(default)?;
+        let after = self.current_offset();
+        self.patch_jump(skip, after);
         Ok(())
     }
 
@@ -751,7 +950,9 @@ impl Compiler {
                 }
                 if parts == 0 {
                     self.emit(Instruction::Push(Constant::String(String::new())));
-                } else if parts > 1 {
+                } else {
+                    // Always concat (even a single interpolated expression) so the
+                    // result is string-coerced: `${obj}` yields "[object Object]".
                     self.emit(Instruction::ConcatStrings(parts));
                 }
             }
@@ -776,38 +977,82 @@ impl Compiler {
                 }
             }
             Expr::Array(elements) => {
-                let mut count = 0;
-                for elem in elements {
-                    match elem {
-                        Some(e) => {
-                            self.compile_expr(e)?;
-                            count += 1;
+                let has_spread = elements.iter().any(|e| matches!(e, Some(Expr::Spread(_))));
+                if !has_spread {
+                    let mut count = 0;
+                    for elem in elements {
+                        match elem {
+                            Some(e) => {
+                                self.compile_expr(e)?;
+                                count += 1;
+                            }
+                            None => {
+                                self.emit(Instruction::Push(Constant::Undefined));
+                                count += 1;
+                            }
                         }
-                        None => {
-                            self.emit(Instruction::Push(Constant::Undefined));
-                            count += 1;
+                    }
+                    self.emit(Instruction::CreateArray(count));
+                } else {
+                    // Build incrementally so `[...a, x, ...b]` flattens correctly.
+                    self.emit(Instruction::CreateArray(0));
+                    for elem in elements {
+                        match elem {
+                            Some(Expr::Spread(inner)) => {
+                                self.compile_expr(inner)?;
+                                self.emit(Instruction::ArraySpreadAppend);
+                            }
+                            Some(e) => {
+                                self.compile_expr(e)?;
+                                self.emit(Instruction::ArrayAppend);
+                            }
+                            None => {
+                                self.emit(Instruction::Push(Constant::Undefined));
+                                self.emit(Instruction::ArrayAppend);
+                            }
                         }
                     }
                 }
-                self.emit(Instruction::CreateArray(count));
             }
             Expr::Object(props) => {
-                let mut count = 0;
-                for prop in props {
-                    match prop.kind {
-                        PropKind::Spread => {
-                            self.compile_expr(&prop.value)?;
-                            self.emit(Instruction::Spread);
-                            count += 1;
+                let has_spread = props.iter().any(|p| matches!(p.kind, PropKind::Spread));
+                if !has_spread {
+                    let mut count = 0;
+                    for prop in props {
+                        match &prop.key_expr {
+                            Some(key_expr) => self.compile_expr(key_expr)?,
+                            None => {
+                                self.emit(Instruction::Push(Constant::String(prop.key.clone())));
+                            }
                         }
-                        _ => {
-                            self.emit(Instruction::Push(Constant::String(prop.key.clone())));
-                            self.compile_expr(&prop.value)?;
-                            count += 1;
+                        self.compile_expr(&prop.value)?;
+                        count += 1;
+                    }
+                    self.emit(Instruction::CreateObject(count));
+                } else {
+                    // Build incrementally so `{ ...a, k: v, ...b }` merges in order.
+                    self.emit(Instruction::CreateObject(0));
+                    for prop in props {
+                        match prop.kind {
+                            PropKind::Spread => {
+                                self.compile_expr(&prop.value)?;
+                                self.emit(Instruction::ObjectSpreadAssign);
+                            }
+                            _ => {
+                                match &prop.key_expr {
+                                    Some(key_expr) => self.compile_expr(key_expr)?,
+                                    None => {
+                                        self.emit(Instruction::Push(Constant::String(
+                                            prop.key.clone(),
+                                        )));
+                                    }
+                                }
+                                self.compile_expr(&prop.value)?;
+                                self.emit(Instruction::ObjectInsert);
+                            }
                         }
                     }
                 }
-                self.emit(Instruction::CreateObject(count));
             }
             Expr::Spread(expr) => {
                 self.compile_expr(expr)?;
@@ -912,16 +1157,21 @@ impl Compiler {
                     self.patch_jump(skip, end);
                 }
                 LogicalOp::NullishCoalescing => {
+                    // JumpIfNullish peeks (does not pop), so both branches must
+                    // explicitly clear the duplicate to leave exactly one value.
                     self.compile_expr(left)?;
                     self.emit(Instruction::Dup);
-                    let skip = self.emit(Instruction::JumpIfNullish(0));
-                    let jump_end = self.emit(Instruction::Jump(0));
-                    let nullish_target = self.current_offset();
-                    self.patch_jump(skip, nullish_target);
+                    let to_right = self.emit(Instruction::JumpIfNullish(0));
+                    // Not nullish: keep the left value.
+                    self.emit(Instruction::Pop);
+                    let end = self.emit(Instruction::Jump(0));
+                    let right_target = self.current_offset();
+                    self.patch_jump(to_right, right_target);
+                    self.emit(Instruction::Pop);
                     self.emit(Instruction::Pop);
                     self.compile_expr(right)?;
-                    let end = self.current_offset();
-                    self.patch_jump(jump_end, end);
+                    let after = self.current_offset();
+                    self.patch_jump(end, after);
                 }
             },
             Expr::Conditional {
@@ -945,6 +1195,46 @@ impl Compiler {
                         self.compile_expr(value)?;
                         self.emit(Instruction::Dup);
                         self.compile_store(target)?;
+                    }
+                    // Logical assignments short-circuit: the right-hand side is
+                    // only evaluated (and stored) when the current value fails the
+                    // keep condition. `a ||= b` / `a &&= b` test truthiness;
+                    // `a ??= b` tests nullishness.
+                    AssignOp::OrAssign | AssignOp::AndAssign => {
+                        self.compile_expr(target)?;
+                        self.emit(Instruction::Dup);
+                        let assign_b = match op {
+                            AssignOp::OrAssign => self.emit(Instruction::JumpIfFalse(0)),
+                            _ => self.emit(Instruction::JumpIfTrue(0)),
+                        };
+                        // Keep path: leave the current value as the result.
+                        let end = self.emit(Instruction::Jump(0));
+                        let bpos = self.current_offset();
+                        self.patch_jump(assign_b, bpos);
+                        self.emit(Instruction::Pop);
+                        self.compile_expr(value)?;
+                        self.emit(Instruction::Dup);
+                        self.compile_store(target)?;
+                        let after = self.current_offset();
+                        self.patch_jump(end, after);
+                    }
+                    AssignOp::NullishAssign => {
+                        self.compile_expr(target)?;
+                        self.emit(Instruction::Dup);
+                        // JumpIfNullish peeks (does not pop) the tested value.
+                        let assign_b = self.emit(Instruction::JumpIfNullish(0));
+                        // Keep path: discard the duplicate, leave the current value.
+                        self.emit(Instruction::Pop);
+                        let end = self.emit(Instruction::Jump(0));
+                        let bpos = self.current_offset();
+                        self.patch_jump(assign_b, bpos);
+                        self.emit(Instruction::Pop);
+                        self.emit(Instruction::Pop);
+                        self.compile_expr(value)?;
+                        self.emit(Instruction::Dup);
+                        self.compile_store(target)?;
+                        let after = self.current_offset();
+                        self.patch_jump(end, after);
                     }
                     _ => {
                         // Compound assignment: load, operate, store
@@ -1063,22 +1353,33 @@ impl Compiler {
                         return Ok(());
                     }
                 }
+                let has_spread = args.iter().any(|a| matches!(a, Expr::Spread(_)));
                 // Check if this is a direct call to an external function
                 if let Expr::Ident(name) = callee.as_ref() {
                     if self.external_functions.contains(name) {
-                        // Emit args then CallExternal (no callee push needed)
-                        for arg in args {
-                            self.compile_expr(arg)?;
+                        if has_spread {
+                            self.compile_spread_args(args)?;
+                            self.emit(Instruction::CallExternalSpread(name.clone()));
+                        } else {
+                            for arg in args {
+                                self.compile_expr(arg)?;
+                            }
+                            self.emit(Instruction::CallExternal(name.clone(), args.len()));
                         }
-                        self.emit(Instruction::CallExternal(name.clone(), args.len()));
                         return Ok(());
                     }
                 }
                 self.compile_expr(callee)?;
-                for arg in args {
-                    self.compile_expr(arg)?;
+                if has_spread {
+                    // [callee, args_array] → CallSpread expands and dispatches.
+                    self.compile_spread_args(args)?;
+                    self.emit(Instruction::CallSpread);
+                } else {
+                    for arg in args {
+                        self.compile_expr(arg)?;
+                    }
+                    self.emit(Instruction::Call(args.len()));
                 }
-                self.emit(Instruction::Call(args.len()));
             }
             Expr::New { callee, args } => {
                 self.compile_expr(callee)?;
@@ -1111,6 +1412,36 @@ impl Compiler {
             Expr::TypeOf(operand) => {
                 self.compile_expr(operand)?;
                 self.emit(Instruction::TypeOf);
+            }
+            Expr::Delete(target) => {
+                // `delete obj.prop` removes the key and writes the mutated object
+                // back to its source place (value semantics), then yields `true`.
+                match target.as_ref() {
+                    Expr::Member {
+                        object, property, ..
+                    } if is_place_expr(object) => {
+                        self.compile_expr(object)?;
+                        self.emit(Instruction::DeleteProperty(property.clone()));
+                        self.compile_store(object)?;
+                        self.emit(Instruction::Push(Constant::Bool(true)));
+                    }
+                    Expr::ComputedMember {
+                        object, property, ..
+                    } if is_place_expr(object) => {
+                        self.compile_expr(object)?;
+                        self.compile_expr(property)?;
+                        self.emit(Instruction::DeleteIndex);
+                        self.compile_store(object)?;
+                        self.emit(Instruction::Push(Constant::Bool(true)));
+                    }
+                    // `delete` on a non-reference (or a non-place object) is a
+                    // no-op that evaluates to true in non-strict mode.
+                    other => {
+                        self.compile_expr(other)?;
+                        self.emit(Instruction::Pop);
+                        self.emit(Instruction::Push(Constant::Bool(true)));
+                    }
+                }
             }
             Expr::ClassExpr {
                 name,
@@ -1292,6 +1623,15 @@ impl Compiler {
         }
         Ok(())
     }
+}
+
+/// Whether an expression denotes a storable location (so a mutated copy can be
+/// written back). Used by `delete` to decide whether to persist the change.
+fn is_place_expr(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Ident(_) | Expr::Member { .. } | Expr::ComputedMember { .. }
+    )
 }
 
 pub fn compile(program: &Program) -> Result<CompiledProgram> {

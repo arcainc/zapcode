@@ -34,6 +34,7 @@ impl Default for ResourceLimits {
 #[derive(Debug, Default)]
 pub struct ResourceTracker {
     pub allocations: usize,
+    pub memory_bytes: usize,
     pub current_stack_depth: usize,
     pub peak_stack_depth: usize,
     start_time: Option<std::time::Instant>,
@@ -65,6 +66,22 @@ impl ResourceTracker {
         if self.allocations > limits.max_allocations {
             return Err(crate::ZapcodeError::AllocationLimitExceeded);
         }
+        Ok(())
+    }
+
+    pub fn track_memory(
+        &mut self,
+        bytes: usize,
+        limits: &ResourceLimits,
+    ) -> crate::error::Result<()> {
+        let next = self.memory_bytes.saturating_add(bytes);
+        if next > limits.memory_limit_bytes {
+            return Err(crate::ZapcodeError::MemoryLimitExceeded(format!(
+                "guest allocation of {} bytes exceeds memory limit of {} bytes",
+                bytes, limits.memory_limit_bytes
+            )));
+        }
+        self.memory_bytes = next;
         Ok(())
     }
 

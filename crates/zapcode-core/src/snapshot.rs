@@ -17,6 +17,10 @@ pub(crate) struct VmSnapshot {
     pub(crate) programs: Vec<crate::compiler::CompiledProgram>,
     pub(crate) stack: Vec<Value>,
     pub(crate) frames: Vec<CallFrame>,
+    /// Shared upvalue cells (captured variables). Ids are indices; sharing is
+    /// preserved because closures/frames reference the same id.
+    #[serde(default)]
+    pub(crate) cells: Vec<Value>,
     /// User-defined globals only — builtins are re-registered on resume.
     pub(crate) globals: Vec<(String, Value)>,
     pub(crate) try_stack: Vec<TryInfo>,
@@ -66,6 +70,7 @@ impl VmSnapshot {
             programs: vm.programs.clone(),
             stack: vm.stack.clone(),
             frames: vm.frames.clone(),
+            cells: vm.cells.clone(),
             globals: user_globals,
             try_stack: vm.try_stack.clone(),
             continuations: vm.continuations.clone(),
@@ -113,6 +118,7 @@ impl VmSnapshot {
         vm.pending_batch = self.pending_batch;
         vm.tracker.allocations = self.allocations;
         vm.rng_state = self.rng_state;
+        vm.cells = self.cells;
         vm
     }
 }
