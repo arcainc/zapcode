@@ -37,6 +37,7 @@ pub fn register_globals(globals: &mut HashMap<String, Value>) {
         "parseFloat",
         "isNaN",
         "isFinite",
+        "structuredClone",
     ] {
         globals.insert(name.to_string(), global_fn(name));
     }
@@ -73,6 +74,16 @@ fn builtin_constructor(name: &str) -> Value {
 fn global_fn(name: &str) -> Value {
     let mut obj = IndexMap::new();
     obj.insert(Arc::from("__global_fn__"), Value::String(Arc::from(name)));
+    if name == "String" {
+        obj.insert(Arc::from("fromCharCode"), {
+            let mut s = IndexMap::new();
+            s.insert(
+                Arc::from("__global_fn__"),
+                Value::String(Arc::from("String.fromCharCode")),
+            );
+            Value::Object(s)
+        });
+    }
     if name == "Number" {
         obj.insert(
             Arc::from("MAX_SAFE_INTEGER"),
@@ -263,6 +274,15 @@ pub fn call_global_fn(kind: &str, args: &[Value]) -> Result<Value> {
         }
         "isNaN" => Value::Bool(arg.to_number().is_nan()),
         "isFinite" => Value::Bool(arg.to_number().is_finite()),
+        // Values are deep-copied on assignment in this VM, so a clone suffices.
+        "structuredClone" => arg,
+        "String.fromCharCode" => {
+            let s: String = args
+                .iter()
+                .filter_map(|v| char::from_u32(v.to_number() as u32))
+                .collect();
+            Value::String(Arc::from(s.as_str()))
+        }
         "Number.isNaN" => Value::Bool(matches!(arg, Value::Float(n) if n.is_nan())),
         "Number.isFinite" => Value::Bool(
             matches!(arg, Value::Int(_)) || matches!(arg, Value::Float(n) if n.is_finite()),
@@ -1283,6 +1303,30 @@ fn call_array_static_method(method: &str, args: &[Value]) -> Result<Option<Value
                         .map(|c| Value::String(Arc::from(c.to_string().as_str())))
                         .collect();
                     Ok(Some(Value::Array(chars)))
+                }
+                // Array.from(set) / Array.from(map) over the built-in collections.
+                Value::Object(m) if matches!(m.get("__set__"), Some(Value::Bool(true))) => {
+                    Ok(Some(
+                        m.get("__items__")
+                            .cloned()
+                            .unwrap_or(Value::Array(Vec::new())),
+                    ))
+                }
+                Value::Object(m) if matches!(m.get("__map__"), Some(Value::Bool(true))) => {
+                    let pairs = match m.get("__entries__") {
+                        Some(Value::Array(entries)) => entries
+                            .iter()
+                            .filter_map(|e| match e {
+                                Value::Object(e) => Some(Value::Array(vec![
+                                    e.get("key").cloned().unwrap_or(Value::Undefined),
+                                    e.get("value").cloned().unwrap_or(Value::Undefined),
+                                ])),
+                                _ => None,
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    Ok(Some(Value::Array(pairs)))
                 }
                 _ => Ok(Some(Value::Array(Vec::new()))),
             }

@@ -234,6 +234,7 @@ impl Vm {
         "RangeError",
         "SyntaxError",
         "ReferenceError",
+        "structuredClone",
     ];
 
     /// Restore a VM from snapshot state and continue execution.
@@ -3591,7 +3592,28 @@ fn is_date_object(value: &Value) -> bool {
 }
 
 fn is_date_method(name: &str) -> bool {
-    matches!(name, "toISOString" | "getTime")
+    matches!(
+        name,
+        "toISOString"
+            | "getTime"
+            | "valueOf"
+            | "getUTCFullYear"
+            | "getFullYear"
+            | "getUTCMonth"
+            | "getMonth"
+            | "getUTCDate"
+            | "getDate"
+            | "getUTCDay"
+            | "getDay"
+            | "getUTCHours"
+            | "getHours"
+            | "getUTCMinutes"
+            | "getMinutes"
+            | "getUTCSeconds"
+            | "getSeconds"
+            | "getUTCMilliseconds"
+            | "getMilliseconds"
+    )
 }
 
 fn execute_date_method(map: &IndexMap<Arc<str>, Value>, method: &str) -> Option<Value> {
@@ -3600,11 +3622,27 @@ fn execute_date_method(map: &IndexMap<Arc<str>, Value>, method: &str) -> Option<
         Some(Value::Float(millis)) => *millis as i64,
         _ => 0,
     };
+    let seconds = millis.div_euclid(1000);
+    let ms = millis.rem_euclid(1000);
+    let days = seconds.div_euclid(86_400);
+    let sod = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    // 1970-01-01 was a Thursday (4); 0 = Sunday.
+    let dow = (days + 4).rem_euclid(7);
     match method {
-        "getTime" => Some(Value::Int(millis)),
+        "getTime" | "valueOf" => Some(Value::Int(millis)),
         "toISOString" => Some(Value::String(Arc::from(
             unix_millis_to_iso(millis).as_str(),
         ))),
+        // No timezone in the sandbox — local getters alias the UTC ones.
+        "getUTCFullYear" | "getFullYear" => Some(Value::Int(year)),
+        "getUTCMonth" | "getMonth" => Some(Value::Int((month as i64) - 1)), // 0-indexed
+        "getUTCDate" | "getDate" => Some(Value::Int(day as i64)),
+        "getUTCDay" | "getDay" => Some(Value::Int(dow)),
+        "getUTCHours" | "getHours" => Some(Value::Int(sod / 3_600)),
+        "getUTCMinutes" | "getMinutes" => Some(Value::Int((sod % 3_600) / 60)),
+        "getUTCSeconds" | "getSeconds" => Some(Value::Int(sod % 60)),
+        "getUTCMilliseconds" | "getMilliseconds" => Some(Value::Int(ms)),
         _ => None,
     }
 }
