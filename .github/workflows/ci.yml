@@ -68,7 +68,7 @@ jobs:
         working-directory: crates/zapcode-js
         run: |
           npm install
-          npx napi build --release --platform --js index.js --dts index.d.ts
+          npm run build
       - name: Run basic example
         working-directory: examples/typescript/basic
         run: |

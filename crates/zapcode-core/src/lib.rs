@@ -43,14 +43,17 @@ pub mod compiler;
 pub mod error;
 pub mod parser;
 pub mod sandbox;
+pub mod session;
 pub mod snapshot;
 pub mod trace;
 pub mod value;
 pub mod vm;
+pub(crate) mod wire;
 
 pub use error::ZapcodeError;
 pub use sandbox::ResourceLimits;
+pub use session::{ZapcodeSessionSnapshot, ZapcodeSessionState};
 pub use snapshot::ZapcodeSnapshot;
 pub use trace::{ExecutionTrace, TraceSpan, TraceStatus};
 pub use value::Value;
-pub use vm::{RunResult, VmState, ZapcodeRun};
+pub use vm::{ExternalCall, RunResult, VmState, ZapcodeRun};

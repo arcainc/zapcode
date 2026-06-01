@@ -15,12 +15,15 @@ pub enum Value {
     Object(IndexMap<Arc<str>, Value>),
     Function(Closure),
     /// A generator object — calling function* creates one of these.
-    /// Generators are stateful and cannot be serialized mid-yield.
-    #[serde(skip)]
     Generator(GeneratorObject),
+    /// A deferred external call result, used to batch parallel calls inside a
+    /// `Promise.all([...])`. Holds the call id; resolved by the host on resume.
+    /// Only ever lives transiently inside a batch — never escapes to user code.
+    Pending(u64),
     /// Internal: a bound method on a built-in object (e.g., console.log, Math.floor).
-    /// Not visible to user code — used to dispatch builtin calls.
-    #[serde(skip)]
+    /// Not visible to user code — used to dispatch builtin calls. These handles
+    /// must be serializable because argument evaluation can suspend after a
+    /// method is loaded but before it is called.
     BuiltinMethod {
         object_name: Arc<str>,
         method_name: Arc<str>,
@@ -29,22 +32,25 @@ pub enum Value {
 
 /// Identifies a function in the compiled program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct FunctionId(pub usize);
+pub struct FunctionRef {
+    pub program_id: usize,
+    pub function_id: usize,
+}
 
 /// A closure captures the enclosing scope's variables.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Closure {
-    pub func_id: FunctionId,
+    pub func_ref: FunctionRef,
     pub captured: Vec<(String, Value)>,
 }
 
 /// The state of a generator object.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeneratorObject {
     /// Unique ID for this generator instance (used as key in VM generator registry).
     pub id: u64,
     /// The function this generator was created from.
-    pub func_id: FunctionId,
+    pub func_ref: FunctionRef,
     /// Captured closure variables.
     pub captured: Vec<(String, Value)>,
     /// Suspended execution state. None = not yet started.
@@ -54,7 +60,7 @@ pub struct GeneratorObject {
 }
 
 /// Saved execution state of a suspended generator.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SuspendedFrame {
     pub ip: usize,
     pub locals: Vec<Value>,
@@ -73,6 +79,7 @@ impl Value {
             Value::Object(_) => "object",
             Value::Function(_) | Value::BuiltinMethod { .. } => "function",
             Value::Generator(_) => "object",
+            Value::Pending(_) => "object",
         }
     }
 
@@ -87,7 +94,8 @@ impl Value {
             | Value::Object(_)
             | Value::Function(_)
             | Value::BuiltinMethod { .. }
-            | Value::Generator(_) => true,
+            | Value::Generator(_)
+            | Value::Pending(_) => true,
         }
     }
 
@@ -132,6 +140,7 @@ impl Value {
             Value::Object(_) => "[object Object]".to_string(),
             Value::Function(_) | Value::BuiltinMethod { .. } => "function".to_string(),
             Value::Generator(_) => "[object Generator]".to_string(),
+            Value::Pending(_) => "[object Promise]".to_string(),
         }
     }
 

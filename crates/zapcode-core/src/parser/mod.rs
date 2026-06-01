@@ -8,6 +8,8 @@ use oxc_span::SourceType;
 
 use crate::error::{Result, ZapcodeError};
 
+type DestructureFieldParts = (Option<String>, Option<Vec<DestructureField>>, Option<Expr>);
+
 pub fn parse(source: &str) -> Result<Program> {
     // Auto-wrap trailing object literals: `{ key: value }` → `({ key: value })`
     // This avoids the JS ambiguity where `{` at statement start is a block.
@@ -340,35 +342,9 @@ impl<'a> AstLowerer<'a> {
             ast::BindingPattern::BindingIdentifier(id) => {
                 Ok(AssignTarget::Ident(id.name.to_string()))
             }
-            ast::BindingPattern::ObjectPattern(obj) => {
-                let mut fields = Vec::new();
-                for prop in &obj.properties {
-                    let key = property_key_to_string(&prop.key);
-                    let alias = match &prop.value {
-                        ast::BindingPattern::BindingIdentifier(id) => {
-                            let name = id.name.to_string();
-                            if name != key {
-                                Some(name)
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None,
-                    };
-                    let default = match &prop.value {
-                        ast::BindingPattern::AssignmentPattern(assign) => {
-                            Some(self.lower_expr(&assign.right)?)
-                        }
-                        _ => None,
-                    };
-                    fields.push(DestructureField {
-                        key,
-                        alias,
-                        default,
-                    });
-                }
-                Ok(AssignTarget::ObjectDestructure(fields))
-            }
+            ast::BindingPattern::ObjectPattern(obj) => Ok(AssignTarget::ObjectDestructure(
+                self.lower_object_pattern_fields(obj)?,
+            )),
             ast::BindingPattern::ArrayPattern(arr) => {
                 let mut elements = Vec::new();
                 for elem in &arr.elements {
@@ -385,6 +361,70 @@ impl<'a> AstLowerer<'a> {
         }
     }
 
+    fn lower_object_pattern_fields(
+        &mut self,
+        obj: &ast::ObjectPattern<'_>,
+    ) -> Result<Vec<DestructureField>> {
+        let mut fields = Vec::new();
+        for prop in &obj.properties {
+            let key = property_key_to_string(&prop.key);
+            let (alias, nested, default) = self.lower_destructure_field_value(&prop.value, &key)?;
+            fields.push(DestructureField {
+                key,
+                alias,
+                nested,
+                default,
+                rest: false,
+            });
+        }
+
+        if let Some(rest) = &obj.rest {
+            match &rest.argument {
+                ast::BindingPattern::BindingIdentifier(id) => {
+                    fields.push(DestructureField {
+                        key: id.name.to_string(),
+                        alias: Some(id.name.to_string()),
+                        nested: None,
+                        default: None,
+                        rest: true,
+                    });
+                }
+                _ => {
+                    return Err(ZapcodeError::UnsupportedSyntax {
+                        span: self.span(rest.span).to_string(),
+                        description: "only identifier object rest destructuring is supported"
+                            .to_string(),
+                    });
+                }
+            }
+        }
+
+        Ok(fields)
+    }
+
+    fn lower_destructure_field_value(
+        &mut self,
+        value: &ast::BindingPattern<'_>,
+        key: &str,
+    ) -> Result<DestructureFieldParts> {
+        match value {
+            ast::BindingPattern::BindingIdentifier(id) => {
+                let name = id.name.to_string();
+                let alias = if name != key { Some(name) } else { None };
+                Ok((alias, None, None))
+            }
+            ast::BindingPattern::ObjectPattern(obj) => {
+                Ok((None, Some(self.lower_object_pattern_fields(obj)?), None))
+            }
+            ast::BindingPattern::AssignmentPattern(assign) => {
+                let default = self.lower_expr(&assign.right)?;
+                let (alias, nested, _) = self.lower_destructure_field_value(&assign.left, key)?;
+                Ok((alias, nested, Some(default)))
+            }
+            _ => Ok((None, None, None)),
+        }
+    }
+
     fn lower_binding_pattern_to_param(
         &mut self,
         pat: &ast::BindingPattern<'_>,
@@ -393,29 +433,9 @@ impl<'a> AstLowerer<'a> {
             ast::BindingPattern::BindingIdentifier(id) => {
                 Ok(ParamPattern::Ident(id.name.to_string()))
             }
-            ast::BindingPattern::ObjectPattern(obj) => {
-                let mut fields = Vec::new();
-                for prop in &obj.properties {
-                    let key = property_key_to_string(&prop.key);
-                    let alias = match &prop.value {
-                        ast::BindingPattern::BindingIdentifier(id) => {
-                            let name = id.name.to_string();
-                            if name != key {
-                                Some(name)
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None,
-                    };
-                    fields.push(DestructureField {
-                        key,
-                        alias,
-                        default: None,
-                    });
-                }
-                Ok(ParamPattern::ObjectDestructure(fields))
-            }
+            ast::BindingPattern::ObjectPattern(obj) => Ok(ParamPattern::ObjectDestructure(
+                self.lower_object_pattern_fields(obj)?,
+            )),
             ast::BindingPattern::ArrayPattern(arr) => {
                 let mut elems = Vec::new();
                 for elem in &arr.elements {
@@ -782,7 +802,7 @@ impl<'a> AstLowerer<'a> {
                 })
             }
             ast::Expression::RegExpLiteral(re) => Ok(Expr::RegExpLit {
-                pattern: format!("{:?}", re.regex.pattern),
+                pattern: re.regex.pattern.text.to_string(),
                 flags: re.regex.flags.to_string(),
             }),
             ast::Expression::Identifier(id) => {

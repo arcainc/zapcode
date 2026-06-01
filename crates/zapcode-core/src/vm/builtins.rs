@@ -14,6 +14,8 @@ pub fn register_globals(globals: &mut HashMap<String, Value>) {
     globals.insert("Object".to_string(), Value::Object(IndexMap::new()));
     globals.insert("Array".to_string(), Value::Object(IndexMap::new()));
     globals.insert("Promise".to_string(), Value::Object(IndexMap::new()));
+    globals.insert("Map".to_string(), builtin_constructor("Map"));
+    globals.insert("Date".to_string(), builtin_constructor("Date"));
 
     // Math gets its constants as real properties
     let mut math = IndexMap::new();
@@ -29,6 +31,15 @@ pub fn register_globals(globals: &mut HashMap<String, Value>) {
         Value::Float(1.0 / std::f64::consts::SQRT_2),
     );
     globals.insert("Math".to_string(), Value::Object(math));
+}
+
+fn builtin_constructor(name: &str) -> Value {
+    let mut obj = IndexMap::new();
+    obj.insert(
+        Arc::from("__builtin_constructor__"),
+        Value::String(Arc::from(name)),
+    );
+    Value::Object(obj)
 }
 
 /// Execute a built-in method call. Returns Some(value) if handled, None if not a builtin.
@@ -199,9 +210,10 @@ fn call_math_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
             }
         }
         "random" => {
-            // Deterministic for sandbox reproducibility — use a simple LCG
-            // In production this should be configurable
-            Value::Float(0.5) // TODO: proper PRNG
+            // Math.random is served by the VM's seeded PRNG (see Vm::next_random)
+            // so the sequence is deterministic across replay yet varied. This
+            // stateless fallback is only reached if called without a VM.
+            Value::Float(0.5)
         }
         "PI" => Value::Float(std::f64::consts::PI),
         "E" => Value::Float(std::f64::consts::E),
@@ -260,9 +272,10 @@ fn value_to_json(val: &Value) -> String {
                 .collect();
             format!("{{{}}}", pairs.join(","))
         }
-        Value::Function(_) | Value::BuiltinMethod { .. } | Value::Generator(_) => {
-            "undefined".to_string()
-        }
+        Value::Function(_)
+        | Value::BuiltinMethod { .. }
+        | Value::Generator(_)
+        | Value::Pending(_) => "undefined".to_string(),
     }
 }
 
@@ -549,6 +562,24 @@ fn call_string_method(s: &Arc<str>, method: &str, args: &[Value]) -> Result<Opti
             let search = arg_str(args, 0);
             let replacement = arg_str(args, 1);
             Value::String(Arc::from(s.replace(&*search, &replacement).as_str()))
+        }
+        "match" => {
+            let pattern = match args.first() {
+                Some(Value::Object(map))
+                    if matches!(map.get("__regexp__"), Some(Value::Bool(true))) =>
+                {
+                    match map.get("pattern") {
+                        Some(Value::String(pattern)) => pattern.to_string(),
+                        _ => String::new(),
+                    }
+                }
+                Some(value) => value.to_js_string(),
+                None => String::new(),
+            };
+            match s.find(&pattern) {
+                Some(_) => Value::Array(vec![Value::String(Arc::from(pattern.as_str()))]),
+                None => Value::Null,
+            }
         }
         "concat" => {
             let mut result = s.to_string();

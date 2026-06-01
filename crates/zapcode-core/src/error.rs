@@ -23,6 +23,9 @@ pub enum ZapcodeError {
     #[error("unknown external function: {0}")]
     UnknownExternalFunction(String),
 
+    #[error("external function error: {0}")]
+    ExternalError(String),
+
     #[error("memory limit exceeded: {0}")]
     MemoryLimitExceeded(String),
 

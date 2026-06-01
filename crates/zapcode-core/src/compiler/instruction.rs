@@ -47,6 +47,7 @@ pub enum Instruction {
     // Objects & Arrays
     CreateArray(usize),
     CreateObject(usize),
+    ObjectRest(Vec<String>),
     GetProperty(String),
     SetProperty(String),
     GetIndex,
@@ -60,6 +61,14 @@ pub enum Instruction {
     Call(usize),
     Return,
     CallExternal(String, usize),
+    /// Like `CallExternal` but does not suspend: pops the args, registers a
+    /// deferred external call, and pushes a `Value::Pending`. Emitted only for
+    /// direct external calls that are elements of a `Promise.all([...])` literal,
+    /// so the calls can be batched and run in parallel by the host.
+    CallExternalDeferred(String, usize),
+    /// Pops `n` items (some may be `Value::Pending`) and builds a batch promise
+    /// that, when awaited, suspends once with all of its pending calls.
+    MakeBatchPromise(usize),
 
     // Control flow
     Jump(usize),

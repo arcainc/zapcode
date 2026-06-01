@@ -4,7 +4,7 @@
  * Works with any AI SDK:
  *
  * ```typescript
- * // Vercel AI SDK (recommended)
+ * // AI SDK (recommended)
  * import { zapcode } from "@unchartedfr/zapcode-ai";
  * const { system, tools } = zapcode({ tools: { ... } });
  * await generateText({ model, system, tools, messages });
@@ -26,8 +26,8 @@
  * ```
  */
 
-import { Zapcode, ZapcodeSnapshotHandle } from "@unchartedfr/zapcode";
-import { jsonSchema, tool } from "ai";
+import { Zapcode, ZapcodeSnapshotHandle, ZapcodeSessionHandle } from "@unchartedfr/zapcode";
+import { jsonSchema, tool, type ToolSet } from "ai";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -73,6 +73,13 @@ export interface ZapcodeAIOptions {
    * Works with `maxSteps` in the Vercel AI SDK. Default: false.
    */
   autoFix?: boolean;
+  /**
+   * Type-check generated code against the tool stubs before running it, so an
+   * unknown tool or a wrong argument type fails fast as a compile error
+   * (cheaper than a runtime trap). Requires the optional `typescript`
+   * dependency. Default: false.
+   */
+  typeCheck?: boolean;
 }
 
 /** A single span in the execution trace. OTel-compatible shape. */
@@ -99,12 +106,42 @@ export interface ExecutionResult {
   code: string;
   output: unknown;
   stdout: string;
-  toolCalls: Array<{ name: string; args: unknown[]; result: unknown }>;
+  toolCalls: Array<{
+    name: string;
+    /** Raw positional arguments emitted by the sandboxed code. */
+    args: unknown[];
+    /** Schema-validated named input passed to the host tool. */
+    input: Record<string, unknown>;
+    result: unknown;
+    /**
+     * Present when the tool threw. The error was raised back into the sandbox
+     * (catchable by guest `try`/`catch`); `result` is undefined in that case.
+     */
+    error?: string;
+  }>;
   /** Present when autoFix is enabled and execution failed. */
   error?: string;
   /** Execution trace. Present when debug or autoFix is enabled. */
   trace?: TraceSpan;
 }
+
+const RESERVED_TOOL_NAMES = new Set([
+  "console",
+  "JSON",
+  "Object",
+  "Array",
+  "Math",
+  "Promise",
+  "Map",
+  "Date",
+  "eval",
+  "Function",
+  "process",
+  "globalThis",
+  "global",
+  "require",
+  "execute_code",
+]);
 
 /** What `zapcode()` returns — adapters for every major AI SDK. */
 export interface ZapcodeAIResult {
@@ -112,10 +149,10 @@ export interface ZapcodeAIResult {
   system: string;
 
   /**
-   * Vercel AI SDK tool format.
+   * AI SDK tool format.
    * Use with `generateText({ tools })` or `streamText({ tools })`.
    */
-  tools: Record<string, VercelAITool>;
+  tools: ToolSet;
 
   /**
    * OpenAI SDK tool format.
@@ -160,17 +197,6 @@ export interface ZapcodeAIResult {
 // SDK-specific tool shapes
 // ---------------------------------------------------------------------------
 
-/** Vercel AI SDK tool shape. */
-export interface VercelAITool {
-  description: string;
-  parameters: {
-    type: "object";
-    properties: Record<string, unknown>;
-    required: string[];
-  };
-  execute: (args: { code: string }) => Promise<ExecutionResult>;
-}
-
 /** OpenAI SDK tool shape. */
 export interface OpenAITool {
   type: "function";
@@ -210,12 +236,43 @@ function generateSignature(name: string, def: ToolDefinition): string {
   return `${name}(${params})`;
 }
 
+function generateNamedObjectSignature(name: string, def: ToolDefinition): string {
+  const params = Object.entries(def.parameters)
+    .map(([pName, pDef]) => {
+      const opt = pDef.optional ? "?" : "";
+      return `${pName}${opt}: ${pDef.type}`;
+    })
+    .join(", ");
+  return `${name}({ ${params} })`;
+}
+
+function generateDeclaration(name: string, def: ToolDefinition): string {
+  const entries = Object.entries(def.parameters);
+  if (entries.length > 1) {
+    const fields = entries
+      .map(([pName, pDef]) => `${pName}${pDef.optional ? "?" : ""}: ${pDef.type}`)
+      .join("; ");
+    return `declare function ${name}(input: { ${fields} }): Promise<unknown>;`;
+  }
+
+  const params = entries
+    .map(([pName, pDef]) => `${pName}${pDef.optional ? "?" : ""}: ${pDef.type}`)
+    .join(", ");
+  return `declare function ${name}(${params}): Promise<unknown>;`;
+}
+
 function buildSystemPrompt(
   tools: Record<string, ToolDefinition>,
   userSystem?: string
 ): string {
   const toolDocs = Object.entries(tools)
-    .map(([name, def]) => `- await ${generateSignature(name, def)}\n  ${def.description}`)
+    .map(([name, def]) => {
+      const signature =
+        Object.keys(def.parameters).length > 1
+          ? generateNamedObjectSignature(name, def)
+          : generateSignature(name, def);
+      return `- ${generateDeclaration(name, def)}\n  Call shape: await ${signature}\n  ${def.description}`;
+    })
     .join("\n");
 
   const parts: string[] = [];
@@ -234,6 +291,7 @@ Rules:
 - The last expression in your code is the return value.
 - You can use variables, loops, conditionals, array methods, etc.
 - All tool calls must use \`await\`.
+- Prefer the declared function signatures above exactly. For tools with more than one parameter, call them with one named object argument, e.g. \`await toolName({ key: value })\`.
 - When a tool returns a structured object, access its properties directly instead of reparsing the result as text.
 - If the user's question doesn't need tools, you can compute the answer directly.`);
 
@@ -300,6 +358,238 @@ function printTrace(span: TraceSpan, indent = 0): void {
   }
 }
 
+function isValidIdentifier(name: string): boolean {
+  return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name);
+}
+
+function validateToolDefinitions(toolDefs: Record<string, ToolDefinition>): void {
+  for (const name of Object.keys(toolDefs)) {
+    if (!isValidIdentifier(name)) {
+      throw new Error(`Invalid tool name '${name}': tool names must be valid JavaScript identifiers.`);
+    }
+    if (RESERVED_TOOL_NAMES.has(name)) {
+      throw new Error(`Invalid tool name '${name}': this name is reserved by Zapcode.`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tool argument validation
+// ---------------------------------------------------------------------------
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function jsTypeName(value: unknown): string {
+  if (Array.isArray(value)) return "array";
+  if (value === null) return "null";
+  return typeof value;
+}
+
+function matchesParamType(value: unknown, param: ParamDef): boolean {
+  switch (param.type) {
+    case "array":
+      return Array.isArray(value);
+    case "object":
+      return isPlainObject(value);
+    case "number":
+      return typeof value === "number" && Number.isFinite(value);
+    case "string":
+      return typeof value === "string";
+    case "boolean":
+      return typeof value === "boolean";
+  }
+}
+
+function formatToolSignature(name: string, def: ToolDefinition): string {
+  const params = Object.entries(def.parameters)
+    .map(([paramName, param]) => `${paramName}${param.optional ? "?" : ""}: ${param.type}`)
+    .join(", ");
+  return Object.keys(def.parameters).length > 1
+    ? `${name}({ ${params} })`
+    : `${name}(${params})`;
+}
+
+function buildNamedArgs(
+  functionName: string,
+  toolDef: ToolDefinition,
+  args: unknown[]
+): Record<string, unknown> {
+  const paramEntries = Object.entries(toolDef.parameters);
+  const paramNames = paramEntries.map(([name]) => name);
+  const singleObjectArg = args.length === 1 && isPlainObject(args[0]) ? args[0] : undefined;
+  const usesNamedObject =
+    singleObjectArg !== undefined &&
+    (paramEntries.length > 1 || shouldTreatSingleObjectArgAsNamed(toolDef, singleObjectArg));
+  if (paramEntries.length > 1 && !usesNamedObject) {
+    throw new Error(
+      `Invalid arguments for tool '${functionName}': expected one named object argument. ` +
+        `Use ${formatToolSignature(functionName, toolDef)}.`
+    );
+  }
+  const namedArgs =
+    usesNamedObject
+      ? { ...singleObjectArg }
+      : Object.fromEntries(paramNames.map((name, index) => [name, args[index]]));
+
+  if (!usesNamedObject) {
+    const extraCount = args.length - paramNames.length;
+    if (extraCount > 0) {
+      throw new Error(
+        `Invalid arguments for tool '${functionName}': received ${args.length} positional ` +
+          `arguments but expected ${paramNames.length}. Use ${formatToolSignature(functionName, toolDef)}.`
+      );
+    }
+  }
+
+  const unexpected = Object.keys(namedArgs).filter(name => !toolDef.parameters[name]);
+  if (unexpected.length > 0) {
+    throw new Error(
+      `Invalid arguments for tool '${functionName}': unexpected parameter '${unexpected[0]}'. ` +
+        `Expected ${formatToolSignature(functionName, toolDef)}.`
+    );
+  }
+
+  for (const [paramName, paramDef] of paramEntries) {
+    const value = namedArgs[paramName];
+    if (value === undefined) {
+      if (!paramDef.optional) {
+        throw new Error(
+          `Invalid arguments for tool '${functionName}': missing required parameter '${paramName}'. ` +
+            `Expected ${formatToolSignature(functionName, toolDef)}.`
+        );
+      }
+      delete namedArgs[paramName];
+      continue;
+    }
+    // An omitted optional field written as `{ field: undefined }` in guest code
+    // crosses the JSON boundary as `null`. No declared param type is nullable,
+    // so for an *optional* param treat null as "omitted" — this makes the common
+    // agent pattern work. A required param still rejects null as a type error.
+    if (value === null && paramDef.optional) {
+      delete namedArgs[paramName];
+      continue;
+    }
+
+    if (!matchesParamType(value, paramDef)) {
+      throw new Error(
+        `Invalid arguments for tool '${functionName}': parameter '${paramName}' expected ` +
+          `${paramDef.type}, got ${jsTypeName(value)}. Expected ${formatToolSignature(functionName, toolDef)}.`
+      );
+    }
+  }
+
+  return namedArgs;
+}
+
+function shouldTreatSingleObjectArgAsNamed(
+  toolDef: ToolDefinition,
+  arg: Record<string, unknown>
+): boolean {
+  const entries = Object.entries(toolDef.parameters);
+  if (entries.length !== 1) return false;
+
+  const [[name, param]] = entries;
+  if (!Object.hasOwn(arg, name)) return false;
+
+  // Non-object single params are unambiguous: foo({ id }) means named input.
+  if (param.type !== "object") return true;
+
+  // For a single object param, support foo({ payload: {...} }) as named input,
+  // but keep foo({ arbitrary: "shape" }) as the payload value itself.
+  return Object.keys(arg).length === 1 || Object.keys(arg).some(key => !toolDef.parameters[key]);
+}
+
+// ---------------------------------------------------------------------------
+// Optional type-check pre-pass
+// ---------------------------------------------------------------------------
+
+/** A `declare function` stub for type-checking. Uses `any` returns so property
+ * access on results isn't flagged — the goal is to catch unknown tool names and
+ * wrong argument types/shapes before running, not to police result usage. */
+function declarationForTypeCheck(name: string, def: ToolDefinition): string {
+  const entries = Object.entries(def.parameters);
+  if (entries.length > 1) {
+    const fields = entries
+      .map(([p, d]) => `${p}${d.optional ? "?" : ""}: ${d.type}`)
+      .join("; ");
+    return `declare function ${name}(input: { ${fields} }): Promise<any>;`;
+  }
+  const params = entries.map(([p, d]) => `${p}${d.optional ? "?" : ""}: ${d.type}`).join(", ");
+  return `declare function ${name}(${params}): Promise<any>;`;
+}
+
+/**
+ * Type-check the generated TypeScript against the tool stubs before running it,
+ * so a malformed call (unknown tool, wrong argument type, missing argument)
+ * fails fast with a compile error the model can self-correct — cheaper than a
+ * runtime trap. Returns a list of human-readable diagnostics (empty if clean).
+ * Requires the optional `typescript` dependency.
+ */
+async function typeCheckGeneratedCode(
+  code: string,
+  toolDefs: Record<string, ToolDefinition>
+): Promise<string[]> {
+  let ts: any;
+  try {
+    const mod: any = await import("typescript");
+    ts = mod.default ?? mod;
+  } catch {
+    throw new Error(
+      "Type-checking requires the optional 'typescript' dependency. " +
+        "Install it (npm i typescript) or disable the typeCheck option."
+    );
+  }
+
+  const stub =
+    Object.entries(toolDefs)
+      .map(([name, def]) => declarationForTypeCheck(name, def))
+      .join("\n") +
+    "\ndeclare const console: { log(...args: any[]): void; error(...args: any[]): void };\n";
+  // Wrap in an async function so top-level await is allowed and a trailing
+  // expression (the sandbox's "return value") is a valid statement.
+  const main = `export {};\nasync function __zapcode_main__() {\n${code}\n}\n`;
+
+  const options = {
+    noEmit: true,
+    strict: false,
+    noImplicitAny: false,
+    skipLibCheck: true,
+    target: ts.ScriptTarget.ES2020,
+    lib: ["lib.es2020.d.ts"],
+    moduleDetection: ts.ModuleDetectionKind?.Force,
+  };
+  const virtual: Record<string, string> = { "__tools__.d.ts": stub, "__main__.ts": main };
+  const host = ts.createCompilerHost(options);
+  const origGetSourceFile = host.getSourceFile.bind(host);
+  host.getSourceFile = (name: string, langVersion: any, ...rest: any[]) =>
+    virtual[name] !== undefined
+      ? ts.createSourceFile(name, virtual[name], langVersion)
+      : origGetSourceFile(name, langVersion, ...rest);
+  const origReadFile = host.readFile.bind(host);
+  host.readFile = (name: string) => (virtual[name] !== undefined ? virtual[name] : origReadFile(name));
+  const origFileExists = host.fileExists.bind(host);
+  host.fileExists = (name: string) => virtual[name] !== undefined || origFileExists(name);
+
+  const program = ts.createProgram(Object.keys(virtual), options, host);
+  const diagnostics = ts
+    .getPreEmitDiagnostics(program)
+    .filter((d: any) => d.file && d.file.fileName === "__main__.ts");
+
+  return diagnostics.map((d: any) => {
+    const message = ts.flattenDiagnosticMessageText(d.messageText, "\n");
+    if (d.file && typeof d.start === "number") {
+      const { line, character } = d.file.getLineAndColumnOfPosition
+        ? d.file.getLineAndColumnOfPosition(d.start)
+        : d.file.getLineAndCharacterOfPosition(d.start);
+      // Subtract the wrapper line so positions map to the agent's code.
+      return `line ${line}, col ${character + 1}: ${message}`;
+    }
+    return message;
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Execution engine
 // ---------------------------------------------------------------------------
@@ -307,8 +597,15 @@ function printTrace(span: TraceSpan, indent = 0): void {
 async function executeCode(
   code: string,
   toolDefs: Record<string, ToolDefinition>,
-  options: { memoryLimitMb?: number; timeLimitMs?: number; debug?: boolean; autoFix?: boolean }
+  options: {
+    memoryLimitMb?: number;
+    timeLimitMs?: number;
+    debug?: boolean;
+    autoFix?: boolean;
+    typeCheck?: boolean;
+  }
 ): Promise<ExecutionResult> {
+  validateToolDefinitions(toolDefs);
   const toolNames = Object.keys(toolDefs);
   const toolCalls: ExecutionResult["toolCalls"] = [];
   const debug = options.debug ?? false;
@@ -318,6 +615,15 @@ async function executeCode(
   const execSpan = tracing ? createSpan("execute", { "zapcode.code": code }) : undefined;
 
   try {
+    // Optional type-check pre-pass: catch unknown tools / wrong argument types
+    // as compile errors before running anything.
+    if (options.typeCheck) {
+      const diagnostics = await typeCheckGeneratedCode(code, toolDefs);
+      if (diagnostics.length > 0) {
+        throw new Error(`Type error before execution:\n${diagnostics.join("\n")}`);
+      }
+    }
+
     const sandbox = new Zapcode(code, {
       externalFunctions: toolNames,
       timeLimitMs: options.timeLimitMs ?? 10_000,
@@ -327,42 +633,85 @@ async function executeCode(
     let state = sandbox.start();
     let stdout = "";
 
-    // Snapshot/resume loop — resolve each tool call as the VM suspends
-    while (!state.completed) {
-      const { functionName, args } = state;
-
-      const toolDef = toolDefs[functionName];
+    // Validate + run one tool call, recording its span and a toolCalls entry.
+    // Throws on a *malformed* call (a code bug → abort/autoFix). Returns a
+    // discriminated outcome for a *runtime* tool failure so the caller can raise
+    // it back into the sandbox as a catchable error.
+    type ToolOutcome = { ok: true; result: unknown } | { ok: false; message: string };
+    const invokeTool = async (name: string, rawArgs: unknown[]): Promise<ToolOutcome> => {
+      const toolDef = toolDefs[name];
       if (!toolDef) {
         throw new Error(
-          `Guest code called unknown function '${functionName}'. ` +
-          `Available: ${toolNames.join(", ")}`
+          `Guest code called unknown function '${name}'. Available: ${toolNames.join(", ")}`
         );
       }
+      const toolSpan = tracing
+        ? createSpan("tool_call", {
+            "zapcode.tool.name": name,
+            "zapcode.tool.args": JSON.stringify(rawArgs),
+          })
+        : undefined;
 
-      // Build named args from positional args using the parameter schema
-      const paramNames = Object.keys(toolDef.parameters);
-      const namedArgs: Record<string, unknown> = {};
-      for (let i = 0; i < paramNames.length && i < args.length; i++) {
-        namedArgs[paramNames[i]] = args[i];
+      let namedArgs: Record<string, unknown>;
+      try {
+        namedArgs = buildNamedArgs(name, toolDef, rawArgs);
+      } catch (err: any) {
+        if (toolSpan) {
+          toolSpan.attributes["zapcode.tool.error"] = err.message ?? String(err);
+          endSpan(toolSpan, "error");
+          execSpan!.children.push(toolSpan);
+        }
+        throw err; // malformed call — not catchable by the guest
       }
-
-      const toolSpan = tracing ? createSpan("tool_call", {
-        "zapcode.tool.name": functionName,
-        "zapcode.tool.args": JSON.stringify(args),
-      }) : undefined;
-
-      const result = await toolDef.execute(namedArgs);
-      toolCalls.push({ name: functionName, args, result });
-
       if (toolSpan) {
-        toolSpan.attributes["zapcode.tool.result"] = JSON.stringify(result);
-        endSpan(toolSpan);
-        execSpan!.children.push(toolSpan);
+        toolSpan.attributes["zapcode.tool.input"] = JSON.stringify(namedArgs);
       }
 
-      // Resume the VM with the tool's return value
+      try {
+        const result = await toolDef.execute(namedArgs);
+        toolCalls.push({ name, args: rawArgs, input: namedArgs, result });
+        if (toolSpan) {
+          toolSpan.attributes["zapcode.tool.result"] = JSON.stringify(result);
+          endSpan(toolSpan);
+          execSpan!.children.push(toolSpan);
+        }
+        return { ok: true, result };
+      } catch (err: any) {
+        const message = err?.message ?? String(err);
+        toolCalls.push({ name, args: rawArgs, input: namedArgs, result: undefined, error: message });
+        if (toolSpan) {
+          toolSpan.attributes["zapcode.tool.error"] = message;
+          endSpan(toolSpan, "error");
+          execSpan!.children.push(toolSpan);
+        }
+        return { ok: false, message };
+      }
+    };
+
+    // Snapshot/resume loop — resolve tool calls as the VM suspends.
+    while (!state.completed) {
       const snapshot = ZapcodeSnapshotHandle.load(state.snapshot);
-      state = snapshot.resume(result);
+
+      if (state.kind === "suspended_many") {
+        // Parallel batch (Promise.all). Run every call concurrently. A failing
+        // tool surfaces like a Promise.all rejection: the first failure is
+        // raised back into the guest (catchable); otherwise resume with all
+        // results. A malformed call throws and aborts the whole execution.
+        const outcomes = await Promise.all(
+          state.calls.map(call => invokeTool(call.name, call.args))
+        );
+        const firstFailure = outcomes.find((o): o is { ok: false; message: string } => !o.ok);
+        if (firstFailure) {
+          state = snapshot.resumeError(firstFailure.message);
+        } else {
+          state = snapshot.resumeMany(outcomes.map(o => (o as { ok: true; result: unknown }).result));
+        }
+        continue;
+      }
+
+      // Single external call.
+      const outcome = await invokeTool(state.functionName, state.args);
+      state = outcome.ok ? snapshot.resume(outcome.result) : snapshot.resumeError(outcome.message);
     }
 
     if (state.stdout) {
@@ -452,11 +801,12 @@ async function executeCode(
  * ```
  */
 export function zapcode(options: ZapcodeAIOptions): ZapcodeAIResult {
-  const { tools: toolDefs, system: userSystem, memoryLimitMb, timeLimitMs, adapters, debug, autoFix } = options;
+  const { tools: toolDefs, system: userSystem, memoryLimitMb, timeLimitMs, adapters, debug, autoFix, typeCheck } = options;
+  validateToolDefinitions(toolDefs);
 
   const system = buildSystemPrompt(toolDefs, userSystem);
 
-  const execOptions = { memoryLimitMb, timeLimitMs, debug, autoFix };
+  const execOptions = { memoryLimitMb, timeLimitMs, debug, autoFix, typeCheck };
   const tracing = debug || autoFix;
 
   // Session-level trace collects all attempts
@@ -479,12 +829,40 @@ export function zapcode(options: ZapcodeAIOptions): ZapcodeAIResult {
     return result;
   };
 
-  // Vercel AI SDK format — use tool() + jsonSchema() for proper integration
-  const tools: Record<string, any> = {
+  const handleExecuteCodeInput = async (args: unknown): Promise<ExecutionResult> => {
+    if (!isPlainObject(args) || typeof args.code !== "string") {
+      const actual = !isPlainObject(args) ? jsTypeName(args) : jsTypeName(args.code);
+      const message = `Invalid execute_code input: expected object with code: string, got ${actual}.`;
+      if (!autoFix) {
+        throw new Error(message);
+      }
+
+      const trace = createSpan("attempt_0", { "zapcode.code": "" });
+      trace.attributes["zapcode.error"] = message;
+      endSpan(trace, "error");
+      if (sessionTrace) {
+        sessionTrace.children.push(trace);
+      }
+
+      return {
+        code: "",
+        output: null,
+        stdout: "",
+        toolCalls: [],
+        error: `Execution failed: ${message}. Please fix your code and try again.`,
+        trace,
+      };
+    }
+
+    return handleToolCall(args.code);
+  };
+
+  // AI SDK format — use tool() + jsonSchema() for proper integration
+  const tools: ToolSet = {
     execute_code: tool({
       description: CODE_TOOL_DESCRIPTION,
-      parameters: jsonSchema(CODE_TOOL_SCHEMA),
-      execute: async (args: unknown) => handleToolCall((args as { code: string }).code),
+      inputSchema: jsonSchema(CODE_TOOL_SCHEMA),
+      execute: handleExecuteCodeInput,
     }),
   };
 
@@ -657,7 +1035,151 @@ export function createAdapter<TOutput>(
 export async function execute(
   code: string,
   tools: Record<string, ToolDefinition>,
-  options?: { memoryLimitMb?: number; timeLimitMs?: number; debug?: boolean; autoFix?: boolean }
+  options?: {
+    memoryLimitMb?: number;
+    timeLimitMs?: number;
+    debug?: boolean;
+    autoFix?: boolean;
+    typeCheck?: boolean;
+  }
 ): Promise<ExecutionResult> {
   return executeCode(code, tools, options ?? {});
+}
+
+// ---------------------------------------------------------------------------
+// Durable sessions
+// ---------------------------------------------------------------------------
+
+/** Outcome of resolving a single tool call inside a session driver. */
+type ToolOutcome = { ok: true; result: unknown } | { ok: false; message: string };
+
+/**
+ * Validate + run one tool call, recording a toolCalls entry. Throws on a
+ * *malformed* call (a code bug → abort). Returns a discriminated outcome for a
+ * *runtime* tool failure so the caller can raise it back into the sandbox.
+ */
+async function invokeToolCall(
+  toolDefs: Record<string, ToolDefinition>,
+  toolNames: string[],
+  name: string,
+  rawArgs: unknown[],
+  toolCalls: ExecutionResult["toolCalls"]
+): Promise<ToolOutcome> {
+  const toolDef = toolDefs[name];
+  if (!toolDef) {
+    throw new Error(
+      `Guest code called unknown function '${name}'. Available: ${toolNames.join(", ")}`
+    );
+  }
+  const namedArgs = buildNamedArgs(name, toolDef, rawArgs); // throws → abort
+  try {
+    const result = await toolDef.execute(namedArgs);
+    toolCalls.push({ name, args: rawArgs, input: namedArgs, result });
+    return { ok: true, result };
+  } catch (err: any) {
+    const message = err?.message ?? String(err);
+    toolCalls.push({ name, args: rawArgs, input: namedArgs, result: undefined, error: message });
+    return { ok: false, message };
+  }
+}
+
+/** Options for {@link createSession} / {@link loadSession}. */
+export interface SessionOptions {
+  /** Tools available to guest code across the whole session. */
+  tools: Record<string, ToolDefinition>;
+  /** Memory limit in MB (default: 32). */
+  memoryLimitMb?: number;
+  /** Execution time limit per chunk in ms (default: 10000). */
+  timeLimitMs?: number;
+}
+
+/** Result of running one session chunk. */
+export interface SessionChunkResult {
+  output: unknown;
+  stdout: string;
+  toolCalls: ExecutionResult["toolCalls"];
+}
+
+/**
+ * A durable, multi-chunk Zapcode session. Top-level bindings, functions, and
+ * classes declared in one chunk are available to later chunks. The entire VM
+ * state serializes to compact bytes via {@link ZapcodeSession.dump}, so a
+ * workflow an agent defines now can be stored and resumed later — in another
+ * process, a Temporal activity, or after a restart — with {@link loadSession}.
+ *
+ * Tool *implementations* are not serialized (only the VM state is), so the same
+ * `tools` must be provided again when reloading.
+ *
+ * @example
+ * ```typescript
+ * const session = createSession({ tools: { fetchRow: {...} } });
+ * await session.runChunk(`async function step(id) { return await fetchRow(id); }`);
+ * const bytes = session.dump();              // hand to a Temporal activity
+ * // ...later, elsewhere...
+ * const resumed = loadSession(bytes, { tools: { fetchRow: {...} } });
+ * const out = await resumed.runChunk(`await step("42")`);
+ * ```
+ */
+export interface ZapcodeSession {
+  /** Run a chunk to completion, resolving tool calls (incl. parallel batches). */
+  runChunk(code: string, inputs?: Record<string, unknown>): Promise<SessionChunkResult>;
+  /** Serialize the whole session state to bytes for storage / transport. */
+  dump(): Buffer;
+}
+
+function makeSession(
+  initialBytes: Buffer,
+  toolDefs: Record<string, ToolDefinition>
+): ZapcodeSession {
+  validateToolDefinitions(toolDefs);
+  const toolNames = Object.keys(toolDefs);
+  let sessionBytes = initialBytes;
+
+  const runChunk = async (
+    code: string,
+    inputs?: Record<string, unknown>
+  ): Promise<SessionChunkResult> => {
+    const toolCalls: ExecutionResult["toolCalls"] = [];
+    let state = ZapcodeSessionHandle.load(sessionBytes).runChunk(code, inputs ?? {});
+
+    while (!state.completed) {
+      const handle = ZapcodeSessionHandle.load(state.session);
+      if (state.kind === "suspended_many") {
+        const outcomes = await Promise.all(
+          state.calls.map(call => invokeToolCall(toolDefs, toolNames, call.name, call.args, toolCalls))
+        );
+        const failure = outcomes.find((o): o is { ok: false; message: string } => !o.ok);
+        state = failure
+          ? handle.resumeError(failure.message)
+          : handle.resumeMany(outcomes.map(o => (o as { ok: true; result: unknown }).result));
+      } else {
+        const outcome = await invokeToolCall(toolDefs, toolNames, state.functionName, state.args, toolCalls);
+        state = outcome.ok ? handle.resume(outcome.result) : handle.resumeError(outcome.message);
+      }
+    }
+
+    // Persist the new idle state for the next chunk / dump().
+    sessionBytes = state.session;
+    return { output: state.output, stdout: state.stdout ?? "", toolCalls };
+  };
+
+  return { runChunk, dump: () => sessionBytes };
+}
+
+/** Create a new durable session. */
+export function createSession(options: SessionOptions): ZapcodeSession {
+  validateToolDefinitions(options.tools);
+  const handle = ZapcodeSessionHandle.create({
+    externalFunctions: Object.keys(options.tools),
+    memoryLimitMb: options.memoryLimitMb,
+    timeLimitMs: options.timeLimitMs,
+  });
+  return makeSession(handle.dump(), options.tools);
+}
+
+/** Reload a durable session from bytes produced by {@link ZapcodeSession.dump}. */
+export function loadSession(bytes: Buffer, options: SessionOptions): ZapcodeSession {
+  // Validate the bytes are loadable up front (throws on a bad/incompatible blob).
+  ZapcodeSessionHandle.load(bytes);
+  return makeSession(bytes, options.tools);
 }

@@ -58,3 +58,4 @@ const binding = loadNativeBinding()
 module.exports = binding
 module.exports.Zapcode = binding.Zapcode
 module.exports.ZapcodeSnapshotHandle = binding.ZapcodeSnapshotHandle
+module.exports.ZapcodeSessionHandle = binding.ZapcodeSessionHandle

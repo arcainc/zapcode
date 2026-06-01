@@ -308,6 +308,7 @@ fn test_await_external_function_suspends() {
             assert_eq!(args[0], Value::String("https://example.com".into()));
         }
         VmState::Complete(_) => panic!("expected suspension at external call"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }
 
@@ -334,9 +335,11 @@ fn test_await_external_function_resume() {
                     assert_eq!(v, Value::String("response body processed".into()));
                 }
                 VmState::Suspended { .. } => panic!("expected completion after resume"),
+                VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
             }
         }
         VmState::Complete(_) => panic!("expected suspension at external call"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }
 
@@ -383,6 +386,7 @@ fn test_multiple_external_awaits_suspend_resume() {
             snapshot
         }
         VmState::Complete(_) => panic!("expected first suspension"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
     // Resume with result of getA
@@ -399,6 +403,7 @@ fn test_multiple_external_awaits_suspend_resume() {
             snapshot
         }
         VmState::Complete(_) => panic!("expected second suspension"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
     // Resume with result of getB
@@ -409,6 +414,7 @@ fn test_multiple_external_awaits_suspend_resume() {
             assert_eq!(v, Value::Int(300));
         }
         VmState::Suspended { .. } => panic!("expected completion"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }
 
@@ -676,6 +682,7 @@ fn test_sequential_external_calls_in_loop() {
             snapshot
         }
         VmState::Complete(_) => panic!("expected suspension"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
     let state2 = snap.resume(Value::String("rainy".into())).unwrap();
@@ -690,6 +697,7 @@ fn test_sequential_external_calls_in_loop() {
             snapshot
         }
         VmState::Complete(_) => panic!("expected second suspension"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
     let state3 = snap2.resume(Value::String("sunny".into())).unwrap();
@@ -704,6 +712,7 @@ fn test_sequential_external_calls_in_loop() {
             snapshot
         }
         VmState::Complete(_) => panic!("expected third suspension"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
     let final_state = snap3.resume(Value::String("cloudy".into())).unwrap();
@@ -744,6 +753,7 @@ fn test_array_map_async_callback_with_external() {
             snapshot
         }
         VmState::Complete(_) => panic!("expected suspension for 'a'"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
     // Resume with result for "a"
@@ -759,6 +769,7 @@ fn test_array_map_async_callback_with_external() {
             snapshot
         }
         VmState::Complete(_) => panic!("expected suspension for 'b'"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
     // Resume with result for "b"
@@ -774,6 +785,7 @@ fn test_array_map_async_callback_with_external() {
             snapshot
         }
         VmState::Complete(_) => panic!("expected suspension for 'c'"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
     // Resume with result for "c"
@@ -852,6 +864,7 @@ fn test_array_map_async_single_element() {
             snapshot
         }
         VmState::Complete(_) => panic!("expected suspension"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
     let final_state = snap.resume(Value::String("result".into())).unwrap();
@@ -892,6 +905,7 @@ fn test_array_for_each_async_callback_with_external() {
                     .unwrap();
             }
             VmState::Complete(_) => panic!("expected suspension for {}", expected),
+            VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
         }
     }
 
@@ -920,6 +934,7 @@ fn test_array_for_each_async_empty() {
             assert_eq!(val, Value::String("done".into()));
         }
         VmState::Suspended { .. } => panic!("expected immediate completion for empty array"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }
 
@@ -995,6 +1010,7 @@ fn test_callback_result_user_object_not_unwrapped() {
     let snap = match state {
         VmState::Suspended { snapshot, .. } => snapshot,
         VmState::Complete(_) => panic!("expected suspension"),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
     // Return a user object that looks like a promise but lacks __promise__
@@ -1044,7 +1060,6 @@ fn test_for_of_sync_counter() {
 }
 
 #[test]
-#[ignore = "pre-existing bug: array.push() inside for-of doesn't mutate the array (value semantics vs reference)"]
 fn test_for_of_sync_push() {
     let result = eval_ts(
         r#"
@@ -1102,6 +1117,7 @@ fn test_for_of_with_external_calls_terminates() {
                 "expected suspension for {} but got completion: {:?}",
                 expected_city, v
             ),
+            VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
         }
     }
 
@@ -1118,6 +1134,7 @@ fn test_for_of_with_external_calls_terminates() {
             "expected completion but got suspension: {}({:?})",
             function_name, args
         ),
+        VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     }
 }
 

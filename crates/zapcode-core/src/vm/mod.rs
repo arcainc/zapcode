@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -9,7 +9,7 @@ use crate::error::{Result, ZapcodeError};
 use crate::sandbox::{ResourceLimits, ResourceTracker};
 use crate::snapshot::ZapcodeSnapshot;
 use crate::trace::{ExecutionTrace, SpanBuilder, TraceStatus};
-use crate::value::{Closure, FunctionId, GeneratorObject, SuspendedFrame, Value};
+use crate::value::{Closure, FunctionRef, GeneratorObject, SuspendedFrame, Value};
 
 mod builtins;
 
@@ -22,6 +22,39 @@ pub enum VmState {
         args: Vec<Value>,
         snapshot: ZapcodeSnapshot,
     },
+    /// Suspended on a batch of external calls (`Promise.all([...])`) that the
+    /// host can run in parallel. Resume with `resume_many` passing one result
+    /// per call, in order.
+    SuspendedMany {
+        calls: Vec<ExternalCall>,
+        snapshot: ZapcodeSnapshot,
+    },
+}
+
+/// One pending external call exposed to the host in a batch suspension.
+#[derive(Debug, Clone)]
+pub struct ExternalCall {
+    pub name: String,
+    pub args: Vec<Value>,
+}
+
+/// A deferred external call recorded by `CallExternalDeferred`, awaiting batch
+/// resolution.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PendingExternalCall {
+    pub(crate) id: u64,
+    pub(crate) name: String,
+    pub(crate) args: Vec<Value>,
+}
+
+/// The structure of an in-flight `Promise.all` batch, captured at the await so
+/// resume can rebuild the result array in element order.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PendingBatch {
+    /// Original array elements (some are `Value::Pending`).
+    pub(crate) items: Vec<Value>,
+    /// Call ids being awaited, in the order presented to the host.
+    pub(crate) call_ids: Vec<u64>,
 }
 
 /// Tracks where a method receiver originated so that mutations to `this`
@@ -38,6 +71,7 @@ pub(crate) enum ReceiverSource {
 /// A call frame in the VM stack.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CallFrame {
+    pub(crate) program_index: usize,
     pub(crate) func_index: Option<usize>,
     pub(crate) ip: usize,
     pub(crate) locals: Vec<Value>,
@@ -78,7 +112,7 @@ pub(crate) enum Continuation {
 
 /// The Zapcode VM.
 pub struct Vm {
-    pub(crate) program: CompiledProgram,
+    pub(crate) programs: Vec<CompiledProgram>,
     pub(crate) stack: Vec<Value>,
     pub(crate) frames: Vec<CallFrame>,
     pub(crate) globals: HashMap<String, Value>,
@@ -90,15 +124,29 @@ pub struct Vm {
     /// Active continuations for array callback methods that may suspend.
     pub(crate) continuations: Vec<Continuation>,
     /// The last object a property was accessed on — used for method dispatch.
-    last_receiver: Option<Value>,
+    pub(crate) last_receiver: Option<Value>,
     /// Where the last receiver came from — used to write back `this` mutations.
-    last_receiver_source: Option<ReceiverSource>,
+    pub(crate) last_receiver_source: Option<ReceiverSource>,
     /// The name of the last global loaded — used to identify known globals.
-    last_global_name: Option<String>,
+    pub(crate) last_global_name: Option<String>,
     /// Tracks the source of the most recent Load instruction for receiver tracking.
-    last_load_source: Option<ReceiverSource>,
+    pub(crate) last_load_source: Option<ReceiverSource>,
     /// Counter for assigning unique generator IDs.
-    next_generator_id: u64,
+    pub(crate) next_generator_id: u64,
+    /// External calls deferred by `CallExternalDeferred`, pending batch resolution.
+    pub(crate) pending_calls: Vec<PendingExternalCall>,
+    /// Results delivered by `resume_many`, keyed by call id (BTreeMap for
+    /// deterministic snapshot bytes).
+    pub(crate) resolved: BTreeMap<u64, Value>,
+    /// Counter for assigning unique deferred-call IDs.
+    pub(crate) next_call_id: u64,
+    /// The batch currently awaiting host resolution (set at the batch await).
+    pub(crate) pending_batch: Option<PendingBatch>,
+    /// Deterministic PRNG state for `Math.random`. Seeded to a fixed value and
+    /// carried in the snapshot, so a replayed program produces the same random
+    /// sequence (required for durable/Temporal replay) while still varying call
+    /// to call.
+    pub(crate) rng_state: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -114,13 +162,21 @@ impl Vm {
         limits: ResourceLimits,
         external_functions: HashSet<String>,
     ) -> Self {
+        Self::with_programs(vec![program], limits, external_functions)
+    }
+
+    pub(crate) fn with_programs(
+        programs: Vec<CompiledProgram>,
+        limits: ResourceLimits,
+        external_functions: HashSet<String>,
+    ) -> Self {
         let mut globals = HashMap::new();
 
         // Register built-in globals
         builtins::register_globals(&mut globals);
 
         Self {
-            program,
+            programs,
             stack: Vec::new(),
             frames: Vec::new(),
             globals,
@@ -135,19 +191,25 @@ impl Vm {
             last_global_name: None,
             last_load_source: None,
             next_generator_id: 0,
+            pending_calls: Vec::new(),
+            resolved: BTreeMap::new(),
+            next_call_id: 0,
+            pending_batch: None,
+            rng_state: 0,
         }
     }
 
     /// Names of all builtin globals registered by `register_globals`.
-    pub(crate) const BUILTIN_GLOBAL_NAMES: &'static [&'static str] =
-        &["console", "JSON", "Object", "Array", "Math", "Promise"];
+    pub(crate) const BUILTIN_GLOBAL_NAMES: &'static [&'static str] = &[
+        "console", "JSON", "Object", "Array", "Math", "Promise", "Map", "Date",
+    ];
 
     /// Restore a VM from snapshot state and continue execution.
     /// Builtins are re-registered after restoring user globals.
     /// The return_value is pushed onto the stack (result of the external call).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_snapshot(
-        program: CompiledProgram,
+        programs: Vec<CompiledProgram>,
         stack: Vec<Value>,
         frames: Vec<CallFrame>,
         user_globals: HashMap<String, Value>,
@@ -156,6 +218,11 @@ impl Vm {
         stdout: String,
         limits: ResourceLimits,
         external_functions: HashSet<String>,
+        next_generator_id: u64,
+        last_receiver: Option<Value>,
+        last_receiver_source: Option<ReceiverSource>,
+        last_global_name: Option<String>,
+        last_load_source: Option<ReceiverSource>,
     ) -> Self {
         let mut globals = HashMap::new();
         // Re-register builtins first
@@ -166,7 +233,7 @@ impl Vm {
         }
 
         Self {
-            program,
+            programs,
             stack,
             frames,
             globals,
@@ -176,12 +243,28 @@ impl Vm {
             external_functions,
             try_stack,
             continuations,
-            last_receiver: None,
-            last_receiver_source: None,
-            last_global_name: None,
-            last_load_source: None,
-            next_generator_id: 0,
+            last_receiver,
+            last_receiver_source,
+            last_global_name,
+            last_load_source,
+            next_generator_id,
+            pending_calls: Vec::new(),
+            resolved: BTreeMap::new(),
+            next_call_id: 0,
+            pending_batch: None,
+            rng_state: 0,
         }
+    }
+
+    /// Advance the deterministic PRNG (splitmix64) and return a float in [0, 1).
+    pub(crate) fn next_random(&mut self) -> f64 {
+        self.rng_state = self.rng_state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.rng_state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        // Use the top 53 bits for a uniform double in [0, 1).
+        (z >> 11) as f64 / ((1u64 << 53) as f64)
     }
 
     /// Resume execution after a snapshot restore. The return value from
@@ -191,10 +274,139 @@ impl Vm {
         self.execute()
     }
 
+    /// Resume a suspended external call by making it *throw* `error` instead of
+    /// returning a value. The error surfaces inside guest code at the await/call
+    /// site: if it is inside a `try`, the `catch` block runs (receiving `error`);
+    /// otherwise it propagates out to the host as `ExternalError`. This mirrors
+    /// how a real failing tool/activity should look to agent-written code.
+    pub(crate) fn resume_with_error(&mut self, error: Value) -> Result<VmState> {
+        self.tracker.start();
+        match self.try_stack.pop() {
+            Some(try_info) => {
+                // Unwind frames and stack to the nearest enclosing try block,
+                // exactly as the execute loop does for a runtime error.
+                while self.frames.len() > try_info.frame_depth {
+                    self.frames.pop();
+                    self.tracker.pop_frame();
+                }
+                self.stack.truncate(try_info.stack_depth);
+                self.push(error)?;
+                self.current_frame_mut().ip = try_info.catch_ip;
+                self.execute()
+            }
+            // No handler — the failure is the program's failure.
+            None => Err(ZapcodeError::ExternalError(error.to_js_string())),
+        }
+    }
+
+    /// Resume a batch suspension (`Promise.all([...])`) with one result per
+    /// pending call, in the order the calls were presented to the host. The
+    /// resolved array is pushed and execution continues after the await.
+    pub(crate) fn resume_many(&mut self, results: Vec<Value>) -> Result<VmState> {
+        self.tracker.start();
+        let batch = self.pending_batch.take().ok_or_else(|| {
+            ZapcodeError::RuntimeError(
+                "resume_many called but the VM is not suspended on a batch".to_string(),
+            )
+        })?;
+        if results.len() != batch.call_ids.len() {
+            return Err(ZapcodeError::RuntimeError(format!(
+                "resume_many expected {} results but got {}",
+                batch.call_ids.len(),
+                results.len()
+            )));
+        }
+        for (id, value) in batch.call_ids.iter().zip(results) {
+            self.resolved.insert(*id, value);
+        }
+        // Rebuild the result array in element order, substituting resolved values.
+        let mut array = Vec::with_capacity(batch.items.len());
+        for item in batch.items {
+            match item {
+                Value::Pending(id) => {
+                    let value = self.resolved.remove(&id).ok_or_else(|| {
+                        ZapcodeError::RuntimeError(format!("missing result for call {}", id))
+                    })?;
+                    array.push(value);
+                }
+                other => array.push(other),
+            }
+        }
+        // Drop the now-resolved pending calls.
+        let resolved_ids: HashSet<u64> = batch.call_ids.iter().copied().collect();
+        self.pending_calls.retain(|c| !resolved_ids.contains(&c.id));
+        self.push(Value::Array(array))?;
+        self.execute()
+    }
+
+    /// Await a `Promise.all` batch. If any element is an unresolved deferred
+    /// call, suspend once with the whole batch so the host can run the calls in
+    /// parallel; otherwise build and push the result array inline.
+    fn await_batch(&mut self, items: Vec<Value>) -> Result<Option<VmState>> {
+        let mut call_ids = Vec::new();
+        for item in &items {
+            if let Value::Pending(id) = item {
+                if !self.resolved.contains_key(id) {
+                    call_ids.push(*id);
+                }
+            }
+        }
+
+        if call_ids.is_empty() {
+            let mut array = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Value::Pending(id) => {
+                        array.push(self.resolved.remove(&id).unwrap_or(Value::Undefined))
+                    }
+                    other => array.push(other),
+                }
+            }
+            self.push(Value::Array(array))?;
+            return Ok(None);
+        }
+
+        // Present the calls to the host in element order.
+        let mut calls = Vec::with_capacity(call_ids.len());
+        for id in &call_ids {
+            let pc = self
+                .pending_calls
+                .iter()
+                .find(|c| c.id == *id)
+                .ok_or_else(|| {
+                    ZapcodeError::RuntimeError(format!("unknown pending call {}", id))
+                })?;
+            calls.push(ExternalCall {
+                name: pc.name.clone(),
+                args: pc.args.clone(),
+            });
+        }
+
+        self.pending_batch = Some(PendingBatch { items, call_ids });
+        let snapshot = ZapcodeSnapshot::capture(self)?;
+        Ok(Some(VmState::SuspendedMany { calls, snapshot }))
+    }
+
     fn push(&mut self, value: Value) -> Result<()> {
         self.tracker.track_allocation(&self.limits)?;
         self.stack.push(value);
         Ok(())
+    }
+
+    fn write_receiver_source(&mut self, source: &ReceiverSource, value: Value) {
+        match source {
+            ReceiverSource::Global(name) => {
+                self.globals.insert(name.clone(), value);
+            }
+            ReceiverSource::Local { frame_index, slot } => {
+                if let Some(target_frame) = self.frames.get_mut(*frame_index) {
+                    while target_frame.locals.len() <= *slot {
+                        target_frame.locals.push(Value::Undefined);
+                    }
+                    target_frame.locals[*slot] = value;
+                }
+            }
+        }
     }
 
     fn pop(&mut self) -> Result<Value> {
@@ -221,11 +433,28 @@ impl Vm {
             .expect("internal error: no active frame")
     }
 
+    fn program(&self, program_index: usize) -> &CompiledProgram {
+        self.programs
+            .get(program_index)
+            .expect("internal error: invalid program index")
+    }
+
+    fn current_program(&self) -> &CompiledProgram {
+        self.program(self.current_frame().program_index)
+    }
+
+    fn current_function(&self, func_ref: FunctionRef) -> &crate::compiler::CompiledFunction {
+        self.program(func_ref.program_id)
+            .functions
+            .get(func_ref.function_id)
+            .expect("internal error: invalid function reference")
+    }
+
     #[allow(dead_code)]
     fn instructions(&self) -> &[Instruction] {
         match self.current_frame().func_index {
-            Some(idx) => &self.program.functions[idx].instructions,
-            None => &self.program.instructions,
+            Some(idx) => &self.current_program().functions[idx].instructions,
+            None => &self.current_program().instructions,
         }
     }
 
@@ -272,7 +501,7 @@ impl Vm {
             }
         }
 
-        let func = &self.program.functions[closure.func_id.0];
+        let func = self.current_function(closure.func_ref);
         let locals = Self::bind_params(&func.params, args, func.local_count);
 
         // If this is a method call (has this_value from a receiver), transfer
@@ -285,7 +514,8 @@ impl Vm {
         };
 
         self.frames.push(CallFrame {
-            func_index: Some(closure.func_id.0),
+            program_index: closure.func_ref.program_id,
+            func_index: Some(closure.func_ref.function_id),
             ip: 0,
             locals,
             stack_base: self.stack.len(),
@@ -296,10 +526,15 @@ impl Vm {
     }
 
     fn run(&mut self) -> Result<VmState> {
+        self.run_program(0)
+    }
+
+    pub(crate) fn run_program(&mut self, program_index: usize) -> Result<VmState> {
         self.tracker.start();
 
         // Set up top-level frame
         self.frames.push(CallFrame {
+            program_index,
             func_index: None,
             ip: 0,
             locals: Vec::new(),
@@ -318,8 +553,8 @@ impl Vm {
 
             let frame = self.frames.last().unwrap();
             let instructions = match frame.func_index {
-                Some(idx) => &self.program.functions[idx].instructions,
-                None => &self.program.instructions,
+                Some(idx) => &self.program(frame.program_index).functions[idx].instructions,
+                None => &self.program(frame.program_index).instructions,
             };
 
             if frame.ip >= instructions.len() {
@@ -549,8 +784,8 @@ impl Vm {
 
             let frame = self.frames.last().unwrap();
             let instructions = match frame.func_index {
-                Some(idx) => &self.program.functions[idx].instructions,
-                None => &self.program.instructions,
+                Some(idx) => &self.program(frame.program_index).functions[idx].instructions,
+                None => &self.program(frame.program_index).instructions,
             };
 
             if frame.ip >= instructions.len() {
@@ -578,7 +813,7 @@ impl Vm {
                     // This shouldn't happen inside a callback but handle gracefully.
                     return Ok(val);
                 }
-                Ok(Some(VmState::Suspended { .. })) => {
+                Ok(Some(VmState::Suspended { .. })) | Ok(Some(VmState::SuspendedMany { .. })) => {
                     return Err(ZapcodeError::RuntimeError(
                         "cannot suspend inside array callback".to_string(),
                     ));
@@ -624,9 +859,7 @@ impl Vm {
     /// Check if a callback value is an async function that might suspend.
     fn is_async_callback(&self, callback: &Value) -> bool {
         if let Value::Function(closure) = callback {
-            if let Some(func) = self.program.functions.get(closure.func_id.0) {
-                return func.is_async;
-            }
+            return self.current_function(closure.func_ref).is_async;
         }
         false
     }
@@ -943,13 +1176,16 @@ impl Vm {
                 self.globals.insert(name.clone(), val.clone());
             }
         }
-        let func_idx = gen_obj.func_id.0;
+        let func_ref = gen_obj.func_ref;
         match gen_obj.suspended.take() {
             None => {
-                let func = &self.program.functions[func_idx];
+                let (params, local_count) = {
+                    let func = self.current_function(func_ref);
+                    (func.params.clone(), func.local_count)
+                };
                 self.tracker.push_frame();
-                let mut locals = Vec::with_capacity(func.local_count);
-                for param in func.params.iter() {
+                let mut locals = Vec::with_capacity(local_count);
+                for param in params.iter() {
                     match param {
                         ParamPattern::Ident(name) => {
                             let val = gen_obj
@@ -976,7 +1212,8 @@ impl Vm {
                 }
                 let stack_base = self.stack.len();
                 self.frames.push(CallFrame {
-                    func_index: Some(func_idx),
+                    program_index: func_ref.program_id,
+                    func_index: Some(func_ref.function_id),
                     ip: 0,
                     locals,
                     stack_base,
@@ -993,7 +1230,8 @@ impl Vm {
                 }
                 self.push(arg)?;
                 self.frames.push(CallFrame {
-                    func_index: Some(func_idx),
+                    program_index: func_ref.program_id,
+                    func_index: Some(func_ref.function_id),
                     ip: suspended.ip,
                     locals: suspended.locals,
                     stack_base,
@@ -1033,8 +1271,8 @@ impl Vm {
             self.tracker.check_time(&self.limits)?;
             let frame = self.frames.last().unwrap();
             let instructions = match frame.func_index {
-                Some(idx) => &self.program.functions[idx].instructions,
-                None => &self.program.instructions,
+                Some(idx) => &self.program(frame.program_index).functions[idx].instructions,
+                None => &self.program(frame.program_index).instructions,
             };
             if frame.ip >= instructions.len() {
                 if self.frames.len() > target_frame_depth + 1 {
@@ -1089,7 +1327,7 @@ impl Vm {
             let result = self.dispatch(instr);
             match result {
                 Ok(Some(VmState::Complete(val))) => return Ok(val),
-                Ok(Some(VmState::Suspended { .. })) => {
+                Ok(Some(VmState::Suspended { .. })) | Ok(Some(VmState::SuspendedMany { .. })) => {
                     return Err(ZapcodeError::RuntimeError(
                         "cannot suspend inside a generator".to_string(),
                     ));
@@ -1394,6 +1632,19 @@ impl Vm {
                 }
                 self.push(Value::Object(obj))?;
             }
+            Instruction::ObjectRest(excluded) => {
+                let source = self.pop()?;
+                let rest = match source {
+                    Value::Object(map) => map
+                        .into_iter()
+                        .filter(|(key, _)| {
+                            !excluded.iter().any(|excluded| excluded == key.as_ref())
+                        })
+                        .collect(),
+                    _ => IndexMap::new(),
+                };
+                self.push(Value::Object(rest))?;
+            }
             Instruction::GetProperty(name) => {
                 let obj = self.pop()?;
                 let result = self.get_property(&obj, &name)?;
@@ -1539,9 +1790,9 @@ impl Vm {
                 // Capture all locals from all active frames using local_names
                 for frame in &self.frames {
                     let local_names = if let Some(fidx) = frame.func_index {
-                        &self.program.functions[fidx].local_names
+                        &self.program(frame.program_index).functions[fidx].local_names
                     } else {
-                        &self.program.local_names
+                        &self.program(frame.program_index).local_names
                     };
                     for (i, val) in frame.locals.iter().enumerate() {
                         if let Some(name) = local_names.get(i) {
@@ -1550,14 +1801,16 @@ impl Vm {
                     }
                 }
                 // Also capture all globals that are user-defined (not builtins)
-                let builtins = ["console", "Math", "JSON", "Object", "Array"];
                 for (name, val) in &self.globals {
-                    if !builtins.contains(&name.as_str()) {
+                    if !Self::BUILTIN_GLOBAL_NAMES.contains(&name.as_str()) {
                         captured.push((name.clone(), val.clone()));
                     }
                 }
                 let closure = Closure {
-                    func_id: FunctionId(func_idx),
+                    func_ref: FunctionRef {
+                        program_id: self.current_frame().program_index,
+                        function_id: func_idx,
+                    },
                     captured,
                 };
                 self.push(Value::Function(closure))?;
@@ -1572,12 +1825,13 @@ impl Vm {
                 let callee = self.pop()?;
                 match callee {
                     Value::Function(closure) => {
-                        let func_idx = closure.func_id.0;
-                        let is_generator = self.program.functions[func_idx].is_generator;
+                        let func_ref = closure.func_ref;
+                        let function = self.current_function(func_ref);
+                        let is_generator = function.is_generator;
 
                         // Generator function: create a Generator object instead of running
                         if is_generator {
-                            let params = self.program.functions[func_idx].params.clone();
+                            let params = function.params.clone();
                             let gen_id = self.alloc_generator_id();
                             // Capture args as named params so generator_next can restore them
                             let mut captured = closure.captured.clone();
@@ -1598,7 +1852,7 @@ impl Vm {
                             }
                             let gen_obj = GeneratorObject {
                                 id: gen_id,
-                                func_id: closure.func_id,
+                                func_ref,
                                 captured,
                                 suspended: None,
                                 done: false,
@@ -1624,8 +1878,10 @@ impl Vm {
                         let result = match object_name.as_ref() {
                             "__array__" => {
                                 if let Some(Value::Array(arr)) = &receiver {
+                                    let receiver_update =
+                                        mutated_array_receiver(&method_name, arr, &args);
                                     // Check if this is a callback method first
-                                    match method_name.as_ref() {
+                                    let result = match method_name.as_ref() {
                                         "map" | "filter" | "forEach" | "find" | "findIndex"
                                         | "every" | "some" | "reduce" | "sort" | "flatMap" => {
                                             match self.execute_array_callback_method(
@@ -1648,7 +1904,13 @@ impl Vm {
                                             &args,
                                             &mut self.stdout,
                                         )?,
+                                    };
+                                    if let (Some(source), Some(updated)) =
+                                        (self.last_receiver_source.clone(), receiver_update)
+                                    {
+                                        self.write_receiver_source(&source, Value::Array(updated));
                                     }
+                                    result
                                 } else {
                                     None
                                 }
@@ -1715,6 +1977,32 @@ impl Vm {
                                     None
                                 }
                             }
+                            "__map__" => {
+                                if let Some(Value::Object(map)) = receiver {
+                                    let (result, updated) =
+                                        execute_map_method(map, &method_name, &args);
+                                    if let (Some(source), Some(updated)) =
+                                        (self.last_receiver_source.clone(), updated)
+                                    {
+                                        self.write_receiver_source(&source, Value::Object(updated));
+                                    }
+                                    result
+                                } else {
+                                    None
+                                }
+                            }
+                            "__date__" => {
+                                if let Some(Value::Object(date)) = receiver {
+                                    execute_date_method(&date, &method_name)
+                                } else {
+                                    None
+                                }
+                            }
+                            // Math.random is stateful — served by the VM's
+                            // deterministic PRNG rather than the stateless builtin.
+                            "Math" if method_name.as_ref() == "random" => {
+                                Some(Value::Float(self.next_random()))
+                            }
                             global_name => builtins::call_global_method(
                                 global_name,
                                 &method_name,
@@ -1765,19 +2053,7 @@ impl Vm {
                     // value-type semantics work correctly for method calls
                     // that mutate `this` properties (e.g., this.count += 1).
                     if let Some(ref source) = frame.receiver_source {
-                        match source {
-                            ReceiverSource::Global(name) => {
-                                self.globals.insert(name.clone(), this_val.clone());
-                            }
-                            ReceiverSource::Local { frame_index, slot } => {
-                                if let Some(target_frame) = self.frames.get_mut(*frame_index) {
-                                    while target_frame.locals.len() <= *slot {
-                                        target_frame.locals.push(Value::Undefined);
-                                    }
-                                    target_frame.locals[*slot] = this_val.clone();
-                                }
-                            }
-                        }
+                        self.write_receiver_source(source, this_val.clone());
                     }
                     if matches!(return_val, Value::Undefined) {
                         this_val.clone()
@@ -1807,6 +2083,34 @@ impl Vm {
                     args,
                     snapshot,
                 }));
+            }
+            Instruction::CallExternalDeferred(name, arg_count) => {
+                if !self.external_functions.contains(&name) {
+                    return Err(ZapcodeError::UnknownExternalFunction(name));
+                }
+                let mut args = Vec::with_capacity(arg_count);
+                for _ in 0..arg_count {
+                    args.push(self.pop()?);
+                }
+                args.reverse();
+                let id = self.next_call_id;
+                self.next_call_id += 1;
+                self.pending_calls
+                    .push(PendingExternalCall { id, name, args });
+                self.push(Value::Pending(id))?;
+            }
+            Instruction::MakeBatchPromise(n) => {
+                let mut items = Vec::with_capacity(n);
+                for _ in 0..n {
+                    items.push(self.pop()?);
+                }
+                items.reverse();
+                // Mark as a pending-all batch promise; the await resolves it.
+                let mut obj = IndexMap::new();
+                obj.insert(Arc::from("__promise__"), Value::Bool(true));
+                obj.insert(Arc::from("status"), Value::String(Arc::from("pending_all")));
+                obj.insert(Arc::from("items"), Value::Array(items));
+                self.push(Value::Object(obj))?;
             }
 
             // Control flow
@@ -2106,6 +2410,13 @@ impl Vm {
                 // If resolved, unwrap its value. If rejected, throw its reason.
                 // If it's a regular (non-promise) value, leave it as-is.
                 let val = self.pop()?;
+                if matches!(val, Value::Pending(_)) {
+                    // A deferred call only ever lives inside a Promise.all batch;
+                    // awaiting one bare is a compiler invariant violation.
+                    return Err(ZapcodeError::RuntimeError(
+                        "internal error: awaited a deferred call outside Promise.all".to_string(),
+                    ));
+                }
                 if builtins::is_promise(&val) {
                     if let Value::Object(map) = &val {
                         let status = map.get("status").cloned().unwrap_or(Value::Undefined);
@@ -2120,6 +2431,15 @@ impl Vm {
                                     "Unhandled promise rejection: {}",
                                     reason.to_js_string()
                                 )));
+                            }
+                            Value::String(s) if s.as_ref() == "pending_all" => {
+                                let items = match map.get("items") {
+                                    Some(Value::Array(a)) => a.clone(),
+                                    _ => Vec::new(),
+                                };
+                                // Suspend on the whole batch (or resolve inline if
+                                // every element is already available).
+                                return self.await_batch(items);
                             }
                             _ => {
                                 // Unknown status — pass through
@@ -2215,6 +2535,24 @@ impl Vm {
                 args.reverse();
 
                 let callee = self.pop()?;
+
+                if let Value::Object(obj) = &callee {
+                    if let Some(Value::String(name)) = obj.get("__builtin_constructor__") {
+                        match name.as_ref() {
+                            "Map" => {
+                                self.push(make_map_object(Vec::new()))?;
+                                return Ok(None);
+                            }
+                            "Date" => {
+                                let millis =
+                                    args.first().map_or(0, |value| value.to_number() as i64);
+                                self.push(make_date_object(millis))?;
+                                return Ok(None);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
 
                 match &callee {
                     Value::Object(class_obj) if class_obj.contains_key("__class_name__") => {
@@ -2355,10 +2693,21 @@ impl Vm {
                         method_name: Arc::from(name),
                     });
                 }
+                if is_map_object(obj) && is_map_method(name) {
+                    return Ok(Value::BuiltinMethod {
+                        object_name: Arc::from("__map__"),
+                        method_name: Arc::from(name),
+                    });
+                }
+                if is_date_object(obj) && is_date_method(name) {
+                    return Ok(Value::BuiltinMethod {
+                        object_name: Arc::from("__date__"),
+                        method_name: Arc::from(name),
+                    });
+                }
                 // Check if this is a known global object — return builtin method handle
                 if let Some(global_name) = &self.last_global_name {
-                    let known_globals = ["console", "Math", "JSON", "Object", "Array", "Promise"];
-                    if known_globals.contains(&global_name.as_str()) {
+                    if Self::BUILTIN_GLOBAL_NAMES.contains(&global_name.as_str()) {
                         return Ok(Value::BuiltinMethod {
                             object_name: Arc::from(global_name.as_str()),
                             method_name: Arc::from(name),
@@ -2403,6 +2752,223 @@ impl Vm {
 
 // Re-export for the ParamPattern type used in function calls
 use crate::parser::ir::ParamPattern;
+
+fn mutated_array_receiver(method: &str, arr: &[Value], args: &[Value]) -> Option<Vec<Value>> {
+    match method {
+        "push" => {
+            let mut updated = arr.to_vec();
+            updated.extend(args.iter().cloned());
+            Some(updated)
+        }
+        "pop" => {
+            let mut updated = arr.to_vec();
+            updated.pop();
+            Some(updated)
+        }
+        "shift" => {
+            let mut updated = arr.to_vec();
+            if !updated.is_empty() {
+                updated.remove(0);
+            }
+            Some(updated)
+        }
+        "unshift" => {
+            let mut updated = args.to_vec();
+            updated.extend_from_slice(arr);
+            Some(updated)
+        }
+        "reverse" => {
+            let mut updated = arr.to_vec();
+            updated.reverse();
+            Some(updated)
+        }
+        "fill" => {
+            let fill_val = args.first().cloned().unwrap_or(Value::Undefined);
+            let len = arr.len() as i64;
+            let start = if args.len() > 1 {
+                normalize_array_index(args[1].to_number() as i64, len)
+            } else {
+                0
+            };
+            let end = if args.len() > 2 {
+                normalize_array_index(args[2].to_number() as i64, len)
+            } else {
+                arr.len()
+            };
+            let mut updated = arr.to_vec();
+            for item in updated.iter_mut().take(end.min(arr.len())).skip(start) {
+                *item = fill_val.clone();
+            }
+            Some(updated)
+        }
+        "splice" => {
+            let len = arr.len() as i64;
+            let raw_start = args.first().map_or(0, |value| value.to_number() as i64);
+            let start = if raw_start < 0 {
+                (len + raw_start).max(0) as usize
+            } else {
+                (raw_start as usize).min(arr.len())
+            };
+            let delete_count = if args.len() > 1 {
+                ((args[1].to_number() as i64).max(0) as usize).min(arr.len() - start)
+            } else {
+                arr.len() - start
+            };
+            let mut updated = arr.to_vec();
+            updated.splice(start..start + delete_count, args.iter().skip(2).cloned());
+            Some(updated)
+        }
+        _ => None,
+    }
+}
+
+fn normalize_array_index(idx: i64, len: i64) -> usize {
+    if idx < 0 {
+        (len + idx).max(0) as usize
+    } else {
+        (idx as usize).min(len as usize)
+    }
+}
+
+fn make_map_object(entries: Vec<Value>) -> Value {
+    let mut obj = IndexMap::new();
+    obj.insert(Arc::from("__map__"), Value::Bool(true));
+    obj.insert(Arc::from("__entries__"), Value::Array(entries));
+    Value::Object(obj)
+}
+
+fn is_map_object(value: &Value) -> bool {
+    matches!(value, Value::Object(map) if matches!(map.get("__map__"), Some(Value::Bool(true))))
+}
+
+fn is_map_method(name: &str) -> bool {
+    matches!(name, "get" | "set" | "has" | "delete")
+}
+
+fn execute_map_method(
+    mut map: IndexMap<Arc<str>, Value>,
+    method: &str,
+    args: &[Value],
+) -> (Option<Value>, Option<IndexMap<Arc<str>, Value>>) {
+    let entries = match map.get("__entries__") {
+        Some(Value::Array(entries)) => entries.clone(),
+        _ => Vec::new(),
+    };
+    let key = args.first().cloned().unwrap_or(Value::Undefined);
+
+    match method {
+        "get" => {
+            let value = entries
+                .iter()
+                .find_map(|entry| match entry {
+                    Value::Object(entry)
+                        if entry.get("key").is_some_and(|item| item.strict_eq(&key)) =>
+                    {
+                        entry.get("value").cloned()
+                    }
+                    _ => None,
+                })
+                .unwrap_or(Value::Undefined);
+            (Some(value), None)
+        }
+        "has" => {
+            let has_key = entries.iter().any(|entry| match entry {
+                Value::Object(entry) => entry.get("key").is_some_and(|item| item.strict_eq(&key)),
+                _ => false,
+            });
+            (Some(Value::Bool(has_key)), None)
+        }
+        "set" => {
+            let value = args.get(1).cloned().unwrap_or(Value::Undefined);
+            let mut updated_entries = entries;
+            let mut replaced = false;
+            for entry in &mut updated_entries {
+                if let Value::Object(entry) = entry {
+                    if entry.get("key").is_some_and(|item| item.strict_eq(&key)) {
+                        entry.insert(Arc::from("value"), value.clone());
+                        replaced = true;
+                        break;
+                    }
+                }
+            }
+            if !replaced {
+                let mut entry = IndexMap::new();
+                entry.insert(Arc::from("key"), key);
+                entry.insert(Arc::from("value"), value);
+                updated_entries.push(Value::Object(entry));
+            }
+            map.insert(Arc::from("__entries__"), Value::Array(updated_entries));
+            (Some(Value::Object(map.clone())), Some(map))
+        }
+        "delete" => {
+            let mut updated_entries = entries;
+            let before = updated_entries.len();
+            updated_entries.retain(|entry| match entry {
+                Value::Object(entry) => !entry.get("key").is_some_and(|item| item.strict_eq(&key)),
+                _ => true,
+            });
+            let deleted = updated_entries.len() != before;
+            map.insert(Arc::from("__entries__"), Value::Array(updated_entries));
+            (Some(Value::Bool(deleted)), Some(map))
+        }
+        _ => (None, None),
+    }
+}
+
+fn make_date_object(millis: i64) -> Value {
+    let mut obj = IndexMap::new();
+    obj.insert(Arc::from("__date_ms__"), Value::Int(millis));
+    Value::Object(obj)
+}
+
+fn is_date_object(value: &Value) -> bool {
+    matches!(value, Value::Object(map) if map.contains_key("__date_ms__"))
+}
+
+fn is_date_method(name: &str) -> bool {
+    matches!(name, "toISOString" | "getTime")
+}
+
+fn execute_date_method(map: &IndexMap<Arc<str>, Value>, method: &str) -> Option<Value> {
+    let millis = match map.get("__date_ms__") {
+        Some(Value::Int(millis)) => *millis,
+        Some(Value::Float(millis)) => *millis as i64,
+        _ => 0,
+    };
+    match method {
+        "getTime" => Some(Value::Int(millis)),
+        "toISOString" => Some(Value::String(Arc::from(
+            unix_millis_to_iso(millis).as_str(),
+        ))),
+        _ => None,
+    }
+}
+
+fn unix_millis_to_iso(millis: i64) -> String {
+    let seconds = millis.div_euclid(1000);
+    let ms = millis.rem_euclid(1000);
+    let days = seconds.div_euclid(86_400);
+    let second_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = second_of_day / 3_600;
+    let minute = (second_of_day % 3_600) / 60;
+    let second = second_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{ms:03}Z")
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+    (year, month as u32, day as u32)
+}
 
 fn is_array_method(name: &str) -> bool {
     matches!(
@@ -2566,6 +3132,20 @@ impl ZapcodeRun {
                             trace,
                         });
                     }
+                    VmState::SuspendedMany { calls, .. } => {
+                        let mut span = execute_span;
+                        span.set_attr("zapcode.suspended_on", "Promise.all batch");
+                        span.set_attr("zapcode.args_count", calls.len());
+                        root_span.add_child(span.finish(TraceStatus::Ok));
+                        let trace = ExecutionTrace {
+                            root: root_span.finish_ok(),
+                        };
+                        return Ok(RunResult {
+                            state: s,
+                            stdout: vm.stdout,
+                            trace,
+                        });
+                    }
                 };
                 root_span.add_child(execute_span.finish(status));
                 s
@@ -2606,6 +3186,9 @@ impl ZapcodeRun {
                 "execution suspended on external function '{}' — use run() instead",
                 function_name
             ))),
+            VmState::SuspendedMany { .. } => Err(ZapcodeError::RuntimeError(
+                "execution suspended on a Promise.all batch — use run() instead".to_string(),
+            )),
         }
     }
 }
@@ -2644,5 +3227,8 @@ pub fn eval_ts_with_output(source: &str) -> Result<(Value, String)> {
             "execution suspended on external function '{}'",
             function_name
         ))),
+        VmState::SuspendedMany { .. } => Err(ZapcodeError::RuntimeError(
+            "execution suspended on a Promise.all batch".to_string(),
+        )),
     }
 }

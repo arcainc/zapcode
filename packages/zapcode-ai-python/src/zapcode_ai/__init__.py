@@ -30,11 +30,15 @@ Works with any AI SDK:
 from __future__ import annotations
 
 import json
+import math
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Awaitable
 
-from zapcode import Zapcode, ZapcodeSnapshot
+# Note: the native `zapcode` module is imported lazily inside `_execute_code`,
+# so the system-prompt and argument-validation helpers can be used (and tested)
+# without the compiled extension present.
 
 
 # ---------------------------------------------------------------------------
@@ -120,22 +124,44 @@ class Adapter:
 # System prompt generation
 # ---------------------------------------------------------------------------
 
-def _generate_signature(name: str, defn: ToolDefinition) -> str:
-    params = ", ".join(
+def _param_list(defn: ToolDefinition) -> str:
+    return ", ".join(
         f"{pname}{'?' if pdef.optional else ''}: {pdef.type}"
         for pname, pdef in defn.parameters.items()
     )
-    return f"{name}({params})"
+
+
+def _generate_signature(name: str, defn: ToolDefinition) -> str:
+    return f"{name}({_param_list(defn)})"
+
+
+def _generate_named_object_signature(name: str, defn: ToolDefinition) -> str:
+    return f"{name}({{ {_param_list(defn)} }})"
+
+
+def _generate_declaration(name: str, defn: ToolDefinition) -> str:
+    entries = list(defn.parameters.items())
+    if len(entries) > 1:
+        fields = "; ".join(
+            f"{pname}{'?' if pdef.optional else ''}: {pdef.type}" for pname, pdef in entries
+        )
+        return f"declare function {name}(input: {{ {fields} }}): Promise<unknown>;"
+    return f"declare function {name}({_param_list(defn)}): Promise<unknown>;"
 
 
 def _build_system_prompt(
     tools: dict[str, ToolDefinition],
     user_system: str | None = None,
 ) -> str:
-    tool_docs = "\n".join(
-        f"- await {_generate_signature(name, defn)}\n  {defn.description}"
-        for name, defn in tools.items()
-    )
+    def _doc(name: str, defn: ToolDefinition) -> str:
+        signature = (
+            _generate_named_object_signature(name, defn)
+            if len(defn.parameters) > 1
+            else _generate_signature(name, defn)
+        )
+        return f"- {_generate_declaration(name, defn)}\n  Call shape: await {signature}\n  {defn.description}"
+
+    tool_docs = "\n".join(_doc(name, defn) for name, defn in tools.items())
 
     parts = []
     if user_system:
@@ -152,11 +178,148 @@ Rules:
 - The last expression in your code is the return value.
 - You can use variables, loops, conditionals, array methods, etc.
 - All tool calls must use `await`.
+- Prefer the declared function signatures above exactly. For tools with more than one parameter, call them with one named object argument, e.g. `await toolName({{ key: value }})`.
 - When a tool returns a structured object, access its properties directly instead of reparsing the result as text.
 - If the user's question doesn't need tools, you can compute the answer directly."""
     )
 
     return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Tool name + argument validation (parity with the TS package)
+# ---------------------------------------------------------------------------
+
+_RESERVED_TOOL_NAMES = {
+    "console", "JSON", "Object", "Array", "Math", "Promise", "Map", "Date",
+    "eval", "Function", "process", "globalThis", "global", "require", "execute_code",
+}
+
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
+
+
+def _validate_tool_definitions(tool_defs: dict[str, ToolDefinition]) -> None:
+    for name in tool_defs:
+        if not _IDENTIFIER_RE.match(name):
+            raise ValueError(
+                f"Invalid tool name '{name}': tool names must be valid JavaScript identifiers."
+            )
+        if name in _RESERVED_TOOL_NAMES:
+            raise ValueError(f"Invalid tool name '{name}': this name is reserved by Zapcode.")
+
+
+def _is_plain_object(value: Any) -> bool:
+    return isinstance(value, dict)
+
+
+def _js_type_name(value: Any) -> str:
+    if isinstance(value, list):
+        return "array"
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, dict):
+        return "object"
+    return type(value).__name__
+
+
+def _matches_param_type(value: Any, pdef: ParamDef) -> bool:
+    if pdef.type == "array":
+        return isinstance(value, list)
+    if pdef.type == "object":
+        return _is_plain_object(value)
+    if pdef.type == "number":
+        # bool is an int subclass in Python — exclude it; require a finite number.
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    if pdef.type == "string":
+        return isinstance(value, str)
+    if pdef.type == "boolean":
+        return isinstance(value, bool)
+    return False
+
+
+def _format_tool_signature(name: str, defn: ToolDefinition) -> str:
+    return (
+        _generate_named_object_signature(name, defn)
+        if len(defn.parameters) > 1
+        else _generate_signature(name, defn)
+    )
+
+
+def _should_treat_single_object_arg_as_named(defn: ToolDefinition, arg: dict[str, Any]) -> bool:
+    entries = list(defn.parameters.items())
+    if len(entries) != 1:
+        return False
+    name, param = entries[0]
+    if name not in arg:
+        return False
+    # Non-object single params are unambiguous: foo({ id }) means named input.
+    if param.type != "object":
+        return True
+    # For a single object param, support foo({ payload: {...} }) as named input,
+    # but keep foo({ arbitrary: "shape" }) as the payload value itself.
+    return len(arg) == 1 or any(key not in defn.parameters for key in arg)
+
+
+def _build_named_args(fn_name: str, defn: ToolDefinition, args: list[Any]) -> dict[str, Any]:
+    """Normalize the positional args emitted by guest code into a validated,
+    named argument dict — mirroring the TypeScript package."""
+    param_entries = list(defn.parameters.items())
+    param_names = [name for name, _ in param_entries]
+    single_object_arg = args[0] if len(args) == 1 and _is_plain_object(args[0]) else None
+    uses_named_object = single_object_arg is not None and (
+        len(param_entries) > 1
+        or _should_treat_single_object_arg_as_named(defn, single_object_arg)
+    )
+
+    if len(param_entries) > 1 and not uses_named_object:
+        raise ValueError(
+            f"Invalid arguments for tool '{fn_name}': expected one named object argument. "
+            f"Use {_format_tool_signature(fn_name, defn)}."
+        )
+
+    if uses_named_object:
+        named: dict[str, Any] = dict(single_object_arg)
+    else:
+        named = {param_names[i]: args[i] for i in range(min(len(param_names), len(args)))}
+        extra = len(args) - len(param_names)
+        if extra > 0:
+            raise ValueError(
+                f"Invalid arguments for tool '{fn_name}': received {len(args)} positional "
+                f"arguments but expected {len(param_names)}. Use {_format_tool_signature(fn_name, defn)}."
+            )
+
+    unexpected = [name for name in named if name not in defn.parameters]
+    if unexpected:
+        raise ValueError(
+            f"Invalid arguments for tool '{fn_name}': unexpected parameter '{unexpected[0]}'. "
+            f"Expected {_format_tool_signature(fn_name, defn)}."
+        )
+
+    for pname, pdef in param_entries:
+        value = named.get(pname)
+        # None covers an absent / undefined field (which crosses the boundary as
+        # None). Optional → omit; required → a clear missing-field error.
+        if value is None:
+            if not pdef.optional:
+                raise ValueError(
+                    f"Invalid arguments for tool '{fn_name}': missing required parameter '{pname}'. "
+                    f"Expected {_format_tool_signature(fn_name, defn)}."
+                )
+            named.pop(pname, None)
+            continue
+        if not _matches_param_type(value, pdef):
+            raise ValueError(
+                f"Invalid arguments for tool '{fn_name}': parameter '{pname}' expected "
+                f"{pdef.type}, got {_js_type_name(value)}. Expected {_format_tool_signature(fn_name, defn)}."
+            )
+
+    return named
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +368,7 @@ def _execute_code(
     debug: bool = False,
     auto_fix: bool = False,
 ) -> ExecutionResult:
+    _validate_tool_definitions(tool_defs)
     tool_names = list(tool_defs.keys())
     tool_calls: list[dict[str, Any]] = []
     tracing = debug or auto_fix
@@ -212,6 +376,8 @@ def _execute_code(
     exec_span = _create_span("execute", {"zapcode.code": code}) if tracing else None
 
     try:
+        from zapcode import Zapcode, ZapcodeSnapshot  # native module (lazy)
+
         kwargs: dict[str, Any] = {"external_functions": tool_names}
         if time_limit_ms is not None:
             kwargs["time_limit_ms"] = time_limit_ms
@@ -232,20 +398,28 @@ def _execute_code(
                     f"Available: {', '.join(tool_names)}"
                 )
 
-            # Build named args from positional args
-            param_names = list(tool_def.parameters.keys())
-            named_args = {
-                param_names[i]: args[i]
-                for i in range(min(len(param_names), len(args)))
-            }
-
             tool_span = _create_span("tool_call", {
                 "zapcode.tool.name": fn_name,
                 "zapcode.tool.args": json.dumps(args, default=str),
             }) if tracing else None
 
+            # Validate + normalize into named args (schema-aware, like the TS pkg).
+            try:
+                named_args = _build_named_args(fn_name, tool_def, args)
+            except Exception as err:
+                if tool_span:
+                    tool_span.attributes["zapcode.tool.error"] = str(err)
+                    _end_span(tool_span, "error")
+                    exec_span.children.append(tool_span)
+                raise
+
+            if tool_span:
+                tool_span.attributes["zapcode.tool.input"] = json.dumps(named_args, default=str)
+
             result = tool_def.execute(named_args)
-            tool_calls.append({"name": fn_name, "args": args, "result": result})
+            tool_calls.append(
+                {"name": fn_name, "args": args, "input": named_args, "result": result}
+            )
 
             if tool_span:
                 tool_span.attributes["zapcode.tool.result"] = json.dumps(result, default=str)
@@ -407,6 +581,7 @@ def zapcode(
                 result = b.handle_tool_call(block.input["code"])
                 print(result.output)
     """
+    _validate_tool_definitions(tools)
     system_prompt = _build_system_prompt(tools, system)
     tracing = debug or auto_fix
 
