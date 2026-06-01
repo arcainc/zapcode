@@ -17,9 +17,17 @@ pub fn register_globals(globals: &mut HashMap<String, Value>) {
     globals.insert("Map".to_string(), builtin_constructor("Map"));
     globals.insert("Date".to_string(), builtin_constructor("Date"));
 
-    // Type-conversion functions, callable as bare globals: String(x), Number(x),
-    // Boolean(x). Dispatched by the VM's Call instruction (object "__global_fn__").
-    for name in ["String", "Number", "Boolean"] {
+    // Callable bare globals (type conversions + numeric parsing/predicates),
+    // dispatched by the VM's Call instruction (object marker "__global_fn__").
+    for name in [
+        "String",
+        "Number",
+        "Boolean",
+        "parseInt",
+        "parseFloat",
+        "isNaN",
+        "isFinite",
+    ] {
         globals.insert(name.to_string(), global_fn(name));
     }
 
@@ -73,8 +81,194 @@ fn global_fn(name: &str) -> Value {
             Value::Float(f64::NEG_INFINITY),
         );
         obj.insert(Arc::from("NaN"), Value::Float(f64::NAN));
+        // Static methods (callable): Number.isInteger(x), Number.parseInt(s), …
+        for m in ["isInteger", "isNaN", "isFinite", "parseInt", "parseFloat"] {
+            obj.insert(Arc::from(m), global_fn(&format!("Number.{m}")));
+        }
     }
     Value::Object(obj)
+}
+
+/// Parse the leading integer of a string (JS `parseInt` semantics, base 10 or a
+/// given radix). Returns NaN if no digits lead.
+fn js_parse_int(s: &str, radix: u32) -> f64 {
+    let t = s.trim();
+    let (neg, rest) = match t.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let digits: String = rest.chars().take_while(|c| c.is_digit(radix)).collect();
+    if digits.is_empty() {
+        return f64::NAN;
+    }
+    match i64::from_str_radix(&digits, radix) {
+        Ok(n) => {
+            let n = n as f64;
+            if neg {
+                -n
+            } else {
+                n
+            }
+        }
+        Err(_) => f64::NAN,
+    }
+}
+
+/// Parse the leading float of a string (JS `parseFloat` semantics).
+fn js_parse_float(s: &str) -> f64 {
+    let t = s.trim();
+    // Take the longest valid float prefix.
+    let mut end = 0;
+    let bytes = t.as_bytes();
+    let mut seen_dot = false;
+    let mut seen_e = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        let c = b as char;
+        let ok = c.is_ascii_digit()
+            || (c == '-' || c == '+') && (i == 0 || bytes[i - 1] == b'e' || bytes[i - 1] == b'E')
+            || (c == '.' && !seen_dot && !seen_e)
+            || ((c == 'e' || c == 'E') && !seen_e && i > 0);
+        if !ok {
+            break;
+        }
+        if c == '.' {
+            seen_dot = true;
+        }
+        if c == 'e' || c == 'E' {
+            seen_e = true;
+        }
+        end = i + 1;
+    }
+    t[..end].parse::<f64>().unwrap_or(f64::NAN)
+}
+
+fn finite_number(n: f64) -> Value {
+    if n.is_finite() && n.fract() == 0.0 {
+        Value::Int(n as i64)
+    } else {
+        Value::Float(n)
+    }
+}
+
+pub fn is_number_method(name: &str) -> bool {
+    matches!(name, "toFixed" | "toString" | "toPrecision" | "valueOf")
+}
+
+/// Methods on number primitives: `(3.14159).toFixed(2)`, `(255).toString(16)`, …
+pub fn call_number_method(n: f64, method: &str, args: &[Value]) -> Result<Option<Value>> {
+    let result = match method {
+        "toFixed" => {
+            let digits = match args.first() {
+                Some(v) => v.to_number().clamp(0.0, 100.0) as usize,
+                None => 0,
+            };
+            Value::String(Arc::from(format!("{:.*}", digits, n).as_str()))
+        }
+        "toPrecision" => match args.first() {
+            None => Value::String(Arc::from(format_number(n).as_str())),
+            Some(v) => {
+                let p = (v.to_number() as usize).clamp(1, 100);
+                Value::String(Arc::from(
+                    format!("{:.*e}", p.saturating_sub(1), n).as_str(),
+                ))
+            }
+        },
+        "toString" => {
+            let radix = match args.first() {
+                Some(v) => v.to_number() as u32,
+                None => 10,
+            };
+            if radix == 10 || !(2..=36).contains(&radix) {
+                Value::String(Arc::from(format_number(n).as_str()))
+            } else {
+                // Integer radix conversion (JS only does integer part for non-10 here).
+                let mut i = n.trunc() as i64;
+                if i == 0 {
+                    Value::String(Arc::from("0"))
+                } else {
+                    let neg = i < 0;
+                    i = i.abs();
+                    let mut digits = Vec::new();
+                    while i > 0 {
+                        let d = (i % radix as i64) as u32;
+                        digits.push(std::char::from_digit(d, radix).unwrap());
+                        i /= radix as i64;
+                    }
+                    if neg {
+                        digits.push('-');
+                    }
+                    let s: String = digits.into_iter().rev().collect();
+                    Value::String(Arc::from(s.as_str()))
+                }
+            }
+        }
+        "valueOf" => finite_number(n),
+        _ => return Ok(None),
+    };
+    Ok(Some(result))
+}
+
+/// Format a number the way the VM's `to_js_string` does (no trailing `.0`).
+fn format_number(n: f64) -> String {
+    if n.is_nan() {
+        "NaN".to_string()
+    } else if n.is_infinite() {
+        if n > 0.0 {
+            "Infinity".to_string()
+        } else {
+            "-Infinity".to_string()
+        }
+    } else if n.fract() == 0.0 && n.abs() < 1e15 {
+        (n as i64).to_string()
+    } else {
+        n.to_string()
+    }
+}
+
+/// Dispatch a callable bare global / Number static (see `global_fn`).
+pub fn call_global_fn(kind: &str, args: &[Value]) -> Result<Value> {
+    let arg = args.first().cloned().unwrap_or(Value::Undefined);
+    Ok(match kind {
+        "String" => Value::String(Arc::from(arg.to_js_string().as_str())),
+        "Number" => finite_number(arg.to_number()),
+        "Boolean" => Value::Bool(arg.is_truthy()),
+        "parseInt" | "Number.parseInt" => {
+            let radix = match args.get(1) {
+                Some(Value::Int(r)) if (2..=36).contains(r) => *r as u32,
+                Some(Value::Float(r)) if (2.0..=36.0).contains(r) => *r as u32,
+                _ => 10,
+            };
+            let s = match &arg {
+                Value::String(s) => s.to_string(),
+                other => other.to_js_string(),
+            };
+            Value::Float(js_parse_int(&s, radix))
+        }
+        "parseFloat" | "Number.parseFloat" => {
+            let s = match &arg {
+                Value::String(s) => s.to_string(),
+                other => other.to_js_string(),
+            };
+            Value::Float(js_parse_float(&s))
+        }
+        "isNaN" => Value::Bool(arg.to_number().is_nan()),
+        "isFinite" => Value::Bool(arg.to_number().is_finite()),
+        "Number.isNaN" => Value::Bool(matches!(arg, Value::Float(n) if n.is_nan())),
+        "Number.isFinite" => Value::Bool(
+            matches!(arg, Value::Int(_)) || matches!(arg, Value::Float(n) if n.is_finite()),
+        ),
+        "Number.isInteger" => Value::Bool(match arg {
+            Value::Int(_) => true,
+            Value::Float(n) => n.is_finite() && n.fract() == 0.0,
+            _ => false,
+        }),
+        other => {
+            return Err(ZapcodeError::TypeError(format!(
+                "{} is not a function",
+                other
+            )))
+        }
+    })
 }
 
 /// Execute a built-in method call. Returns Some(value) if handled, None if not a builtin.
@@ -823,6 +1017,24 @@ fn call_object_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
                 }
             }
             Ok(Some(Value::Object(target)))
+        }
+        "fromEntries" => {
+            // Object.fromEntries([[k, v], ...]) — inverse of Object.entries.
+            let mut obj = IndexMap::new();
+            if let Some(Value::Array(pairs)) = args.first() {
+                for pair in pairs {
+                    if let Value::Array(kv) = pair {
+                        let key = kv.first().cloned().unwrap_or(Value::Undefined);
+                        let val = kv.get(1).cloned().unwrap_or(Value::Undefined);
+                        let key: Arc<str> = match key {
+                            Value::String(s) => s,
+                            other => Arc::from(other.to_js_string().as_str()),
+                        };
+                        obj.insert(key, val);
+                    }
+                }
+            }
+            Ok(Some(Value::Object(obj)))
         }
         "freeze" | "seal" => {
             // No-op in sandbox — return object as-is

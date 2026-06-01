@@ -206,8 +206,21 @@ impl Vm {
 
     /// Names of all builtin globals registered by `register_globals`.
     pub(crate) const BUILTIN_GLOBAL_NAMES: &'static [&'static str] = &[
-        "console", "JSON", "Object", "Array", "Math", "Promise", "Map", "Date", "String", "Number",
+        "console",
+        "JSON",
+        "Object",
+        "Array",
+        "Math",
+        "Promise",
+        "Map",
+        "Date",
+        "String",
+        "Number",
         "Boolean",
+        "parseInt",
+        "parseFloat",
+        "isNaN",
+        "isFinite",
     ];
 
     /// Restore a VM from snapshot state and continue execution.
@@ -2045,6 +2058,11 @@ impl Vm {
                                     None
                                 }
                             }
+                            "__number__" => {
+                                let n =
+                                    receiver.as_ref().map(|v| v.to_number()).unwrap_or(f64::NAN);
+                                builtins::call_number_method(n, &method_name, &args)?
+                            }
                             "__generator__" => {
                                 if let Some(Value::Generator(gen_obj)) = receiver {
                                     match method_name.as_ref() {
@@ -2145,25 +2163,7 @@ impl Vm {
                             Some(Value::String(s)) => s.clone(),
                             _ => Arc::from(""),
                         };
-                        let arg = args.into_iter().next().unwrap_or(Value::Undefined);
-                        let value = match kind.as_ref() {
-                            "String" => Value::String(Arc::from(arg.to_js_string().as_str())),
-                            "Number" => {
-                                let n = arg.to_number();
-                                if n.is_finite() && n.fract() == 0.0 {
-                                    Value::Int(n as i64)
-                                } else {
-                                    Value::Float(n)
-                                }
-                            }
-                            "Boolean" => Value::Bool(arg.is_truthy()),
-                            other => {
-                                return Err(ZapcodeError::TypeError(format!(
-                                    "{} is not a function",
-                                    other
-                                )))
-                            }
-                        };
+                        let value = builtins::call_global_fn(kind.as_ref(), &args)?;
                         self.push(value)?;
                     }
                     _ => {
@@ -2894,6 +2894,12 @@ impl Vm {
                 }),
                 _ => Ok(Value::Undefined),
             },
+            Value::Int(_) | Value::Float(_) if builtins::is_number_method(name) => {
+                Ok(Value::BuiltinMethod {
+                    object_name: Arc::from("__number__"),
+                    method_name: Arc::from(name),
+                })
+            }
             _ => Ok(Value::Undefined),
         }
     }
