@@ -145,7 +145,7 @@ impl ZapcodeSnapshot {
             .map_err(|e| ZapcodeError::SnapshotError(format!("dump failed: {}", e)))?;
         // Guard against unbounded serialized state — a runaway session shouldn't
         // produce a snapshot too large to pass between activities.
-        crate::wire::check_state_size(payload.len(), self.snapshot.limits.memory_limit_bytes)?;
+        crate::wire::check_state_size(payload.len(), self.snapshot.limits.max_snapshot_bytes)?;
         Ok(crate::wire::encode_frame(FrameKind::Snapshot, &payload))
     }
 

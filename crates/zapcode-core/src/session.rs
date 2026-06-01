@@ -132,14 +132,14 @@ impl ZapcodeSessionSnapshot {
     pub fn dump(&self) -> Result<Vec<u8>> {
         let payload = postcard::to_allocvec(self)
             .map_err(|e| ZapcodeError::SnapshotError(format!("dump failed: {}", e)))?;
-        crate::wire::check_state_size(payload.len(), self.memory_limit_bytes())?;
+        crate::wire::check_state_size(payload.len(), self.max_snapshot_bytes())?;
         Ok(crate::wire::encode_frame(FrameKind::Session, &payload))
     }
 
-    fn memory_limit_bytes(&self) -> usize {
+    fn max_snapshot_bytes(&self) -> usize {
         match &self.data {
-            SessionSnapshotData::Idle(idle) => idle.limits.memory_limit_bytes,
-            SessionSnapshotData::Suspended(s) => s.vm.limits.memory_limit_bytes,
+            SessionSnapshotData::Idle(idle) => idle.limits.max_snapshot_bytes,
+            SessionSnapshotData::Suspended(s) => s.vm.limits.max_snapshot_bytes,
         }
     }
 

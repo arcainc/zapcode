@@ -43,9 +43,9 @@ fn allocation_budget_accumulates_across_chunks() {
 
 #[test]
 fn dump_rejects_oversized_state() {
-    // A tiny memory budget makes even normal state too large to persist.
+    // A tiny snapshot cap makes even normal state too large to persist.
     let limits = ResourceLimits {
-        memory_limit_bytes: 16,
+        max_snapshot_bytes: 16,
         ..ResourceLimits::default()
     };
     let session = ZapcodeSessionSnapshot::new(Vec::new(), limits).unwrap();

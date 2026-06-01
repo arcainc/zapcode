@@ -6,6 +6,16 @@ pub struct ResourceLimits {
     pub time_limit_ms: u64,
     pub max_stack_depth: usize,
     pub max_allocations: usize,
+    /// Max size of a serialized snapshot/session. A runaway-growth backstop,
+    /// kept separate from (and far larger than) `memory_limit_bytes`: callers
+    /// typically persist a snapshot to blob/DB storage and pass a pointer
+    /// around, so the practical ceiling is generous.
+    #[serde(default = "default_max_snapshot_bytes")]
+    pub max_snapshot_bytes: usize,
+}
+
+fn default_max_snapshot_bytes() -> usize {
+    256 * 1024 * 1024 // 256MB
 }
 
 impl Default for ResourceLimits {
@@ -15,6 +25,7 @@ impl Default for ResourceLimits {
             time_limit_ms: 5000,                  // 5s
             max_stack_depth: 512,
             max_allocations: 100_000,
+            max_snapshot_bytes: default_max_snapshot_bytes(),
         }
     }
 }
