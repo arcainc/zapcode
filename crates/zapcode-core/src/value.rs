@@ -220,6 +220,36 @@ impl Value {
             _ => false,
         }
     }
+
+    /// JS abstract (loose) equality (`==`). Performs type coercion between
+    /// numbers, strings, and booleans; `null`/`undefined` are loosely equal to
+    /// each other and to nothing else. Object/array operands fall back to
+    /// reference equality (no `toPrimitive` coercion).
+    pub fn loose_eq(&self, other: &Value) -> bool {
+        match (self, other) {
+            // null and undefined are loosely equal to each other only.
+            (Value::Null | Value::Undefined, Value::Null | Value::Undefined) => true,
+            (Value::Null | Value::Undefined, _) | (_, Value::Null | Value::Undefined) => false,
+            // Same-type primitives.
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::String(a), Value::String(b)) => a == b,
+            (Value::Int(_) | Value::Float(_), Value::Int(_) | Value::Float(_)) => {
+                self.strict_eq(other)
+            }
+            // number == string: compare numerically (NaN never equal).
+            (Value::Int(_) | Value::Float(_), Value::String(_))
+            | (Value::String(_), Value::Int(_) | Value::Float(_)) => {
+                let a = self.to_number();
+                let b = other.to_number();
+                !a.is_nan() && !b.is_nan() && a == b
+            }
+            // boolean coerces to number, then compare.
+            (Value::Bool(_), _) => Value::Float(self.to_number()).loose_eq(other),
+            (_, Value::Bool(_)) => self.loose_eq(&Value::Float(other.to_number())),
+            // Arrays/objects: reference equality only.
+            _ => self.strict_eq(other),
+        }
+    }
 }
 
 impl fmt::Display for Value {

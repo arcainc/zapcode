@@ -1686,12 +1686,22 @@ impl Vm {
             }
 
             // Comparison
-            Instruction::Eq | Instruction::StrictEq => {
+            Instruction::Eq => {
+                let right = self.pop()?;
+                let left = self.pop()?;
+                self.push(Value::Bool(left.loose_eq(&right)))?;
+            }
+            Instruction::StrictEq => {
                 let right = self.pop()?;
                 let left = self.pop()?;
                 self.push(Value::Bool(left.strict_eq(&right)))?;
             }
-            Instruction::Neq | Instruction::StrictNeq => {
+            Instruction::Neq => {
+                let right = self.pop()?;
+                let left = self.pop()?;
+                self.push(Value::Bool(!left.loose_eq(&right)))?;
+            }
+            Instruction::StrictNeq => {
                 let right = self.pop()?;
                 let left = self.pop()?;
                 self.push(Value::Bool(!left.strict_eq(&right)))?;

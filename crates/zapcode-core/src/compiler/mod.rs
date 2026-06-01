@@ -1079,16 +1079,21 @@ impl Compiler {
                     self.patch_jump(skip, end);
                 }
                 LogicalOp::NullishCoalescing => {
+                    // JumpIfNullish peeks (does not pop), so both branches must
+                    // explicitly clear the duplicate to leave exactly one value.
                     self.compile_expr(left)?;
                     self.emit(Instruction::Dup);
-                    let skip = self.emit(Instruction::JumpIfNullish(0));
-                    let jump_end = self.emit(Instruction::Jump(0));
-                    let nullish_target = self.current_offset();
-                    self.patch_jump(skip, nullish_target);
+                    let to_right = self.emit(Instruction::JumpIfNullish(0));
+                    // Not nullish: keep the left value.
+                    self.emit(Instruction::Pop);
+                    let end = self.emit(Instruction::Jump(0));
+                    let right_target = self.current_offset();
+                    self.patch_jump(to_right, right_target);
+                    self.emit(Instruction::Pop);
                     self.emit(Instruction::Pop);
                     self.compile_expr(right)?;
-                    let end = self.current_offset();
-                    self.patch_jump(jump_end, end);
+                    let after = self.current_offset();
+                    self.patch_jump(end, after);
                 }
             },
             Expr::Conditional {
@@ -1112,6 +1117,46 @@ impl Compiler {
                         self.compile_expr(value)?;
                         self.emit(Instruction::Dup);
                         self.compile_store(target)?;
+                    }
+                    // Logical assignments short-circuit: the right-hand side is
+                    // only evaluated (and stored) when the current value fails the
+                    // keep condition. `a ||= b` / `a &&= b` test truthiness;
+                    // `a ??= b` tests nullishness.
+                    AssignOp::OrAssign | AssignOp::AndAssign => {
+                        self.compile_expr(target)?;
+                        self.emit(Instruction::Dup);
+                        let assign_b = match op {
+                            AssignOp::OrAssign => self.emit(Instruction::JumpIfFalse(0)),
+                            _ => self.emit(Instruction::JumpIfTrue(0)),
+                        };
+                        // Keep path: leave the current value as the result.
+                        let end = self.emit(Instruction::Jump(0));
+                        let bpos = self.current_offset();
+                        self.patch_jump(assign_b, bpos);
+                        self.emit(Instruction::Pop);
+                        self.compile_expr(value)?;
+                        self.emit(Instruction::Dup);
+                        self.compile_store(target)?;
+                        let after = self.current_offset();
+                        self.patch_jump(end, after);
+                    }
+                    AssignOp::NullishAssign => {
+                        self.compile_expr(target)?;
+                        self.emit(Instruction::Dup);
+                        // JumpIfNullish peeks (does not pop) the tested value.
+                        let assign_b = self.emit(Instruction::JumpIfNullish(0));
+                        // Keep path: discard the duplicate, leave the current value.
+                        self.emit(Instruction::Pop);
+                        let end = self.emit(Instruction::Jump(0));
+                        let bpos = self.current_offset();
+                        self.patch_jump(assign_b, bpos);
+                        self.emit(Instruction::Pop);
+                        self.emit(Instruction::Pop);
+                        self.compile_expr(value)?;
+                        self.emit(Instruction::Dup);
+                        self.compile_store(target)?;
+                        let after = self.current_offset();
+                        self.patch_jump(end, after);
                     }
                     _ => {
                         // Compound assignment: load, operate, store
