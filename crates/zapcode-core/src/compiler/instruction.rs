@@ -69,6 +69,11 @@ pub enum Instruction {
     Call(usize),
     Return,
     CallExternal(String, usize),
+    /// Call with spread args: stack is `[callee, args_array]`. The flattened
+    /// args array (built like an array literal) is expanded and the call runs.
+    CallSpread,
+    /// External call with spread args: stack is `[args_array]`.
+    CallExternalSpread(String),
     /// Like `CallExternal` but does not suspend: pops the args, registers a
     /// deferred external call, and pushes a `Value::Pending`. Emitted only for
     /// direct external calls that are elements of a `Promise.all([...])` literal,

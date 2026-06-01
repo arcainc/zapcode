@@ -77,6 +77,25 @@ fn trailing_object_literal_still_parses_as_expression() {
 }
 
 #[test]
+fn call_argument_spread() {
+    assert_eq!(run_str("Math.min(...[5, 2, 9, 1])"), "1");
+    assert_eq!(run_str("Math.max(...[5, 2, 9, 1])"), "9");
+    assert_eq!(
+        run_int("function add(a, b, c) { return a + b + c; } add(...[1, 2, 3])"),
+        6
+    );
+    assert_eq!(
+        run_str("function f(a, b, c, d) { return [a,b,c,d].join(\",\"); } f(1, ...[2, 3], 4)"),
+        "1,2,3,4"
+    );
+    // array method with spread args
+    assert_eq!(
+        run_str("const a = [0]; a.push(...[1, 2, 3]); a.join(\",\")"),
+        "0,1,2,3"
+    );
+}
+
+#[test]
 fn type_conversion_functions_are_callable() {
     assert_eq!(run_str("String(42)"), "42");
     assert_eq!(run_str("String(true)"), "true");

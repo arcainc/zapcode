@@ -688,6 +688,22 @@ impl Compiler {
         Ok(())
     }
 
+    /// Build a single flattened arguments array on the stack from call args that
+    /// include a spread (`f(a, ...xs, b)`), reusing the array-append instructions.
+    fn compile_spread_args(&mut self, args: &[Expr]) -> Result<()> {
+        self.emit(Instruction::CreateArray(0));
+        for arg in args {
+            if let Expr::Spread(inner) = arg {
+                self.compile_expr(inner)?;
+                self.emit(Instruction::ArraySpreadAppend);
+            } else {
+                self.compile_expr(arg)?;
+                self.emit(Instruction::ArrayAppend);
+            }
+        }
+        Ok(())
+    }
+
     /// Destructure the value on top of the stack into the names of a parameter
     /// pattern (object or array, nested), storing each via `store_binding`. The
     /// source value is left on the stack for the caller to pop.
@@ -1133,22 +1149,33 @@ impl Compiler {
                         return Ok(());
                     }
                 }
+                let has_spread = args.iter().any(|a| matches!(a, Expr::Spread(_)));
                 // Check if this is a direct call to an external function
                 if let Expr::Ident(name) = callee.as_ref() {
                     if self.external_functions.contains(name) {
-                        // Emit args then CallExternal (no callee push needed)
-                        for arg in args {
-                            self.compile_expr(arg)?;
+                        if has_spread {
+                            self.compile_spread_args(args)?;
+                            self.emit(Instruction::CallExternalSpread(name.clone()));
+                        } else {
+                            for arg in args {
+                                self.compile_expr(arg)?;
+                            }
+                            self.emit(Instruction::CallExternal(name.clone(), args.len()));
                         }
-                        self.emit(Instruction::CallExternal(name.clone(), args.len()));
                         return Ok(());
                     }
                 }
                 self.compile_expr(callee)?;
-                for arg in args {
-                    self.compile_expr(arg)?;
+                if has_spread {
+                    // [callee, args_array] → CallSpread expands and dispatches.
+                    self.compile_spread_args(args)?;
+                    self.emit(Instruction::CallSpread);
+                } else {
+                    for arg in args {
+                        self.compile_expr(arg)?;
+                    }
+                    self.emit(Instruction::Call(args.len()));
                 }
-                self.emit(Instruction::Call(args.len()));
             }
             Expr::New { callee, args } => {
                 self.compile_expr(callee)?;

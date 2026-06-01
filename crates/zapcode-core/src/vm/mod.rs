@@ -2416,6 +2416,33 @@ impl Vm {
                     snapshot,
                 }));
             }
+            // Spread calls: expand the flattened args array onto the stack, then
+            // re-dispatch the normal call. The `ip -= 1` compensates for the ip
+            // increment the re-dispatched instruction performs.
+            Instruction::CallSpread => {
+                let items = match self.pop()? {
+                    Value::Array(a) => a,
+                    _ => Vec::new(),
+                };
+                let n = items.len();
+                for item in items {
+                    self.push(item)?;
+                }
+                self.current_frame_mut().ip -= 1;
+                return self.dispatch(Instruction::Call(n));
+            }
+            Instruction::CallExternalSpread(name) => {
+                let items = match self.pop()? {
+                    Value::Array(a) => a,
+                    _ => Vec::new(),
+                };
+                let n = items.len();
+                for item in items {
+                    self.push(item)?;
+                }
+                self.current_frame_mut().ip -= 1;
+                return self.dispatch(Instruction::CallExternal(name, n));
+            }
             Instruction::CallExternalDeferred(name, arg_count) => {
                 if !self.external_functions.contains(&name) {
                     return Err(ZapcodeError::UnknownExternalFunction(name));
