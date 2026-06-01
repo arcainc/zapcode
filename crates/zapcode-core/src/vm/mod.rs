@@ -1077,7 +1077,8 @@ impl Vm {
                 }
                 Ok(Some(Value::Array(result)))
             }
-            "filter" | "find" | "findIndex" | "every" | "some" | "reduce" | "sort" | "flatMap" => {
+            "filter" | "find" | "findIndex" | "findLast" | "findLastIndex" | "every" | "some"
+            | "reduce" | "reduceRight" | "sort" | "flatMap" => {
                 // Async callbacks are not supported for these methods
                 if self.is_async_callback(&callback) {
                     return Err(ZapcodeError::RuntimeError(format!(
@@ -1105,6 +1106,22 @@ impl Vm {
                     }
                     "findIndex" => {
                         for (i, item) in arr.iter().enumerate() {
+                            if self.call_element_callback(&callback, item, i)?.is_truthy() {
+                                return Ok(Some(Value::Int(i as i64)));
+                            }
+                        }
+                        Ok(Some(Value::Int(-1)))
+                    }
+                    "findLast" => {
+                        for (i, item) in arr.iter().enumerate().rev() {
+                            if self.call_element_callback(&callback, item, i)?.is_truthy() {
+                                return Ok(Some(item.clone()));
+                            }
+                        }
+                        Ok(Some(Value::Undefined))
+                    }
+                    "findLastIndex" => {
+                        for (i, item) in arr.iter().enumerate().rev() {
                             if self.call_element_callback(&callback, item, i)?.is_truthy() {
                                 return Ok(Some(Value::Int(i as i64)));
                             }
@@ -1139,6 +1156,31 @@ impl Vm {
                         };
                         let start = if all_args.get(1).is_some() { 0 } else { 1 };
                         for (i, item) in arr.iter().enumerate().skip(start) {
+                            acc = Some(self.call_function_internal(
+                                &callback,
+                                vec![acc.unwrap(), item.clone(), Value::Int(i as i64)],
+                            )?);
+                        }
+                        Ok(Some(acc.unwrap_or(Value::Undefined)))
+                    }
+                    "reduceRight" => {
+                        let n = arr.len();
+                        let mut acc = match all_args.get(1).cloned() {
+                            Some(init) => Some(init),
+                            None if n > 0 => Some(arr[n - 1].clone()),
+                            None => {
+                                return Err(ZapcodeError::TypeError(
+                                    "Reduce of empty array with no initial value".to_string(),
+                                ));
+                            }
+                        };
+                        // Iterate from the end; skip the seed element when no
+                        // initial value was supplied.
+                        let skip_last = all_args.get(1).is_none();
+                        for (i, item) in arr.iter().enumerate().rev() {
+                            if skip_last && i == n - 1 {
+                                continue;
+                            }
                             acc = Some(self.call_function_internal(
                                 &callback,
                                 vec![acc.unwrap(), item.clone(), Value::Int(i as i64)],
@@ -1681,7 +1723,10 @@ impl Vm {
                 let right = self.pop()?;
                 let left = self.pop()?;
                 let shift = (right.to_number() as u32) & 0x1f;
-                let result = (left.to_number() as u32) >> shift;
+                // ToUint32: cast through i64 so negative operands wrap (JS
+                // semantics) rather than saturating to 0 as a direct f64->u32
+                // cast would (e.g. -1 >>> 0 === 4294967295).
+                let result = (left.to_number() as i64 as u32) >> shift;
                 self.push(Value::Int(result as i64))?;
             }
 
@@ -2059,31 +2104,38 @@ impl Vm {
                 let right = self.pop()?;
                 let left = self.pop()?;
                 // Check if left's __class__ matches right's __class_name__
-                let result = match (&left, &right) {
-                    (Value::Object(instance), Value::Object(class_obj)) => {
-                        if let Some(Value::String(ctor)) = class_obj.get("__builtin_constructor__")
-                        {
-                            // Builtin constructors: Error matches any error object;
-                            // a specific error type matches by name; Map/Set by marker.
-                            match ctor.as_ref() {
-                                "Error" => instance.contains_key("__error__"),
-                                "TypeError" | "RangeError" | "SyntaxError" | "ReferenceError" => {
-                                    instance.get("name")
-                                        == Some(&Value::String(Arc::from(ctor.as_ref())))
-                                }
-                                "Map" => instance.contains_key("__map__"),
-                                "Set" => instance.contains_key("__set__"),
-                                _ => false,
+                let result = if let Value::Object(class_obj) = &right {
+                    if let Some(Value::String(ctor)) = class_obj.get("__builtin_constructor__") {
+                        // Builtin constructors. Object matches any object/array/function;
+                        // Array matches arrays; Error matches any error object; a specific
+                        // error type matches by name; Map/Set by marker.
+                        match ctor.as_ref() {
+                            "Object" => matches!(
+                                left,
+                                Value::Object(_) | Value::Array(_) | Value::Function(_)
+                            ),
+                            "Array" => matches!(left, Value::Array(_)),
+                            "Error" => {
+                                matches!(&left, Value::Object(i) if i.contains_key("__error__"))
                             }
-                        } else if let (Some(inst_class), Some(class_name)) =
-                            (instance.get("__class__"), class_obj.get("__class_name__"))
-                        {
-                            inst_class == class_name
-                        } else {
-                            false
+                            "TypeError" | "RangeError" | "SyntaxError" | "ReferenceError" => {
+                                matches!(&left, Value::Object(i)
+                                    if i.get("name")
+                                        == Some(&Value::String(Arc::from(ctor.as_ref()))))
+                            }
+                            "Map" => matches!(&left, Value::Object(i) if i.contains_key("__map__")),
+                            "Set" => matches!(&left, Value::Object(i) if i.contains_key("__set__")),
+                            _ => false,
                         }
+                    } else if let (Value::Object(instance), Some(class_name)) =
+                        (&left, class_obj.get("__class_name__"))
+                    {
+                        instance.get("__class__") == Some(class_name)
+                    } else {
+                        false
                     }
-                    _ => false,
+                } else {
+                    false
                 };
                 self.push(Value::Bool(result))?;
             }
@@ -2192,7 +2244,8 @@ impl Vm {
                                     // Check if this is a callback method first
                                     let result = match method_name.as_ref() {
                                         "map" | "filter" | "forEach" | "find" | "findIndex"
-                                        | "every" | "some" | "reduce" | "sort" | "flatMap" => {
+                                        | "findLast" | "findLastIndex" | "every" | "some"
+                                        | "reduce" | "reduceRight" | "sort" | "flatMap" => {
                                             match self.execute_array_callback_method(
                                                 arr.clone(),
                                                 &method_name,
@@ -2239,6 +2292,14 @@ impl Vm {
                                     receiver.as_ref().map(|v| v.to_number()).unwrap_or(f64::NAN);
                                 builtins::call_number_method(n, &method_name, &args)?
                             }
+                            "__object__" => match (&receiver, method_name.as_ref()) {
+                                (Some(Value::Object(map)), "hasOwnProperty") => {
+                                    let key =
+                                        args.first().map(|v| v.to_js_string()).unwrap_or_default();
+                                    Some(Value::Bool(map.contains_key(key.as_str())))
+                                }
+                                _ => None,
+                            },
                             "__regexp__" => {
                                 match receiver.as_ref().and_then(builtins::regexp_parts) {
                                     Some((pat, flags)) => builtins::call_regexp_method(
@@ -2302,24 +2363,67 @@ impl Vm {
                             }
                             "__map__" => {
                                 if let Some(Value::Object(map)) = receiver {
-                                    let (result, updated) =
-                                        execute_map_method(map, &method_name, &args);
-                                    if let (Some(p), Some(updated)) = (&place, updated) {
-                                        self.write_place(p, Value::Object(updated));
+                                    if method_name.as_ref() == "forEach" {
+                                        // cb(value, key, map) — needs guest closure.
+                                        let cb = args.first().cloned().unwrap_or(Value::Undefined);
+                                        let entries = match map.get("__entries__") {
+                                            Some(Value::Array(e)) => e.clone(),
+                                            _ => Vec::new(),
+                                        };
+                                        for entry in &entries {
+                                            if let Value::Object(e) = entry {
+                                                let v = e
+                                                    .get("value")
+                                                    .cloned()
+                                                    .unwrap_or(Value::Undefined);
+                                                let k = e
+                                                    .get("key")
+                                                    .cloned()
+                                                    .unwrap_or(Value::Undefined);
+                                                self.call_function_internal(
+                                                    &cb,
+                                                    vec![v, k, Value::Object(map.clone())],
+                                                )?;
+                                            }
+                                        }
+                                        Some(Value::Undefined)
+                                    } else {
+                                        let (result, updated) =
+                                            execute_map_method(map, &method_name, &args);
+                                        if let (Some(p), Some(updated)) = (&place, updated) {
+                                            self.write_place(p, Value::Object(updated));
+                                        }
+                                        result
                                     }
-                                    result
                                 } else {
                                     None
                                 }
                             }
                             "__set__" => {
                                 if let Some(Value::Object(map)) = receiver {
-                                    let (result, updated) =
-                                        execute_set_method(map, &method_name, &args);
-                                    if let (Some(p), Some(updated)) = (&place, updated) {
-                                        self.write_place(p, Value::Object(updated));
+                                    if method_name.as_ref() == "forEach" {
+                                        // cb(value, value, set) — needs guest closure.
+                                        let cb = args.first().cloned().unwrap_or(Value::Undefined);
+                                        let items = set_items(&map);
+                                        for item in items {
+                                            self.call_function_internal(
+                                                &cb,
+                                                vec![
+                                                    item.clone(),
+                                                    item.clone(),
+                                                    Value::Object(map.clone()),
+                                                ],
+                                            )?;
+                                        }
+                                        Some(Value::Undefined)
+                                    } else {
+                                        let (result, updated) =
+                                            execute_set_method(map, &method_name, &args);
+                                        if let (Some(p), Some(updated)) = (&place, updated) {
+                                            self.write_place(p, Value::Object(updated));
+                                        }
+                                        result
                                     }
-                                    result
                                 } else {
                                     None
                                 }
@@ -2335,6 +2439,23 @@ impl Vm {
                             // deterministic PRNG rather than the stateless builtin.
                             "Math" if method_name.as_ref() == "random" => {
                                 Some(Value::Float(self.next_random()))
+                            }
+                            // Array.from(source, mapFn): mapFn may be a guest
+                            // closure, so apply it here rather than in the pure
+                            // builtin.
+                            "Array"
+                                if method_name.as_ref() == "from"
+                                    && matches!(args.get(1), Some(Value::Function(_))) =>
+                            {
+                                let src = builtins::array_from_source(
+                                    args.first().unwrap_or(&Value::Undefined),
+                                );
+                                let map_fn = args[1].clone();
+                                let mut out = Vec::with_capacity(src.len());
+                                for (i, item) in src.iter().enumerate() {
+                                    out.push(self.call_element_callback(&map_fn, item, i)?);
+                                }
+                                Some(Value::Array(out))
                             }
                             global_name => builtins::call_global_method(
                                 global_name,
@@ -2980,6 +3101,32 @@ impl Vm {
                                 self.push(make_error_object(name.as_ref(), &msg))?;
                                 return Ok(None);
                             }
+                            "Array" => {
+                                // new Array(n) → n empty slots; new Array(a, b, …) → [a, b, …].
+                                let arr = match args.as_slice() {
+                                    [single] => match single {
+                                        Value::Int(n) if *n >= 0 => {
+                                            vec![Value::Undefined; *n as usize]
+                                        }
+                                        Value::Float(f) if f.fract() == 0.0 && *f >= 0.0 => {
+                                            vec![Value::Undefined; *f as usize]
+                                        }
+                                        other => vec![other.clone()],
+                                    },
+                                    other => other.to_vec(),
+                                };
+                                self.push(Value::Array(arr))?;
+                                return Ok(None);
+                            }
+                            "Object" => {
+                                match args.first() {
+                                    Some(v @ (Value::Object(_) | Value::Array(_))) => {
+                                        self.push(v.clone())?
+                                    }
+                                    _ => self.push(Value::Object(IndexMap::new()))?,
+                                }
+                                return Ok(None);
+                            }
                             _ => {}
                         }
                     }
@@ -3165,6 +3312,10 @@ impl Vm {
                     if Self::BUILTIN_GLOBAL_NAMES.contains(&global_name.as_str()) {
                         return Ok(builtin_method(global_name.as_str(), name));
                     }
+                }
+                // Object.prototype instance methods.
+                if matches!(name, "hasOwnProperty") {
+                    return Ok(builtin_method("__object__", name));
                 }
                 Ok(Value::Undefined)
             }
@@ -3400,7 +3551,7 @@ fn is_map_object(value: &Value) -> bool {
 fn is_map_method(name: &str) -> bool {
     matches!(
         name,
-        "get" | "set" | "has" | "delete" | "clear" | "keys" | "values" | "entries"
+        "get" | "set" | "has" | "delete" | "clear" | "keys" | "values" | "entries" | "forEach"
     )
 }
 
@@ -3409,7 +3560,10 @@ fn is_set_object(value: &Value) -> bool {
 }
 
 fn is_set_method(name: &str) -> bool {
-    matches!(name, "add" | "has" | "delete" | "clear" | "values" | "keys")
+    matches!(
+        name,
+        "add" | "has" | "delete" | "clear" | "values" | "keys" | "forEach"
+    )
 }
 
 /// Build a Set object from items, de-duplicating by strict equality.
@@ -3701,9 +3855,12 @@ fn is_array_method(name: &str) -> bool {
             | "includes"
             | "find"
             | "findIndex"
+            | "findLast"
+            | "findLastIndex"
             | "map"
             | "filter"
             | "reduce"
+            | "reduceRight"
             | "forEach"
             | "every"
             | "some"
@@ -3749,6 +3906,7 @@ fn is_string_method(name: &str) -> bool {
             | "matchAll"
             | "search"
             | "normalize"
+            | "localeCompare"
     )
 }
 

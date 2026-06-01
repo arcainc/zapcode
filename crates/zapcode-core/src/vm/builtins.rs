@@ -11,8 +11,8 @@ pub fn register_globals(globals: &mut HashMap<String, Value>) {
     // Register known globals as empty objects — method calls are intercepted by the VM
     globals.insert("console".to_string(), Value::Object(IndexMap::new()));
     globals.insert("JSON".to_string(), Value::Object(IndexMap::new()));
-    globals.insert("Object".to_string(), Value::Object(IndexMap::new()));
-    globals.insert("Array".to_string(), Value::Object(IndexMap::new()));
+    globals.insert("Object".to_string(), builtin_constructor("Object"));
+    globals.insert("Array".to_string(), builtin_constructor("Array"));
     globals.insert("Promise".to_string(), Value::Object(IndexMap::new()));
     globals.insert("Map".to_string(), builtin_constructor("Map"));
     globals.insert("Set".to_string(), builtin_constructor("Set"));
@@ -103,7 +103,14 @@ fn global_fn(name: &str) -> Value {
         );
         obj.insert(Arc::from("NaN"), Value::Float(f64::NAN));
         // Static methods (callable): Number.isInteger(x), Number.parseInt(s), …
-        for m in ["isInteger", "isNaN", "isFinite", "parseInt", "parseFloat"] {
+        for m in [
+            "isInteger",
+            "isSafeInteger",
+            "isNaN",
+            "isFinite",
+            "parseInt",
+            "parseFloat",
+        ] {
             obj.insert(Arc::from(m), global_fn(&format!("Number.{m}")));
         }
     }
@@ -292,6 +299,13 @@ pub fn call_global_fn(kind: &str, args: &[Value]) -> Result<Value> {
             Value::Float(n) => n.is_finite() && n.fract() == 0.0,
             _ => false,
         }),
+        "Number.isSafeInteger" => Value::Bool(match arg {
+            Value::Int(n) => n.unsigned_abs() <= 9_007_199_254_740_991,
+            Value::Float(n) => {
+                n.is_finite() && n.fract() == 0.0 && n.abs() <= 9_007_199_254_740_991.0
+            }
+            _ => false,
+        }),
         other => {
             return Err(ZapcodeError::TypeError(format!(
                 "{} is not a function",
@@ -468,6 +482,15 @@ fn call_math_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
                 Value::Float(0.0)
             }
         }
+        "hypot" => {
+            let sum_sq: f64 = args.iter().map(|a| a.to_number().powi(2)).sum();
+            Value::Float(sum_sq.sqrt())
+        }
+        "expm1" => Value::Float(arg_num(args, 0).exp_m1()),
+        "log1p" => Value::Float(arg_num(args, 0).ln_1p()),
+        "sinh" => Value::Float(arg_num(args, 0).sinh()),
+        "cosh" => Value::Float(arg_num(args, 0).cosh()),
+        "tanh" => Value::Float(arg_num(args, 0).tanh()),
         "random" => {
             // Math.random is served by the VM's seeded PRNG (see Vm::next_random)
             // so the sequence is deterministic across replay yet varied. This
@@ -899,6 +922,16 @@ fn call_string_method(s: &Arc<str>, method: &str, args: &[Value]) -> Result<Opti
         }
         "toUpperCase" => Value::String(Arc::from(s.to_uppercase().as_str())),
         "toLowerCase" => Value::String(Arc::from(s.to_lowercase().as_str())),
+        "localeCompare" => {
+            // Codepoint ordering (no locale data); returns -1, 0, or 1.
+            let other = arg_str(args, 0);
+            let cmp = s.as_ref().cmp(other.as_str());
+            Value::Int(match cmp {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            })
+        }
         "trim" => Value::String(Arc::from(s.trim())),
         "trimStart" | "trimLeft" => Value::String(Arc::from(s.trim_start())),
         "trimEnd" | "trimRight" => Value::String(Arc::from(s.trim_end())),
@@ -1200,8 +1233,18 @@ fn call_array_method(arr: &[Value], method: &str, args: &[Value]) -> Result<Opti
             let deleted: Vec<Value> = arr[start..start + delete_count].to_vec();
             Value::Array(deleted)
         }
-        "every" | "some" | "map" | "filter" | "reduce" | "forEach" | "find" | "findIndex"
-        | "sort" | "flatMap" => {
+        // Array iterators. JS returns iterator objects; we return plain arrays,
+        // which spread (`[...arr.entries()]`) and for-of iterate identically.
+        "entries" => Value::Array(
+            arr.iter()
+                .enumerate()
+                .map(|(i, v)| Value::Array(vec![Value::Int(i as i64), v.clone()]))
+                .collect(),
+        ),
+        "keys" => Value::Array((0..arr.len()).map(|i| Value::Int(i as i64)).collect()),
+        "values" => Value::Array(arr.to_vec()),
+        "every" | "some" | "map" | "filter" | "reduce" | "reduceRight" | "forEach" | "find"
+        | "findIndex" | "findLast" | "findLastIndex" | "sort" | "flatMap" => {
             // These require function callbacks — handled in VM dispatch
             return Ok(None);
         }
@@ -1247,6 +1290,16 @@ fn call_object_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
                 _ => Ok(Some(Value::Array(Vec::new()))),
             }
         }
+        "hasOwn" => {
+            let has = match args.first() {
+                Some(Value::Object(map)) => {
+                    let key = args.get(1).map(|v| v.to_js_string()).unwrap_or_default();
+                    map.contains_key(key.as_str())
+                }
+                _ => false,
+            };
+            Ok(Some(Value::Bool(has)))
+        }
         "assign" => {
             let mut target = match args.first() {
                 Some(Value::Object(map)) => map.clone(),
@@ -1287,6 +1340,61 @@ fn call_object_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
     }
 }
 
+/// Materialize the iterable/array-like accepted by `Array.from` into a Vec.
+/// Handles arrays, strings (by char), built-in Set/Map, and `{ length: n }`
+/// array-likes. The optional mapFn is applied by the caller (it may be a
+/// guest closure that requires the VM).
+pub fn array_from_source(val: &Value) -> Vec<Value> {
+    match val {
+        Value::Array(arr) => arr.clone(),
+        Value::String(s) => s
+            .chars()
+            .map(|c| Value::String(Arc::from(c.to_string().as_str())))
+            .collect(),
+        Value::Object(m) if matches!(m.get("__set__"), Some(Value::Bool(true))) => {
+            match m.get("__items__") {
+                Some(Value::Array(items)) => items.clone(),
+                _ => Vec::new(),
+            }
+        }
+        Value::Object(m) if matches!(m.get("__map__"), Some(Value::Bool(true))) => {
+            match m.get("__entries__") {
+                Some(Value::Array(entries)) => entries
+                    .iter()
+                    .filter_map(|e| match e {
+                        Value::Object(e) => Some(Value::Array(vec![
+                            e.get("key").cloned().unwrap_or(Value::Undefined),
+                            e.get("value").cloned().unwrap_or(Value::Undefined),
+                        ])),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            }
+        }
+        // `{ length: n }` array-like: index into present keys, else undefined.
+        Value::Object(m) => match m.get("length") {
+            Some(len_val) => {
+                let n = len_val.to_number();
+                if n.is_finite() && n >= 0.0 {
+                    let len = n as usize;
+                    (0..len)
+                        .map(|i| {
+                            m.get(i.to_string().as_str())
+                                .cloned()
+                                .unwrap_or(Value::Undefined)
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            }
+            None => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
 fn call_array_static_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
     match method {
         "isArray" => {
@@ -1294,42 +1402,10 @@ fn call_array_static_method(method: &str, args: &[Value]) -> Result<Option<Value
             Ok(Some(Value::Bool(matches!(val, Value::Array(_)))))
         }
         "from" => {
+            // Note: the (source, mapFn) form with a closure mapFn is intercepted
+            // in the VM Call dispatch (it needs to invoke guest closures).
             let val = args.first().unwrap_or(&Value::Undefined);
-            match val {
-                Value::Array(arr) => Ok(Some(Value::Array(arr.clone()))),
-                Value::String(s) => {
-                    let chars: Vec<Value> = s
-                        .chars()
-                        .map(|c| Value::String(Arc::from(c.to_string().as_str())))
-                        .collect();
-                    Ok(Some(Value::Array(chars)))
-                }
-                // Array.from(set) / Array.from(map) over the built-in collections.
-                Value::Object(m) if matches!(m.get("__set__"), Some(Value::Bool(true))) => {
-                    Ok(Some(
-                        m.get("__items__")
-                            .cloned()
-                            .unwrap_or(Value::Array(Vec::new())),
-                    ))
-                }
-                Value::Object(m) if matches!(m.get("__map__"), Some(Value::Bool(true))) => {
-                    let pairs = match m.get("__entries__") {
-                        Some(Value::Array(entries)) => entries
-                            .iter()
-                            .filter_map(|e| match e {
-                                Value::Object(e) => Some(Value::Array(vec![
-                                    e.get("key").cloned().unwrap_or(Value::Undefined),
-                                    e.get("value").cloned().unwrap_or(Value::Undefined),
-                                ])),
-                                _ => None,
-                            })
-                            .collect(),
-                        _ => Vec::new(),
-                    };
-                    Ok(Some(Value::Array(pairs)))
-                }
-                _ => Ok(Some(Value::Array(Vec::new()))),
-            }
+            Ok(Some(Value::Array(array_from_source(val))))
         }
         "of" => Ok(Some(Value::Array(args.to_vec()))),
         _ => Ok(None),
@@ -1387,6 +1463,99 @@ fn call_promise_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
             obj.insert(Arc::from("__promise__"), Value::Bool(true));
             obj.insert(Arc::from("status"), Value::String(Arc::from("resolved")));
             obj.insert(Arc::from("value"), Value::Array(results));
+            Ok(Some(Value::Object(obj)))
+        }
+        "allSettled" => {
+            let arr = match args.first() {
+                Some(Value::Array(arr)) => arr.clone(),
+                _ => Vec::new(),
+            };
+            let results: Vec<Value> = arr
+                .iter()
+                .map(|item| {
+                    let mut entry = IndexMap::new();
+                    if let Value::Object(map) = item {
+                        if matches!(map.get("status"), Some(Value::String(s)) if s.as_ref() == "rejected")
+                        {
+                            entry.insert(Arc::from("status"), Value::String(Arc::from("rejected")));
+                            entry.insert(
+                                Arc::from("reason"),
+                                map.get("reason").cloned().unwrap_or(Value::Undefined),
+                            );
+                            return Value::Object(entry);
+                        }
+                    }
+                    let value = match item {
+                        Value::Object(map) if is_promise(item) => {
+                            map.get("value").cloned().unwrap_or(Value::Undefined)
+                        }
+                        other => other.clone(),
+                    };
+                    entry.insert(Arc::from("status"), Value::String(Arc::from("fulfilled")));
+                    entry.insert(Arc::from("value"), value);
+                    Value::Object(entry)
+                })
+                .collect();
+            Ok(Some(make_resolved_promise(Value::Array(results))))
+        }
+        "race" => {
+            // Synchronous model: every input is already settled, so the first
+            // element wins. Returns that promise (resolved or rejected).
+            match args.first() {
+                Some(Value::Array(arr)) if !arr.is_empty() => {
+                    let first = &arr[0];
+                    if is_promise(first) {
+                        Ok(Some(first.clone()))
+                    } else {
+                        Ok(Some(make_resolved_promise(first.clone())))
+                    }
+                }
+                // An empty array races forever; surface a pending promise.
+                _ => {
+                    let mut obj = IndexMap::new();
+                    obj.insert(Arc::from("__promise__"), Value::Bool(true));
+                    obj.insert(Arc::from("status"), Value::String(Arc::from("pending")));
+                    Ok(Some(Value::Object(obj)))
+                }
+            }
+        }
+        "any" => {
+            // First fulfilled value wins; if all reject, reject with an
+            // AggregateError-shaped object.
+            let arr = match args.first() {
+                Some(Value::Array(arr)) => arr.clone(),
+                _ => Vec::new(),
+            };
+            let mut errors = Vec::with_capacity(arr.len());
+            for item in &arr {
+                match item {
+                    Value::Object(map) if is_promise(item) => {
+                        if matches!(map.get("status"), Some(Value::String(s)) if s.as_ref() == "rejected")
+                        {
+                            errors.push(map.get("reason").cloned().unwrap_or(Value::Undefined));
+                        } else {
+                            return Ok(Some(make_resolved_promise(
+                                map.get("value").cloned().unwrap_or(Value::Undefined),
+                            )));
+                        }
+                    }
+                    other => return Ok(Some(make_resolved_promise(other.clone()))),
+                }
+            }
+            let mut agg = IndexMap::new();
+            agg.insert(
+                Arc::from("name"),
+                Value::String(Arc::from("AggregateError")),
+            );
+            agg.insert(
+                Arc::from("message"),
+                Value::String(Arc::from("All promises were rejected")),
+            );
+            agg.insert(Arc::from("errors"), Value::Array(errors));
+            let mut obj = IndexMap::new();
+            obj.insert(Arc::from("__promise__"), Value::Bool(true));
+            obj.insert(Arc::from("status"), Value::String(Arc::from("rejected")));
+            obj.insert(Arc::from("reason"), Value::Object(agg));
             Ok(Some(Value::Object(obj)))
         }
         _ => Ok(None),
