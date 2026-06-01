@@ -375,6 +375,24 @@ impl Compiler {
                     self.compile_statement(init)?;
                 }
 
+                // `for (let i ...)` gives each iteration a fresh binding of the
+                // loop variables. Collect the let/const-declared slots so we can
+                // re-bind any captured ones per iteration (see FreshenBinding).
+                let per_iter_slots: Vec<usize> = match init.as_deref() {
+                    Some(Statement::VariableDecl {
+                        kind: VarKind::Let | VarKind::Const,
+                        declarations,
+                        ..
+                    }) => declarations
+                        .iter()
+                        .filter_map(|d| match &d.pattern {
+                            AssignTarget::Ident(name) => self.resolve_local(name),
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+
                 let loop_start = self.current_offset();
                 self.loop_stack.push(LoopInfo {
                     break_patches: Vec::new(),
@@ -394,6 +412,12 @@ impl Compiler {
                 }
 
                 let continue_target = self.current_offset();
+                // Freshen captured let-loop bindings before the update runs, so a
+                // closure created this iteration keeps the value it saw rather
+                // than sharing the updated binding with later iterations.
+                for &slot in &per_iter_slots {
+                    self.emit(Instruction::FreshenBinding(slot));
+                }
                 if let Some(update) = update {
                     self.compile_expr(update)?;
                     self.emit(Instruction::Pop);

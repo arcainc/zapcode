@@ -56,6 +56,10 @@ pub enum Instruction {
     DeleteProperty(String),
     /// Remove a property by computed key: `[obj, key] -> [obj']`.
     DeleteIndex,
+    /// Per-iteration rebinding for `for (let i ...)`: if the local slot has been
+    /// captured (boxed) into a shared cell, copy its value into a fresh cell so
+    /// closures created in the just-finished iteration keep their own binding.
+    FreshenBinding(usize),
     Spread,
     /// Append one value to an accumulator array on the stack: `[acc, value] -> [acc']`.
     ArrayAppend,

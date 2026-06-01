@@ -46,6 +46,8 @@ pub enum PlaceRoot {
         frame_index: usize,
         slot: usize,
     },
+    /// A shared upvalue cell (captured variable) by arena id.
+    Cell(u64),
     /// The nearest enclosing `this` (for `this.items.push(...)` in a method).
     This,
 }
@@ -76,7 +78,13 @@ pub struct FunctionRef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Closure {
     pub func_ref: FunctionRef,
+    /// Free variables captured by value (functions, top-level user globals).
     pub captured: Vec<(String, Value)>,
+    /// Free variables captured by reference: name -> shared upvalue cell id.
+    /// Mutations through the cell are visible to every scope sharing it, which
+    /// is what makes accumulators, factory state, and callback side effects work.
+    #[serde(default)]
+    pub env: Vec<(String, u64)>,
 }
 
 /// The state of a generator object.
@@ -88,6 +96,9 @@ pub struct GeneratorObject {
     pub func_ref: FunctionRef,
     /// Captured closure variables.
     pub captured: Vec<(String, Value)>,
+    /// Free variables captured by reference (shared upvalue cells).
+    #[serde(default)]
+    pub env: Vec<(String, u64)>,
     /// Suspended execution state. None = not yet started.
     pub suspended: Option<SuspendedFrame>,
     /// Whether the generator has completed.

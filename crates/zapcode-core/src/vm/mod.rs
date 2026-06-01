@@ -68,6 +68,8 @@ pub(crate) enum ReceiverSource {
     /// The receiver was loaded from a local variable at the given slot index
     /// in the frame at the given depth (index into `self.frames`).
     Local { frame_index: usize, slot: usize },
+    /// The receiver was loaded from a captured variable held in a shared cell.
+    Cell(u64),
 }
 
 /// A call frame in the VM stack.
@@ -82,6 +84,16 @@ pub(crate) struct CallFrame {
     pub(crate) this_value: Option<Value>,
     /// Where the method receiver came from, so we can write back mutations.
     pub(crate) receiver_source: Option<ReceiverSource>,
+    /// Local slots that have been promoted to shared upvalue cells (captured by
+    /// a nested closure): slot -> cell id. Reads/writes of these slots route
+    /// through the cell arena so the closure and this frame stay in sync.
+    #[serde(default)]
+    pub(crate) boxed: HashMap<usize, u64>,
+    /// Free-variable bindings for a closure frame: name -> cell id. A name found
+    /// here shadows the global of the same name (LoadGlobal/StoreGlobal consult
+    /// it first), connecting captured names to their shared cells.
+    #[serde(default)]
+    pub(crate) env: HashMap<String, u64>,
 }
 
 /// A continuation for array callback methods that may suspend (e.g., `.map()` with async callbacks).
@@ -118,6 +130,10 @@ pub struct Vm {
     pub(crate) stack: Vec<Value>,
     pub(crate) frames: Vec<CallFrame>,
     pub(crate) globals: HashMap<String, Value>,
+    /// Arena of shared upvalue cells, indexed by id. A captured variable lives
+    /// here once boxed; every closure and frame referencing it shares the id, so
+    /// the sharing survives serialization (ids are reconstructed on load).
+    pub(crate) cells: Vec<Value>,
     pub(crate) stdout: String,
     pub(crate) limits: ResourceLimits,
     pub(crate) tracker: ResourceTracker,
@@ -190,6 +206,7 @@ impl Vm {
             stack: Vec::new(),
             frames: Vec::new(),
             globals,
+            cells: Vec::new(),
             stdout: String::new(),
             limits,
             tracker: ResourceTracker::default(),
@@ -270,6 +287,7 @@ impl Vm {
             stack,
             frames,
             globals,
+            cells: Vec::new(),
             stdout,
             limits,
             tracker: ResourceTracker::default(),
@@ -456,11 +474,11 @@ impl Vm {
                 self.globals.insert(name.clone(), value);
             }
             ReceiverSource::Local { frame_index, slot } => {
-                if let Some(target_frame) = self.frames.get_mut(*frame_index) {
-                    while target_frame.locals.len() <= *slot {
-                        target_frame.locals.push(Value::Undefined);
-                    }
-                    target_frame.locals[*slot] = value;
+                self.write_local(*frame_index, *slot, value);
+            }
+            ReceiverSource::Cell(id) => {
+                if let Some(slot_ref) = self.cells.get_mut(*id as usize) {
+                    *slot_ref = value;
                 }
             }
         }
@@ -470,10 +488,14 @@ impl Vm {
     fn read_place_root(&self, root: &PlaceRoot) -> Option<Value> {
         match root {
             PlaceRoot::Global(name) => self.globals.get(name).cloned(),
-            PlaceRoot::Local { frame_index, slot } => self
-                .frames
-                .get(*frame_index)
-                .and_then(|f| f.locals.get(*slot).cloned()),
+            PlaceRoot::Local { frame_index, slot } => {
+                if self.frames.get(*frame_index).is_some() {
+                    Some(self.read_local(*frame_index, *slot))
+                } else {
+                    None
+                }
+            }
+            PlaceRoot::Cell(id) => self.cells.get(*id as usize).cloned(),
             PlaceRoot::This => self.frames.iter().rev().find_map(|f| f.this_value.clone()),
         }
     }
@@ -485,6 +507,7 @@ impl Vm {
                 frame_index: *frame_index,
                 slot: *slot,
             },
+            PlaceRoot::Cell(id) => ReceiverSource::Cell(*id),
             PlaceRoot::This => {
                 // Update the nearest enclosing `this`; the method-return path then
                 // persists it to the original receiver.
@@ -525,6 +548,116 @@ impl Vm {
         self.stack
             .last()
             .ok_or_else(|| ZapcodeError::RuntimeError("stack underflow".to_string()))
+    }
+
+    /// Promote frame `frame_index`'s local `slot` to a shared cell, returning its
+    /// id. Idempotent: a slot already boxed returns its existing cell.
+    fn box_local(&mut self, frame_index: usize, slot: usize) -> u64 {
+        if let Some(&cell) = self
+            .frames
+            .get(frame_index)
+            .and_then(|f| f.boxed.get(&slot))
+        {
+            return cell;
+        }
+        let val = self
+            .frames
+            .get(frame_index)
+            .and_then(|f| f.locals.get(slot).cloned())
+            .unwrap_or(Value::Undefined);
+        let cell_id = self.cells.len() as u64;
+        self.cells.push(val);
+        if let Some(f) = self.frames.get_mut(frame_index) {
+            f.boxed.insert(slot, cell_id);
+        }
+        cell_id
+    }
+
+    /// Build a closure over the current scope. Free variables that name a frame
+    /// local (or an enclosing closure's captured variable) are bound by reference
+    /// through shared cells (`env`); user globals are captured by value. The
+    /// innermost binding of a name wins, matching lexical scoping.
+    fn create_closure(&mut self, func_idx: usize) -> Closure {
+        let mut seen: HashSet<String> = HashSet::new();
+        // Names to box (frame_index, slot, name) and cells inherited from
+        // enclosing closure frames, gathered innermost -> outermost.
+        let mut to_box: Vec<(usize, usize, String)> = Vec::new();
+        let mut inherited: Vec<(String, u64)> = Vec::new();
+        for fi in (0..self.frames.len()).rev() {
+            let frame = &self.frames[fi];
+            // Cells this frame already references (it is itself a closure body).
+            for (name, cell) in &frame.env {
+                if seen.insert(name.clone()) {
+                    inherited.push((name.clone(), *cell));
+                }
+            }
+            let local_names = if let Some(fidx) = frame.func_index {
+                &self.program(frame.program_index).functions[fidx].local_names
+            } else {
+                &self.program(frame.program_index).local_names
+            };
+            for (slot, name) in local_names.iter().enumerate() {
+                if seen.insert(name.clone()) {
+                    to_box.push((fi, slot, name.clone()));
+                }
+            }
+        }
+        let mut env: Vec<(String, u64)> = Vec::with_capacity(to_box.len() + inherited.len());
+        for (fi, slot, name) in to_box {
+            let cell = self.box_local(fi, slot);
+            env.push((name, cell));
+        }
+        env.extend(inherited);
+        // User globals (functions, top-level consts) are captured by value.
+        let mut captured = Vec::new();
+        for (name, val) in &self.globals {
+            if !Self::BUILTIN_GLOBAL_NAMES.contains(&name.as_str()) && !seen.contains(name) {
+                captured.push((name.clone(), val.clone()));
+            }
+        }
+        Closure {
+            func_ref: FunctionRef {
+                program_id: self.current_frame().program_index,
+                function_id: func_idx,
+            },
+            captured,
+            env,
+        }
+    }
+
+    /// Read a local, routing through its cell if the slot has been boxed.
+    fn read_local(&self, frame_index: usize, slot: usize) -> Value {
+        let Some(frame) = self.frames.get(frame_index) else {
+            return Value::Undefined;
+        };
+        if let Some(&cell) = frame.boxed.get(&slot) {
+            self.cells
+                .get(cell as usize)
+                .cloned()
+                .unwrap_or(Value::Undefined)
+        } else {
+            frame.locals.get(slot).cloned().unwrap_or(Value::Undefined)
+        }
+    }
+
+    /// Write a local, routing through its cell if the slot has been boxed.
+    fn write_local(&mut self, frame_index: usize, slot: usize, value: Value) {
+        let cell = self
+            .frames
+            .get(frame_index)
+            .and_then(|f| f.boxed.get(&slot).copied());
+        if let Some(cell) = cell {
+            if let Some(slot_ref) = self.cells.get_mut(cell as usize) {
+                *slot_ref = value;
+            }
+            return;
+        }
+        if let Some(f) = self.frames.get_mut(frame_index) {
+            while f.locals.len() <= slot {
+                f.locals.push(Value::Undefined);
+            }
+            f.locals[slot] = value;
+        }
     }
 
     fn current_frame(&self) -> &CallFrame {
@@ -603,7 +736,7 @@ impl Vm {
         self.tracker.push_frame();
         self.tracker.check_stack(&self.limits)?;
 
-        // Inject captured variables as globals
+        // Inject captured-by-value variables as globals
         for (name, val) in &closure.captured {
             if !self.globals.contains_key(name) {
                 self.globals.insert(name.clone(), val.clone());
@@ -622,6 +755,10 @@ impl Vm {
             None
         };
 
+        // Captured-by-reference variables: the frame's env maps each name to its
+        // shared cell so LoadGlobal/StoreGlobal in the body see and mutate it.
+        let env: HashMap<String, u64> = closure.env.iter().cloned().collect();
+
         self.frames.push(CallFrame {
             program_index: closure.func_ref.program_id,
             func_index: Some(closure.func_ref.function_id),
@@ -630,6 +767,8 @@ impl Vm {
             stack_base: self.stack.len(),
             this_value,
             receiver_source,
+            boxed: HashMap::new(),
+            env,
         });
         Ok(())
     }
@@ -650,6 +789,8 @@ impl Vm {
             stack_base: 0,
             this_value: None,
             receiver_source: None,
+            boxed: HashMap::new(),
+            env: HashMap::new(),
         });
 
         self.execute()
@@ -1366,6 +1507,7 @@ impl Vm {
                     }
                 }
                 let stack_base = self.stack.len();
+                let env: HashMap<String, u64> = gen_obj.env.iter().cloned().collect();
                 self.frames.push(CallFrame {
                     program_index: func_ref.program_id,
                     func_index: Some(func_ref.function_id),
@@ -1374,6 +1516,8 @@ impl Vm {
                     stack_base,
                     this_value: None,
                     receiver_source: None,
+                    boxed: HashMap::new(),
+                    env,
                 });
                 self.run_generator_until_yield_or_return(gen_obj)
             }
@@ -1384,6 +1528,7 @@ impl Vm {
                     self.push(val.clone())?;
                 }
                 self.push(arg)?;
+                let env: HashMap<String, u64> = gen_obj.env.iter().cloned().collect();
                 self.frames.push(CallFrame {
                     program_index: func_ref.program_id,
                     func_index: Some(func_ref.function_id),
@@ -1392,6 +1537,8 @@ impl Vm {
                     stack_base,
                     this_value: None,
                     receiver_source: None,
+                    boxed: HashMap::new(),
+                    env,
                 });
                 self.run_generator_until_yield_or_return(gen_obj)
             }
@@ -1543,30 +1690,53 @@ impl Vm {
             }
             Instruction::LoadLocal(idx) => {
                 let frame_index = self.frames.len() - 1;
-                let frame = self.current_frame();
-                let val = frame.locals.get(idx).cloned().unwrap_or(Value::Undefined);
-                self.last_load_source = Some(ReceiverSource::Local {
-                    frame_index,
-                    slot: idx,
-                });
-                self.last_place = Some(Place {
-                    root: PlaceRoot::Local {
+                let val = self.read_local(frame_index, idx);
+                // If the slot is boxed, write-back must target the cell so the
+                // owning frame and capturing closures stay in sync.
+                if let Some(&cell) = self.current_frame().boxed.get(&idx) {
+                    self.last_load_source = Some(ReceiverSource::Cell(cell));
+                    self.last_place = Some(Place {
+                        root: PlaceRoot::Cell(cell),
+                        path: Vec::new(),
+                    });
+                } else {
+                    self.last_load_source = Some(ReceiverSource::Local {
                         frame_index,
                         slot: idx,
-                    },
-                    path: Vec::new(),
-                });
+                    });
+                    self.last_place = Some(Place {
+                        root: PlaceRoot::Local {
+                            frame_index,
+                            slot: idx,
+                        },
+                        path: Vec::new(),
+                    });
+                }
                 self.push(val)?;
             }
             Instruction::StoreLocal(idx) => {
                 let val = self.pop()?;
-                let frame = self.current_frame_mut();
-                while frame.locals.len() <= idx {
-                    frame.locals.push(Value::Undefined);
-                }
-                frame.locals[idx] = val;
+                let frame_index = self.frames.len() - 1;
+                self.write_local(frame_index, idx, val);
             }
             Instruction::LoadGlobal(name) => {
+                // A captured free variable resolves to its shared cell via the
+                // current frame's env overlay before falling back to true globals.
+                if let Some(&cell) = self.current_frame().env.get(name.as_str()) {
+                    let val = self
+                        .cells
+                        .get(cell as usize)
+                        .cloned()
+                        .unwrap_or(Value::Undefined);
+                    self.last_global_name = Some(name.clone());
+                    self.last_load_source = Some(ReceiverSource::Cell(cell));
+                    self.last_place = Some(Place {
+                        root: PlaceRoot::Cell(cell),
+                        path: Vec::new(),
+                    });
+                    self.push(val)?;
+                    return Ok(None);
+                }
                 let val = self.globals.get(&name).cloned().unwrap_or(Value::Undefined);
                 self.last_global_name = Some(name.clone());
                 // Only track receiver source for user-defined globals — builtins
@@ -1586,7 +1756,14 @@ impl Vm {
             }
             Instruction::StoreGlobal(name) => {
                 let val = self.pop()?;
-                self.globals.insert(name, val);
+                // Route writes to a captured variable through its shared cell.
+                if let Some(&cell) = self.current_frame().env.get(name.as_str()) {
+                    if let Some(slot_ref) = self.cells.get_mut(cell as usize) {
+                        *slot_ref = val;
+                    }
+                } else {
+                    self.globals.insert(name, val);
+                }
             }
             Instruction::DeclareLocal(_) => {
                 let frame = self.current_frame_mut();
@@ -1992,6 +2169,20 @@ impl Vm {
                 // Push modified object back so compile_store can store it to the variable
                 self.push(obj)?;
             }
+            Instruction::FreshenBinding(slot) => {
+                let frame_index = self.frames.len() - 1;
+                // Only meaningful if a closure captured this slot this iteration.
+                if let Some(&cell) = self.current_frame().boxed.get(&slot) {
+                    let val = self
+                        .cells
+                        .get(cell as usize)
+                        .cloned()
+                        .unwrap_or(Value::Undefined);
+                    let new_cell = self.cells.len() as u64;
+                    self.cells.push(val);
+                    self.frames[frame_index].boxed.insert(slot, new_cell);
+                }
+            }
             Instruction::DeleteProperty(name) => {
                 let mut obj = self.pop()?;
                 if let Value::Object(map) = &mut obj {
@@ -2170,34 +2361,7 @@ impl Vm {
 
             // Functions
             Instruction::CreateClosure(func_idx) => {
-                // Capture current scope for closure
-                let mut captured = Vec::new();
-                // Capture all locals from all active frames using local_names
-                for frame in &self.frames {
-                    let local_names = if let Some(fidx) = frame.func_index {
-                        &self.program(frame.program_index).functions[fidx].local_names
-                    } else {
-                        &self.program(frame.program_index).local_names
-                    };
-                    for (i, val) in frame.locals.iter().enumerate() {
-                        if let Some(name) = local_names.get(i) {
-                            captured.push((name.clone(), val.clone()));
-                        }
-                    }
-                }
-                // Also capture all globals that are user-defined (not builtins)
-                for (name, val) in &self.globals {
-                    if !Self::BUILTIN_GLOBAL_NAMES.contains(&name.as_str()) {
-                        captured.push((name.clone(), val.clone()));
-                    }
-                }
-                let closure = Closure {
-                    func_ref: FunctionRef {
-                        program_id: self.current_frame().program_index,
-                        function_id: func_idx,
-                    },
-                    captured,
-                };
+                let closure = self.create_closure(func_idx);
                 self.push(Value::Function(closure))?;
             }
             Instruction::Call(arg_count) => {
@@ -2239,6 +2403,7 @@ impl Vm {
                                 id: gen_id,
                                 func_ref,
                                 captured,
+                                env: closure.env.clone(),
                                 suspended: None,
                                 done: false,
                             };
