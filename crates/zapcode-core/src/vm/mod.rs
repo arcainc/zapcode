@@ -9,7 +9,9 @@ use crate::error::{Result, ZapcodeError};
 use crate::sandbox::{ResourceLimits, ResourceTracker};
 use crate::snapshot::ZapcodeSnapshot;
 use crate::trace::{ExecutionTrace, SpanBuilder, TraceStatus};
-use crate::value::{Closure, FunctionRef, GeneratorObject, SuspendedFrame, Value};
+use crate::value::{
+    Closure, FunctionRef, GeneratorObject, Place, PlaceRoot, PlaceSeg, SuspendedFrame, Value,
+};
 
 mod builtins;
 
@@ -131,6 +133,10 @@ pub struct Vm {
     pub(crate) last_global_name: Option<String>,
     /// Tracks the source of the most recent Load instruction for receiver tracking.
     pub(crate) last_load_source: Option<ReceiverSource>,
+    /// Write-back place (root + path) of the most recently loaded/accessed value,
+    /// captured onto a builtin method so mutating calls persist to the right
+    /// location (incl. nested `obj.items.push(...)`). Transient; not serialized.
+    pub(crate) last_place: Option<Place>,
     /// Counter for assigning unique generator IDs.
     pub(crate) next_generator_id: u64,
     /// External calls deferred by `CallExternalDeferred`, pending batch resolution.
@@ -194,6 +200,7 @@ impl Vm {
             last_receiver_source: None,
             last_global_name: None,
             last_load_source: None,
+            last_place: None,
             next_generator_id: 0,
             pending_calls: Vec::new(),
             resolved: BTreeMap::new(),
@@ -266,6 +273,7 @@ impl Vm {
             last_receiver_source,
             last_global_name,
             last_load_source,
+            last_place: None,
             next_generator_id,
             pending_calls: Vec::new(),
             resolved: BTreeMap::new(),
@@ -448,6 +456,55 @@ impl Vm {
                     target_frame.locals[*slot] = value;
                 }
             }
+        }
+    }
+
+    /// Read the root variable of a [`Place`].
+    fn read_place_root(&self, root: &PlaceRoot) -> Option<Value> {
+        match root {
+            PlaceRoot::Global(name) => self.globals.get(name).cloned(),
+            PlaceRoot::Local { frame_index, slot } => self
+                .frames
+                .get(*frame_index)
+                .and_then(|f| f.locals.get(*slot).cloned()),
+            PlaceRoot::This => self.frames.iter().rev().find_map(|f| f.this_value.clone()),
+        }
+    }
+
+    fn write_place_root(&mut self, root: &PlaceRoot, value: Value) {
+        let source = match root {
+            PlaceRoot::Global(name) => ReceiverSource::Global(name.clone()),
+            PlaceRoot::Local { frame_index, slot } => ReceiverSource::Local {
+                frame_index: *frame_index,
+                slot: *slot,
+            },
+            PlaceRoot::This => {
+                // Update the nearest enclosing `this`; the method-return path then
+                // persists it to the original receiver.
+                for frame in self.frames.iter_mut().rev() {
+                    if frame.this_value.is_some() {
+                        frame.this_value = Some(value);
+                        break;
+                    }
+                }
+                return;
+            }
+        };
+        self.write_receiver_source(&source, value);
+    }
+
+    /// Persist a mutated receiver back to its place: the root variable, navigated
+    /// through the property/index path. Handles nested `obj.items.push(...)`.
+    fn write_place(&mut self, place: &Place, value: Value) {
+        if place.path.is_empty() {
+            self.write_place_root(&place.root, value);
+            return;
+        }
+        let Some(mut root_val) = self.read_place_root(&place.root) else {
+            return;
+        };
+        if set_in_place(&mut root_val, &place.path, value) {
+            self.write_place_root(&place.root, root_val);
         }
     }
 
@@ -1440,6 +1497,13 @@ impl Vm {
                     frame_index,
                     slot: idx,
                 });
+                self.last_place = Some(Place {
+                    root: PlaceRoot::Local {
+                        frame_index,
+                        slot: idx,
+                    },
+                    path: Vec::new(),
+                });
                 self.push(val)?;
             }
             Instruction::StoreLocal(idx) => {
@@ -1458,8 +1522,13 @@ impl Vm {
                 // values that would break snapshot serialization if written back.
                 if Self::BUILTIN_GLOBAL_NAMES.contains(&name.as_str()) {
                     self.last_load_source = None;
+                    self.last_place = None;
                 } else {
-                    self.last_load_source = Some(ReceiverSource::Global(name));
+                    self.last_load_source = Some(ReceiverSource::Global(name.clone()));
+                    self.last_place = Some(Place {
+                        root: PlaceRoot::Global(name),
+                        path: Vec::new(),
+                    });
                 }
                 self.push(val)?;
             }
@@ -1693,15 +1762,42 @@ impl Vm {
             }
             Instruction::GetProperty(name) => {
                 let obj = self.pop()?;
+                // Place of the object we're reading the property from.
+                let obj_place = self.last_place.take();
                 let result = self.get_property(&obj, &name)?;
-                // Store receiver for method calls
-                if matches!(result, Value::BuiltinMethod { .. } | Value::Function(_)) {
-                    self.last_receiver = Some(obj);
-                    self.last_receiver_source = self.last_load_source.take();
-                } else {
-                    self.last_receiver_source = None;
+                match result {
+                    Value::BuiltinMethod {
+                        object_name,
+                        method_name,
+                        ..
+                    } => {
+                        // Bind the receiver + write-back place onto the method so
+                        // argument evaluation can't clobber it.
+                        self.last_receiver_source = None;
+                        self.push(Value::BuiltinMethod {
+                            object_name,
+                            method_name,
+                            recv: Some(Box::new(obj)),
+                            place: obj_place,
+                        })?;
+                    }
+                    Value::Function(_) => {
+                        // User method: keep the existing `this`-binding mechanism.
+                        self.last_receiver = Some(obj);
+                        self.last_receiver_source = self.last_load_source.take();
+                        self.push(result)?;
+                    }
+                    other => {
+                        // Plain value: extend the place path so a later method on
+                        // it (e.g. `obj.items.push`) writes back to the right spot.
+                        self.last_receiver_source = None;
+                        self.last_place = obj_place.map(|mut p| {
+                            p.path.push(PlaceSeg::Prop(name.to_string()));
+                            p
+                        });
+                        self.push(other)?;
+                    }
                 }
-                self.push(result)?;
             }
             Instruction::SetProperty(name) => {
                 // Stack: [value_to_store, object] with object on top
@@ -1726,6 +1822,19 @@ impl Vm {
             Instruction::GetIndex => {
                 let index = self.pop()?;
                 let obj = self.pop()?;
+                let obj_place = self.last_place.take();
+                // The path step for this index access (for write-back chains).
+                let seg = match (&obj, &index) {
+                    (Value::Array(_), Value::Int(i)) if *i >= 0 => {
+                        Some(PlaceSeg::Index(*i as usize))
+                    }
+                    (Value::Array(_), Value::Float(f)) if *f >= 0.0 => {
+                        Some(PlaceSeg::Index(*f as usize))
+                    }
+                    (Value::Object(_), Value::String(key)) => Some(PlaceSeg::Prop(key.to_string())),
+                    (Value::Object(_), _) => Some(PlaceSeg::Prop(index.to_js_string())),
+                    _ => None,
+                };
                 let result = match (&obj, &index) {
                     (Value::Array(arr), Value::Int(i)) => {
                         arr.get(*i as usize).cloned().unwrap_or(Value::Undefined)
@@ -1747,7 +1856,37 @@ impl Vm {
                         .unwrap_or(Value::Undefined),
                     _ => Value::Undefined,
                 };
-                self.push(result)?;
+                match result {
+                    Value::BuiltinMethod {
+                        object_name,
+                        method_name,
+                        ..
+                    } => {
+                        let place = match (obj_place, seg) {
+                            (Some(mut p), Some(s)) => {
+                                p.path.push(s);
+                                Some(p)
+                            }
+                            _ => None,
+                        };
+                        self.push(Value::BuiltinMethod {
+                            object_name,
+                            method_name,
+                            recv: Some(Box::new(obj)),
+                            place,
+                        })?;
+                    }
+                    other => {
+                        self.last_place = match (obj_place, seg) {
+                            (Some(mut p), Some(s)) => {
+                                p.path.push(s);
+                                Some(p)
+                            }
+                            _ => None,
+                        };
+                        self.push(other)?;
+                    }
+                }
             }
             Instruction::SetIndex => {
                 let index = self.pop()?;
@@ -2004,8 +2143,12 @@ impl Vm {
                     Value::BuiltinMethod {
                         object_name,
                         method_name,
+                        recv,
+                        place,
                     } => {
-                        let receiver = self.last_receiver.take();
+                        // Receiver is carried on the method (immune to arg eval);
+                        // fall back to the legacy slot for any unbound handle.
+                        let receiver = recv.map(|b| *b).or_else(|| self.last_receiver.take());
                         let result = match object_name.as_ref() {
                             "__array__" => {
                                 if let Some(Value::Array(arr)) = &receiver {
@@ -2036,10 +2179,8 @@ impl Vm {
                                             &mut self.stdout,
                                         )?,
                                     };
-                                    if let (Some(source), Some(updated)) =
-                                        (self.last_receiver_source.clone(), receiver_update)
-                                    {
-                                        self.write_receiver_source(&source, Value::Array(updated));
+                                    if let (Some(p), Some(updated)) = (&place, receiver_update) {
+                                        self.write_place(p, Value::Array(updated));
                                     }
                                     result
                                 } else {
@@ -2117,10 +2258,8 @@ impl Vm {
                                 if let Some(Value::Object(map)) = receiver {
                                     let (result, updated) =
                                         execute_map_method(map, &method_name, &args);
-                                    if let (Some(source), Some(updated)) =
-                                        (self.last_receiver_source.clone(), updated)
-                                    {
-                                        self.write_receiver_source(&source, Value::Object(updated));
+                                    if let (Some(p), Some(updated)) = (&place, updated) {
+                                        self.write_place(p, Value::Object(updated));
                                     }
                                     result
                                 } else {
@@ -2761,6 +2900,12 @@ impl Vm {
                     .rev()
                     .find_map(|f| f.this_value.clone())
                     .unwrap_or(Value::Undefined);
+                // Establish a place so `this.items.push(...)` writes back to the
+                // instance (persisted to the receiver when the method returns).
+                self.last_place = Some(Place {
+                    root: PlaceRoot::This,
+                    path: Vec::new(),
+                });
                 self.push(this_val)?;
             }
             Instruction::StoreThis => {
@@ -2837,40 +2982,25 @@ impl Vm {
                 }
                 // Check if this is a promise instance — expose .then/.catch/.finally
                 if builtins::is_promise(obj) && is_promise_method(name) {
-                    return Ok(Value::BuiltinMethod {
-                        object_name: Arc::from("__promise__"),
-                        method_name: Arc::from(name),
-                    });
+                    return Ok(builtin_method("__promise__", name));
                 }
                 if is_map_object(obj) && is_map_method(name) {
-                    return Ok(Value::BuiltinMethod {
-                        object_name: Arc::from("__map__"),
-                        method_name: Arc::from(name),
-                    });
+                    return Ok(builtin_method("__map__", name));
                 }
                 if is_date_object(obj) && is_date_method(name) {
-                    return Ok(Value::BuiltinMethod {
-                        object_name: Arc::from("__date__"),
-                        method_name: Arc::from(name),
-                    });
+                    return Ok(builtin_method("__date__", name));
                 }
                 // Check if this is a known global object — return builtin method handle
                 if let Some(global_name) = &self.last_global_name {
                     if Self::BUILTIN_GLOBAL_NAMES.contains(&global_name.as_str()) {
-                        return Ok(Value::BuiltinMethod {
-                            object_name: Arc::from(global_name.as_str()),
-                            method_name: Arc::from(name),
-                        });
+                        return Ok(builtin_method(global_name.as_str(), name));
                     }
                 }
                 Ok(Value::Undefined)
             }
             Value::Array(arr) => match name {
                 "length" => Ok(Value::Int(arr.len() as i64)),
-                _ if is_array_method(name) => Ok(Value::BuiltinMethod {
-                    object_name: Arc::from("__array__"),
-                    method_name: Arc::from(name),
-                }),
+                _ if is_array_method(name) => Ok(builtin_method("__array__", name)),
                 _ => {
                     if let Ok(idx) = name.parse::<usize>() {
                         Ok(arr.get(idx).cloned().unwrap_or(Value::Undefined))
@@ -2881,32 +3011,79 @@ impl Vm {
             },
             Value::String(s) => match name {
                 "length" => Ok(Value::Int(s.chars().count() as i64)),
-                _ if is_string_method(name) => Ok(Value::BuiltinMethod {
-                    object_name: Arc::from("__string__"),
-                    method_name: Arc::from(name),
-                }),
+                _ if is_string_method(name) => Ok(builtin_method("__string__", name)),
                 _ => Ok(Value::Undefined),
             },
             Value::Generator(_) => match name {
-                "next" | "return" | "throw" => Ok(Value::BuiltinMethod {
-                    object_name: Arc::from("__generator__"),
-                    method_name: Arc::from(name),
-                }),
+                "next" | "return" | "throw" => Ok(builtin_method("__generator__", name)),
                 _ => Ok(Value::Undefined),
             },
             Value::Int(_) | Value::Float(_) if builtins::is_number_method(name) => {
-                Ok(Value::BuiltinMethod {
-                    object_name: Arc::from("__number__"),
-                    method_name: Arc::from(name),
-                })
+                Ok(builtin_method("__number__", name))
             }
             _ => Ok(Value::Undefined),
         }
     }
 }
 
+/// Construct an unbound builtin-method handle. The receiver and write-back place
+/// are attached by the `GetProperty`/`GetIndex` handlers.
+fn builtin_method(object_name: &str, method_name: &str) -> Value {
+    Value::BuiltinMethod {
+        object_name: Arc::from(object_name),
+        method_name: Arc::from(method_name),
+        recv: None,
+        place: None,
+    }
+}
+
 // Re-export for the ParamPattern type used in function calls
 use crate::parser::ir::ParamPattern;
+
+/// Navigate `path` within `target` and store `value` at the leaf. Returns whether
+/// the write succeeded (false if the path doesn't resolve).
+fn set_in_place(target: &mut Value, path: &[PlaceSeg], value: Value) -> bool {
+    let Some((last, prefix)) = path.split_last() else {
+        return false;
+    };
+    let mut cur = target;
+    for seg in prefix {
+        cur = match nav_mut(cur, seg) {
+            Some(c) => c,
+            None => return false,
+        };
+    }
+    set_seg(cur, last, value)
+}
+
+fn nav_mut<'a>(v: &'a mut Value, seg: &PlaceSeg) -> Option<&'a mut Value> {
+    match (v, seg) {
+        (Value::Object(map), PlaceSeg::Prop(k)) => map.get_mut(k.as_str()),
+        (Value::Array(arr), PlaceSeg::Index(i)) => arr.get_mut(*i),
+        _ => None,
+    }
+}
+
+fn set_seg(v: &mut Value, seg: &PlaceSeg, value: Value) -> bool {
+    match (v, seg) {
+        (Value::Object(map), PlaceSeg::Prop(k)) => {
+            map.insert(Arc::from(k.as_str()), value);
+            true
+        }
+        (Value::Array(arr), PlaceSeg::Index(i)) => {
+            if *i < arr.len() {
+                arr[*i] = value;
+                true
+            } else if *i == arr.len() {
+                arr.push(value);
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
 
 fn mutated_array_receiver(method: &str, arr: &[Value], args: &[Value]) -> Option<Vec<Value>> {
     match method {

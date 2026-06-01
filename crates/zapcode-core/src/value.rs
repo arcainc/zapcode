@@ -27,7 +27,42 @@ pub enum Value {
     BuiltinMethod {
         object_name: Arc<str>,
         method_name: Arc<str>,
+        /// The receiver this method is bound to, captured at property-load time
+        /// so argument evaluation can't clobber it. `None` for unbound markers.
+        #[serde(default)]
+        recv: Option<Box<Value>>,
+        /// Where to write the receiver back after a mutating method (push, etc.),
+        /// supporting nested paths like `obj.items` or `rows[i].tags`.
+        #[serde(default)]
+        place: Option<Place>,
     },
+}
+
+/// The root variable a [`Place`] resolves from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PlaceRoot {
+    Global(String),
+    Local {
+        frame_index: usize,
+        slot: usize,
+    },
+    /// The nearest enclosing `this` (for `this.items.push(...)` in a method).
+    This,
+}
+
+/// One step in a [`Place`] path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PlaceSeg {
+    Prop(String),
+    Index(usize),
+}
+
+/// A write-back location: a root variable plus a path of property/index steps,
+/// e.g. `obj.items` is `{ root: obj, path: [Prop("items")] }`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Place {
+    pub root: PlaceRoot,
+    pub path: Vec<PlaceSeg>,
 }
 
 /// Identifies a function in the compiled program.
