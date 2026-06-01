@@ -195,17 +195,25 @@ await expectExecutionError(
   /Invalid arguments for tool 'escalateTo': parameter 'dueAtMs' expected number, got null/
 );
 
-await expectExecutionError(
-  `
-  await escalateTo({
-    assignee: "guy Y",
-    dueAtMs: 1780444800000,
-    reason: "bad metadata",
-    metadata: null,
-  })
-  `,
-  /Invalid arguments for tool 'escalateTo': parameter 'metadata' expected object, got null/
-);
+// An optional field written as `metadata: undefined` crosses the boundary as
+// null; it's treated as omitted (the common agent pattern) rather than rejected.
+{
+  const escalations = [];
+  await execute(
+    `
+    await escalateTo({
+      assignee: "guy Y",
+      dueAtMs: 1780444800000,
+      reason: "optional metadata omitted via undefined",
+      metadata: undefined,
+    })
+    `,
+    createRoutingTools(escalations)
+  );
+
+  assert.equal(escalations.length, 1);
+  assert.equal(Object.hasOwn(escalations[0], "metadata"), false);
+}
 
 await expectExecutionError(
   `

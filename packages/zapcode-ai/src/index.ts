@@ -456,6 +456,14 @@ function buildNamedArgs(
       delete namedArgs[paramName];
       continue;
     }
+    // An omitted optional field written as `{ field: undefined }` in guest code
+    // crosses the JSON boundary as `null`. No declared param type is nullable,
+    // so for an *optional* param treat null as "omitted" — this makes the common
+    // agent pattern work. A required param still rejects null as a type error.
+    if (value === null && paramDef.optional) {
+      delete namedArgs[paramName];
+      continue;
+    }
 
     if (!matchesParamType(value, paramDef)) {
       throw new Error(
