@@ -1301,10 +1301,12 @@ impl Compiler {
                 if *optional {
                     self.emit(Instruction::Dup);
                     let skip = self.emit(Instruction::JumpIfNullish(0));
+                    self.emit(Instruction::Pop);
                     self.emit(Instruction::GetProperty(property.clone()));
                     let end = self.emit(Instruction::Jump(0));
                     let nullish = self.current_offset();
                     self.patch_jump(skip, nullish);
+                    self.emit(Instruction::Pop);
                     self.emit(Instruction::Pop);
                     self.emit(Instruction::Push(Constant::Undefined));
                     let after = self.current_offset();
@@ -1322,11 +1324,13 @@ impl Compiler {
                 if *optional {
                     self.emit(Instruction::Dup);
                     let skip = self.emit(Instruction::JumpIfNullish(0));
+                    self.emit(Instruction::Pop);
                     self.compile_expr(property)?;
                     self.emit(Instruction::GetIndex);
                     let end = self.emit(Instruction::Jump(0));
                     let nullish = self.current_offset();
                     self.patch_jump(skip, nullish);
+                    self.emit(Instruction::Pop);
                     self.emit(Instruction::Pop);
                     self.emit(Instruction::Push(Constant::Undefined));
                     let after = self.current_offset();
