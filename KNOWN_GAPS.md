@@ -1,5 +1,12 @@
 # Known gaps & bugs (from the realistic-scenario stress pass)
 
+> **Status: all items below have been fixed** (see GAPS_FIX_PLAN.md and the
+> `tests/{receiver_writeback,regex,destructuring,data_structures,spread_and_throw,control_flow_extra,misc_builtins}.rs`
+> regression suites). The original prioritized findings are kept below for the record.
+> The only intentionally-unsupported regex constructs are lookaround / backreferences
+> (the linear-time engine's limitation), which now raise a clear error.
+
+
 A pass of 5 parallel agents wrote realistic agent-generated TypeScript across
 data/ETL, date/time, text/regex, control-flow/errors, and durable-session
 domains (~220 checks, in `packages/zapcode-ai/tests/scenarios-*.mjs`). This is
