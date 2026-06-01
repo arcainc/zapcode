@@ -15,7 +15,17 @@ pub fn register_globals(globals: &mut HashMap<String, Value>) {
     globals.insert("Array".to_string(), Value::Object(IndexMap::new()));
     globals.insert("Promise".to_string(), Value::Object(IndexMap::new()));
     globals.insert("Map".to_string(), builtin_constructor("Map"));
+    globals.insert("Set".to_string(), builtin_constructor("Set"));
     globals.insert("Date".to_string(), builtin_constructor("Date"));
+    for err in [
+        "Error",
+        "TypeError",
+        "RangeError",
+        "SyntaxError",
+        "ReferenceError",
+    ] {
+        globals.insert(err.to_string(), builtin_constructor(err));
+    }
 
     // Callable bare globals (type conversions + numeric parsing/predicates),
     // dispatched by the VM's Call instruction (object marker "__global_fn__").

@@ -172,7 +172,26 @@ impl Value {
                 let items: Vec<String> = arr.iter().map(|v| v.to_js_string()).collect();
                 items.join(",")
             }
-            Value::Object(_) => "[object Object]".to_string(),
+            Value::Object(map) => {
+                // Error objects stringify as "Name: message" (like JS).
+                if matches!(map.get("__error__"), Some(Value::Bool(true))) {
+                    let name = map
+                        .get("name")
+                        .map(|v| v.to_js_string())
+                        .unwrap_or_else(|| "Error".to_string());
+                    let message = map
+                        .get("message")
+                        .map(|v| v.to_js_string())
+                        .unwrap_or_default();
+                    if message.is_empty() {
+                        name
+                    } else {
+                        format!("{}: {}", name, message)
+                    }
+                } else {
+                    "[object Object]".to_string()
+                }
+            }
             Value::Function(_) | Value::BuiltinMethod { .. } => "function".to_string(),
             Value::Generator(_) => "[object Generator]".to_string(),
             Value::Pending(_) => "[object Promise]".to_string(),

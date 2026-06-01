@@ -228,6 +228,12 @@ impl Vm {
         "parseFloat",
         "isNaN",
         "isFinite",
+        "Set",
+        "Error",
+        "TypeError",
+        "RangeError",
+        "SyntaxError",
+        "ReferenceError",
     ];
 
     /// Restore a VM from snapshot state and continue execution.
@@ -1967,6 +1973,7 @@ impl Vm {
                         s.chars()
                             .map(|c| Value::String(Arc::from(c.to_string().as_str()))),
                     ),
+                    Value::Object(ref m) if is_set_object(&iterable) => acc.extend(set_items(m)),
                     other => {
                         return Err(ZapcodeError::TypeError(format!(
                             "{} is not iterable (spread)",
@@ -2043,7 +2050,21 @@ impl Vm {
                 // Check if left's __class__ matches right's __class_name__
                 let result = match (&left, &right) {
                     (Value::Object(instance), Value::Object(class_obj)) => {
-                        if let (Some(inst_class), Some(class_name)) =
+                        if let Some(Value::String(ctor)) = class_obj.get("__builtin_constructor__")
+                        {
+                            // Builtin constructors: Error matches any error object;
+                            // a specific error type matches by name; Map/Set by marker.
+                            match ctor.as_ref() {
+                                "Error" => instance.contains_key("__error__"),
+                                "TypeError" | "RangeError" | "SyntaxError" | "ReferenceError" => {
+                                    instance.get("name")
+                                        == Some(&Value::String(Arc::from(ctor.as_ref())))
+                                }
+                                "Map" => instance.contains_key("__map__"),
+                                "Set" => instance.contains_key("__set__"),
+                                _ => false,
+                            }
+                        } else if let (Some(inst_class), Some(class_name)) =
                             (instance.get("__class__"), class_obj.get("__class_name__"))
                         {
                             inst_class == class_name
@@ -2280,6 +2301,18 @@ impl Vm {
                                     None
                                 }
                             }
+                            "__set__" => {
+                                if let Some(Value::Object(map)) = receiver {
+                                    let (result, updated) =
+                                        execute_set_method(map, &method_name, &args);
+                                    if let (Some(p), Some(updated)) = (&place, updated) {
+                                        self.write_place(p, Value::Object(updated));
+                                    }
+                                    result
+                                } else {
+                                    None
+                                }
+                            }
                             "__date__" => {
                                 if let Some(Value::Object(date)) = receiver {
                                     execute_date_method(&date, &method_name)
@@ -2464,6 +2497,29 @@ impl Vm {
                             Value::Int(gen_obj.id as i64),
                             Value::Bool(false),
                         ]);
+                        self.push(iter_obj)?;
+                    }
+                    // Map iterates as [key, value] pairs; Set as its items.
+                    Value::Object(ref m) if is_set_object(&val) => {
+                        let iter_obj =
+                            Value::Array(vec![Value::Array(set_items(m)), Value::Int(0)]);
+                        self.push(iter_obj)?;
+                    }
+                    Value::Object(ref m) if is_map_object(&val) => {
+                        let pairs: Vec<Value> = match m.get("__entries__") {
+                            Some(Value::Array(entries)) => entries
+                                .iter()
+                                .filter_map(|e| match e {
+                                    Value::Object(e) => Some(Value::Array(vec![
+                                        e.get("key").cloned().unwrap_or(Value::Undefined),
+                                        e.get("value").cloned().unwrap_or(Value::Undefined),
+                                    ])),
+                                    _ => None,
+                                })
+                                .collect(),
+                            _ => Vec::new(),
+                        };
+                        let iter_obj = Value::Array(vec![Value::Array(pairs), Value::Int(0)]);
                         self.push(iter_obj)?;
                     }
                     _ => {
@@ -2842,13 +2898,48 @@ impl Vm {
                     if let Some(Value::String(name)) = obj.get("__builtin_constructor__") {
                         match name.as_ref() {
                             "Map" => {
-                                self.push(make_map_object(Vec::new()))?;
+                                // new Map([[k, v], ...]) seeds {key,value} entries.
+                                let entries = match args.first() {
+                                    Some(Value::Array(pairs)) => pairs
+                                        .iter()
+                                        .map(|p| {
+                                            let (k, v) = match p {
+                                                Value::Array(kv) => (
+                                                    kv.first().cloned().unwrap_or(Value::Undefined),
+                                                    kv.get(1).cloned().unwrap_or(Value::Undefined),
+                                                ),
+                                                _ => (Value::Undefined, Value::Undefined),
+                                            };
+                                            let mut e = IndexMap::new();
+                                            e.insert(Arc::from("key"), k);
+                                            e.insert(Arc::from("value"), v);
+                                            Value::Object(e)
+                                        })
+                                        .collect(),
+                                    _ => Vec::new(),
+                                };
+                                self.push(make_map_object(entries))?;
+                                return Ok(None);
+                            }
+                            "Set" => {
+                                let items = match args.first() {
+                                    Some(Value::Array(items)) => items.clone(),
+                                    _ => Vec::new(),
+                                };
+                                self.push(make_set_object(items))?;
                                 return Ok(None);
                             }
                             "Date" => {
                                 let millis =
                                     args.first().map_or(0, |value| value.to_number() as i64);
                                 self.push(make_date_object(millis))?;
+                                return Ok(None);
+                            }
+                            "Error" | "TypeError" | "RangeError" | "SyntaxError"
+                            | "ReferenceError" => {
+                                let msg =
+                                    args.first().map(|v| v.to_js_string()).unwrap_or_default();
+                                self.push(make_error_object(name.as_ref(), &msg))?;
                                 return Ok(None);
                             }
                             _ => {}
@@ -2998,8 +3089,32 @@ impl Vm {
                 if builtins::is_promise(obj) && is_promise_method(name) {
                     return Ok(builtin_method("__promise__", name));
                 }
-                if is_map_object(obj) && is_map_method(name) {
-                    return Ok(builtin_method("__map__", name));
+                if is_map_object(obj) {
+                    if name == "size" {
+                        let n = match obj {
+                            Value::Object(m) => match m.get("__entries__") {
+                                Some(Value::Array(e)) => e.len(),
+                                _ => 0,
+                            },
+                            _ => 0,
+                        };
+                        return Ok(Value::Int(n as i64));
+                    }
+                    if is_map_method(name) {
+                        return Ok(builtin_method("__map__", name));
+                    }
+                }
+                if is_set_object(obj) {
+                    if name == "size" {
+                        let n = match obj {
+                            Value::Object(m) => set_items(m).len(),
+                            _ => 0,
+                        };
+                        return Ok(Value::Int(n as i64));
+                    }
+                    if is_set_method(name) {
+                        return Ok(builtin_method("__set__", name));
+                    }
                 }
                 if is_date_object(obj) && is_date_method(name) {
                     return Ok(builtin_method("__date__", name));
@@ -3245,7 +3360,90 @@ fn is_map_object(value: &Value) -> bool {
 }
 
 fn is_map_method(name: &str) -> bool {
-    matches!(name, "get" | "set" | "has" | "delete")
+    matches!(
+        name,
+        "get" | "set" | "has" | "delete" | "clear" | "keys" | "values" | "entries"
+    )
+}
+
+fn is_set_object(value: &Value) -> bool {
+    matches!(value, Value::Object(map) if matches!(map.get("__set__"), Some(Value::Bool(true))))
+}
+
+fn is_set_method(name: &str) -> bool {
+    matches!(name, "add" | "has" | "delete" | "clear" | "values" | "keys")
+}
+
+/// Build a Set object from items, de-duplicating by strict equality.
+fn make_set_object(items: Vec<Value>) -> Value {
+    let mut unique: Vec<Value> = Vec::new();
+    for item in items {
+        if !unique.iter().any(|u| u.strict_eq(&item)) {
+            unique.push(item);
+        }
+    }
+    let mut obj = IndexMap::new();
+    obj.insert(Arc::from("__set__"), Value::Bool(true));
+    obj.insert(Arc::from("__items__"), Value::Array(unique));
+    Value::Object(obj)
+}
+
+fn set_items(map: &IndexMap<Arc<str>, Value>) -> Vec<Value> {
+    match map.get("__items__") {
+        Some(Value::Array(items)) => items.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// Execute a Set method, returning (result, updated-set-for-write-back).
+fn execute_set_method(
+    map: IndexMap<Arc<str>, Value>,
+    method: &str,
+    args: &[Value],
+) -> (Option<Value>, Option<IndexMap<Arc<str>, Value>>) {
+    let mut items = set_items(&map);
+    let arg = args.first().cloned().unwrap_or(Value::Undefined);
+    match method {
+        "has" => (
+            Some(Value::Bool(items.iter().any(|i| i.strict_eq(&arg)))),
+            None,
+        ),
+        "add" => {
+            if !items.iter().any(|i| i.strict_eq(&arg)) {
+                items.push(arg);
+            }
+            let mut m = map;
+            m.insert(Arc::from("__items__"), Value::Array(items));
+            (Some(Value::Object(m.clone())), Some(m))
+        }
+        "delete" => {
+            let before = items.len();
+            items.retain(|i| !i.strict_eq(&arg));
+            let removed = items.len() != before;
+            let mut m = map;
+            m.insert(Arc::from("__items__"), Value::Array(items));
+            (Some(Value::Bool(removed)), Some(m))
+        }
+        "clear" => {
+            let mut m = map;
+            m.insert(Arc::from("__items__"), Value::Array(Vec::new()));
+            (Some(Value::Undefined), Some(m))
+        }
+        "values" | "keys" => (Some(Value::Array(items)), None),
+        _ => (None, None),
+    }
+}
+
+fn make_error_object(name: &str, message: &str) -> Value {
+    let mut obj = IndexMap::new();
+    obj.insert(Arc::from("__error__"), Value::Bool(true));
+    obj.insert(Arc::from("name"), Value::String(Arc::from(name)));
+    obj.insert(Arc::from("message"), Value::String(Arc::from(message)));
+    obj.insert(
+        Arc::from("stack"),
+        Value::String(Arc::from(format!("{}: {}", name, message).as_str())),
+    );
+    Value::Object(obj)
 }
 
 fn execute_map_method(
@@ -3313,6 +3511,43 @@ fn execute_map_method(
             let deleted = updated_entries.len() != before;
             map.insert(Arc::from("__entries__"), Value::Array(updated_entries));
             (Some(Value::Bool(deleted)), Some(map))
+        }
+        "clear" => {
+            map.insert(Arc::from("__entries__"), Value::Array(Vec::new()));
+            (Some(Value::Undefined), Some(map))
+        }
+        "keys" => {
+            let keys = entries
+                .iter()
+                .filter_map(|e| match e {
+                    Value::Object(e) => e.get("key").cloned(),
+                    _ => None,
+                })
+                .collect();
+            (Some(Value::Array(keys)), None)
+        }
+        "values" => {
+            let vals = entries
+                .iter()
+                .filter_map(|e| match e {
+                    Value::Object(e) => e.get("value").cloned(),
+                    _ => None,
+                })
+                .collect();
+            (Some(Value::Array(vals)), None)
+        }
+        "entries" => {
+            let pairs = entries
+                .iter()
+                .filter_map(|e| match e {
+                    Value::Object(e) => Some(Value::Array(vec![
+                        e.get("key").cloned().unwrap_or(Value::Undefined),
+                        e.get("value").cloned().unwrap_or(Value::Undefined),
+                    ])),
+                    _ => None,
+                })
+                .collect();
+            (Some(Value::Array(pairs)), None)
         }
         _ => (None, None),
     }
