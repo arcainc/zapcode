@@ -4,6 +4,7 @@ use std::sync::Arc;
 use indexmap::IndexMap;
 
 use crate::error::{Result, ZapcodeError};
+use crate::sandbox::ResourceLimits;
 use crate::value::Value;
 
 /// Register built-in global objects and functions.
@@ -339,11 +340,12 @@ pub fn call_builtin(
     object: &Value,
     method: &str,
     args: &[Value],
+    limits: &ResourceLimits,
     _stdout: &mut String,
 ) -> Result<Option<Value>> {
     match object {
-        Value::String(s) => call_string_method(s, method, args),
-        Value::Array(arr) => call_array_method(arr, method, args),
+        Value::String(s) => call_string_method(s, method, args, limits),
+        Value::Array(arr) => call_array_method(arr, method, args, limits),
         _ => Ok(None),
     }
 }
@@ -862,7 +864,12 @@ fn translate_replacement(repl: &str) -> String {
     out
 }
 
-fn call_string_method(s: &Arc<str>, method: &str, args: &[Value]) -> Result<Option<Value>> {
+fn call_string_method(
+    s: &Arc<str>,
+    method: &str,
+    args: &[Value],
+    limits: &ResourceLimits,
+) -> Result<Option<Value>> {
     let result = match method {
         "length" => Value::Int(s.len() as i64),
         "charAt" => {
@@ -959,8 +966,11 @@ fn call_string_method(s: &Arc<str>, method: &str, args: &[Value]) -> Result<Opti
         "repeat" => {
             let count = arg_int(args, 0).max(0) as usize;
             let result_len = s.len().saturating_mul(count);
-            if result_len > 10_000_000 {
-                return Err(ZapcodeError::AllocationLimitExceeded);
+            if result_len > limits.memory_limit_bytes {
+                return Err(ZapcodeError::MemoryLimitExceeded(format!(
+                    "string repeat result of {} bytes exceeds memory limit of {} bytes",
+                    result_len, limits.memory_limit_bytes
+                )));
             }
             Value::String(Arc::from(s.repeat(count).as_str()))
         }
@@ -1134,7 +1144,12 @@ fn call_string_method(s: &Arc<str>, method: &str, args: &[Value]) -> Result<Opti
 
 // ── Array methods ────────────────────────────────────────────────────
 
-fn call_array_method(arr: &[Value], method: &str, args: &[Value]) -> Result<Option<Value>> {
+fn call_array_method(
+    arr: &[Value],
+    method: &str,
+    args: &[Value],
+    _limits: &ResourceLimits,
+) -> Result<Option<Value>> {
     let result = match method {
         "length" => Value::Int(arr.len() as i64),
         "indexOf" => {

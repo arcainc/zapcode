@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::mem::size_of;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -458,6 +459,11 @@ impl Vm {
         self.tracker.track_allocation(&self.limits)?;
         self.stack.push(value);
         Ok(())
+    }
+
+    fn track_array_capacity(&mut self, len: usize) -> Result<()> {
+        self.tracker
+            .track_memory(len.saturating_mul(size_of::<Value>()), &self.limits)
     }
 
     /// The value a `catch` block should bind: the original guest-thrown value if
@@ -1957,6 +1963,7 @@ impl Vm {
 
             // Objects & Arrays
             Instruction::CreateArray(count) => {
+                self.track_array_capacity(count)?;
                 self.tracker.track_allocation(&self.limits)?;
                 let mut arr = Vec::with_capacity(count);
                 for _ in 0..count {
@@ -2457,6 +2464,7 @@ impl Vm {
                                             &Value::Array(arr.clone()),
                                             &method_name,
                                             &args,
+                                            &self.limits,
                                             &mut self.stdout,
                                         )?,
                                     };
@@ -2474,6 +2482,7 @@ impl Vm {
                                         &Value::String(s.clone()),
                                         &method_name,
                                         &args,
+                                        &self.limits,
                                         &mut self.stdout,
                                     )?
                                 } else {
@@ -3305,16 +3314,13 @@ impl Vm {
                                     [single] => match single {
                                         Value::Int(n) if *n >= 0 => {
                                             let len = *n as usize;
-                                            if len > self.limits.max_allocations {
-                                                return Err(ZapcodeError::AllocationLimitExceeded);
-                                            }
+                                            self.track_array_capacity(len)?;
                                             vec![Value::Undefined; len]
                                         }
                                         Value::Float(f) if f.fract() == 0.0 && *f >= 0.0 => {
-                                            if *f > self.limits.max_allocations as f64 {
-                                                return Err(ZapcodeError::AllocationLimitExceeded);
-                                            }
-                                            vec![Value::Undefined; *f as usize]
+                                            let len = *f as usize;
+                                            self.track_array_capacity(len)?;
+                                            vec![Value::Undefined; len]
                                         }
                                         other => vec![other.clone()],
                                     },
