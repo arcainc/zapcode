@@ -52,6 +52,10 @@ pub enum Instruction {
     SetProperty(String),
     GetIndex,
     SetIndex,
+    /// Remove a property by name from the object on the stack: `[obj] -> [obj']`.
+    DeleteProperty(String),
+    /// Remove a property by computed key: `[obj, key] -> [obj']`.
+    DeleteIndex,
     Spread,
     /// Append one value to an accumulator array on the stack: `[acc, value] -> [acc']`.
     ArrayAppend,

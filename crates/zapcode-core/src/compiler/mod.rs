@@ -1335,6 +1335,36 @@ impl Compiler {
                 self.compile_expr(operand)?;
                 self.emit(Instruction::TypeOf);
             }
+            Expr::Delete(target) => {
+                // `delete obj.prop` removes the key and writes the mutated object
+                // back to its source place (value semantics), then yields `true`.
+                match target.as_ref() {
+                    Expr::Member {
+                        object, property, ..
+                    } if is_place_expr(object) => {
+                        self.compile_expr(object)?;
+                        self.emit(Instruction::DeleteProperty(property.clone()));
+                        self.compile_store(object)?;
+                        self.emit(Instruction::Push(Constant::Bool(true)));
+                    }
+                    Expr::ComputedMember {
+                        object, property, ..
+                    } if is_place_expr(object) => {
+                        self.compile_expr(object)?;
+                        self.compile_expr(property)?;
+                        self.emit(Instruction::DeleteIndex);
+                        self.compile_store(object)?;
+                        self.emit(Instruction::Push(Constant::Bool(true)));
+                    }
+                    // `delete` on a non-reference (or a non-place object) is a
+                    // no-op that evaluates to true in non-strict mode.
+                    other => {
+                        self.compile_expr(other)?;
+                        self.emit(Instruction::Pop);
+                        self.emit(Instruction::Push(Constant::Bool(true)));
+                    }
+                }
+            }
             Expr::ClassExpr {
                 name,
                 super_class,
@@ -1515,6 +1545,15 @@ impl Compiler {
         }
         Ok(())
     }
+}
+
+/// Whether an expression denotes a storable location (so a mutated copy can be
+/// written back). Used by `delete` to decide whether to persist the change.
+fn is_place_expr(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Ident(_) | Expr::Member { .. } | Expr::ComputedMember { .. }
+    )
 }
 
 pub fn compile(program: &Program) -> Result<CompiledProgram> {

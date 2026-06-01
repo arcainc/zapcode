@@ -1992,6 +1992,34 @@ impl Vm {
                 // Push modified object back so compile_store can store it to the variable
                 self.push(obj)?;
             }
+            Instruction::DeleteProperty(name) => {
+                let mut obj = self.pop()?;
+                if let Value::Object(map) = &mut obj {
+                    map.shift_remove(name.as_str());
+                }
+                self.push(obj)?;
+            }
+            Instruction::DeleteIndex => {
+                let key = self.pop()?;
+                let mut obj = self.pop()?;
+                match &mut obj {
+                    Value::Object(map) => {
+                        let k = key.to_js_string();
+                        map.shift_remove(k.as_str());
+                    }
+                    Value::Array(arr) => {
+                        // `delete arr[i]` leaves a hole (undefined) without
+                        // changing length, matching JS.
+                        if let Value::Int(i) = &key {
+                            if *i >= 0 && (*i as usize) < arr.len() {
+                                arr[*i as usize] = Value::Undefined;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                self.push(obj)?;
+            }
             Instruction::Spread => {
                 // No-op marker; spread is expanded by the dedicated
                 // Array/Object append instructions below.

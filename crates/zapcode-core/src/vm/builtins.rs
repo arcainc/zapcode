@@ -1264,6 +1264,12 @@ fn call_object_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
                     let keys: Vec<Value> = map.keys().map(|k| Value::String(k.clone())).collect();
                     Ok(Some(Value::Array(keys)))
                 }
+                // Object.keys([...]) yields index strings.
+                Value::Array(arr) => Ok(Some(Value::Array(
+                    (0..arr.len())
+                        .map(|i| Value::String(Arc::from(i.to_string().as_str())))
+                        .collect(),
+                ))),
                 _ => Ok(Some(Value::Array(Vec::new()))),
             }
         }
@@ -1274,6 +1280,7 @@ fn call_object_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
                     let values: Vec<Value> = map.values().cloned().collect();
                     Ok(Some(Value::Array(values)))
                 }
+                Value::Array(arr) => Ok(Some(Value::Array(arr.clone()))),
                 _ => Ok(Some(Value::Array(Vec::new()))),
             }
         }
@@ -1287,6 +1294,17 @@ fn call_object_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
                         .collect();
                     Ok(Some(Value::Array(entries)))
                 }
+                Value::Array(arr) => Ok(Some(Value::Array(
+                    arr.iter()
+                        .enumerate()
+                        .map(|(i, v)| {
+                            Value::Array(vec![
+                                Value::String(Arc::from(i.to_string().as_str())),
+                                v.clone(),
+                            ])
+                        })
+                        .collect(),
+                ))),
                 _ => Ok(Some(Value::Array(Vec::new()))),
             }
         }

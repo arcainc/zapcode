@@ -216,9 +216,7 @@ impl<'a> AstLowerer<'a> {
                 Ok(Statement::DoWhile { body, test, span })
             }
             ast::Statement::ForStatement(for_stmt) => self.lower_for(for_stmt),
-            ast::Statement::ForInStatement(s) => {
-                Err(self.unsupported(s.span, "for...in loops are not supported, use for...of"))
-            }
+            ast::Statement::ForInStatement(s) => self.lower_for_in(s),
             ast::Statement::ForOfStatement(for_of) => self.lower_for_of(for_of),
             ast::Statement::BlockStatement(block) => {
                 let span = self.span(block.span);
@@ -514,6 +512,49 @@ impl<'a> AstLowerer<'a> {
             init,
             test,
             update,
+            body,
+            span,
+        })
+    }
+
+    /// `for (const k in obj)` iterates the object's own enumerable keys. We
+    /// lower it to a for-of over `Object.keys(obj)`, which yields string keys
+    /// for objects and index strings for arrays — matching for-in semantics.
+    fn lower_for_in(&mut self, for_in: &ast::ForInStatement<'_>) -> Result<Statement> {
+        let span = self.span(for_in.span);
+        let binding = match &for_in.left {
+            ast::ForStatementLeft::VariableDeclaration(decl) => {
+                if let Some(declarator) = decl.declarations.first() {
+                    match &declarator.id {
+                        ast::BindingPattern::BindingIdentifier(id) => {
+                            ForBinding::Ident(id.name.to_string())
+                        }
+                        _ => {
+                            return Err(
+                                self.unsupported(for_in.span, "destructuring for-in binding")
+                            )
+                        }
+                    }
+                } else {
+                    return Err(self.unsupported(for_in.span, "empty for-in binding"));
+                }
+            }
+            _ => return Err(self.unsupported(for_in.span, "unsupported for-in left-hand side")),
+        };
+        let source = self.lower_expr(&for_in.right)?;
+        let iterable = Expr::Call {
+            callee: Box::new(Expr::Member {
+                object: Box::new(Expr::Ident("Object".to_string())),
+                property: "keys".to_string(),
+                optional: false,
+            }),
+            args: vec![source],
+            optional: false,
+        };
+        let body = self.lower_statement_as_block(&for_in.body)?;
+        Ok(Statement::ForOf {
+            binding,
+            iterable,
             body,
             span,
         })
@@ -940,7 +981,8 @@ impl<'a> AstLowerer<'a> {
                     return Ok(Expr::TypeOf(Box::new(operand)));
                 }
                 if matches!(unary.operator, ast::UnaryOperator::Delete) {
-                    return Err(self.unsupported(unary.span, "delete operator is not supported"));
+                    let operand = self.lower_expr(&unary.argument)?;
+                    return Ok(Expr::Delete(Box::new(operand)));
                 }
                 let op = match unary.operator {
                     ast::UnaryOperator::UnaryNegation => UnaryOp::Neg,

@@ -296,6 +296,9 @@ pub enum Expr {
     // Typeof
     TypeOf(Box<Expr>),
 
+    // `delete obj.prop` / `delete obj[key]`. Yields a boolean.
+    Delete(Box<Expr>),
+
     // Classes
     ClassExpr {
         name: Option<String>,
