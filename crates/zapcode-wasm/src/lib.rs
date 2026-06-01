@@ -85,6 +85,8 @@ fn value_to_js(val: &Value) -> Result<JsValue, JsError> {
         }
         Value::Function(_) | Value::BuiltinMethod { .. } => Ok(JsValue::from_str("<function>")),
         Value::Generator(_) => Ok(JsValue::from_str("<generator>")),
+        // A deferred batch call never escapes to a result value.
+        Value::Pending(_) => Ok(JsValue::null()),
     }
 }
 
@@ -152,6 +154,7 @@ impl Zapcode {
             time_limit_ms: opts.time_limit_ms.unwrap_or(defaults.time_limit_ms),
             max_stack_depth: opts.max_stack_depth.unwrap_or(defaults.max_stack_depth),
             max_allocations: opts.max_allocations.unwrap_or(defaults.max_allocations),
+            max_snapshot_bytes: defaults.max_snapshot_bytes,
         };
 
         let inner = zapcode_core::ZapcodeRun::new(
@@ -295,6 +298,44 @@ fn vm_state_to_js(
             }
             Reflect::set(&obj, &JsValue::from_str("args"), &js_args.into())
                 .map_err(|_| JsError::new("failed to set args"))?;
+            let snap = ZapcodeSnapshot { inner: snapshot };
+            Reflect::set(&obj, &JsValue::from_str("snapshot"), &snap.into_js()?)
+                .map_err(|_| JsError::new("failed to set snapshot"))?;
+            Reflect::set(
+                &obj,
+                &JsValue::from_str("stdout"),
+                &JsValue::from_str(stdout),
+            )
+            .map_err(|_| JsError::new("failed to set stdout"))?;
+        }
+        VmState::SuspendedMany { calls, snapshot } => {
+            Reflect::set(&obj, &JsValue::from_str("suspended"), &JsValue::from(true))
+                .map_err(|_| JsError::new("failed to set suspended"))?;
+            Reflect::set(
+                &obj,
+                &JsValue::from_str("suspendedMany"),
+                &JsValue::from(true),
+            )
+            .map_err(|_| JsError::new("failed to set suspendedMany"))?;
+            let js_calls = Array::new_with_length(calls.len() as u32);
+            for (i, call) in calls.iter().enumerate() {
+                let call_obj = Object::new();
+                Reflect::set(
+                    &call_obj,
+                    &JsValue::from_str("name"),
+                    &JsValue::from_str(&call.name),
+                )
+                .map_err(|_| JsError::new("failed to set call name"))?;
+                let js_args = Array::new_with_length(call.args.len() as u32);
+                for (j, arg) in call.args.iter().enumerate() {
+                    js_args.set(j as u32, value_to_js(arg)?);
+                }
+                Reflect::set(&call_obj, &JsValue::from_str("args"), &js_args.into())
+                    .map_err(|_| JsError::new("failed to set call args"))?;
+                js_calls.set(i as u32, call_obj.into());
+            }
+            Reflect::set(&obj, &JsValue::from_str("calls"), &js_calls.into())
+                .map_err(|_| JsError::new("failed to set calls"))?;
             let snap = ZapcodeSnapshot { inner: snapshot };
             Reflect::set(&obj, &JsValue::from_str("snapshot"), &snap.into_js()?)
                 .map_err(|_| JsError::new("failed to set snapshot"))?;

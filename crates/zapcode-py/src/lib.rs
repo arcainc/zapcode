@@ -74,6 +74,8 @@ fn value_to_py(py: Python<'_>, val: &Value) -> PyResult<PyObject> {
             Ok("<function>".into_pyobject(py)?.into_any().unbind())
         }
         Value::Generator(_) => Ok("<generator>".into_pyobject(py)?.into_any().unbind()),
+        // A deferred batch call never escapes to a result value.
+        Value::Pending(_) => Ok(py.None()),
     }
 }
 
@@ -136,6 +138,7 @@ impl Zapcode {
             time_limit_ms: time_limit_ms.unwrap_or(defaults.time_limit_ms),
             max_stack_depth: max_stack_depth.unwrap_or(defaults.max_stack_depth),
             max_allocations: max_allocations.unwrap_or(defaults.max_allocations),
+            max_snapshot_bytes: defaults.max_snapshot_bytes,
         };
         let inner = zapcode_core::ZapcodeRun::new(
             code,
@@ -233,6 +236,24 @@ fn run_result_to_py(
             dict.set_item("snapshot", ZapcodeSnapshot { inner: snapshot })?;
             dict.set_item("stdout", stdout)?;
         }
+        VmState::SuspendedMany { calls, snapshot } => {
+            dict.set_item("suspended", true)?;
+            dict.set_item("suspended_many", true)?;
+            let py_calls = PyList::empty(py);
+            for call in &calls {
+                let call_dict = PyDict::new(py);
+                call_dict.set_item("name", &call.name)?;
+                let py_args = PyList::empty(py);
+                for arg in &call.args {
+                    py_args.append(value_to_py(py, arg)?)?;
+                }
+                call_dict.set_item("args", py_args)?;
+                py_calls.append(call_dict)?;
+            }
+            dict.set_item("calls", py_calls)?;
+            dict.set_item("snapshot", ZapcodeSnapshot { inner: snapshot })?;
+            dict.set_item("stdout", stdout)?;
+        }
     }
     if let Some(t) = trace {
         dict.set_item("trace", trace_span_to_py(py, &t.root)?)?;
@@ -273,6 +294,33 @@ impl ZapcodeSnapshot {
     fn resume(&self, py: Python<'_>, return_value: &Bound<'_, PyAny>) -> PyResult<PyObject> {
         let val = py_to_value(return_value)?;
         let state = self.inner.clone().resume(val).map_err(zapcode_err)?;
+        run_result_to_py(py, state, "", None)
+    }
+
+    /// Resume by raising an error at the suspended external call (a failed
+    /// tool). Catchable by a surrounding try/catch in the guest.
+    fn resume_error(&self, py: Python<'_>, error: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+        let val = py_to_value(error)?;
+        let state = self
+            .inner
+            .clone()
+            .resume_with_error(val)
+            .map_err(zapcode_err)?;
+        run_result_to_py(py, state, "", None)
+    }
+
+    /// Resume a `Promise.all` batch suspension with one result per call, in the
+    /// order the calls were presented.
+    fn resume_many(&self, py: Python<'_>, results: &Bound<'_, PyList>) -> PyResult<PyObject> {
+        let mut values = Vec::with_capacity(results.len());
+        for item in results.iter() {
+            values.push(py_to_value(&item)?);
+        }
+        let state = self
+            .inner
+            .clone()
+            .resume_many(values)
+            .map_err(zapcode_err)?;
         run_result_to_py(py, state, "", None)
     }
 }
