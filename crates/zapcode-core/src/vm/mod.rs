@@ -2204,6 +2204,17 @@ impl Vm {
                                     receiver.as_ref().map(|v| v.to_number()).unwrap_or(f64::NAN);
                                 builtins::call_number_method(n, &method_name, &args)?
                             }
+                            "__regexp__" => {
+                                match receiver.as_ref().and_then(builtins::regexp_parts) {
+                                    Some((pat, flags)) => builtins::call_regexp_method(
+                                        &pat,
+                                        &flags,
+                                        &method_name,
+                                        &args,
+                                    )?,
+                                    None => None,
+                                }
+                            }
                             "__generator__" => {
                                 if let Some(Value::Generator(gen_obj)) = receiver {
                                     match method_name.as_ref() {
@@ -2990,6 +3001,9 @@ impl Vm {
                 if is_date_object(obj) && is_date_method(name) {
                     return Ok(builtin_method("__date__", name));
                 }
+                if builtins::regexp_parts(obj).is_some() && matches!(name, "test" | "exec") {
+                    return Ok(builtin_method("__regexp__", name));
+                }
                 // Check if this is a known global object — return builtin method handle
                 if let Some(global_name) = &self.last_global_name {
                     if Self::BUILTIN_GLOBAL_NAMES.contains(&global_name.as_str()) {
@@ -3365,6 +3379,7 @@ fn is_string_method(name: &str) -> bool {
             | "concat"
             | "at"
             | "match"
+            | "matchAll"
             | "search"
             | "normalize"
     )

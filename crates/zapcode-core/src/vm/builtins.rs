@@ -652,6 +652,101 @@ fn find_json_colon(s: &str) -> Option<usize> {
 
 // ── String methods ───────────────────────────────────────────────────
 
+/// Extract `(pattern, flags)` if `v` is a regex literal object `{__regexp__, …}`.
+pub fn regexp_parts(v: &Value) -> Option<(String, String)> {
+    if let Value::Object(map) = v {
+        if matches!(map.get("__regexp__"), Some(Value::Bool(true))) {
+            let pat = match map.get("pattern") {
+                Some(Value::String(s)) => s.to_string(),
+                _ => String::new(),
+            };
+            let flags = match map.get("flags") {
+                Some(Value::String(s)) => s.to_string(),
+                _ => String::new(),
+            };
+            return Some((pat, flags));
+        }
+    }
+    None
+}
+
+/// Compile a JS-ish regex with the supported flags (i, m, s). The `g` flag is
+/// handled by callers (all matches vs first). Lookaround/backreferences aren't
+/// supported by the linear-time engine and produce a clear error.
+fn compile_regex(pattern: &str, flags: &str) -> Result<regex::Regex> {
+    regex::RegexBuilder::new(pattern)
+        .case_insensitive(flags.contains('i'))
+        .multi_line(flags.contains('m'))
+        .dot_matches_new_line(flags.contains('s'))
+        .build()
+        .map_err(|e| {
+            ZapcodeError::RuntimeError(format!("invalid regex /{}/{}: {}", pattern, flags, e))
+        })
+}
+
+/// Methods on a regex literal: `re.test(str)`, `re.exec(str)`.
+pub fn call_regexp_method(
+    pattern: &str,
+    flags: &str,
+    method: &str,
+    args: &[Value],
+) -> Result<Option<Value>> {
+    let subject = arg_str(args, 0);
+    let re = compile_regex(pattern, flags)?;
+    Ok(match method {
+        "test" => Some(Value::Bool(re.is_match(&subject))),
+        "exec" => Some(match re.captures(&subject) {
+            Some(caps) => Value::Array(
+                caps.iter()
+                    .map(|c| {
+                        c.map(|m| Value::String(Arc::from(m.as_str())))
+                            .unwrap_or(Value::Undefined)
+                    })
+                    .collect(),
+            ),
+            None => Value::Null,
+        }),
+        _ => None,
+    })
+}
+
+/// Translate JS replacement tokens (`$&`, `$1`, `$$`) to the regex crate's
+/// `${0}`/`${1}`/`$` so group substitution works as agents expect.
+fn translate_replacement(repl: &str) -> String {
+    let mut out = String::new();
+    let mut chars = repl.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('&') => {
+                chars.next();
+                out.push_str("${0}");
+            }
+            Some('$') => {
+                chars.next();
+                out.push('$');
+            }
+            Some(d) if d.is_ascii_digit() => {
+                let mut num = String::new();
+                while let Some(d2) = chars.peek() {
+                    if d2.is_ascii_digit() {
+                        num.push(*d2);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                out.push_str(&format!("${{{}}}", num));
+            }
+            _ => out.push('$'),
+        }
+    }
+    out
+}
+
 fn call_string_method(s: &Arc<str>, method: &str, args: &[Value]) -> Result<Option<Value>> {
     let result = match method {
         "length" => Value::Int(s.len() as i64),
@@ -770,6 +865,11 @@ fn call_string_method(s: &Arc<str>, method: &str, args: &[Value]) -> Result<Opti
             }
         }
         "split" => {
+            if let Some((pat, flags)) = args.first().and_then(regexp_parts) {
+                let re = compile_regex(&pat, &flags)?;
+                let parts: Vec<Value> = re.split(s).map(|p| Value::String(Arc::from(p))).collect();
+                return Ok(Some(Value::Array(parts)));
+            }
             let separator = arg_str(args, 0);
             let parts: Vec<Value> = if separator.is_empty() {
                 s.chars()
@@ -783,31 +883,96 @@ fn call_string_method(s: &Arc<str>, method: &str, args: &[Value]) -> Result<Opti
             Value::Array(parts)
         }
         "replace" => {
+            if let Some((pat, flags)) = args.first().and_then(regexp_parts) {
+                let re = compile_regex(&pat, &flags)?;
+                let repl = translate_replacement(&arg_str(args, 1));
+                let out = if flags.contains('g') {
+                    re.replace_all(s, repl.as_str())
+                } else {
+                    re.replace(s, repl.as_str())
+                };
+                return Ok(Some(Value::String(Arc::from(out.as_ref()))));
+            }
             let search = arg_str(args, 0);
             let replacement = arg_str(args, 1);
             Value::String(Arc::from(s.replacen(&*search, &replacement, 1).as_str()))
         }
         "replaceAll" => {
+            if let Some((pat, flags)) = args.first().and_then(regexp_parts) {
+                let re = compile_regex(&pat, &flags)?;
+                let repl = translate_replacement(&arg_str(args, 1));
+                let out = re.replace_all(s, repl.as_str());
+                return Ok(Some(Value::String(Arc::from(out.as_ref()))));
+            }
             let search = arg_str(args, 0);
             let replacement = arg_str(args, 1);
             Value::String(Arc::from(s.replace(&*search, &replacement).as_str()))
         }
         "match" => {
-            let pattern = match args.first() {
-                Some(Value::Object(map))
-                    if matches!(map.get("__regexp__"), Some(Value::Bool(true))) =>
-                {
-                    match map.get("pattern") {
-                        Some(Value::String(pattern)) => pattern.to_string(),
-                        _ => String::new(),
-                    }
+            if let Some((pat, flags)) = args.first().and_then(regexp_parts) {
+                let re = compile_regex(&pat, &flags)?;
+                if flags.contains('g') {
+                    let all: Vec<Value> = re
+                        .find_iter(s)
+                        .map(|m| Value::String(Arc::from(m.as_str())))
+                        .collect();
+                    return Ok(Some(if all.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::Array(all)
+                    }));
                 }
-                Some(value) => value.to_js_string(),
-                None => String::new(),
-            };
+                return Ok(Some(match re.captures(s) {
+                    Some(caps) => Value::Array(
+                        caps.iter()
+                            .map(|c| {
+                                c.map(|m| Value::String(Arc::from(m.as_str())))
+                                    .unwrap_or(Value::Undefined)
+                            })
+                            .collect(),
+                    ),
+                    None => Value::Null,
+                }));
+            }
+            // Non-regex arg: literal substring (kept for back-compat).
+            let pattern = args.first().map(|v| v.to_js_string()).unwrap_or_default();
             match s.find(&pattern) {
                 Some(_) => Value::Array(vec![Value::String(Arc::from(pattern.as_str()))]),
                 None => Value::Null,
+            }
+        }
+        "matchAll" => {
+            if let Some((pat, flags)) = args.first().and_then(regexp_parts) {
+                let re = compile_regex(&pat, &flags)?;
+                let all: Vec<Value> = re
+                    .captures_iter(s)
+                    .map(|caps| {
+                        Value::Array(
+                            caps.iter()
+                                .map(|c| {
+                                    c.map(|m| Value::String(Arc::from(m.as_str())))
+                                        .unwrap_or(Value::Undefined)
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect();
+                return Ok(Some(Value::Array(all)));
+            }
+            Value::Array(Vec::new())
+        }
+        "search" => {
+            if let Some((pat, flags)) = args.first().and_then(regexp_parts) {
+                let re = compile_regex(&pat, &flags)?;
+                return Ok(Some(match re.find(s) {
+                    Some(m) => Value::Int(m.start() as i64),
+                    None => Value::Int(-1),
+                }));
+            }
+            let pattern = arg_str(args, 0);
+            match s.find(&*pattern) {
+                Some(i) => Value::Int(i as i64),
+                None => Value::Int(-1),
             }
         }
         "concat" => {

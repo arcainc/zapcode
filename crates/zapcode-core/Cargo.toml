@@ -20,6 +20,7 @@ serde.workspace = true
 postcard.workspace = true
 sha2.workspace = true
 miniz_oxide.workspace = true
+regex.workspace = true
 indexmap.workspace = true
 thiserror.workspace = true
 
