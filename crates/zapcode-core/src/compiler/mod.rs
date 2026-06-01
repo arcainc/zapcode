@@ -414,8 +414,11 @@ impl Compiler {
                         let idx = self.declare_local(name);
                         self.emit(Instruction::StoreLocal(idx));
                     }
-                    ForBinding::Destructure(_) => {
-                        self.emit(Instruction::Pop); // TODO: destructure
+                    ForBinding::Destructure(pattern) => {
+                        // Destructure the iterated value into the bound names, then
+                        // pop the value the pattern was read from.
+                        self.compile_destructure_pattern(pattern, VarKind::Let)?;
+                        self.emit(Instruction::Pop);
                     }
                 }
 
@@ -683,6 +686,41 @@ impl Compiler {
             self.emit(self.top_level_store_instruction(name, idx));
         }
         Ok(())
+    }
+
+    /// Destructure the value on top of the stack into the names of a parameter
+    /// pattern (object or array, nested), storing each via `store_binding`. The
+    /// source value is left on the stack for the caller to pop.
+    fn compile_destructure_pattern(&mut self, pattern: &ParamPattern, kind: VarKind) -> Result<()> {
+        match pattern {
+            ParamPattern::ObjectDestructure(fields) => {
+                self.compile_object_destructure(fields, kind)
+            }
+            ParamPattern::ArrayDestructure(elems) => {
+                for (i, elem) in elems.iter().enumerate() {
+                    let Some(p) = elem else { continue };
+                    self.emit(Instruction::Dup);
+                    self.emit(Instruction::Push(Constant::Int(i as i64)));
+                    self.emit(Instruction::GetIndex);
+                    match p {
+                        ParamPattern::Ident(name) => self.store_binding(name, kind)?,
+                        ParamPattern::ObjectDestructure(_) | ParamPattern::ArrayDestructure(_) => {
+                            self.compile_destructure_pattern(p, kind)?;
+                            self.emit(Instruction::Pop);
+                        }
+                        _ => {
+                            self.emit(Instruction::Pop);
+                        }
+                    }
+                }
+                Ok(())
+            }
+            ParamPattern::Ident(name) => self.store_binding(name, kind),
+            _ => {
+                self.emit(Instruction::Pop);
+                Ok(())
+            }
+        }
     }
 
     fn compile_object_destructure(

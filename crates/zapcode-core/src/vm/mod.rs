@@ -567,7 +567,7 @@ impl Vm {
                     locals.push(args.get(i).cloned().unwrap_or(Value::Undefined));
                 }
                 ParamPattern::Rest(_) => {
-                    let rest: Vec<Value> = args[i..].to_vec();
+                    let rest: Vec<Value> = args.get(i..).map(|s| s.to_vec()).unwrap_or_default();
                     locals.push(Value::Array(rest));
                 }
                 ParamPattern::DefaultValue { .. } => {
@@ -575,8 +575,11 @@ impl Vm {
                     // Keep Undefined so the compiler-emitted default init can fire
                     locals.push(val);
                 }
-                _ => {
-                    locals.push(args.get(i).cloned().unwrap_or(Value::Undefined));
+                // Destructuring params bind multiple locals in declaration order;
+                // extract the fields from the argument into those slots.
+                ParamPattern::ObjectDestructure(_) | ParamPattern::ArrayDestructure(_) => {
+                    let arg = args.get(i).cloned().unwrap_or(Value::Undefined);
+                    extract_pattern(param, &arg, &mut locals);
                 }
             }
         }
@@ -3052,7 +3055,61 @@ fn builtin_method(object_name: &str, method_name: &str) -> Value {
 }
 
 // Re-export for the ParamPattern type used in function calls
-use crate::parser::ir::ParamPattern;
+use crate::parser::ir::{DestructureField, ParamPattern};
+
+/// Read a named field from `value` (Undefined if missing / not an object).
+fn field_of(value: &Value, key: &str) -> Value {
+    match value {
+        Value::Object(map) => map.get(key).cloned().unwrap_or(Value::Undefined),
+        _ => Value::Undefined,
+    }
+}
+
+/// Extract the locals bound by a (possibly nested) destructuring pattern from
+/// `value`, pushing them in declaration order to mirror `declare_destructure_locals`.
+fn extract_pattern(pattern: &ParamPattern, value: &Value, out: &mut Vec<Value>) {
+    match pattern {
+        ParamPattern::Ident(_) | ParamPattern::Rest(_) => out.push(value.clone()),
+        ParamPattern::DefaultValue { pattern, .. } => extract_pattern(pattern, value, out),
+        ParamPattern::ObjectDestructure(fields) => extract_object_fields(fields, value, out),
+        ParamPattern::ArrayDestructure(elems) => {
+            for (i, elem) in elems.iter().enumerate() {
+                if let Some(p) = elem {
+                    let item = match value {
+                        Value::Array(a) => a.get(i).cloned().unwrap_or(Value::Undefined),
+                        _ => Value::Undefined,
+                    };
+                    extract_pattern(p, &item, out);
+                }
+            }
+        }
+    }
+}
+
+fn extract_object_fields(fields: &[DestructureField], value: &Value, out: &mut Vec<Value>) {
+    let mut consumed: Vec<String> = Vec::new();
+    for field in fields {
+        if field.rest {
+            let rest = match value {
+                Value::Object(map) => Value::Object(
+                    map.iter()
+                        .filter(|(k, _)| !consumed.iter().any(|c| c == k.as_ref()))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                ),
+                _ => Value::Object(IndexMap::new()),
+            };
+            out.push(rest);
+        } else if let Some(nested) = &field.nested {
+            consumed.push(field.key.clone());
+            let child = field_of(value, &field.key);
+            extract_object_fields(nested, &child, out);
+        } else {
+            consumed.push(field.key.clone());
+            out.push(field_of(value, &field.key));
+        }
+    }
+}
 
 /// Navigate `path` within `target` and store `value` at the leaf. Returns whether
 /// the write succeeded (false if the path doesn't resolve).
