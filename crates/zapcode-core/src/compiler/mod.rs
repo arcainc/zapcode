@@ -53,6 +53,8 @@ struct Compiler {
     external_functions: HashSet<String>,
     mode: CompilerMode,
     top_level_bindings: HashMap<String, TopLevelBindingKind>,
+    /// Label attached to the next loop (from a `label:` statement), if any.
+    pending_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +66,7 @@ enum CompilerMode {
 struct LoopInfo {
     break_patches: Vec<usize>,
     continue_patches: Vec<usize>,
+    label: Option<String>,
 }
 
 impl Compiler {
@@ -77,6 +80,7 @@ impl Compiler {
             external_functions,
             mode: CompilerMode::Standard,
             top_level_bindings: HashMap::new(),
+            pending_label: None,
         }
     }
 
@@ -93,6 +97,7 @@ impl Compiler {
             external_functions,
             mode: CompilerMode::SessionChunk,
             top_level_bindings,
+            pending_label: None,
         }
     }
 
@@ -294,6 +299,7 @@ impl Compiler {
                 self.loop_stack.push(LoopInfo {
                     break_patches: Vec::new(),
                     continue_patches: Vec::new(),
+                    label: self.pending_label.take(),
                 });
 
                 self.compile_expr(test)?;
@@ -320,6 +326,7 @@ impl Compiler {
                 self.loop_stack.push(LoopInfo {
                     break_patches: Vec::new(),
                     continue_patches: Vec::new(),
+                    label: self.pending_label.take(),
                 });
 
                 for s in body {
@@ -354,6 +361,7 @@ impl Compiler {
                 self.loop_stack.push(LoopInfo {
                     break_patches: Vec::new(),
                     continue_patches: Vec::new(),
+                    label: self.pending_label.take(),
                 });
 
                 let exit_jump = if let Some(test) = test {
@@ -401,6 +409,7 @@ impl Compiler {
                 self.loop_stack.push(LoopInfo {
                     break_patches: Vec::new(),
                     continue_patches: Vec::new(),
+                    label: self.pending_label.take(),
                 });
 
                 self.emit(Instruction::Dup);
@@ -487,17 +496,40 @@ impl Compiler {
                     }
                 }
             }
-            Statement::Break { .. } => {
+            Statement::Break { label, .. } => {
                 let idx = self.emit(Instruction::Jump(0));
-                if let Some(loop_info) = self.loop_stack.last_mut() {
+                let target = match label {
+                    Some(l) => self
+                        .loop_stack
+                        .iter_mut()
+                        .rev()
+                        .find(|li| li.label.as_deref() == Some(l.as_str())),
+                    None => self.loop_stack.last_mut(),
+                };
+                if let Some(loop_info) = target {
                     loop_info.break_patches.push(idx);
                 }
             }
-            Statement::Continue { .. } => {
+            Statement::Continue { label, .. } => {
                 let idx = self.emit(Instruction::Jump(0));
-                if let Some(loop_info) = self.loop_stack.last_mut() {
+                let target = match label {
+                    Some(l) => self
+                        .loop_stack
+                        .iter_mut()
+                        .rev()
+                        .find(|li| li.label.as_deref() == Some(l.as_str())),
+                    None => self.loop_stack.last_mut(),
+                };
+                if let Some(loop_info) = target {
                     loop_info.continue_patches.push(idx);
                 }
+            }
+            Statement::Labeled { label, body, .. } => {
+                // The next loop/switch picks up this label; clear it afterward in
+                // case the labeled statement wasn't a loop.
+                self.pending_label = Some(label.clone());
+                self.compile_statement(body)?;
+                self.pending_label = None;
             }
             Statement::FunctionDecl { func_index, .. } => {
                 self.emit(Instruction::CreateClosure(*func_index));
@@ -577,6 +609,7 @@ impl Compiler {
                 self.loop_stack.push(LoopInfo {
                     break_patches: Vec::new(),
                     continue_patches: Vec::new(),
+                    label: self.pending_label.take(),
                 });
 
                 // Compile case bodies

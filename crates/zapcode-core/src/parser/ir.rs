@@ -121,9 +121,17 @@ pub enum Statement {
         span: Span,
     },
     Break {
+        label: Option<String>,
         span: Span,
     },
     Continue {
+        label: Option<String>,
+        span: Span,
+    },
+    /// A labeled statement, e.g. `outer: for (...) { ... }`.
+    Labeled {
+        label: String,
+        body: Box<Statement>,
         span: Span,
     },
     FunctionDecl {

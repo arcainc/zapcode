@@ -46,6 +46,29 @@ fn switch_fallthrough_and_continue_target_enclosing_loop() {
 }
 
 #[test]
+fn labeled_break_and_continue() {
+    assert_eq!(
+        run_str("const out=[]; outer: for (let i=0;i<3;i++){ for (let j=0;j<3;j++){ if (i===1&&j===1) break outer; out.push(i+\":\"+j);} } out.join(\",\")"),
+        "0:0,0:1,0:2,1:0"
+    );
+    assert_eq!(
+        run_str("const out=[]; outer: for (let i=0;i<3;i++){ for (let j=0;j<3;j++){ if (j===1) continue outer; out.push(i+\":\"+j);} } out.join(\",\")"),
+        "0:0,1:0,2:0"
+    );
+    // Unlabeled break/continue unaffected.
+    assert_eq!(
+        run_str(
+            "const out=[]; for (let i=0;i<5;i++){ if(i===2) break; out.push(i);} out.join(\",\")"
+        ),
+        "0,1"
+    );
+    assert_eq!(
+        run_str("const out=[]; for (let i=0;i<4;i++){ if(i===1) continue; out.push(i);} out.join(\",\")"),
+        "0,2,3"
+    );
+}
+
+#[test]
 fn number_of_empty_string_is_zero() {
     assert_eq!(run_str("Number(\"\")"), "0");
     assert_eq!(run_str("Number(\"  \") + 5"), "5");

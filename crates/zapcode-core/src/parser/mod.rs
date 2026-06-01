@@ -232,9 +232,11 @@ impl<'a> AstLowerer<'a> {
             }
             ast::Statement::TryStatement(try_stmt) => self.lower_try(try_stmt),
             ast::Statement::BreakStatement(s) => Ok(Statement::Break {
+                label: s.label.as_ref().map(|l| l.name.to_string()),
                 span: self.span(s.span),
             }),
             ast::Statement::ContinueStatement(s) => Ok(Statement::Continue {
+                label: s.label.as_ref().map(|l| l.name.to_string()),
                 span: self.span(s.span),
             }),
             ast::Statement::FunctionDeclaration(func) => self.lower_func_decl(func),
@@ -244,7 +246,11 @@ impl<'a> AstLowerer<'a> {
                 expr: Expr::UndefinedLit,
                 span: Span { start: 0, end: 0 },
             }),
-            ast::Statement::LabeledStatement(labeled) => self.lower_statement(&labeled.body),
+            ast::Statement::LabeledStatement(labeled) => Ok(Statement::Labeled {
+                label: labeled.label.name.to_string(),
+                body: Box::new(self.lower_statement(&labeled.body)?),
+                span: self.span(labeled.span),
+            }),
             ast::Statement::TSTypeAliasDeclaration(s) => Ok(Statement::Expression {
                 expr: Expr::UndefinedLit,
                 span: self.span(s.span),
