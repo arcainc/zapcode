@@ -147,6 +147,10 @@ pub struct Vm {
     /// sequence (required for durable/Temporal replay) while still varying call
     /// to call.
     pub(crate) rng_state: u64,
+    /// The value of an in-flight guest `throw`, so `catch` receives the original
+    /// value (string, object, …) rather than a stringified error. Transient —
+    /// set by `Throw`, consumed by the catch handler; never crosses a suspension.
+    pub(crate) pending_throw: Option<Value>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -196,12 +200,14 @@ impl Vm {
             next_call_id: 0,
             pending_batch: None,
             rng_state: 0,
+            pending_throw: None,
         }
     }
 
     /// Names of all builtin globals registered by `register_globals`.
     pub(crate) const BUILTIN_GLOBAL_NAMES: &'static [&'static str] = &[
-        "console", "JSON", "Object", "Array", "Math", "Promise", "Map", "Date",
+        "console", "JSON", "Object", "Array", "Math", "Promise", "Map", "Date", "String", "Number",
+        "Boolean",
     ];
 
     /// Restore a VM from snapshot state and continue execution.
@@ -253,6 +259,7 @@ impl Vm {
             next_call_id: 0,
             pending_batch: None,
             rng_state: 0,
+            pending_throw: None,
         }
     }
 
@@ -320,8 +327,21 @@ impl Vm {
             self.resolved.insert(*id, value);
         }
         // Rebuild the result array in element order, substituting resolved values.
-        let mut array = Vec::with_capacity(batch.items.len());
-        for item in batch.items {
+        let array = self.build_batch_array(batch.items)?;
+        // Drop the now-resolved pending calls.
+        let resolved_ids: HashSet<u64> = batch.call_ids.iter().copied().collect();
+        self.pending_calls.retain(|c| !resolved_ids.contains(&c.id));
+        self.push(Value::Array(array))?;
+        self.execute()
+    }
+
+    /// Build a `Promise.all` result array from its elements: deferred calls are
+    /// replaced by their resolved value, and any plain promise element is
+    /// unwrapped (resolved → value, rejected → propagate) exactly like the
+    /// non-batched `Promise.all` builtin. Plain values pass through unchanged.
+    fn build_batch_array(&mut self, items: Vec<Value>) -> Result<Vec<Value>> {
+        let mut array = Vec::with_capacity(items.len());
+        for item in items {
             match item {
                 Value::Pending(id) => {
                     let value = self.resolved.remove(&id).ok_or_else(|| {
@@ -329,14 +349,23 @@ impl Vm {
                     })?;
                     array.push(value);
                 }
+                Value::Object(ref map) if builtins::is_promise(&item) => match map.get("status") {
+                    Some(Value::String(s)) if s.as_ref() == "resolved" => {
+                        array.push(map.get("value").cloned().unwrap_or(Value::Undefined));
+                    }
+                    Some(Value::String(s)) if s.as_ref() == "rejected" => {
+                        let reason = map.get("reason").cloned().unwrap_or(Value::Undefined);
+                        return Err(ZapcodeError::RuntimeError(format!(
+                            "Unhandled promise rejection: {}",
+                            reason.to_js_string()
+                        )));
+                    }
+                    _ => array.push(item),
+                },
                 other => array.push(other),
             }
         }
-        // Drop the now-resolved pending calls.
-        let resolved_ids: HashSet<u64> = batch.call_ids.iter().copied().collect();
-        self.pending_calls.retain(|c| !resolved_ids.contains(&c.id));
-        self.push(Value::Array(array))?;
-        self.execute()
+        Ok(array)
     }
 
     /// Await a `Promise.all` batch. If any element is an unresolved deferred
@@ -353,15 +382,7 @@ impl Vm {
         }
 
         if call_ids.is_empty() {
-            let mut array = Vec::with_capacity(items.len());
-            for item in items {
-                match item {
-                    Value::Pending(id) => {
-                        array.push(self.resolved.remove(&id).unwrap_or(Value::Undefined))
-                    }
-                    other => array.push(other),
-                }
-            }
+            let array = self.build_batch_array(items)?;
             self.push(Value::Array(array))?;
             return Ok(None);
         }
@@ -391,6 +412,14 @@ impl Vm {
         self.tracker.track_allocation(&self.limits)?;
         self.stack.push(value);
         Ok(())
+    }
+
+    /// The value a `catch` block should bind: the original guest-thrown value if
+    /// this came from `throw`, otherwise the stringified runtime error.
+    fn caught_error_value(&mut self, err: &ZapcodeError) -> Value {
+        self.pending_throw
+            .take()
+            .unwrap_or_else(|| Value::String(Arc::from(err.to_string().as_str())))
     }
 
     fn write_receiver_source(&mut self, source: &ReceiverSource, value: Value) {
@@ -607,7 +636,7 @@ impl Vm {
                         self.stack.truncate(try_info.stack_depth);
 
                         // Push error value
-                        let error_val = Value::String(Arc::from(err.to_string()));
+                        let error_val = self.caught_error_value(&err);
                         self.push(error_val)?;
 
                         // Jump to catch
@@ -815,7 +844,11 @@ impl Vm {
                 }
                 Ok(Some(VmState::Suspended { .. })) | Ok(Some(VmState::SuspendedMany { .. })) => {
                     return Err(ZapcodeError::RuntimeError(
-                        "cannot suspend inside array callback".to_string(),
+                        "cannot call an external function inside an array-callback method \
+                         (.map/.filter/.forEach/.reduce/...). Use a `for...of` loop with `await`, \
+                         or `await Promise.all([toolA(), toolB(), ...])` with the calls written \
+                         directly as array elements."
+                            .to_string(),
                     ));
                 }
                 Ok(None) => {
@@ -833,7 +866,7 @@ impl Vm {
                             self.tracker.pop_frame();
                         }
                         self.stack.truncate(try_info.stack_depth);
-                        let error_val = Value::String(Arc::from(err.to_string()));
+                        let error_val = self.caught_error_value(&err);
                         self.push(error_val)?;
                         self.current_frame_mut().ip = try_info.catch_ip;
                     } else {
@@ -1346,7 +1379,7 @@ impl Vm {
                             self.tracker.pop_frame();
                         }
                         self.stack.truncate(try_info.stack_depth);
-                        let error_val = Value::String(Arc::from(err.to_string()));
+                        let error_val = self.caught_error_value(&err);
                         self.push(error_val)?;
                         self.current_frame_mut().ip = try_info.catch_ip;
                     } else {
@@ -1743,7 +1776,92 @@ impl Vm {
                 self.push(obj)?;
             }
             Instruction::Spread => {
-                // Handled contextually in CreateArray/CreateObject
+                // No-op marker; spread is expanded by the dedicated
+                // Array/Object append instructions below.
+            }
+            Instruction::ArrayAppend => {
+                self.tracker.track_allocation(&self.limits)?;
+                let value = self.pop()?;
+                let mut acc = match self.pop()? {
+                    Value::Array(a) => a,
+                    other => {
+                        return Err(ZapcodeError::TypeError(format!(
+                            "internal: ArrayAppend on {}",
+                            other.type_name()
+                        )))
+                    }
+                };
+                acc.push(value);
+                self.push(Value::Array(acc))?;
+            }
+            Instruction::ArraySpreadAppend => {
+                self.tracker.track_allocation(&self.limits)?;
+                let iterable = self.pop()?;
+                let mut acc = match self.pop()? {
+                    Value::Array(a) => a,
+                    other => {
+                        return Err(ZapcodeError::TypeError(format!(
+                            "internal: ArraySpreadAppend on {}",
+                            other.type_name()
+                        )))
+                    }
+                };
+                match iterable {
+                    Value::Array(items) => acc.extend(items),
+                    Value::String(s) => acc.extend(
+                        s.chars()
+                            .map(|c| Value::String(Arc::from(c.to_string().as_str()))),
+                    ),
+                    other => {
+                        return Err(ZapcodeError::TypeError(format!(
+                            "{} is not iterable (spread)",
+                            other.type_name()
+                        )))
+                    }
+                }
+                self.push(Value::Array(acc))?;
+            }
+            Instruction::ObjectInsert => {
+                let value = self.pop()?;
+                let key = self.pop()?;
+                let mut acc = match self.pop()? {
+                    Value::Object(o) => o,
+                    other => {
+                        return Err(ZapcodeError::TypeError(format!(
+                            "internal: ObjectInsert on {}",
+                            other.type_name()
+                        )))
+                    }
+                };
+                let key: Arc<str> = match key {
+                    Value::String(k) => k,
+                    other => Arc::from(other.to_js_string().as_str()),
+                };
+                acc.insert(key, value);
+                self.push(Value::Object(acc))?;
+            }
+            Instruction::ObjectSpreadAssign => {
+                let source = self.pop()?;
+                let mut acc = match self.pop()? {
+                    Value::Object(o) => o,
+                    other => {
+                        return Err(ZapcodeError::TypeError(format!(
+                            "internal: ObjectSpreadAssign on {}",
+                            other.type_name()
+                        )))
+                    }
+                };
+                match source {
+                    Value::Object(map) => {
+                        for (k, v) in map {
+                            acc.insert(k, v);
+                        }
+                    }
+                    // Spreading null/undefined is a no-op in JS; ignore others.
+                    Value::Null | Value::Undefined => {}
+                    _ => {}
+                }
+                self.push(Value::Object(acc))?;
             }
             Instruction::In => {
                 let right = self.pop()?;
@@ -2019,6 +2137,34 @@ impl Vm {
                                 )));
                             }
                         }
+                    }
+                    // Bare type-conversion functions: String(x)/Number(x)/Boolean(x),
+                    // represented as objects carrying a "__global_fn__" marker.
+                    Value::Object(ref map) if map.contains_key("__global_fn__") => {
+                        let kind = match map.get("__global_fn__") {
+                            Some(Value::String(s)) => s.clone(),
+                            _ => Arc::from(""),
+                        };
+                        let arg = args.into_iter().next().unwrap_or(Value::Undefined);
+                        let value = match kind.as_ref() {
+                            "String" => Value::String(Arc::from(arg.to_js_string().as_str())),
+                            "Number" => {
+                                let n = arg.to_number();
+                                if n.is_finite() && n.fract() == 0.0 {
+                                    Value::Int(n as i64)
+                                } else {
+                                    Value::Float(n)
+                                }
+                            }
+                            "Boolean" => Value::Bool(arg.is_truthy()),
+                            other => {
+                                return Err(ZapcodeError::TypeError(format!(
+                                    "{} is not a function",
+                                    other
+                                )))
+                            }
+                        };
+                        self.push(value)?;
                     }
                     _ => {
                         return Err(ZapcodeError::TypeError(format!(
@@ -2319,6 +2465,9 @@ impl Vm {
             Instruction::Throw => {
                 let val = self.pop()?;
                 let msg = val.to_js_string();
+                // Preserve the thrown value so a `catch` binding sees it verbatim
+                // (string/object/…), while uncaught throws still report `msg`.
+                self.pending_throw = Some(val);
                 return Err(ZapcodeError::RuntimeError(msg));
             }
             Instruction::EndTry => {

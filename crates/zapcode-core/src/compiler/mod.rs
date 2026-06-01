@@ -776,38 +776,70 @@ impl Compiler {
                 }
             }
             Expr::Array(elements) => {
-                let mut count = 0;
-                for elem in elements {
-                    match elem {
-                        Some(e) => {
-                            self.compile_expr(e)?;
-                            count += 1;
+                let has_spread = elements.iter().any(|e| matches!(e, Some(Expr::Spread(_))));
+                if !has_spread {
+                    let mut count = 0;
+                    for elem in elements {
+                        match elem {
+                            Some(e) => {
+                                self.compile_expr(e)?;
+                                count += 1;
+                            }
+                            None => {
+                                self.emit(Instruction::Push(Constant::Undefined));
+                                count += 1;
+                            }
                         }
-                        None => {
-                            self.emit(Instruction::Push(Constant::Undefined));
-                            count += 1;
+                    }
+                    self.emit(Instruction::CreateArray(count));
+                } else {
+                    // Build incrementally so `[...a, x, ...b]` flattens correctly.
+                    self.emit(Instruction::CreateArray(0));
+                    for elem in elements {
+                        match elem {
+                            Some(Expr::Spread(inner)) => {
+                                self.compile_expr(inner)?;
+                                self.emit(Instruction::ArraySpreadAppend);
+                            }
+                            Some(e) => {
+                                self.compile_expr(e)?;
+                                self.emit(Instruction::ArrayAppend);
+                            }
+                            None => {
+                                self.emit(Instruction::Push(Constant::Undefined));
+                                self.emit(Instruction::ArrayAppend);
+                            }
                         }
                     }
                 }
-                self.emit(Instruction::CreateArray(count));
             }
             Expr::Object(props) => {
-                let mut count = 0;
-                for prop in props {
-                    match prop.kind {
-                        PropKind::Spread => {
-                            self.compile_expr(&prop.value)?;
-                            self.emit(Instruction::Spread);
-                            count += 1;
-                        }
-                        _ => {
-                            self.emit(Instruction::Push(Constant::String(prop.key.clone())));
-                            self.compile_expr(&prop.value)?;
-                            count += 1;
+                let has_spread = props.iter().any(|p| matches!(p.kind, PropKind::Spread));
+                if !has_spread {
+                    let mut count = 0;
+                    for prop in props {
+                        self.emit(Instruction::Push(Constant::String(prop.key.clone())));
+                        self.compile_expr(&prop.value)?;
+                        count += 1;
+                    }
+                    self.emit(Instruction::CreateObject(count));
+                } else {
+                    // Build incrementally so `{ ...a, k: v, ...b }` merges in order.
+                    self.emit(Instruction::CreateObject(0));
+                    for prop in props {
+                        match prop.kind {
+                            PropKind::Spread => {
+                                self.compile_expr(&prop.value)?;
+                                self.emit(Instruction::ObjectSpreadAssign);
+                            }
+                            _ => {
+                                self.emit(Instruction::Push(Constant::String(prop.key.clone())));
+                                self.compile_expr(&prop.value)?;
+                                self.emit(Instruction::ObjectInsert);
+                            }
                         }
                     }
                 }
-                self.emit(Instruction::CreateObject(count));
             }
             Expr::Spread(expr) => {
                 self.compile_expr(expr)?;

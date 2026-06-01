@@ -53,6 +53,14 @@ pub enum Instruction {
     GetIndex,
     SetIndex,
     Spread,
+    /// Append one value to an accumulator array on the stack: `[acc, value] -> [acc']`.
+    ArrayAppend,
+    /// Spread an iterable into an accumulator array: `[acc, iterable] -> [acc']`.
+    ArraySpreadAppend,
+    /// Insert a key/value into an accumulator object: `[acc, key, value] -> [acc']`.
+    ObjectInsert,
+    /// Merge a source object's entries into an accumulator object: `[acc, src] -> [acc']`.
+    ObjectSpreadAssign,
     In,
     InstanceOf,
 

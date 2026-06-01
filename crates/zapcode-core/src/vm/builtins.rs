@@ -17,6 +17,12 @@ pub fn register_globals(globals: &mut HashMap<String, Value>) {
     globals.insert("Map".to_string(), builtin_constructor("Map"));
     globals.insert("Date".to_string(), builtin_constructor("Date"));
 
+    // Type-conversion functions, callable as bare globals: String(x), Number(x),
+    // Boolean(x). Dispatched by the VM's Call instruction (object "__global_fn__").
+    for name in ["String", "Number", "Boolean"] {
+        globals.insert(name.to_string(), global_fn(name));
+    }
+
     // Math gets its constants as real properties
     let mut math = IndexMap::new();
     math.insert(Arc::from("PI"), Value::Float(std::f64::consts::PI));
@@ -39,6 +45,35 @@ fn builtin_constructor(name: &str) -> Value {
         Arc::from("__builtin_constructor__"),
         Value::String(Arc::from(name)),
     );
+    Value::Object(obj)
+}
+
+/// A bare type-conversion function (`String`/`Number`/`Boolean`), represented as
+/// an object so it can be both *called* (via the `__global_fn__` marker, handled
+/// in the VM's Call instruction) and carry static properties (e.g.
+/// `Number.MAX_SAFE_INTEGER`).
+fn global_fn(name: &str) -> Value {
+    let mut obj = IndexMap::new();
+    obj.insert(Arc::from("__global_fn__"), Value::String(Arc::from(name)));
+    if name == "Number" {
+        obj.insert(
+            Arc::from("MAX_SAFE_INTEGER"),
+            Value::Int(9_007_199_254_740_991),
+        );
+        obj.insert(
+            Arc::from("MIN_SAFE_INTEGER"),
+            Value::Int(-9_007_199_254_740_991),
+        );
+        obj.insert(Arc::from("MAX_VALUE"), Value::Float(f64::MAX));
+        obj.insert(Arc::from("MIN_VALUE"), Value::Float(f64::MIN_POSITIVE));
+        obj.insert(Arc::from("EPSILON"), Value::Float(f64::EPSILON));
+        obj.insert(Arc::from("POSITIVE_INFINITY"), Value::Float(f64::INFINITY));
+        obj.insert(
+            Arc::from("NEGATIVE_INFINITY"),
+            Value::Float(f64::NEG_INFINITY),
+        );
+        obj.insert(Arc::from("NaN"), Value::Float(f64::NAN));
+    }
     Value::Object(obj)
 }
 

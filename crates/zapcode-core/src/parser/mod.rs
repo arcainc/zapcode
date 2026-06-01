@@ -82,8 +82,10 @@ fn wrap_trailing_object(source: &str) -> String {
     let before = trimmed[..open_pos].trim_end();
     if !before.is_empty() {
         let last_char = before.chars().last().unwrap();
-        // If preceded by =, (, return, =>, etc. — it's already in expression context
-        if matches!(last_char, '=' | '(' | ',' | ':' | '>' | '[') {
+        // If preceded by =, (, return, =>, etc. — it's already in expression context.
+        // `)` means the `{` is a control-flow / function block (if/for/while/catch/
+        // switch/function with params), never an object literal — don't wrap it.
+        if matches!(last_char, '=' | '(' | ',' | ':' | '>' | '[' | ')') {
             return source.to_string();
         }
         // If preceded by a keyword that takes a block, don't wrap
