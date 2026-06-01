@@ -73,6 +73,13 @@ export interface ZapcodeAIOptions {
    * Works with `maxSteps` in the Vercel AI SDK. Default: false.
    */
   autoFix?: boolean;
+  /**
+   * Type-check generated code against the tool stubs before running it, so an
+   * unknown tool or a wrong argument type fails fast as a compile error
+   * (cheaper than a runtime trap). Requires the optional `typescript`
+   * dependency. Default: false.
+   */
+  typeCheck?: boolean;
 }
 
 /** A single span in the execution trace. OTel-compatible shape. */
@@ -495,13 +502,108 @@ function shouldTreatSingleObjectArgAsNamed(
 }
 
 // ---------------------------------------------------------------------------
+// Optional type-check pre-pass
+// ---------------------------------------------------------------------------
+
+/** A `declare function` stub for type-checking. Uses `any` returns so property
+ * access on results isn't flagged — the goal is to catch unknown tool names and
+ * wrong argument types/shapes before running, not to police result usage. */
+function declarationForTypeCheck(name: string, def: ToolDefinition): string {
+  const entries = Object.entries(def.parameters);
+  if (entries.length > 1) {
+    const fields = entries
+      .map(([p, d]) => `${p}${d.optional ? "?" : ""}: ${d.type}`)
+      .join("; ");
+    return `declare function ${name}(input: { ${fields} }): Promise<any>;`;
+  }
+  const params = entries.map(([p, d]) => `${p}${d.optional ? "?" : ""}: ${d.type}`).join(", ");
+  return `declare function ${name}(${params}): Promise<any>;`;
+}
+
+/**
+ * Type-check the generated TypeScript against the tool stubs before running it,
+ * so a malformed call (unknown tool, wrong argument type, missing argument)
+ * fails fast with a compile error the model can self-correct — cheaper than a
+ * runtime trap. Returns a list of human-readable diagnostics (empty if clean).
+ * Requires the optional `typescript` dependency.
+ */
+async function typeCheckGeneratedCode(
+  code: string,
+  toolDefs: Record<string, ToolDefinition>
+): Promise<string[]> {
+  let ts: any;
+  try {
+    const mod: any = await import("typescript");
+    ts = mod.default ?? mod;
+  } catch {
+    throw new Error(
+      "Type-checking requires the optional 'typescript' dependency. " +
+        "Install it (npm i typescript) or disable the typeCheck option."
+    );
+  }
+
+  const stub =
+    Object.entries(toolDefs)
+      .map(([name, def]) => declarationForTypeCheck(name, def))
+      .join("\n") +
+    "\ndeclare const console: { log(...args: any[]): void; error(...args: any[]): void };\n";
+  // Wrap in an async function so top-level await is allowed and a trailing
+  // expression (the sandbox's "return value") is a valid statement.
+  const main = `export {};\nasync function __zapcode_main__() {\n${code}\n}\n`;
+
+  const options = {
+    noEmit: true,
+    strict: false,
+    noImplicitAny: false,
+    skipLibCheck: true,
+    target: ts.ScriptTarget.ES2020,
+    lib: ["lib.es2020.d.ts"],
+    moduleDetection: ts.ModuleDetectionKind?.Force,
+  };
+  const virtual: Record<string, string> = { "__tools__.d.ts": stub, "__main__.ts": main };
+  const host = ts.createCompilerHost(options);
+  const origGetSourceFile = host.getSourceFile.bind(host);
+  host.getSourceFile = (name: string, langVersion: any, ...rest: any[]) =>
+    virtual[name] !== undefined
+      ? ts.createSourceFile(name, virtual[name], langVersion)
+      : origGetSourceFile(name, langVersion, ...rest);
+  const origReadFile = host.readFile.bind(host);
+  host.readFile = (name: string) => (virtual[name] !== undefined ? virtual[name] : origReadFile(name));
+  const origFileExists = host.fileExists.bind(host);
+  host.fileExists = (name: string) => virtual[name] !== undefined || origFileExists(name);
+
+  const program = ts.createProgram(Object.keys(virtual), options, host);
+  const diagnostics = ts
+    .getPreEmitDiagnostics(program)
+    .filter((d: any) => d.file && d.file.fileName === "__main__.ts");
+
+  return diagnostics.map((d: any) => {
+    const message = ts.flattenDiagnosticMessageText(d.messageText, "\n");
+    if (d.file && typeof d.start === "number") {
+      const { line, character } = d.file.getLineAndColumnOfPosition
+        ? d.file.getLineAndColumnOfPosition(d.start)
+        : d.file.getLineAndCharacterOfPosition(d.start);
+      // Subtract the wrapper line so positions map to the agent's code.
+      return `line ${line}, col ${character + 1}: ${message}`;
+    }
+    return message;
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Execution engine
 // ---------------------------------------------------------------------------
 
 async function executeCode(
   code: string,
   toolDefs: Record<string, ToolDefinition>,
-  options: { memoryLimitMb?: number; timeLimitMs?: number; debug?: boolean; autoFix?: boolean }
+  options: {
+    memoryLimitMb?: number;
+    timeLimitMs?: number;
+    debug?: boolean;
+    autoFix?: boolean;
+    typeCheck?: boolean;
+  }
 ): Promise<ExecutionResult> {
   validateToolDefinitions(toolDefs);
   const toolNames = Object.keys(toolDefs);
@@ -513,6 +615,15 @@ async function executeCode(
   const execSpan = tracing ? createSpan("execute", { "zapcode.code": code }) : undefined;
 
   try {
+    // Optional type-check pre-pass: catch unknown tools / wrong argument types
+    // as compile errors before running anything.
+    if (options.typeCheck) {
+      const diagnostics = await typeCheckGeneratedCode(code, toolDefs);
+      if (diagnostics.length > 0) {
+        throw new Error(`Type error before execution:\n${diagnostics.join("\n")}`);
+      }
+    }
+
     const sandbox = new Zapcode(code, {
       externalFunctions: toolNames,
       timeLimitMs: options.timeLimitMs ?? 10_000,
@@ -690,12 +801,12 @@ async function executeCode(
  * ```
  */
 export function zapcode(options: ZapcodeAIOptions): ZapcodeAIResult {
-  const { tools: toolDefs, system: userSystem, memoryLimitMb, timeLimitMs, adapters, debug, autoFix } = options;
+  const { tools: toolDefs, system: userSystem, memoryLimitMb, timeLimitMs, adapters, debug, autoFix, typeCheck } = options;
   validateToolDefinitions(toolDefs);
 
   const system = buildSystemPrompt(toolDefs, userSystem);
 
-  const execOptions = { memoryLimitMb, timeLimitMs, debug, autoFix };
+  const execOptions = { memoryLimitMb, timeLimitMs, debug, autoFix, typeCheck };
   const tracing = debug || autoFix;
 
   // Session-level trace collects all attempts
@@ -924,7 +1035,13 @@ export function createAdapter<TOutput>(
 export async function execute(
   code: string,
   tools: Record<string, ToolDefinition>,
-  options?: { memoryLimitMb?: number; timeLimitMs?: number; debug?: boolean; autoFix?: boolean }
+  options?: {
+    memoryLimitMb?: number;
+    timeLimitMs?: number;
+    debug?: boolean;
+    autoFix?: boolean;
+    typeCheck?: boolean;
+  }
 ): Promise<ExecutionResult> {
   return executeCode(code, tools, options ?? {});
 }
