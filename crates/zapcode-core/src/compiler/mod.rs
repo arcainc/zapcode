@@ -572,6 +572,13 @@ impl Compiler {
 
                 let jump_end = self.emit(Instruction::Jump(0));
 
+                // Establish a `break` target for the switch so `break;` jumps to
+                // the end (an unpatched break would loop to instruction 0).
+                self.loop_stack.push(LoopInfo {
+                    break_patches: Vec::new(),
+                    continue_patches: Vec::new(),
+                });
+
                 // Compile case bodies
                 let mut body_starts = Vec::new();
                 for case in cases {
@@ -583,6 +590,17 @@ impl Compiler {
 
                 let end = self.current_offset();
                 self.emit(Instruction::Pop); // pop discriminant
+
+                let switch_info = self.loop_stack.pop().unwrap();
+                // `break` exits the switch.
+                for patch in switch_info.break_patches {
+                    self.patch_jump(patch, end);
+                }
+                // `continue` inside a switch targets the *enclosing* loop, not the
+                // switch — forward it to the parent loop if there is one.
+                if let Some(parent) = self.loop_stack.last_mut() {
+                    parent.continue_patches.extend(switch_info.continue_patches);
+                }
 
                 // Patch jumps
                 for (i, &jump) in case_jumps.iter().enumerate() {

@@ -467,7 +467,17 @@ fn call_json_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
     match method {
         "stringify" => {
             let val = args.first().unwrap_or(&Value::Undefined);
-            let json = value_to_json(val);
+            // Third arg `space` enables pretty-printing (number of spaces or a string).
+            let indent = match args.get(2) {
+                Some(Value::Int(n)) if *n > 0 => Some(" ".repeat((*n).min(10) as usize)),
+                Some(Value::Float(n)) if *n >= 1.0 => Some(" ".repeat((*n as usize).min(10))),
+                Some(Value::String(s)) if !s.is_empty() => Some(s.to_string()),
+                _ => None,
+            };
+            let json = match indent {
+                Some(unit) => value_to_json_pretty(val, &unit, 0),
+                None => value_to_json(val),
+            };
             Ok(Some(Value::String(Arc::from(json.as_str()))))
         }
         "parse" => {
@@ -515,6 +525,37 @@ fn value_to_json(val: &Value) -> String {
         | Value::BuiltinMethod { .. }
         | Value::Generator(_)
         | Value::Pending(_) => "undefined".to_string(),
+    }
+}
+
+/// Pretty-printing JSON with an indent unit (the `space` arg of JSON.stringify).
+fn value_to_json_pretty(val: &Value, unit: &str, depth: usize) -> String {
+    let pad = unit.repeat(depth + 1);
+    let close_pad = unit.repeat(depth);
+    match val {
+        Value::Array(arr) if !arr.is_empty() => {
+            let items: Vec<String> = arr
+                .iter()
+                .map(|v| format!("{}{}", pad, value_to_json_pretty(v, unit, depth + 1)))
+                .collect();
+            format!("[\n{}\n{}]", items.join(",\n"), close_pad)
+        }
+        Value::Object(map) if !map.is_empty() => {
+            let pairs: Vec<String> = map
+                .iter()
+                .map(|(k, v)| {
+                    format!(
+                        "{}\"{}\": {}",
+                        pad,
+                        k,
+                        value_to_json_pretty(v, unit, depth + 1)
+                    )
+                })
+                .collect();
+            format!("{{\n{}\n{}}}", pairs.join(",\n"), close_pad)
+        }
+        // Scalars (and empty containers) render the same as compact JSON.
+        other => value_to_json(other),
     }
 }
 
@@ -776,8 +817,15 @@ fn call_string_method(s: &Arc<str>, method: &str, args: &[Value]) -> Result<Opti
         }
         "indexOf" => {
             let search = arg_str(args, 0);
-            match s.find(&*search) {
-                Some(pos) => Value::Int(pos as i64),
+            // Optional fromIndex (in chars). Search the remainder, then map the
+            // byte position back to a char index.
+            let from = match args.get(1) {
+                Some(v) => (v.to_number().max(0.0)) as usize,
+                None => 0,
+            };
+            let byte_start = s.char_indices().nth(from).map_or(s.len(), |(i, _)| i);
+            match s[byte_start..].find(&*search) {
+                Some(rel) => Value::Int(s[..byte_start + rel].chars().count() as i64),
                 None => Value::Int(-1),
             }
         }

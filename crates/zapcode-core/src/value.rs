@@ -142,7 +142,15 @@ impl Value {
             Value::Bool(false) => 0.0,
             Value::Int(n) => *n as f64,
             Value::Float(n) => *n,
-            Value::String(s) => s.parse::<f64>().unwrap_or(f64::NAN),
+            Value::String(s) => {
+                // JS: empty / whitespace-only string coerces to 0, not NaN.
+                let t = s.trim();
+                if t.is_empty() {
+                    0.0
+                } else {
+                    t.parse::<f64>().unwrap_or(f64::NAN)
+                }
+            }
             _ => f64::NAN,
         }
     }
