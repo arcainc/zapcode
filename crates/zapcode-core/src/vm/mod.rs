@@ -3038,7 +3038,12 @@ impl Vm {
             // Typeof
             Instruction::TypeOf => {
                 let val = self.pop()?;
-                let type_str = val.type_name();
+                // `typeof null === "object"` (a long-standing JS quirk).
+                // Everything else matches type_name().
+                let type_str = match val {
+                    Value::Null => "object",
+                    other => other.type_name(),
+                };
                 self.push(Value::String(Arc::from(type_str)))?;
             }
 
@@ -3295,13 +3300,20 @@ impl Vm {
                                 return Ok(None);
                             }
                             "Array" => {
-                                // new Array(n) → n empty slots; new Array(a, b, …) → [a, b, …].
+                                // new Array(n): n empty slots; new Array(a, b, ...): [a, b, ...].
                                 let arr = match args.as_slice() {
                                     [single] => match single {
                                         Value::Int(n) if *n >= 0 => {
-                                            vec![Value::Undefined; *n as usize]
+                                            let len = *n as usize;
+                                            if len > self.limits.max_allocations {
+                                                return Err(ZapcodeError::AllocationLimitExceeded);
+                                            }
+                                            vec![Value::Undefined; len]
                                         }
                                         Value::Float(f) if f.fract() == 0.0 && *f >= 0.0 => {
+                                            if *f > self.limits.max_allocations as f64 {
+                                                return Err(ZapcodeError::AllocationLimitExceeded);
+                                            }
                                             vec![Value::Undefined; *f as usize]
                                         }
                                         other => vec![other.clone()],
@@ -3718,6 +3730,35 @@ fn mutated_array_receiver(method: &str, arr: &[Value], args: &[Value]) -> Option
             updated.splice(start..start + delete_count, args.iter().skip(2).cloned());
             Some(updated)
         }
+        "copyWithin" => {
+            let len = arr.len() as i64;
+            let target =
+                normalize_array_index(args.first().map_or(0, |v| v.to_number() as i64), len);
+            let start = if args.len() > 1 {
+                normalize_array_index(args[1].to_number() as i64, len)
+            } else {
+                0
+            };
+            let end = if args.len() > 2 {
+                normalize_array_index(args[2].to_number() as i64, len)
+            } else {
+                arr.len()
+            };
+            let mut updated = arr.to_vec();
+            let slice: Vec<Value> = updated
+                .get(start..end.min(updated.len()))
+                .map(|s| s.to_vec())
+                .unwrap_or_default();
+            for (offset, val) in slice.into_iter().enumerate() {
+                let dst = target + offset;
+                if dst < updated.len() {
+                    updated[dst] = val;
+                } else {
+                    break;
+                }
+            }
+            Some(updated)
+        }
         _ => None,
     }
 }
@@ -4060,6 +4101,7 @@ fn is_array_method(name: &str) -> bool {
             | "flat"
             | "flatMap"
             | "fill"
+            | "copyWithin"
             | "at"
             | "entries"
             | "keys"

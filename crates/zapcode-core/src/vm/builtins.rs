@@ -125,6 +125,23 @@ fn js_parse_int(s: &str, radix: u32) -> f64 {
         Some(r) => (true, r),
         None => (false, t.strip_prefix('+').unwrap_or(t)),
     };
+    // radix 0 = auto-detect: a `0x`/`0X` prefix means hex, otherwise base 10.
+    let (radix, rest) = if radix == 0 {
+        match rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
+            Some(hex) => (16, hex),
+            None => (10, rest),
+        }
+    } else if radix == 16 {
+        // An explicit radix 16 still tolerates a leading 0x.
+        (
+            16,
+            rest.strip_prefix("0x")
+                .or_else(|| rest.strip_prefix("0X"))
+                .unwrap_or(rest),
+        )
+    } else {
+        (radix, rest)
+    };
     let digits: String = rest.chars().take_while(|c| c.is_digit(radix)).collect();
     if digits.is_empty() {
         return f64::NAN;
@@ -261,10 +278,12 @@ pub fn call_global_fn(kind: &str, args: &[Value]) -> Result<Value> {
         "Number" => finite_number(arg.to_number()),
         "Boolean" => Value::Bool(arg.is_truthy()),
         "parseInt" | "Number.parseInt" => {
+            // radix 0 means "auto-detect": js_parse_int infers hex from a 0x
+            // prefix, else base 10.
             let radix = match args.get(1) {
                 Some(Value::Int(r)) if (2..=36).contains(r) => *r as u32,
                 Some(Value::Float(r)) if (2.0..=36.0).contains(r) => *r as u32,
-                _ => 10,
+                _ => 0,
             };
             let s = match &arg {
                 Value::String(s) => s.to_string(),
@@ -379,8 +398,10 @@ fn call_math_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
             Value::Float(n.ceil())
         }
         "round" => {
+            // JS rounds halves toward +Infinity (Math.round(-2.5) === -2),
+            // unlike Rust's round-half-away-from-zero.
             let n = arg_num(args, 0);
-            Value::Float(n.round())
+            Value::Float((n + 0.5).floor())
         }
         "trunc" => {
             let n = arg_num(args, 0);
@@ -1232,6 +1253,34 @@ fn call_array_method(arr: &[Value], method: &str, args: &[Value]) -> Result<Opti
             };
             let deleted: Vec<Value> = arr[start..start + delete_count].to_vec();
             Value::Array(deleted)
+        }
+        "copyWithin" => {
+            let len = arr.len() as i64;
+            let target = normalize_index(arg_int(args, 0), len);
+            let start = if args.len() > 1 {
+                normalize_index(arg_int(args, 1), len)
+            } else {
+                0
+            };
+            let end = if args.len() > 2 {
+                normalize_index(arg_int(args, 2), len)
+            } else {
+                len as usize
+            };
+            let mut result = arr.to_vec();
+            let slice: Vec<Value> = result
+                .get(start..end.min(result.len()))
+                .map(|s| s.to_vec())
+                .unwrap_or_default();
+            for (offset, val) in slice.into_iter().enumerate() {
+                let dst = target + offset;
+                if dst < result.len() {
+                    result[dst] = val;
+                } else {
+                    break;
+                }
+            }
+            Value::Array(result)
         }
         // Array iterators. JS returns iterator objects; we return plain arrays,
         // which spread (`[...arr.entries()]`) and for-of iterate identically.

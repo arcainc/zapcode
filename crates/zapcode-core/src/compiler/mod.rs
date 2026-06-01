@@ -227,19 +227,25 @@ impl Compiler {
 
         // Apply default parameter values: `if (param === undefined) param = <default>`.
         for param in &func.params {
-            if let ParamPattern::DefaultValue { pattern, default } = param {
-                if let ParamPattern::Ident(name) = pattern.as_ref() {
-                    if let Some(slot) = func_compiler.resolve_local(name) {
-                        func_compiler.emit(Instruction::LoadLocal(slot));
-                        func_compiler.emit(Instruction::Push(Constant::Undefined));
-                        func_compiler.emit(Instruction::StrictEq);
-                        let skip = func_compiler.emit(Instruction::JumpIfFalse(0));
-                        func_compiler.compile_expr(default)?;
-                        func_compiler.emit(Instruction::StoreLocal(slot));
-                        let after = func_compiler.current_offset();
-                        func_compiler.patch_jump(skip, after);
+            match param {
+                ParamPattern::DefaultValue { pattern, default } => match pattern.as_ref() {
+                    ParamPattern::Ident(name) => {
+                        if let Some(slot) = func_compiler.resolve_local(name) {
+                            func_compiler.emit_slot_default(slot, default)?;
+                        }
                     }
+                    // `function f({a = 5} = {})`: a missing argument leaves the
+                    // destructured fields undefined, so the field defaults below
+                    // already cover it.
+                    ParamPattern::ObjectDestructure(fields) => {
+                        func_compiler.emit_object_param_defaults(fields)?;
+                    }
+                    _ => {}
+                },
+                ParamPattern::ObjectDestructure(fields) => {
+                    func_compiler.emit_object_param_defaults(fields)?;
                 }
+                _ => {}
             }
         }
 
@@ -851,6 +857,7 @@ impl Compiler {
                 self.store_binding(name, kind)?;
             } else {
                 self.emit(Instruction::GetProperty(field.key.clone()));
+                self.emit_apply_default(field.default.as_ref())?;
                 if let Some(nested) = &field.nested {
                     self.compile_object_destructure(nested, kind)?;
                     self.emit(Instruction::Pop);
@@ -860,6 +867,51 @@ impl Compiler {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Emit `if (localslot === undefined) localslot = <default>`.
+    fn emit_slot_default(&mut self, slot: usize, default: &Expr) -> Result<()> {
+        self.emit(Instruction::LoadLocal(slot));
+        self.emit(Instruction::Push(Constant::Undefined));
+        self.emit(Instruction::StrictEq);
+        let skip = self.emit(Instruction::JumpIfFalse(0));
+        self.compile_expr(default)?;
+        self.emit(Instruction::StoreLocal(slot));
+        let after = self.current_offset();
+        self.patch_jump(skip, after);
+        Ok(())
+    }
+
+    /// Apply field defaults for a destructured object parameter (`function
+    /// f({a = 5})`), whose fields were bound positionally by `bind_params`.
+    fn emit_object_param_defaults(&mut self, fields: &[DestructureField]) -> Result<()> {
+        for field in fields {
+            if field.rest {
+                continue;
+            }
+            let name = field.alias.as_ref().unwrap_or(&field.key);
+            if let (Some(def), Some(slot)) = (&field.default, self.resolve_local(name)) {
+                self.emit_slot_default(slot, def)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// If the top-of-stack value is `undefined`, replace it with the evaluated
+    /// default expression. Used for destructuring defaults (`{a = 10}` / `[x = 1]`).
+    fn emit_apply_default(&mut self, default: Option<&Expr>) -> Result<()> {
+        let Some(default) = default else {
+            return Ok(());
+        };
+        self.emit(Instruction::Dup);
+        self.emit(Instruction::Push(Constant::Undefined));
+        self.emit(Instruction::StrictEq);
+        let skip = self.emit(Instruction::JumpIfFalse(0));
+        self.emit(Instruction::Pop);
+        self.compile_expr(default)?;
+        let after = self.current_offset();
+        self.patch_jump(skip, after);
         Ok(())
     }
 
@@ -898,7 +950,9 @@ impl Compiler {
                 }
                 if parts == 0 {
                     self.emit(Instruction::Push(Constant::String(String::new())));
-                } else if parts > 1 {
+                } else {
+                    // Always concat (even a single interpolated expression) so the
+                    // result is string-coerced: `${obj}` yields "[object Object]".
                     self.emit(Instruction::ConcatStrings(parts));
                 }
             }
