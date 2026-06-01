@@ -312,6 +312,8 @@ pub struct ObjProperty {
     pub key: String,
     pub value: Expr,
     pub computed: bool,
+    /// For computed keys (`{[expr]: v}`), the key expression to evaluate at runtime.
+    pub key_expr: Option<Box<Expr>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

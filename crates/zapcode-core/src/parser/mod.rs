@@ -609,6 +609,15 @@ impl<'a> AstLowerer<'a> {
         let mut result = Vec::new();
         for param in &params.items {
             let pat = self.lower_binding_pattern_to_param(&param.pattern)?;
+            // A defaulted parameter (`function f(x = 42)`) stores its default in
+            // `FormalParameter::initializer`, not as an `AssignmentPattern`.
+            let pat = match &param.initializer {
+                Some(init) => ParamPattern::DefaultValue {
+                    pattern: Box::new(pat),
+                    default: self.lower_expr(init)?,
+                },
+                None => pat,
+            };
             result.push(pat);
         }
         if let Some(rest) = &params.rest {
@@ -864,6 +873,14 @@ impl<'a> AstLowerer<'a> {
                         ast::ObjectPropertyKind::ObjectProperty(p) => {
                             let key = self.lower_property_key(&p.key)?;
                             let computed = p.computed;
+                            let key_expr = if computed {
+                                match p.key.as_expression() {
+                                    Some(e) => Some(Box::new(self.lower_expr(e)?)),
+                                    None => None,
+                                }
+                            } else {
+                                None
+                            };
 
                             if p.shorthand {
                                 props.push(ObjProperty {
@@ -871,6 +888,7 @@ impl<'a> AstLowerer<'a> {
                                     key: key.clone(),
                                     value: Expr::Ident(key),
                                     computed: false,
+                                    key_expr: None,
                                 });
                             } else if p.method {
                                 let value = self.lower_expr(&p.value)?;
@@ -879,6 +897,7 @@ impl<'a> AstLowerer<'a> {
                                     key,
                                     value,
                                     computed,
+                                    key_expr,
                                 });
                             } else {
                                 let value = self.lower_expr(&p.value)?;
@@ -887,6 +906,7 @@ impl<'a> AstLowerer<'a> {
                                     key,
                                     value,
                                     computed,
+                                    key_expr,
                                 });
                             }
                         }
@@ -897,6 +917,7 @@ impl<'a> AstLowerer<'a> {
                                 key: String::new(),
                                 value: expr,
                                 computed: false,
+                                key_expr: None,
                             });
                         }
                     }

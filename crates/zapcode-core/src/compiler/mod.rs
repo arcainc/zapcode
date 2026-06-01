@@ -225,6 +225,24 @@ impl Compiler {
             }
         }
 
+        // Apply default parameter values: `if (param === undefined) param = <default>`.
+        for param in &func.params {
+            if let ParamPattern::DefaultValue { pattern, default } = param {
+                if let ParamPattern::Ident(name) = pattern.as_ref() {
+                    if let Some(slot) = func_compiler.resolve_local(name) {
+                        func_compiler.emit(Instruction::LoadLocal(slot));
+                        func_compiler.emit(Instruction::Push(Constant::Undefined));
+                        func_compiler.emit(Instruction::StrictEq);
+                        let skip = func_compiler.emit(Instruction::JumpIfFalse(0));
+                        func_compiler.compile_expr(default)?;
+                        func_compiler.emit(Instruction::StoreLocal(slot));
+                        let after = func_compiler.current_offset();
+                        func_compiler.patch_jump(skip, after);
+                    }
+                }
+            }
+        }
+
         for stmt in &func.body {
             func_compiler.compile_statement(stmt)?;
         }
@@ -923,7 +941,12 @@ impl Compiler {
                 if !has_spread {
                     let mut count = 0;
                     for prop in props {
-                        self.emit(Instruction::Push(Constant::String(prop.key.clone())));
+                        match &prop.key_expr {
+                            Some(key_expr) => self.compile_expr(key_expr)?,
+                            None => {
+                                self.emit(Instruction::Push(Constant::String(prop.key.clone())));
+                            }
+                        }
                         self.compile_expr(&prop.value)?;
                         count += 1;
                     }
@@ -938,7 +961,14 @@ impl Compiler {
                                 self.emit(Instruction::ObjectSpreadAssign);
                             }
                             _ => {
-                                self.emit(Instruction::Push(Constant::String(prop.key.clone())));
+                                match &prop.key_expr {
+                                    Some(key_expr) => self.compile_expr(key_expr)?,
+                                    None => {
+                                        self.emit(Instruction::Push(Constant::String(
+                                            prop.key.clone(),
+                                        )));
+                                    }
+                                }
                                 self.compile_expr(&prop.value)?;
                                 self.emit(Instruction::ObjectInsert);
                             }
