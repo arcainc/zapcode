@@ -1,5 +1,24 @@
-use zapcode_core::vm::{eval_ts, eval_ts_with_output};
-use zapcode_core::Value;
+use zapcode_core::heap::Heap;
+use zapcode_core::vm::{eval_ts, eval_ts_with_output, VmState};
+use zapcode_core::{ResourceLimits, Value, ZapcodeRun};
+
+/// Run `code` and return the completion value plus the heap that backs any
+/// array/object handles in it.
+fn run(code: &str) -> (Value, Heap) {
+    let result = ZapcodeRun::new(
+        code.to_string(),
+        Vec::new(),
+        Vec::new(),
+        ResourceLimits::default(),
+    )
+    .unwrap()
+    .run(Vec::new())
+    .unwrap();
+    match result.state {
+        VmState::Complete(v) => (v, result.heap),
+        other => panic!("expected completion, got {other:?}"),
+    }
+}
 
 #[test]
 fn test_fizzbuzz() {
@@ -29,7 +48,7 @@ fn test_fizzbuzz() {
 
 #[test]
 fn test_map_implementation() {
-    let result = eval_ts(
+    let (result, heap) = run(
         r#"
         function map(arr, fn) {
             const result = [];
@@ -41,11 +60,13 @@ fn test_map_implementation() {
         const doubled = map([1, 2, 3], (x) => x * 2);
         doubled
     "#,
-    )
-    .unwrap();
+    );
     match result {
-        Value::Array(arr) => {
-            assert_eq!(arr, vec![Value::Int(2), Value::Int(4), Value::Int(6)]);
+        Value::Array(h) => {
+            assert_eq!(
+                heap.array_vec(h),
+                vec![Value::Int(2), Value::Int(4), Value::Int(6)]
+            );
         }
         other => panic!("expected array, got {:?}", other),
     }

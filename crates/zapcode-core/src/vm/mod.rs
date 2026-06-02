@@ -4662,6 +4662,7 @@ impl ZapcodeRun {
                         return Ok(RunResult {
                             state: s,
                             stdout: vm.stdout,
+                            heap: vm.heap,
                             trace,
                         });
                     }
@@ -4676,6 +4677,7 @@ impl ZapcodeRun {
                         return Ok(RunResult {
                             state: s,
                             stdout: vm.stdout,
+                            heap: vm.heap,
                             trace,
                         });
                     }
@@ -4699,6 +4701,7 @@ impl ZapcodeRun {
         Ok(RunResult {
             state,
             stdout: vm.stdout,
+            heap: vm.heap,
             trace,
         })
     }
@@ -4727,11 +4730,35 @@ impl ZapcodeRun {
 }
 
 /// Result of running a Zapcode program.
+#[derive(Debug)]
 pub struct RunResult {
     pub state: VmState,
     pub stdout: String,
+    /// The object heap at the end of the run. Needed to resolve the `Handle`s in
+    /// `Value::Array`/`Value::Object` returned in `state` — e.g. to read array
+    /// elements or coerce a returned array/object to a string. For a suspended
+    /// run it is the heap as of the suspension point.
+    pub heap: Heap,
     /// Execution trace covering parse → compile → execute.
     pub trace: ExecutionTrace,
+}
+
+impl RunResult {
+    /// Build a `RunResult` after a snapshot resume, taking the heap and stdout
+    /// from the resumed VM. The trace covers only the resume span (parse/compile
+    /// already happened in the original run).
+    pub(crate) fn from_resume(state: VmState, vm: Vm) -> Self {
+        let mut root = SpanBuilder::new("zapcode.resume");
+        root.add_child(SpanBuilder::new("resume").finish_ok());
+        RunResult {
+            state,
+            stdout: vm.stdout,
+            heap: vm.heap,
+            trace: ExecutionTrace {
+                root: root.finish_ok(),
+            },
+        }
+    }
 }
 
 /// Quick helper to evaluate a TypeScript expression.

@@ -16,7 +16,7 @@ fn run_str(code: &str) -> String {
     .run(Vec::new())
     .unwrap();
     match result.state {
-        VmState::Complete(v) => v.to_js_string(),
+        VmState::Complete(v) => v.to_js_string(&result.heap),
         other => panic!("expected completion, got {other:?}"),
     }
 }
@@ -118,7 +118,7 @@ fn captured_mutable_cell_survives_snapshot_roundtrip() {
 
     let bytes = take_snapshot(state).dump().unwrap();
     let reloaded = ZapcodeSnapshot::load(&bytes).unwrap();
-    let resumed = reloaded.resume(Value::Int(10)).unwrap();
+    let resumed = reloaded.resume(Value::Int(10)).unwrap().state;
 
     match resumed {
         VmState::Complete(v) => assert_eq!(v, Value::Int(12)),

@@ -1,11 +1,31 @@
-use zapcode_core::vm::eval_ts;
-use zapcode_core::Value;
+use zapcode_core::heap::Heap;
+use zapcode_core::vm::{eval_ts, VmState};
+use zapcode_core::{ResourceLimits, Value, ZapcodeRun};
+
+/// Run `code` and return the completion value plus the heap that backs any
+/// array/object handles in it.
+fn run(code: &str) -> (Value, Heap) {
+    let result = ZapcodeRun::new(
+        code.to_string(),
+        Vec::new(),
+        Vec::new(),
+        ResourceLimits::default(),
+    )
+    .unwrap()
+    .run(Vec::new())
+    .unwrap();
+    match result.state {
+        VmState::Complete(v) => (v, result.heap),
+        other => panic!("expected completion, got {other:?}"),
+    }
+}
 
 #[test]
 fn test_array_literal() {
-    let result = eval_ts("[1, 2, 3]").unwrap();
+    let (result, heap) = run("[1, 2, 3]");
     match result {
-        Value::Array(arr) => {
+        Value::Array(h) => {
+            let arr = heap.array_vec(h);
             assert_eq!(arr.len(), 3);
             assert_eq!(arr[0], Value::Int(1));
             assert_eq!(arr[1], Value::Int(2));
@@ -73,9 +93,10 @@ fn test_string_length() {
 
 #[test]
 fn test_trailing_object_shorthand() {
-    let result = eval_ts("const a = 1\nconst b = 2\n{ a, b }").unwrap();
+    let (result, heap) = run("const a = 1\nconst b = 2\n{ a, b }");
     match result {
-        Value::Object(map) => {
+        Value::Object(h) => {
+            let map = heap.object_map(h);
             assert_eq!(map.get("a"), Some(&Value::Int(1)));
             assert_eq!(map.get("b"), Some(&Value::Int(2)));
         }
@@ -85,9 +106,10 @@ fn test_trailing_object_shorthand() {
 
 #[test]
 fn test_trailing_object_key_value() {
-    let result = eval_ts("const x = 10\n{ value: x }").unwrap();
+    let (result, heap) = run("const x = 10\n{ value: x }");
     match result {
-        Value::Object(map) => {
+        Value::Object(h) => {
+            let map = heap.object_map(h);
             assert_eq!(map.get("value"), Some(&Value::Int(10)));
         }
         other => panic!("expected object, got {:?}", other),
@@ -96,9 +118,10 @@ fn test_trailing_object_key_value() {
 
 #[test]
 fn test_trailing_object_mixed() {
-    let result = eval_ts("const name = \"hello\"\nconst age = 30\n{ name, years: age }").unwrap();
+    let (result, heap) = run("const name = \"hello\"\nconst age = 30\n{ name, years: age }");
     match result {
-        Value::Object(map) => {
+        Value::Object(h) => {
+            let map = heap.object_map(h);
             assert_eq!(map.get("name"), Some(&Value::String("hello".into())));
             assert_eq!(map.get("years"), Some(&Value::Int(30)));
         }
@@ -108,9 +131,10 @@ fn test_trailing_object_mixed() {
 
 #[test]
 fn test_trailing_object_with_parens_still_works() {
-    let result = eval_ts("const a = 1;\n({ a })").unwrap();
+    let (result, heap) = run("const a = 1;\n({ a })");
     match result {
-        Value::Object(map) => {
+        Value::Object(h) => {
+            let map = heap.object_map(h);
             assert_eq!(map.get("a"), Some(&Value::Int(1)));
         }
         other => panic!("expected object, got {:?}", other),
@@ -147,9 +171,10 @@ fn test_arrow_fn_body_not_wrapped() {
 
 #[test]
 fn test_trailing_object_single_prop() {
-    let result = eval_ts("const x = 42\n{ value: x }").unwrap();
+    let (result, heap) = run("const x = 42\n{ value: x }");
     match result {
-        Value::Object(map) => {
+        Value::Object(h) => {
+            let map = heap.object_map(h);
             assert_eq!(map.get("value"), Some(&Value::Int(42)));
         }
         other => panic!("expected object, got {:?}", other),
@@ -158,9 +183,10 @@ fn test_trailing_object_single_prop() {
 
 #[test]
 fn test_trailing_object_after_semicolon() {
-    let result = eval_ts("const a = 1; const b = 2;\n{ a, b }").unwrap();
+    let (result, heap) = run("const a = 1; const b = 2;\n{ a, b }");
     match result {
-        Value::Object(map) => {
+        Value::Object(h) => {
+            let map = heap.object_map(h);
             assert_eq!(map.get("a"), Some(&Value::Int(1)));
             assert_eq!(map.get("b"), Some(&Value::Int(2)));
         }

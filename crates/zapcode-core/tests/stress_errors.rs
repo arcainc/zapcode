@@ -9,7 +9,7 @@ fn run_str(code: &str) -> String {
     let result = ZapcodeRun::new(code.to_string(), Vec::new(), Vec::new(), ResourceLimits::default())
         .unwrap().run(Vec::new()).unwrap();
     match result.state {
-        VmState::Complete(v) => v.to_js_string(),
+        VmState::Complete(v) => v.to_js_string(&result.heap),
         other => panic!("expected completion, got {other:?}"),
     }
 }

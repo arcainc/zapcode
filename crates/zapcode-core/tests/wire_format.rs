@@ -31,7 +31,7 @@ fn load_roundtrips_a_real_snapshot() {
     let bytes = suspended_snapshot().dump().unwrap();
     let loaded = ZapcodeSnapshot::load(&bytes).unwrap();
     // Resuming the reloaded snapshot completes the program.
-    match loaded.resume(Value::Int(7)).unwrap() {
+    match loaded.resume(Value::Int(7)).unwrap().state {
         VmState::Complete(_) => {}
         VmState::Suspended { .. } => panic!("expected completion after resume"),
         VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),

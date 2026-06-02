@@ -14,7 +14,7 @@ fn run_str(code: &str) -> String {
     .run(Vec::new())
     .unwrap();
     match result.state {
-        VmState::Complete(v) => v.to_js_string(),
+        VmState::Complete(v) => v.to_js_string(&result.heap),
         other => panic!("expected completion, got {other:?}"),
     }
 }

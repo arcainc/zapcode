@@ -88,7 +88,8 @@ fn resume_still_works_after_sorting() {
     let resumed = ZapcodeSnapshot::load(&bytes)
         .unwrap()
         .resume(Value::Int(99))
-        .unwrap();
+        .unwrap()
+        .state;
     match resumed {
         VmState::Complete(v) => assert_eq!(v, Value::Int(99)),
         VmState::Suspended { .. } => panic!("expected completion"),
