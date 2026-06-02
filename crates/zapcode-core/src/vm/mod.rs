@@ -2406,6 +2406,9 @@ impl Vm {
                             }
                             "Map" => matches!(&left, Value::Object(i) if i.contains_key("__map__")),
                             "Set" => matches!(&left, Value::Object(i) if i.contains_key("__set__")),
+                            "Date" => {
+                                matches!(&left, Value::Object(i) if i.contains_key("__date_ms__"))
+                            }
                             _ => false,
                         }
                     } else if let (Value::Object(instance), Some(class_name)) =
@@ -3354,9 +3357,7 @@ impl Vm {
                                 return Ok(None);
                             }
                             "Date" => {
-                                let millis =
-                                    args.first().map_or(0, |value| value.to_number() as i64);
-                                self.push(make_date_object(millis))?;
+                                self.push(construct_date(&args))?;
                                 return Ok(None);
                             }
                             "Error" | "TypeError" | "RangeError" | "SyntaxError"
@@ -4195,6 +4196,149 @@ fn make_date_object(millis: i64) -> Value {
     Value::Object(obj)
 }
 
+/// An Invalid Date (its time value is NaN).
+fn make_invalid_date() -> Value {
+    let mut obj = IndexMap::new();
+    obj.insert(Arc::from("__date_ms__"), Value::Float(f64::NAN));
+    Value::Object(obj)
+}
+
+/// Build a Date from constructor arguments:
+/// - none: epoch 0 (the sandbox has no wall clock, for deterministic replay);
+/// - one string: parse it (ISO / `YYYY-MM-DD`); invalid -> Invalid Date;
+/// - one number: epoch millis;
+/// - 2+ numbers: `(year, monthIndex, day, hours, minutes, seconds, ms)` in UTC.
+fn construct_date(args: &[Value]) -> Value {
+    match args {
+        [] => make_date_object(0),
+        [single] => match single {
+            Value::String(s) => match parse_date_string(s) {
+                Some(ms) => make_date_object(ms),
+                None => make_invalid_date(),
+            },
+            other => {
+                let n = other.to_number();
+                if n.is_finite() {
+                    make_date_object(n as i64)
+                } else {
+                    make_invalid_date()
+                }
+            }
+        },
+        _ => {
+            let part = |i: usize, default: i64| -> i64 {
+                args.get(i).map(|v| v.to_number() as i64).unwrap_or(default)
+            };
+            let year = part(0, 1970);
+            let month = part(1, 0); // 0-indexed
+            let day = part(2, 1);
+            let hours = part(3, 0);
+            let minutes = part(4, 0);
+            let seconds = part(5, 0);
+            let ms = part(6, 0);
+            let days = days_from_civil(year, month + 1, day);
+            let millis = days * 86_400_000
+                + hours * 3_600_000
+                + minutes * 60_000
+                + seconds * 1_000
+                + ms;
+            make_date_object(millis)
+        }
+    }
+}
+
+/// `Date.UTC(year, monthIndex, day, ...)` -> epoch millis (UTC).
+pub(crate) fn date_utc_millis(args: &[Value]) -> f64 {
+    let part = |i: usize, default: i64| -> i64 {
+        args.get(i).map(|v| v.to_number() as i64).unwrap_or(default)
+    };
+    let year = part(0, 1970);
+    let month = part(1, 0);
+    let day = part(2, 1);
+    let hours = part(3, 0);
+    let minutes = part(4, 0);
+    let seconds = part(5, 0);
+    let ms = part(6, 0);
+    (days_from_civil(year, month + 1, day) * 86_400_000
+        + hours * 3_600_000
+        + minutes * 60_000
+        + seconds * 1_000
+        + ms) as f64
+}
+
+/// Days since the Unix epoch for a civil (year, month 1-12, day) date (UTC).
+/// Inverse of [`civil_from_days`] (Howard Hinnant's algorithm).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Parse a JS date string to epoch millis (UTC). Supports `YYYY-MM-DD`,
+/// `YYYY-MM-DDTHH:MM[:SS[.fff]]` with an optional `Z` or `±HH:MM` offset, and a
+/// space separator. Returns None for anything it can't parse.
+pub(crate) fn parse_date_string(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (date_part, time_part) = match s.split_once(['T', ' ']) {
+        Some((d, t)) => (d, Some(t)),
+        None => (s, None),
+    };
+    let mut dp = date_part.split('-');
+    let year: i64 = dp.next()?.trim().parse().ok()?;
+    let month: i64 = match dp.next() {
+        Some(m) => m.parse().ok()?,
+        None => 1,
+    };
+    let day: i64 = match dp.next() {
+        Some(d) => d.parse().ok()?,
+        None => 1,
+    };
+    if dp.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let mut millis = days_from_civil(year, month, day) * 86_400_000;
+
+    if let Some(time) = time_part {
+        let time = time.trim();
+        // Split off a trailing timezone designator.
+        let (clock, tz_offset_min): (&str, i64) = if let Some(rest) = time.strip_suffix('Z') {
+            (rest, 0)
+        } else if let Some(idx) = time.rfind(['+', '-']).filter(|&i| i >= 5) {
+            // i >= 5 avoids matching a '-' inside the time (HH:MM:SS has none).
+            let (clock, tz) = time.split_at(idx);
+            let sign = if tz.starts_with('-') { -1 } else { 1 };
+            let tz = &tz[1..];
+            let mut tzp = tz.split(':');
+            let oh: i64 = tzp.next()?.parse().ok()?;
+            let om: i64 = tzp.next().map_or(Ok(0), |x| x.parse()).ok()?;
+            (clock, sign * (oh * 60 + om))
+        } else {
+            (time, 0)
+        };
+        let mut cp = clock.split(':');
+        let hours: i64 = cp.next()?.parse().ok()?;
+        let minutes: i64 = cp.next().map_or(Ok(0), |x| x.parse()).ok()?;
+        let (seconds, frac_ms): (i64, i64) = match cp.next() {
+            Some(sec) => match sec.split_once('.') {
+                Some((whole, frac)) => {
+                    let ms_str: String = frac.chars().take(3).collect();
+                    let ms_str = format!("{:0<3}", ms_str);
+                    (whole.parse().ok()?, ms_str.parse().ok()?)
+                }
+                None => (sec.parse().ok()?, 0),
+            },
+            None => (0, 0),
+        };
+        millis += hours * 3_600_000 + minutes * 60_000 + seconds * 1_000 + frac_ms;
+        millis -= tz_offset_min * 60_000;
+    }
+    Some(millis)
+}
+
 fn is_date_object(value: &Value) -> bool {
     matches!(value, Value::Object(map) if map.contains_key("__date_ms__"))
 }
@@ -4221,15 +4365,39 @@ fn is_date_method(name: &str) -> bool {
             | "getSeconds"
             | "getUTCMilliseconds"
             | "getMilliseconds"
+            | "toJSON"
+            | "toString"
+            | "toDateString"
+            | "getTimezoneOffset"
     )
 }
 
 fn execute_date_method(map: &IndexMap<Arc<str>, Value>, method: &str) -> Option<Value> {
-    let millis = match map.get("__date_ms__") {
-        Some(Value::Int(millis)) => *millis,
-        Some(Value::Float(millis)) => *millis as i64,
-        _ => 0,
+    let millis_f = match map.get("__date_ms__") {
+        Some(Value::Int(millis)) => *millis as f64,
+        Some(Value::Float(millis)) => *millis,
+        _ => 0.0,
     };
+    // An Invalid Date: time-based getters are NaN, formatters say "Invalid Date".
+    if millis_f.is_nan() {
+        return Some(match method {
+            "getTime" | "valueOf" | "getUTCFullYear" | "getFullYear" | "getUTCMonth"
+            | "getMonth" | "getUTCDate" | "getDate" | "getUTCDay" | "getDay" | "getUTCHours"
+            | "getHours" | "getUTCMinutes" | "getMinutes" | "getUTCSeconds" | "getSeconds"
+            | "getUTCMilliseconds" | "getMilliseconds" | "getTimezoneOffset" => {
+                Value::Float(f64::NAN)
+            }
+            _ => Value::String(Arc::from("Invalid Date")),
+        });
+    }
+    let millis = millis_f as i64;
+    // getTimezoneOffset is 0 (the sandbox runs in UTC).
+    if method == "getTimezoneOffset" {
+        return Some(Value::Int(0));
+    }
+    if matches!(method, "toJSON" | "toString" | "toDateString") {
+        return Some(Value::String(Arc::from(unix_millis_to_iso(millis).as_str())));
+    }
     let seconds = millis.div_euclid(1000);
     let ms = millis.rem_euclid(1000);
     let days = seconds.div_euclid(86_400);

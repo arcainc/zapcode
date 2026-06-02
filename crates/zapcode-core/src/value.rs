@@ -157,6 +157,12 @@ impl Value {
             // JS ToNumber(array) = ToNumber(ToPrimitive(array)) = ToNumber(array.toString()):
             // [] -> "" -> 0, [5] -> "5" -> 5, [1,2] -> "1,2" -> NaN.
             Value::Array(_) => Self::parse_number_str(&self.to_js_string()),
+            // A Date coerces to its epoch-millis (so `d2 - d1`, `+d`, `<`/`>` work).
+            Value::Object(map) => match map.get("__date_ms__") {
+                Some(Value::Int(ms)) => *ms as f64,
+                Some(Value::Float(ms)) => *ms,
+                _ => f64::NAN,
+            },
             _ => f64::NAN,
         }
     }
@@ -227,6 +233,18 @@ impl Value {
                 items.join(",")
             }
             Value::Object(map) => {
+                // A Date stringifies to its ISO form (rather than [object Object]).
+                if let Some(ms) = map.get("__date_ms__") {
+                    let ms = match ms {
+                        Value::Int(n) => *n as f64,
+                        Value::Float(n) => *n,
+                        _ => f64::NAN,
+                    };
+                    if ms.is_nan() {
+                        return "Invalid Date".to_string();
+                    }
+                    return crate::vm::unix_millis_to_iso(ms as i64);
+                }
                 // Error objects stringify as "Name: message" (like JS).
                 if matches!(map.get("__error__"), Some(Value::Bool(true))) {
                     let name = map

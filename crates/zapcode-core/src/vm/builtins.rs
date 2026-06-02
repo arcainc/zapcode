@@ -17,7 +17,20 @@ pub fn register_globals(globals: &mut HashMap<String, Value>) {
     globals.insert("Promise".to_string(), Value::Object(IndexMap::new()));
     globals.insert("Map".to_string(), builtin_constructor("Map"));
     globals.insert("Set".to_string(), builtin_constructor("Set"));
-    globals.insert("Date".to_string(), builtin_constructor("Date"));
+    globals.insert("Date".to_string(), {
+        let mut d = IndexMap::new();
+        d.insert(
+            Arc::from("__builtin_constructor__"),
+            Value::String(Arc::from("Date")),
+        );
+        // Static methods Date.now()/Date.parse()/Date.UTC() (callable globals).
+        for (prop, target) in [("now", "Date.now"), ("parse", "Date.parse"), ("UTC", "Date.UTC")] {
+            let mut s = IndexMap::new();
+            s.insert(Arc::from("__global_fn__"), Value::String(Arc::from(target)));
+            d.insert(Arc::from(prop), Value::Object(s));
+        }
+        Value::Object(d)
+    });
     for err in [
         "Error",
         "TypeError",
@@ -488,6 +501,17 @@ pub fn call_global_fn(kind: &str, args: &[Value]) -> Result<Value> {
                 .collect();
             Value::String(Arc::from(s.as_str()))
         }
+        // Date statics. now() is 0 — the sandbox has no wall clock (deterministic
+        // replay); inject the current time via a host tool when needed.
+        "Date.now" => Value::Int(0),
+        "Date.parse" => {
+            let s = arg.to_js_string();
+            match crate::vm::parse_date_string(&s) {
+                Some(ms) => Value::Int(ms),
+                None => Value::Float(f64::NAN),
+            }
+        }
+        "Date.UTC" => finite_number(crate::vm::date_utc_millis(args)),
         "Number.isNaN" => Value::Bool(matches!(arg, Value::Float(n) if n.is_nan())),
         "Number.isFinite" => Value::Bool(
             matches!(arg, Value::Int(_)) || matches!(arg, Value::Float(n) if n.is_finite()),
