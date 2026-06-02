@@ -41,6 +41,7 @@
 
 pub mod compiler;
 pub mod error;
+pub mod heap;
 pub mod parser;
 pub mod sandbox;
 pub mod session;
