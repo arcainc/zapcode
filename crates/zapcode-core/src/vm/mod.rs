@@ -3844,16 +3844,6 @@ fn extract_object_fields(
     }
 }
 
-/// Navigate `path` within `target` and store `value` at the leaf. Returns whether
-/// the write succeeded (false if the path doesn't resolve).
-fn normalize_array_index(idx: i64, len: i64) -> usize {
-    if idx < 0 {
-        (len + idx).max(0) as usize
-    } else {
-        (idx as usize).min(len as usize)
-    }
-}
-
 /// JS `ToInt32`: truncate, take modulo 2^32, then interpret as a signed 32-bit
 /// integer. A plain `f64 as i32` cast in Rust *saturates* at i32::MIN/MAX, which
 /// is wrong for operands >= 2^31 (e.g. `4294967296 | 0` must be 0, not i32::MAX).
