@@ -202,8 +202,22 @@ impl Vm {
         limits: ResourceLimits,
         external_functions: HashSet<String>,
     ) -> Self {
+        Self::with_programs_and_heap(programs, limits, external_functions, Heap::new())
+    }
+
+    /// Like [`with_programs`] but seeds the VM with an existing heap (e.g. the
+    /// heap carried forward between session chunks, which backs the persisted
+    /// array/object globals). Builtin globals are re-registered, appending fresh
+    /// slots to the supplied heap — the same approach as [`from_snapshot`] — so
+    /// user handles in the restored heap remain valid.
+    pub(crate) fn with_programs_and_heap(
+        programs: Vec<CompiledProgram>,
+        limits: ResourceLimits,
+        external_functions: HashSet<String>,
+        heap: Heap,
+    ) -> Self {
         let mut globals = HashMap::new();
-        let mut heap = Heap::new();
+        let mut heap = heap;
 
         // Register built-in globals
         builtins::register_globals(&mut globals, &mut heap);

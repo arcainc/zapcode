@@ -102,6 +102,11 @@ struct IdleSessionState {
     /// Deterministic PRNG state for `Math.random`, carried across chunks.
     #[serde(default)]
     rng_state: u64,
+    /// The object heap backing the persisted `globals`. Array/object globals
+    /// hold `Handle`s into this heap, so it must travel with the idle state or
+    /// those handles dangle when the next chunk runs.
+    #[serde(default)]
+    heap: crate::heap::Heap,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +130,7 @@ impl ZapcodeSessionSnapshot {
                 next_generator_id: 0,
                 allocations: 0,
                 rng_state: 0,
+                heap: crate::heap::Heap::new(),
             }),
         })
     }
@@ -178,7 +184,8 @@ impl ZapcodeSessionSnapshot {
         programs.push(compiled);
         let program_index = programs.len() - 1;
 
-        let mut vm = Vm::with_programs(programs, idle.limits.clone(), ext_set);
+        let mut vm =
+            Vm::with_programs_and_heap(programs, idle.limits.clone(), ext_set, idle.heap);
         for (name, value) in idle.globals {
             vm.globals.insert(name, value);
         }
@@ -266,6 +273,9 @@ fn build_session_state(
                     next_generator_id: vm.next_generator_id,
                     allocations: vm.tracker.allocations,
                     rng_state: vm.rng_state,
+                    // Carry the heap so persisted array/object globals stay valid
+                    // for the next chunk.
+                    heap: vm.heap.clone(),
                 }),
             },
         }),
