@@ -680,7 +680,12 @@ impl Vm {
 
     /// Build the locals vec by binding `args` to the function's declared `params`.
     /// Handles positional, rest, and default-value patterns.
-    fn bind_params(params: &[ParamPattern], args: &[Value], local_count: usize) -> Vec<Value> {
+    fn bind_params(
+        params: &[ParamPattern],
+        args: &[Value],
+        local_count: usize,
+        heap: &mut Heap,
+    ) -> Vec<Value> {
         let mut locals = Vec::with_capacity(local_count);
         for (i, param) in params.iter().enumerate() {
             match param {
@@ -689,7 +694,7 @@ impl Vm {
                 }
                 ParamPattern::Rest(_) => {
                     let rest: Vec<Value> = args.get(i..).map(|s| s.to_vec()).unwrap_or_default();
-                    locals.push(Value::Array(rest));
+                    locals.push(Value::Array(heap.alloc_array(rest)));
                 }
                 ParamPattern::DefaultValue { .. } => {
                     let val = args.get(i).cloned().unwrap_or(Value::Undefined);
@@ -700,7 +705,7 @@ impl Vm {
                 // extract the fields from the argument into those slots.
                 ParamPattern::ObjectDestructure(_) | ParamPattern::ArrayDestructure(_) => {
                     let arg = args.get(i).cloned().unwrap_or(Value::Undefined);
-                    extract_pattern(param, &arg, &mut locals);
+                    extract_pattern(param, &arg, &mut locals, heap);
                 }
             }
         }
@@ -725,7 +730,9 @@ impl Vm {
         }
 
         let func = self.current_function(closure.func_ref);
-        let locals = Self::bind_params(&func.params, args, func.local_count);
+        let params = func.params.clone();
+        let local_count = func.local_count;
+        let locals = Self::bind_params(&params, args, local_count, &mut self.heap);
 
         // If this is a method call (has this_value from a receiver), transfer
         // the receiver source so we can write back mutations on return.
@@ -955,8 +962,9 @@ impl Vm {
                     });
                     Ok(true)
                 } else {
-                    // All done — push final array, no clone needed
-                    self.push(Value::Array(results))?;
+                    // All done — push final array.
+                    let h = self.heap.alloc_array(results);
+                    self.push(Value::Array(h))?;
                     Ok(true)
                 }
             }
@@ -999,10 +1007,8 @@ impl Vm {
         let closure = match callee {
             Value::Function(c) => c.clone(),
             other => {
-                return Err(ZapcodeError::TypeError(format!(
-                    "{} is not a function",
-                    other.to_js_string()
-                )));
+                let msg = other.to_js_string(&self.heap);
+                return Err(ZapcodeError::TypeError(format!("{} is not a function", msg)));
             }
         };
 
@@ -1108,7 +1114,8 @@ impl Vm {
         arr: Vec<Value>,
     ) -> Result<Option<Value>> {
         if arr.is_empty() {
-            return Ok(Some(Value::Array(Vec::new())));
+            let h = self.heap.alloc_array(Vec::new());
+            return Ok(Some(Value::Array(h)));
         }
 
         // Validate callback type BEFORE pushing continuation
@@ -3630,66 +3637,71 @@ fn builtin_method(object_name: &str, method_name: &str) -> Value {
 use crate::parser::ir::{DestructureField, ParamPattern};
 
 /// Read a named field from `value` (Undefined if missing / not an object).
-fn field_of(value: &Value, key: &str) -> Value {
+fn field_of(value: &Value, key: &str, heap: &Heap) -> Value {
     match value {
-        Value::Object(map) => map.get(key).cloned().unwrap_or(Value::Undefined),
+        Value::Object(h) => heap
+            .object(*h)
+            .and_then(|m| m.get(key).cloned())
+            .unwrap_or(Value::Undefined),
         _ => Value::Undefined,
     }
 }
 
 /// Extract the locals bound by a (possibly nested) destructuring pattern from
 /// `value`, pushing them in declaration order to mirror `declare_destructure_locals`.
-fn extract_pattern(pattern: &ParamPattern, value: &Value, out: &mut Vec<Value>) {
+fn extract_pattern(pattern: &ParamPattern, value: &Value, out: &mut Vec<Value>, heap: &mut Heap) {
     match pattern {
         ParamPattern::Ident(_) | ParamPattern::Rest(_) => out.push(value.clone()),
-        ParamPattern::DefaultValue { pattern, .. } => extract_pattern(pattern, value, out),
-        ParamPattern::ObjectDestructure(fields) => extract_object_fields(fields, value, out),
+        ParamPattern::DefaultValue { pattern, .. } => extract_pattern(pattern, value, out, heap),
+        ParamPattern::ObjectDestructure(fields) => extract_object_fields(fields, value, out, heap),
         ParamPattern::ArrayDestructure(elems) => {
             for (i, elem) in elems.iter().enumerate() {
                 if let Some(p) = elem {
                     if matches!(p, ParamPattern::Rest(_)) {
                         // `...rest`: collect the remaining elements as an array.
-                        let rest = match value {
-                            Value::Array(a) => {
-                                Value::Array(a.iter().skip(i).cloned().collect())
-                            }
-                            _ => Value::Array(Vec::new()),
+                        let rest_items: Vec<Value> = match value {
+                            Value::Array(a) => heap.array(*a).iter().skip(i).cloned().collect(),
+                            _ => Vec::new(),
                         };
-                        out.push(rest);
+                        out.push(Value::Array(heap.alloc_array(rest_items)));
                         continue;
                     }
                     let item = match value {
-                        Value::Array(a) => a.get(i).cloned().unwrap_or(Value::Undefined),
+                        Value::Array(a) => heap.array(*a).get(i).cloned().unwrap_or(Value::Undefined),
                         _ => Value::Undefined,
                     };
-                    extract_pattern(p, &item, out);
+                    extract_pattern(p, &item, out, heap);
                 }
             }
         }
     }
 }
 
-fn extract_object_fields(fields: &[DestructureField], value: &Value, out: &mut Vec<Value>) {
+fn extract_object_fields(
+    fields: &[DestructureField],
+    value: &Value,
+    out: &mut Vec<Value>,
+    heap: &mut Heap,
+) {
     let mut consumed: Vec<String> = Vec::new();
     for field in fields {
         if field.rest {
-            let rest = match value {
-                Value::Object(map) => Value::Object(
-                    map.iter()
-                        .filter(|(k, _)| !consumed.iter().any(|c| c == k.as_ref()))
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
-                ),
-                _ => Value::Object(IndexMap::new()),
+            let rest_map: IndexMap<Arc<str>, Value> = match value {
+                Value::Object(h) => heap
+                    .object_map(*h)
+                    .into_iter()
+                    .filter(|(k, _)| !consumed.iter().any(|c| c == k.as_ref()))
+                    .collect(),
+                _ => IndexMap::new(),
             };
-            out.push(rest);
+            out.push(Value::Object(heap.alloc_object(rest_map)));
         } else if let Some(nested) = &field.nested {
             consumed.push(field.key.clone());
-            let child = field_of(value, &field.key);
-            extract_object_fields(nested, &child, out);
+            let child = field_of(value, &field.key, heap);
+            extract_object_fields(nested, &child, out, heap);
         } else {
             consumed.push(field.key.clone());
-            out.push(field_of(value, &field.key));
+            out.push(field_of(value, &field.key, heap));
         }
     }
 }
