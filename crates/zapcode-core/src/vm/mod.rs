@@ -4189,6 +4189,7 @@ fn is_string_method(name: &str) -> bool {
         name,
         "charAt"
             | "charCodeAt"
+            | "codePointAt"
             | "indexOf"
             | "lastIndexOf"
             | "includes"

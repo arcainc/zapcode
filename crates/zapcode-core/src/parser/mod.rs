@@ -850,8 +850,19 @@ impl<'a> AstLowerer<'a> {
             ast::Expression::BooleanLiteral(lit) => Ok(Expr::BoolLit(lit.value)),
             ast::Expression::NullLiteral(_) => Ok(Expr::NullLit),
             ast::Expression::TemplateLiteral(tpl) => {
-                let quasis: Vec<String> =
-                    tpl.quasis.iter().map(|q| q.value.raw.to_string()).collect();
+                // Use the *cooked* value so escape sequences (\n, \t, \uXXXX, \\)
+                // are processed; `raw` is the unescaped source text.
+                let quasis: Vec<String> = tpl
+                    .quasis
+                    .iter()
+                    .map(|q| {
+                        q.value
+                            .cooked
+                            .as_ref()
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| q.value.raw.to_string())
+                    })
+                    .collect();
                 let exprs: Result<Vec<Expr>> =
                     tpl.expressions.iter().map(|e| self.lower_expr(e)).collect();
                 Ok(Expr::TemplateLit {

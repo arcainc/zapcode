@@ -76,14 +76,17 @@ fn global_fn(name: &str) -> Value {
     let mut obj = IndexMap::new();
     obj.insert(Arc::from("__global_fn__"), Value::String(Arc::from(name)));
     if name == "String" {
-        obj.insert(Arc::from("fromCharCode"), {
+        for (prop, target) in [
+            ("fromCharCode", "String.fromCharCode"),
+            ("fromCodePoint", "String.fromCodePoint"),
+        ] {
             let mut s = IndexMap::new();
             s.insert(
                 Arc::from("__global_fn__"),
-                Value::String(Arc::from("String.fromCharCode")),
+                Value::String(Arc::from(target)),
             );
-            Value::Object(s)
-        });
+            obj.insert(Arc::from(prop), Value::Object(s));
+        }
     }
     if name == "Number" {
         obj.insert(
@@ -472,6 +475,13 @@ pub fn call_global_fn(kind: &str, args: &[Value]) -> Result<Value> {
         // Values are deep-copied on assignment in this VM, so a clone suffices.
         "structuredClone" => arg,
         "String.fromCharCode" => {
+            let s: String = args
+                .iter()
+                .filter_map(|v| char::from_u32(v.to_number() as u32))
+                .collect();
+            Value::String(Arc::from(s.as_str()))
+        }
+        "String.fromCodePoint" => {
             let s: String = args
                 .iter()
                 .filter_map(|v| char::from_u32(v.to_number() as u32))
@@ -1014,6 +1024,18 @@ fn translate_replacement(repl: &str) -> String {
                 chars.next();
                 out.push('$');
             }
+            // $<name> -> named capture group.
+            Some('<') => {
+                chars.next();
+                let mut name = String::new();
+                for ch in chars.by_ref() {
+                    if ch == '>' {
+                        break;
+                    }
+                    name.push(ch);
+                }
+                out.push_str(&format!("${{{}}}", name));
+            }
             Some(d) if d.is_ascii_digit() => {
                 let mut num = String::new();
                 while let Some(d2) = chars.peek() {
@@ -1054,6 +1076,30 @@ fn call_string_method(
                 None => Value::Float(f64::NAN),
             }
         }
+        "codePointAt" => {
+            let idx = arg_int(args, 0).max(0) as usize;
+            match s.chars().nth(idx) {
+                Some(c) => Value::Int(c as i64),
+                None => Value::Undefined,
+            }
+        }
+        "substr" => {
+            // substr(start, length); negative start counts from the end.
+            let chars: Vec<char> = s.chars().collect();
+            let len = chars.len() as i64;
+            let raw_start = arg_int(args, 0);
+            let start = if raw_start < 0 {
+                (len + raw_start).max(0)
+            } else {
+                raw_start.min(len)
+            } as usize;
+            let count = match args.get(1) {
+                Some(v) if !matches!(v, Value::Undefined) => v.to_number().max(0.0) as usize,
+                _ => chars.len() - start,
+            };
+            let end = (start + count).min(chars.len());
+            Value::String(Arc::from(chars[start..end].iter().collect::<String>().as_str()))
+        }
         "indexOf" => {
             let search = arg_str(args, 0);
             // Optional fromIndex (in chars). Search the remainder, then map the
@@ -1081,11 +1127,22 @@ fn call_string_method(
         }
         "startsWith" => {
             let search = arg_str(args, 0);
-            Value::Bool(s.starts_with(&*search))
+            let pos = args.get(1).map(|v| v.to_number().max(0.0) as usize).unwrap_or(0);
+            let byte_start = s.char_indices().nth(pos).map_or(s.len(), |(i, _)| i);
+            Value::Bool(s[byte_start..].starts_with(&*search))
         }
         "endsWith" => {
             let search = arg_str(args, 0);
-            Value::Bool(s.ends_with(&*search))
+            // The optional end position treats the string as if it were that many
+            // characters long.
+            let byte_end = match args.get(1) {
+                Some(v) if !matches!(v, Value::Undefined) => {
+                    let c = v.to_number().max(0.0) as usize;
+                    s.char_indices().nth(c).map_or(s.len(), |(i, _)| i)
+                }
+                _ => s.len(),
+            };
+            Value::Bool(s[..byte_end].ends_with(&*search))
         }
         "slice" => {
             let len = s.len() as i64;
@@ -1175,13 +1232,37 @@ fn call_string_method(
             }
         }
         "split" => {
+            // Optional limit (ToUint32); 0 -> empty result.
+            let limit = match args.get(1) {
+                None | Some(Value::Undefined) => usize::MAX,
+                Some(v) => v.to_number().max(0.0) as usize,
+            };
+            if limit == 0 {
+                return Ok(Some(Value::Array(Vec::new())));
+            }
             if let Some((pat, flags)) = args.first().and_then(regexp_parts) {
                 let re = compile_regex(&pat, &flags)?;
-                let parts: Vec<Value> = re.split(s).map(|p| Value::String(Arc::from(p))).collect();
-                return Ok(Some(Value::Array(parts)));
+                // Splice in capture groups between the surrounding pieces, like JS.
+                let mut out: Vec<Value> = Vec::new();
+                let mut last = 0usize;
+                for caps in re.captures_iter(s) {
+                    let m = caps.get(0).unwrap();
+                    out.push(Value::String(Arc::from(&s[last..m.start()])));
+                    for i in 1..caps.len() {
+                        out.push(
+                            caps.get(i)
+                                .map(|g| Value::String(Arc::from(g.as_str())))
+                                .unwrap_or(Value::Undefined),
+                        );
+                    }
+                    last = m.end();
+                }
+                out.push(Value::String(Arc::from(&s[last..])));
+                out.truncate(limit);
+                return Ok(Some(Value::Array(out)));
             }
             let separator = arg_str(args, 0);
-            let parts: Vec<Value> = if separator.is_empty() {
+            let mut parts: Vec<Value> = if separator.is_empty() {
                 s.chars()
                     .map(|c| Value::String(Arc::from(c.to_string().as_str())))
                     .collect()
@@ -1190,6 +1271,7 @@ fn call_string_method(
                     .map(|p| Value::String(Arc::from(p)))
                     .collect()
             };
+            parts.truncate(limit);
             Value::Array(parts)
         }
         "replace" => {
