@@ -2,6 +2,19 @@
 
 ## Fix status (in progress)
 
+**Round 2 (branch `arca/heap-handles-rewrite`) — Tier A complete + most of Tier B:**
+- **J4** nested `for…of`; **D1/D2** function hoisting; **C4** caught runtime
+  errors are real `Error` objects; **B1** trailing-block completion values;
+  **E1/E2** optional-chaining short-circuit (calls + trailing members).
+- **M (Dates)** string/multi-arg construction, `Date.parse`/`Date.UTC`,
+  arithmetic & coercion, Invalid Date, `instanceof Date`, `toJSON`/`toString`.
+- **C1/C2** `instanceof` ancestor classes + implicit constructor → `super`.
+- **N7** `AggregateError` global.
+- Deferred as deep follow-ups (architectural, do dedicated): **A** reference
+  semantics (the heap-with-handles rewrite — chosen, not yet done); **N1–N5/N8/N9**
+  Promise combinator semantics (eager-resolution suspend model + determinism);
+  **C3** `super.method()` (needs current-class tracking in frames).
+
 Fixed and verified (cargo tests + full JS scenario suite, native binding rebuilt):
 
 - **Cluster L (Tier 0 crashes):** L1/L2/L3 (BigInt/Infinity/NaN/undefined tool
