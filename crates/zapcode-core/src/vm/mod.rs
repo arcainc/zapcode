@@ -531,6 +531,21 @@ impl Vm {
 
     /// Persist a mutated receiver back to its place: the root variable, navigated
     /// through the property/index path. Handles nested `obj.items.push(...)`.
+    /// Read the current value at a place, if it resolves. Used to confirm a
+    /// mutating method's receiver is still the live lvalue before writing back.
+    fn read_place(&self, place: &Place) -> Option<Value> {
+        let root = self.read_place_root(&place.root)?;
+        let mut cur = &root;
+        for seg in &place.path {
+            cur = match (cur, seg) {
+                (Value::Object(m), PlaceSeg::Prop(k)) => m.get(k.as_str())?,
+                (Value::Array(a), PlaceSeg::Index(i)) => a.get(*i)?,
+                _ => return None,
+            };
+        }
+        Some(cur.clone())
+    }
+
     fn write_place(&mut self, place: &Place, value: Value) {
         if place.path.is_empty() {
             self.write_place_root(&place.root, value);
@@ -2501,11 +2516,21 @@ impl Vm {
                                     // sort() mutates the array in place (the
                                     // comparator path produces the sorted array
                                     // but isn't covered by mutated_array_receiver).
+                                    // Only write back when the place still holds
+                                    // the exact array we sorted — guards against a
+                                    // stale place leaking through a call-result
+                                    // receiver (e.g. `Object.keys(obj).sort()`,
+                                    // where the place wrongly points at `obj`).
                                     if method_name.as_ref() == "sort" {
                                         if let (Some(p), Some(Value::Array(sorted))) =
                                             (&place, &result)
                                         {
-                                            self.write_place(p, Value::Array(sorted.clone()));
+                                            if matches!(
+                                                self.read_place(p),
+                                                Some(Value::Array(ref cur)) if arrays_same_values(cur, arr)
+                                            ) {
+                                                self.write_place(p, Value::Array(sorted.clone()));
+                                            }
                                         }
                                     }
                                     result
@@ -3847,6 +3872,12 @@ fn js_less_than_or_equal(left: &Value, right: &Value) -> bool {
         return a.as_ref() <= b.as_ref();
     }
     left.to_number() <= right.to_number()
+}
+
+/// Whether two arrays have the same elements in the same order (a cheap
+/// structural compare used to confirm a sort receiver matches its lvalue).
+fn arrays_same_values(a: &[Value], b: &[Value]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_js_string() == y.to_js_string())
 }
 
 /// True for reference values that coerce to a string in JS `+` (their
