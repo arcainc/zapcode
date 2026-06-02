@@ -460,7 +460,13 @@ impl Compiler {
                     label: self.pending_label.take(),
                 });
 
-                self.emit(Instruction::Dup);
+                // IteratorNext consumes the iterator and pushes the *advanced*
+                // iterator plus the next value, so the single iterator is
+                // threaded through each iteration. (A `Dup` here would leak one
+                // iterator per iteration onto the stack; harmless for a single
+                // loop, but a nested loop would then leave exhausted inner
+                // iterators sitting on top of the outer one — making the outer
+                // loop read the wrong iterator and exit after one pass.)
                 self.emit(Instruction::IteratorNext);
                 self.emit(Instruction::IteratorDone);
                 let exit_jump = self.emit(Instruction::JumpIfTrue(0));
