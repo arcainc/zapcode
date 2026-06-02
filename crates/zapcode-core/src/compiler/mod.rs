@@ -188,12 +188,10 @@ impl Compiler {
         for (i, stmt) in program.body.iter().enumerate() {
             let is_last = i == len - 1;
             if is_last {
-                if let Statement::Expression { expr, .. } = stmt {
-                    self.compile_expr(expr)?;
-                    // Don't pop — leave value on stack as program result
-                } else {
-                    self.compile_statement(stmt)?;
-                }
+                // Leave the trailing statement's completion value on the stack as
+                // the program result (so a script ending in try/catch, if, or a
+                // block yields that block's value, not null).
+                self.compile_completion_statement(stmt)?;
             } else {
                 self.compile_statement(stmt)?;
             }
@@ -697,6 +695,102 @@ impl Compiler {
                 } else {
                     self.patch_jump(jump_end, end);
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile a statement in "completion-value position": its value is left on
+    /// the stack as the result (used for the program's trailing statement and,
+    /// recursively, the trailing statement of a block/if/try it contains).
+    /// Expression/Block/If/TryCatch produce a value; anything else keeps its
+    /// normal (value-less) compilation.
+    fn compile_completion_statement(&mut self, stmt: &Statement) -> Result<()> {
+        match stmt {
+            Statement::Expression { expr, .. } => {
+                self.compile_expr(expr)?; // leave value, no Pop
+            }
+            Statement::Block { body, .. } => {
+                self.compile_completion_block(body)?;
+            }
+            Statement::If {
+                test,
+                consequent,
+                alternate,
+                ..
+            } => {
+                self.compile_expr(test)?;
+                let jump_else = self.emit(Instruction::JumpIfFalse(0));
+                self.compile_completion_block(consequent)?;
+                let jump_end = self.emit(Instruction::Jump(0));
+                let else_target = self.current_offset();
+                self.patch_jump(jump_else, else_target);
+                match alternate {
+                    Some(alt) => self.compile_completion_block(alt)?,
+                    None => {
+                        self.emit(Instruction::Push(Constant::Undefined));
+                    }
+                }
+                let end_target = self.current_offset();
+                self.patch_jump(jump_end, end_target);
+            }
+            Statement::TryCatch {
+                try_body,
+                catch_param,
+                catch_body,
+                finally_body,
+                ..
+            } => {
+                let setup = self.emit(Instruction::SetupTry(0, None));
+                self.compile_completion_block(try_body)?;
+                self.emit(Instruction::EndTry);
+                let jump_past_catch = self.emit(Instruction::Jump(0));
+                let catch_start = self.current_offset();
+                self.patch_jump(setup, catch_start);
+                if let Some(param) = catch_param {
+                    let idx = self.declare_local(param);
+                    self.emit(Instruction::StoreLocal(idx));
+                } else {
+                    self.emit(Instruction::Pop);
+                }
+                self.compile_completion_block(catch_body)?;
+                let after_catch = self.current_offset();
+                self.patch_jump(jump_past_catch, after_catch);
+                // A finally block runs for effects; its value is discarded (an
+                // abrupt completion inside finally — return/throw — is B2, separate).
+                if let Some(finally) = finally_body {
+                    for s in finally {
+                        self.compile_statement(s)?;
+                    }
+                }
+            }
+            other => {
+                self.compile_statement(other)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile a statement list so exactly one value (its completion value) is
+    /// left on the stack.
+    fn compile_completion_block(&mut self, stmts: &[Statement]) -> Result<()> {
+        let Some((last, init)) = stmts.split_last() else {
+            self.emit(Instruction::Push(Constant::Undefined));
+            return Ok(());
+        };
+        for s in init {
+            self.compile_statement(s)?;
+        }
+        match last {
+            Statement::Expression { .. }
+            | Statement::Block { .. }
+            | Statement::If { .. }
+            | Statement::TryCatch { .. } => self.compile_completion_statement(last)?,
+            other => {
+                // A non-value statement contributes no completion value; compile
+                // it normally and default the block's value to undefined.
+                self.compile_statement(other)?;
+                self.emit(Instruction::Push(Constant::Undefined));
             }
         }
         Ok(())
