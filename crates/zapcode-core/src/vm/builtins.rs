@@ -197,7 +197,10 @@ fn finite_number(n: f64) -> Value {
 }
 
 pub fn is_number_method(name: &str) -> bool {
-    matches!(name, "toFixed" | "toString" | "toPrecision" | "valueOf")
+    matches!(
+        name,
+        "toFixed" | "toString" | "toPrecision" | "toExponential" | "valueOf"
+    )
 }
 
 /// Methods on number primitives: `(3.14159).toFixed(2)`, `(255).toString(16)`, …
@@ -208,17 +211,22 @@ pub fn call_number_method(n: f64, method: &str, args: &[Value]) -> Result<Option
                 Some(v) => v.to_number().clamp(0.0, 100.0) as usize,
                 None => 0,
             };
-            Value::String(Arc::from(format!("{:.*}", digits, n).as_str()))
+            Value::String(Arc::from(js_to_fixed(n, digits).as_str()))
         }
         "toPrecision" => match args.first() {
-            None => Value::String(Arc::from(format_number(n).as_str())),
+            None | Some(Value::Undefined) => Value::String(Arc::from(format_number(n).as_str())),
             Some(v) => {
                 let p = (v.to_number() as usize).clamp(1, 100);
-                Value::String(Arc::from(
-                    format!("{:.*e}", p.saturating_sub(1), n).as_str(),
-                ))
+                Value::String(Arc::from(js_to_precision(n, p).as_str()))
             }
         },
+        "toExponential" => {
+            let digits = match args.first() {
+                None | Some(Value::Undefined) => None,
+                Some(v) => Some((v.to_number() as usize).min(100)),
+            };
+            Value::String(Arc::from(js_to_exponential(n, digits).as_str()))
+        }
         "toString" => {
             let radix = match args.first() {
                 Some(v) => v.to_number() as u32,
@@ -227,31 +235,191 @@ pub fn call_number_method(n: f64, method: &str, args: &[Value]) -> Result<Option
             if radix == 10 || !(2..=36).contains(&radix) {
                 Value::String(Arc::from(format_number(n).as_str()))
             } else {
-                // Integer radix conversion (JS only does integer part for non-10 here).
-                let mut i = n.trunc() as i64;
-                if i == 0 {
-                    Value::String(Arc::from("0"))
-                } else {
-                    let neg = i < 0;
-                    i = i.abs();
-                    let mut digits = Vec::new();
-                    while i > 0 {
-                        let d = (i % radix as i64) as u32;
-                        digits.push(std::char::from_digit(d, radix).unwrap());
-                        i /= radix as i64;
-                    }
-                    if neg {
-                        digits.push('-');
-                    }
-                    let s: String = digits.into_iter().rev().collect();
-                    Value::String(Arc::from(s.as_str()))
-                }
+                Value::String(Arc::from(radix_to_string(n, radix).as_str()))
             }
         }
         "valueOf" => finite_number(n),
         _ => return Ok(None),
     };
     Ok(Some(result))
+}
+
+/// `Number.prototype.toFixed`: round half away from zero (JS semantics, unlike
+/// Rust's `{:.*}` which rounds half-to-even), then format with `digits` decimals.
+fn js_to_fixed(n: f64, digits: usize) -> String {
+    if n.is_nan() {
+        return "NaN".to_string();
+    }
+    if n.is_infinite() {
+        return if n > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    // JS switches to ToString for magnitudes >= 1e21.
+    if n.abs() >= 1e21 {
+        return format_number(n);
+    }
+    let neg = n < 0.0;
+    // Round the *exact* decimal expansion of the f64 (Rust's high-precision
+    // format is exact), half-away-from-zero. Scaling by 10^digits and rounding
+    // would reintroduce exact halves (e.g. 0.15*10 rounds up to 1.5), giving the
+    // wrong answer; V8 rounds the true decimal value, so we do the same.
+    let extra = 40usize;
+    let full = format!("{:.*}", digits + extra, n.abs());
+    let (int_part, frac) = full.split_once('.').unwrap_or((full.as_str(), ""));
+    let frac_bytes = frac.as_bytes();
+    let decider = frac_bytes.get(digits).map(|b| b - b'0').unwrap_or(0);
+
+    let mut digs: Vec<u8> = int_part
+        .bytes()
+        .chain(frac.bytes().take(digits))
+        .map(|b| b - b'0')
+        .collect();
+    let mut int_len = int_part.len();
+    if decider >= 5 {
+        let mut carry = 1u8;
+        for d in digs.iter_mut().rev() {
+            let v = *d + carry;
+            *d = v % 10;
+            carry = v / 10;
+            if carry == 0 {
+                break;
+            }
+        }
+        if carry > 0 {
+            digs.insert(0, carry);
+            int_len += 1;
+        }
+    }
+    let int_s: String = digs[..int_len].iter().map(|&d| (d + b'0') as char).collect();
+    let s = if digits == 0 {
+        int_s
+    } else {
+        let frac_s: String = digs[int_len..].iter().map(|&d| (d + b'0') as char).collect();
+        format!("{}.{}", int_s, frac_s)
+    };
+    if neg {
+        format!("-{}", s)
+    } else {
+        s
+    }
+}
+
+/// Append an explicit sign to the exponent of a Rust `{:e}`-formatted string
+/// (Rust omits `+` for positive exponents; JS requires `e+N`/`e-N`).
+fn with_exp_sign(s: &str) -> String {
+    match s.find('e') {
+        Some(pos) => {
+            let (mantissa, exp) = s.split_at(pos);
+            let exp = &exp[1..];
+            if exp.starts_with('-') {
+                format!("{}e{}", mantissa, exp)
+            } else {
+                format!("{}e+{}", mantissa, exp)
+            }
+        }
+        None => s.to_string(),
+    }
+}
+
+/// `Number.prototype.toExponential`.
+fn js_to_exponential(n: f64, digits: Option<usize>) -> String {
+    if !n.is_finite() {
+        return format_number(n);
+    }
+    let formatted = match digits {
+        Some(d) => format!("{:.*e}", d, n),
+        None => format!("{:e}", n),
+    };
+    with_exp_sign(&formatted)
+}
+
+/// `Number.prototype.toPrecision` with a significant-digit count.
+fn js_to_precision(n: f64, p: usize) -> String {
+    if !n.is_finite() {
+        return format_number(n);
+    }
+    if n == 0.0 {
+        return if p == 1 {
+            "0".to_string()
+        } else {
+            format!("0.{}", "0".repeat(p - 1))
+        };
+    }
+    let neg = n < 0.0;
+    let x = n.abs();
+    // Decompose into `p` significant digits and a base-10 exponent.
+    let sci = format!("{:.*e}", p - 1, x);
+    let (mantissa, exp_str) = sci.split_once('e').unwrap_or((sci.as_str(), "0"));
+    let e: i32 = exp_str.parse().unwrap_or(0);
+    let digits: String = mantissa.chars().filter(|c| c.is_ascii_digit()).collect();
+
+    let body = if e < -6 || e >= p as i32 {
+        // Exponential form.
+        let mut m = String::new();
+        m.push_str(&digits[..1]);
+        if p > 1 {
+            m.push('.');
+            m.push_str(&digits[1..]);
+        }
+        with_exp_sign(&format!("{}e{}", m, e))
+    } else if e >= 0 {
+        let int_len = (e + 1) as usize;
+        if int_len >= p {
+            format!("{}{}", digits, "0".repeat(int_len - p))
+        } else {
+            format!("{}.{}", &digits[..int_len], &digits[int_len..])
+        }
+    } else {
+        format!("0.{}{}", "0".repeat((-e - 1) as usize), digits)
+    };
+    if neg {
+        format!("-{}", body)
+    } else {
+        body
+    }
+}
+
+/// Radix conversion for `Number.prototype.toString(radix)`, including the
+/// fractional part (e.g. `(3.5).toString(2)` -> "11.1").
+fn radix_to_string(n: f64, radix: u32) -> String {
+    if n == 0.0 {
+        return "0".to_string();
+    }
+    if !n.is_finite() {
+        return format_number(n);
+    }
+    let neg = n < 0.0;
+    let x = n.abs();
+    let mut int_part = x.trunc() as i128;
+    let mut frac = x.fract();
+
+    let mut idigits = Vec::new();
+    if int_part == 0 {
+        idigits.push('0');
+    }
+    while int_part > 0 {
+        let d = (int_part % radix as i128) as u32;
+        idigits.push(std::char::from_digit(d, radix).unwrap());
+        int_part /= radix as i128;
+    }
+    idigits.reverse();
+    let mut s: String = idigits.into_iter().collect();
+
+    if frac > 0.0 {
+        s.push('.');
+        let mut count = 0;
+        while frac > 0.0 && count < 52 {
+            frac *= radix as f64;
+            let d = frac.trunc() as u32;
+            s.push(std::char::from_digit(d, radix).unwrap());
+            frac -= d as f64;
+            count += 1;
+        }
+    }
+    if neg {
+        format!("-{}", s)
+    } else {
+        s
+    }
 }
 
 /// Format a number the way the VM's `to_js_string` does (no trailing `.0`).
