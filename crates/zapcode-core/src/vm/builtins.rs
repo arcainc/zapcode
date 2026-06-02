@@ -555,10 +555,7 @@ pub fn call_builtin(
 ) -> Result<Option<Value>> {
     match object {
         Value::String(s) => call_string_method(&s.clone(), method, args, limits, heap),
-        Value::Array(h) => {
-            let arr = heap.array_vec(*h);
-            call_array_method(&arr, method, args, limits, heap)
-        }
+        Value::Array(h) => call_array_method(*h, method, args, limits, heap),
         _ => Ok(None),
     }
 }
@@ -1563,12 +1560,17 @@ fn flatten_into(arr: &[Value], depth: i64, out: &mut Vec<Value>, heap: &Heap) {
 }
 
 fn call_array_method(
-    arr: &[Value],
+    handle: crate::heap::Handle,
     method: &str,
     args: &[Value],
     _limits: &ResourceLimits,
     heap: &mut Heap,
 ) -> Result<Option<Value>> {
+    // Snapshot the elements for read-only methods. Mutating methods
+    // (push/pop/shift/unshift/splice/fill/reverse/copyWithin) edit the heap slot
+    // in place via `handle` so the change is visible through every alias.
+    let arr = heap.array_vec(handle);
+    let arr = arr.as_slice();
     let result = match method {
         "length" => Value::Int(arr.len() as i64),
         "indexOf" => {
@@ -1634,9 +1636,11 @@ fn call_array_method(
             Value::Array(heap.alloc_array(result))
         }
         "reverse" => {
-            let mut result = arr.to_vec();
-            result.reverse();
-            Value::Array(heap.alloc_array(result))
+            // Mutates in place and returns the (same) array.
+            if let Some(v) = heap.array_mut(handle) {
+                v.reverse();
+            }
+            Value::Array(handle)
         }
         "flat" => {
             let depth = match args.first() {
@@ -1677,21 +1681,45 @@ fn call_array_method(
             } else {
                 len
             };
-            let mut result = arr.to_vec();
-            for item in result.iter_mut().take(end.min(len)).skip(start) {
-                *item = fill_val.clone();
+            if let Some(v) = heap.array_mut(handle) {
+                for item in v.iter_mut().take(end.min(len)).skip(start) {
+                    *item = fill_val.clone();
+                }
             }
-            Value::Array(heap.alloc_array(result))
+            Value::Array(handle)
         }
         "push" => {
-            let new_len = (arr.len() + args.len()) as i64;
-            Value::Int(new_len)
+            if let Some(v) = heap.array_mut(handle) {
+                v.extend(args.iter().cloned());
+                Value::Int(v.len() as i64)
+            } else {
+                Value::Int(0)
+            }
         }
-        "pop" => arr.last().cloned().unwrap_or(Value::Undefined),
-        "shift" => arr.first().cloned().unwrap_or(Value::Undefined),
+        "pop" => heap
+            .array_mut(handle)
+            .and_then(|v| v.pop())
+            .unwrap_or(Value::Undefined),
+        "shift" => {
+            if let Some(v) = heap.array_mut(handle) {
+                if v.is_empty() {
+                    Value::Undefined
+                } else {
+                    v.remove(0)
+                }
+            } else {
+                Value::Undefined
+            }
+        }
         "unshift" => {
-            let new_len = (arr.len() + args.len()) as i64;
-            Value::Int(new_len)
+            if let Some(v) = heap.array_mut(handle) {
+                for (i, a) in args.iter().enumerate() {
+                    v.insert(i, a.clone());
+                }
+                Value::Int(v.len() as i64)
+            } else {
+                Value::Int(0)
+            }
         }
         "splice" => {
             let len = arr.len() as i64;
@@ -1706,7 +1734,16 @@ fn call_array_method(
             } else {
                 arr.len() - start
             };
-            let deleted: Vec<Value> = arr[start..start + delete_count].to_vec();
+            let inserts: Vec<Value> = if args.len() > 2 {
+                args[2..].to_vec()
+            } else {
+                Vec::new()
+            };
+            let deleted: Vec<Value> = if let Some(v) = heap.array_mut(handle) {
+                v.splice(start..start + delete_count, inserts).collect()
+            } else {
+                Vec::new()
+            };
             Value::Array(heap.alloc_array(deleted))
         }
         "copyWithin" => {
@@ -1722,20 +1759,21 @@ fn call_array_method(
             } else {
                 len as usize
             };
-            let mut result = arr.to_vec();
-            let slice: Vec<Value> = result
-                .get(start..end.min(result.len()))
-                .map(|s| s.to_vec())
-                .unwrap_or_default();
-            for (offset, val) in slice.into_iter().enumerate() {
-                let dst = target + offset;
-                if dst < result.len() {
-                    result[dst] = val;
-                } else {
-                    break;
+            if let Some(result) = heap.array_mut(handle) {
+                let slice: Vec<Value> = result
+                    .get(start..end.min(result.len()))
+                    .map(|s| s.to_vec())
+                    .unwrap_or_default();
+                for (offset, val) in slice.into_iter().enumerate() {
+                    let dst = target + offset;
+                    if dst < result.len() {
+                        result[dst] = val;
+                    } else {
+                        break;
+                    }
                 }
             }
-            Value::Array(heap.alloc_array(result))
+            Value::Array(handle)
         }
         // Array iterators. JS returns iterator objects; we return plain arrays,
         // which spread (`[...arr.entries()]`) and for-of iterate identically.

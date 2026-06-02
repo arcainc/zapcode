@@ -1244,11 +1244,15 @@ impl Vm {
     /// `Ok(None)` if a continuation was started (async callback).
     fn execute_array_callback_method(
         &mut self,
-        arr: Vec<Value>,
+        handle: Handle,
         method: &str,
         all_args: Vec<Value>,
     ) -> Result<Option<Value>> {
         let callback = all_args.first().cloned().unwrap_or(Value::Undefined);
+        // Snapshot the elements; callbacks may run guest code, so we iterate over
+        // the snapshot (clone-out) rather than holding a heap borrow. `sort`
+        // re-reads/writes the live slot via `handle` for in-place semantics.
+        let arr = self.heap.array_vec(handle);
 
         match method {
             "map" => {
@@ -1260,7 +1264,8 @@ impl Vm {
                 for (i, item) in arr.iter().enumerate() {
                     result.push(self.call_element_callback(&callback, item, i)?);
                 }
-                Ok(Some(Value::Array(result)))
+                let h = self.heap.alloc_array(result);
+                Ok(Some(Value::Array(h)))
             }
             "filter" | "find" | "findIndex" | "findLast" | "findLastIndex" | "every" | "some"
             | "reduce" | "reduceRight" | "sort" | "flatMap" => {
@@ -1279,7 +1284,8 @@ impl Vm {
                                 result.push(item.clone());
                             }
                         }
-                        Ok(Some(Value::Array(result)))
+                        let h = self.heap.alloc_array(result);
+                        Ok(Some(Value::Array(h)))
                     }
                     "find" => {
                         for (i, item) in arr.iter().enumerate() {
@@ -1395,19 +1401,23 @@ impl Vm {
                                 }
                             }
                         } else {
-                            result.sort_by_key(|a| a.to_js_string());
+                            let heap = &self.heap;
+                            result.sort_by_key(|a| a.to_js_string(heap));
                         }
-                        Ok(Some(Value::Array(result)))
+                        // sort() mutates in place and returns the same array.
+                        self.heap.set_array(handle, result);
+                        Ok(Some(Value::Array(handle)))
                     }
                     "flatMap" => {
                         let mut result = Vec::new();
                         for (i, item) in arr.iter().enumerate() {
                             match self.call_element_callback(&callback, item, i)? {
-                                Value::Array(inner) => result.extend(inner),
+                                Value::Array(inner) => result.extend(self.heap.array_vec(inner)),
                                 other => result.push(other),
                             }
                         }
-                        Ok(Some(Value::Array(result)))
+                        let h = self.heap.alloc_array(result);
+                        Ok(Some(Value::Array(h)))
                     }
                     _ => unreachable!(),
                 }
@@ -2511,16 +2521,20 @@ impl Vm {
                         let receiver = recv.map(|b| *b).or_else(|| self.last_receiver.take());
                         let result = match object_name.as_ref() {
                             "__array__" => {
+                                // Arrays are heap handles: mutating methods edit
+                                // the slot in place, so the change is already
+                                // visible through every alias. No write-back via
+                                // `place` is needed (reference semantics).
+                                let _ = &place;
                                 if let Some(Value::Array(arr)) = &receiver {
-                                    let receiver_update =
-                                        mutated_array_receiver(&method_name, arr, &args);
+                                    let arr = *arr;
                                     // Check if this is a callback method first
-                                    let result = match method_name.as_ref() {
+                                    match method_name.as_ref() {
                                         "map" | "filter" | "forEach" | "find" | "findIndex"
                                         | "findLast" | "findLastIndex" | "every" | "some"
                                         | "reduce" | "reduceRight" | "sort" | "flatMap" => {
                                             match self.execute_array_callback_method(
-                                                arr.clone(),
+                                                arr,
                                                 &method_name,
                                                 args,
                                             )? {
@@ -2534,37 +2548,14 @@ impl Vm {
                                             }
                                         }
                                         _ => builtins::call_builtin(
-                                            &Value::Array(arr.clone()),
+                                            &Value::Array(arr),
                                             &method_name,
                                             &args,
                                             &self.limits,
                                             &mut self.stdout,
+                                            &mut self.heap,
                                         )?,
-                                    };
-                                    if let (Some(p), Some(updated)) = (&place, receiver_update) {
-                                        self.write_place(p, Value::Array(updated));
                                     }
-                                    // sort() mutates the array in place (the
-                                    // comparator path produces the sorted array
-                                    // but isn't covered by mutated_array_receiver).
-                                    // Only write back when the place still holds
-                                    // the exact array we sorted — guards against a
-                                    // stale place leaking through a call-result
-                                    // receiver (e.g. `Object.keys(obj).sort()`,
-                                    // where the place wrongly points at `obj`).
-                                    if method_name.as_ref() == "sort" {
-                                        if let (Some(p), Some(Value::Array(sorted))) =
-                                            (&place, &result)
-                                        {
-                                            if matches!(
-                                                self.read_place(p),
-                                                Some(Value::Array(ref cur)) if arrays_same_values(cur, arr)
-                                            ) {
-                                                self.write_place(p, Value::Array(sorted.clone()));
-                                            }
-                                        }
-                                    }
-                                    result
                                 } else {
                                     None
                                 }
@@ -3785,104 +3776,6 @@ fn set_seg(v: &mut Value, seg: &PlaceSeg, value: Value) -> bool {
     }
 }
 
-fn mutated_array_receiver(method: &str, arr: &[Value], args: &[Value]) -> Option<Vec<Value>> {
-    match method {
-        "push" => {
-            let mut updated = arr.to_vec();
-            updated.extend(args.iter().cloned());
-            Some(updated)
-        }
-        "pop" => {
-            let mut updated = arr.to_vec();
-            updated.pop();
-            Some(updated)
-        }
-        "shift" => {
-            let mut updated = arr.to_vec();
-            if !updated.is_empty() {
-                updated.remove(0);
-            }
-            Some(updated)
-        }
-        "unshift" => {
-            let mut updated = args.to_vec();
-            updated.extend_from_slice(arr);
-            Some(updated)
-        }
-        "reverse" => {
-            let mut updated = arr.to_vec();
-            updated.reverse();
-            Some(updated)
-        }
-        "fill" => {
-            let fill_val = args.first().cloned().unwrap_or(Value::Undefined);
-            let len = arr.len() as i64;
-            let start = if args.len() > 1 {
-                normalize_array_index(args[1].to_number() as i64, len)
-            } else {
-                0
-            };
-            let end = if args.len() > 2 {
-                normalize_array_index(args[2].to_number() as i64, len)
-            } else {
-                arr.len()
-            };
-            let mut updated = arr.to_vec();
-            for item in updated.iter_mut().take(end.min(arr.len())).skip(start) {
-                *item = fill_val.clone();
-            }
-            Some(updated)
-        }
-        "splice" => {
-            let len = arr.len() as i64;
-            let raw_start = args.first().map_or(0, |value| value.to_number() as i64);
-            let start = if raw_start < 0 {
-                (len + raw_start).max(0) as usize
-            } else {
-                (raw_start as usize).min(arr.len())
-            };
-            let delete_count = if args.len() > 1 {
-                ((args[1].to_number() as i64).max(0) as usize).min(arr.len() - start)
-            } else {
-                arr.len() - start
-            };
-            let mut updated = arr.to_vec();
-            updated.splice(start..start + delete_count, args.iter().skip(2).cloned());
-            Some(updated)
-        }
-        "copyWithin" => {
-            let len = arr.len() as i64;
-            let target =
-                normalize_array_index(args.first().map_or(0, |v| v.to_number() as i64), len);
-            let start = if args.len() > 1 {
-                normalize_array_index(args[1].to_number() as i64, len)
-            } else {
-                0
-            };
-            let end = if args.len() > 2 {
-                normalize_array_index(args[2].to_number() as i64, len)
-            } else {
-                arr.len()
-            };
-            let mut updated = arr.to_vec();
-            let slice: Vec<Value> = updated
-                .get(start..end.min(updated.len()))
-                .map(|s| s.to_vec())
-                .unwrap_or_default();
-            for (offset, val) in slice.into_iter().enumerate() {
-                let dst = target + offset;
-                if dst < updated.len() {
-                    updated[dst] = val;
-                } else {
-                    break;
-                }
-            }
-            Some(updated)
-        }
-        _ => None,
-    }
-}
-
 fn normalize_array_index(idx: i64, len: i64) -> usize {
     if idx < 0 {
         (len + idx).max(0) as usize
@@ -3932,12 +3825,6 @@ fn js_less_than_or_equal(left: &Value, right: &Value) -> bool {
     left.to_number() <= right.to_number()
 }
 
-/// Whether two arrays have the same elements in the same order (a cheap
-/// structural compare used to confirm a sort receiver matches its lvalue).
-fn arrays_same_values(a: &[Value], b: &[Value]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_js_string() == y.to_js_string())
-}
-
 /// True for reference values that coerce to a string in JS `+` (their
 /// `ToPrimitive` with a default hint yields a string for the built-in cases:
 /// arrays join, plain objects become `[object Object]`).
@@ -3965,76 +3852,96 @@ fn same_value_zero(a: &Value, b: &Value) -> bool {
 /// Coerce a constructor argument into a list of items for `new Set(...)`:
 /// arrays yield their elements, strings their characters, Sets their items, and
 /// Maps their `[key, value]` pairs.
-fn iterable_items(v: &Value) -> Vec<Value> {
+fn iterable_items(v: &Value, heap: &mut Heap) -> Vec<Value> {
     match v {
-        Value::Array(a) => a.clone(),
+        Value::Array(a) => heap.array_vec(*a),
         Value::String(s) => s
             .chars()
             .map(|c| Value::String(Arc::from(c.to_string().as_str())))
             .collect(),
-        Value::Object(m) if is_set_object(v) => set_items(m),
-        Value::Object(m) if is_map_object(v) => map_entry_pairs(m),
+        Value::Object(_) if is_set_object(v, heap) => set_items(v, heap),
+        Value::Object(_) if is_map_object(v, heap) => map_entry_pairs(v, heap),
         _ => Vec::new(),
     }
 }
 
 /// The `[key, value]` array pairs of a Map object's internal entries.
-fn map_entry_pairs(m: &IndexMap<Arc<str>, Value>) -> Vec<Value> {
-    match m.get("__entries__") {
-        Some(Value::Array(entries)) => entries
-            .iter()
-            .filter_map(|e| match e {
-                Value::Object(em) => Some(Value::Array(vec![
-                    em.get("key").cloned().unwrap_or(Value::Undefined),
-                    em.get("value").cloned().unwrap_or(Value::Undefined),
-                ])),
-                _ => None,
-            })
-            .collect(),
+fn map_entry_pairs(v: &Value, heap: &mut Heap) -> Vec<Value> {
+    let Value::Object(h) = v else {
+        return Vec::new();
+    };
+    let map = heap.object_map(*h);
+    match map.get("__entries__") {
+        Some(Value::Array(eh)) => {
+            let entries = heap.array_vec(*eh);
+            let mut out = Vec::with_capacity(entries.len());
+            for e in entries {
+                if let Value::Object(em_h) = e {
+                    let em = heap.object_map(em_h);
+                    let pair = heap.alloc_array(vec![
+                        em.get("key").cloned().unwrap_or(Value::Undefined),
+                        em.get("value").cloned().unwrap_or(Value::Undefined),
+                    ]);
+                    out.push(Value::Array(pair));
+                }
+            }
+            out
+        }
         _ => Vec::new(),
     }
 }
 
 /// Build Map entry objects from a constructor argument (an array of `[k, v]`
 /// pairs, or another Map). Later duplicate keys overwrite earlier ones.
-fn build_map_entries(arg: &Value) -> Vec<Value> {
-    let pairs = iterable_items(arg);
-    let mut entries: Vec<Value> = Vec::new();
+fn build_map_entries(arg: &Value, heap: &mut Heap) -> Vec<Value> {
+    let pairs = iterable_items(arg, heap);
+    // Track entries as plain (key, value) tuples first, then alloc objects, so
+    // we never hold a heap borrow across the dedup loop.
+    let mut entries: Vec<(Value, Value)> = Vec::new();
     for p in pairs {
         let (k, v) = match p {
-            Value::Array(kv) => (
-                kv.first().cloned().unwrap_or(Value::Undefined),
-                kv.get(1).cloned().unwrap_or(Value::Undefined),
-            ),
+            Value::Array(kv) => {
+                let kv = heap.array_vec(kv);
+                (
+                    kv.first().cloned().unwrap_or(Value::Undefined),
+                    kv.get(1).cloned().unwrap_or(Value::Undefined),
+                )
+            }
             _ => (Value::Undefined, Value::Undefined),
         };
-        let existing = entries.iter_mut().find_map(|e| match e {
-            Value::Object(em) if em.get("key").is_some_and(|ek| same_value_zero(ek, &k)) => {
-                Some(em)
-            }
-            _ => None,
-        });
-        if let Some(em) = existing {
-            em.insert(Arc::from("value"), v);
+        if let Some(slot) = entries.iter_mut().find(|(ek, _)| same_value_zero(ek, &k)) {
+            slot.1 = v;
         } else {
-            let mut em = IndexMap::new();
-            em.insert(Arc::from("key"), k);
-            em.insert(Arc::from("value"), v);
-            entries.push(Value::Object(em));
+            entries.push((k, v));
         }
     }
     entries
+        .into_iter()
+        .map(|(k, v)| {
+            let mut em = IndexMap::new();
+            em.insert(Arc::from("key"), k);
+            em.insert(Arc::from("value"), v);
+            Value::Object(heap.alloc_object(em))
+        })
+        .collect()
 }
 
-fn make_map_object(entries: Vec<Value>) -> Value {
+fn make_map_object(entries: Vec<Value>, heap: &mut Heap) -> Value {
+    let entries_arr = Value::Array(heap.alloc_array(entries));
     let mut obj = IndexMap::new();
     obj.insert(Arc::from("__map__"), Value::Bool(true));
-    obj.insert(Arc::from("__entries__"), Value::Array(entries));
-    Value::Object(obj)
+    obj.insert(Arc::from("__entries__"), entries_arr);
+    Value::Object(heap.alloc_object(obj))
 }
 
-fn is_map_object(value: &Value) -> bool {
-    matches!(value, Value::Object(map) if matches!(map.get("__map__"), Some(Value::Bool(true))))
+fn is_map_object(value: &Value, heap: &Heap) -> bool {
+    match value {
+        Value::Object(h) => matches!(
+            heap.object(*h).and_then(|m| m.get("__map__")),
+            Some(Value::Bool(true))
+        ),
+        _ => false,
+    }
 }
 
 fn is_map_method(name: &str) -> bool {
@@ -4044,8 +3951,14 @@ fn is_map_method(name: &str) -> bool {
     )
 }
 
-fn is_set_object(value: &Value) -> bool {
-    matches!(value, Value::Object(map) if matches!(map.get("__set__"), Some(Value::Bool(true))))
+fn is_set_object(value: &Value, heap: &Heap) -> bool {
+    match value {
+        Value::Object(h) => matches!(
+            heap.object(*h).and_then(|m| m.get("__set__")),
+            Some(Value::Bool(true))
+        ),
+        _ => false,
+    }
 }
 
 fn is_set_method(name: &str) -> bool {
@@ -4056,22 +3969,26 @@ fn is_set_method(name: &str) -> bool {
 }
 
 /// Build a Set object from items, de-duplicating by strict equality.
-fn make_set_object(items: Vec<Value>) -> Value {
+fn make_set_object(items: Vec<Value>, heap: &mut Heap) -> Value {
     let mut unique: Vec<Value> = Vec::new();
     for item in items {
         if !unique.iter().any(|u| same_value_zero(u, &item)) {
             unique.push(item);
         }
     }
+    let items_arr = Value::Array(heap.alloc_array(unique));
     let mut obj = IndexMap::new();
     obj.insert(Arc::from("__set__"), Value::Bool(true));
-    obj.insert(Arc::from("__items__"), Value::Array(unique));
-    Value::Object(obj)
+    obj.insert(Arc::from("__items__"), items_arr);
+    Value::Object(heap.alloc_object(obj))
 }
 
-fn set_items(map: &IndexMap<Arc<str>, Value>) -> Vec<Value> {
-    match map.get("__items__") {
-        Some(Value::Array(items)) => items.clone(),
+fn set_items(value: &Value, heap: &Heap) -> Vec<Value> {
+    let Value::Object(h) = value else {
+        return Vec::new();
+    };
+    match heap.object(*h).and_then(|m| m.get("__items__")) {
+        Some(Value::Array(ih)) => heap.array_vec(*ih),
         _ => Vec::new(),
     }
 }
