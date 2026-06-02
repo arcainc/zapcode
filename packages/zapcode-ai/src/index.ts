@@ -381,6 +381,53 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Make a host tool's return value safe to marshal across the native boundary.
+ *
+ * The native binding deserializes the value into a `serde_json::Value`, which
+ * cannot represent `undefined`, non-finite numbers, or `BigInt` — those used to
+ * abort the whole process (an uncatchable Rust panic / serde error). This
+ * deeply normalizes the value to JSON-compatible types, matching the
+ * interpreter's own semantics: `undefined`/functions/symbols → `null` (and
+ * dropped as object properties), non-finite numbers → `null`, `BigInt` →
+ * `Number`, `Date` → ISO string, `Map`/`Set` → object/array.
+ */
+function sanitizeToolResult(value: unknown, seen: WeakSet<object> = new WeakSet()): unknown {
+  if (value === undefined || value === null) return null;
+  switch (typeof value) {
+    case "bigint":
+      return Number(value);
+    case "number":
+      return Number.isFinite(value) ? value : null;
+    case "string":
+    case "boolean":
+      return value;
+    case "function":
+    case "symbol":
+      return null;
+  }
+  if (value instanceof Date) return value.toISOString();
+  if (value instanceof Map) {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of value) out[String(k)] = sanitizeToolResult(v, seen);
+    return out;
+  }
+  if (value instanceof Set) return Array.from(value, v => sanitizeToolResult(v, seen));
+  if (Array.isArray(value)) return value.map(v => sanitizeToolResult(v, seen));
+  if (typeof value === "object") {
+    if (seen.has(value)) return null; // break accidental cycles
+    seen.add(value);
+    const obj = value as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(obj)) {
+      if (obj[k] === undefined) continue; // JSON drops undefined-valued props
+      out[k] = sanitizeToolResult(obj[k], seen);
+    }
+    return out;
+  }
+  return null;
+}
+
 function jsTypeName(value: unknown): string {
   if (Array.isArray(value)) return "array";
   if (value === null) return "null";
@@ -419,6 +466,15 @@ function buildNamedArgs(
   const paramEntries = Object.entries(toolDef.parameters);
   const paramNames = paramEntries.map(([name]) => name);
   const singleObjectArg = args.length === 1 && isPlainObject(args[0]) ? args[0] : undefined;
+  // A no-arg tool called as `tool({})` (a common LLM habit): accept the empty
+  // object as an empty named call rather than rejecting it as positional.
+  if (
+    paramEntries.length === 0 &&
+    singleObjectArg !== undefined &&
+    Object.keys(singleObjectArg).length === 0
+  ) {
+    return {};
+  }
   const usesNamedObject =
     singleObjectArg !== undefined &&
     (paramEntries.length > 1 || shouldTreatSingleObjectArgAsNamed(toolDef, singleObjectArg));
@@ -668,7 +724,7 @@ async function executeCode(
       }
 
       try {
-        const result = await toolDef.execute(namedArgs);
+        const result = sanitizeToolResult(await toolDef.execute(namedArgs));
         toolCalls.push({ name, args: rawArgs, input: namedArgs, result });
         if (toolSpan) {
           toolSpan.attributes["zapcode.tool.result"] = JSON.stringify(result);
@@ -1073,7 +1129,7 @@ async function invokeToolCall(
   }
   const namedArgs = buildNamedArgs(name, toolDef, rawArgs); // throws → abort
   try {
-    const result = await toolDef.execute(namedArgs);
+    const result = sanitizeToolResult(await toolDef.execute(namedArgs));
     toolCalls.push({ name, args: rawArgs, input: namedArgs, result });
     return { ok: true, result };
   } catch (err: any) {
