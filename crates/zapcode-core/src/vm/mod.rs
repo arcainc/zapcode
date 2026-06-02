@@ -2594,6 +2594,7 @@ impl Vm {
                                         &args,
                                         &self.limits,
                                         &mut self.stdout,
+                                        &mut self.heap,
                                     )?
                                 } else {
                                     None
@@ -3156,7 +3157,7 @@ impl Vm {
             }
             Instruction::Throw => {
                 let val = self.pop()?;
-                let msg = val.to_js_string();
+                let msg = val.to_js_string(&self.heap);
                 // Preserve the thrown value so a `catch` binding sees it verbatim
                 // (string/object/…), while uncaught throws still report `msg`.
                 self.pending_throw = Some(val);
@@ -3189,7 +3190,7 @@ impl Vm {
                 let val = self.pop()?;
                 let result = match val {
                     Value::Int(n) => Value::Int(n + 1),
-                    _ => Value::Float(val.to_number() + 1.0),
+                    _ => Value::Float(val.to_number_heap(&self.heap) + 1.0),
                 };
                 self.push(result)?;
             }
@@ -3197,7 +3198,7 @@ impl Vm {
                 let val = self.pop()?;
                 let result = match val {
                     Value::Int(n) => Value::Int(n - 1),
-                    _ => Value::Float(val.to_number() - 1.0),
+                    _ => Value::Float(val.to_number_heap(&self.heap) - 1.0),
                 };
                 self.push(result)?;
             }
@@ -3209,7 +3210,7 @@ impl Vm {
                     parts.push(self.pop()?);
                 }
                 parts.reverse();
-                let result: String = parts.iter().map(|v| v.to_js_string()).collect();
+                let result: String = parts.iter().map(|v| v.to_js_string(&self.heap)).collect();
                 self.push(Value::String(Arc::from(result.as_str())))?;
             }
 
@@ -3224,7 +3225,8 @@ impl Vm {
             Instruction::DestructureArray(count) => {
                 let arr = self.pop()?;
                 match arr {
-                    Value::Array(items) => {
+                    Value::Array(h) => {
+                        let items = self.heap.array_vec(h);
                         for i in 0..count {
                             self.push(items.get(i).cloned().unwrap_or(Value::Undefined))?;
                         }
@@ -3263,8 +3265,9 @@ impl Vm {
                         "internal error: awaited a deferred call outside Promise.all".to_string(),
                     ));
                 }
-                if builtins::is_promise(&val) {
-                    if let Value::Object(map) = &val {
+                if builtins::is_promise(&val, &self.heap) {
+                    if let Value::Object(h) = &val {
+                        let map = self.heap.object_map(*h);
                         let status = map.get("status").cloned().unwrap_or(Value::Undefined);
                         match status {
                             Value::String(s) if s.as_ref() == "resolved" => {
@@ -3273,14 +3276,15 @@ impl Vm {
                             }
                             Value::String(s) if s.as_ref() == "rejected" => {
                                 let reason = map.get("reason").cloned().unwrap_or(Value::Undefined);
+                                let reason = reason.to_js_string(&self.heap);
                                 return Err(ZapcodeError::RuntimeError(format!(
                                     "Unhandled promise rejection: {}",
-                                    reason.to_js_string()
+                                    reason
                                 )));
                             }
                             Value::String(s) if s.as_ref() == "pending_all" => {
                                 let items = match map.get("items") {
-                                    Some(Value::Array(a)) => a.clone(),
+                                    Some(Value::Array(a)) => self.heap.array_vec(*a),
                                     _ => Vec::new(),
                                 };
                                 // Suspend on the whole batch (or resolve inline if
@@ -3340,10 +3344,12 @@ impl Vm {
                 let super_class = if has_super { Some(self.pop()?) } else { None };
 
                 // If super class, copy its prototype methods to ours (inheritance)
-                if let Some(Value::Object(ref sc)) = super_class {
-                    if let Some(Value::Object(super_proto)) = sc.get("__prototype__").cloned() {
+                if let Some(Value::Object(sc)) = &super_class {
+                    if let Some(Value::Object(super_proto_h)) =
+                        self.heap.object(*sc).and_then(|m| m.get("__prototype__").cloned())
+                    {
                         // Super prototype methods go first, then our own (which override)
-                        let mut merged = super_proto;
+                        let mut merged = self.heap.object_map(super_proto_h);
                         for (k, v) in prototype {
                             merged.insert(k, v);
                         }
@@ -3355,15 +3361,19 @@ impl Vm {
                 // `instanceof` matches ancestor classes too.
                 let mut chain = vec![Value::String(Arc::from(name.as_str()))];
                 if let Some(Value::Object(sc)) = &super_class {
-                    match sc.get("__class_chain__") {
-                        Some(Value::Array(c)) => chain.extend(c.iter().cloned()),
+                    let scm = self.heap.object_map(*sc);
+                    match scm.get("__class_chain__") {
+                        Some(Value::Array(c)) => chain.extend(self.heap.array_vec(*c)),
                         _ => {
-                            if let Some(n) = sc.get("__class_name__") {
+                            if let Some(n) = scm.get("__class_name__") {
                                 chain.push(n.clone());
                             }
                         }
                     }
                 }
+
+                let chain_arr = Value::Array(self.heap.alloc_array(chain));
+                let proto_obj = Value::Object(self.heap.alloc_object(prototype));
 
                 // Build the class object
                 let mut class_obj = IndexMap::new();
@@ -3371,9 +3381,9 @@ impl Vm {
                     Arc::from("__class_name__"),
                     Value::String(Arc::from(name.as_str())),
                 );
-                class_obj.insert(Arc::from("__class_chain__"), Value::Array(chain));
+                class_obj.insert(Arc::from("__class_chain__"), chain_arr);
                 class_obj.insert(Arc::from("__constructor__"), constructor);
-                class_obj.insert(Arc::from("__prototype__"), Value::Object(prototype));
+                class_obj.insert(Arc::from("__prototype__"), proto_obj);
 
                 // Store super class reference for super() calls
                 if let Some(sc) = super_class {
@@ -3385,7 +3395,7 @@ impl Vm {
                     class_obj.insert(k, v);
                 }
 
-                self.push(Value::Object(class_obj))?;
+                self.push(Value::Object(self.heap.alloc_object(class_obj)))?;
             }
 
             Instruction::Construct(arg_count) => {
@@ -3397,43 +3407,63 @@ impl Vm {
 
                 let callee = self.pop()?;
 
-                if let Value::Object(obj) = &callee {
-                    if let Some(Value::String(name)) = obj.get("__builtin_constructor__") {
+                if let Value::Object(obj_h) = &callee {
+                    let builtin_ctor = self
+                        .heap
+                        .object(*obj_h)
+                        .and_then(|m| m.get("__builtin_constructor__"))
+                        .and_then(|v| match v {
+                            Value::String(s) => Some(s.clone()),
+                            _ => None,
+                        });
+                    if let Some(name) = builtin_ctor {
                         match name.as_ref() {
                             "Map" => {
                                 // Accepts an array of [k, v] pairs OR another Map.
-                                let entries = build_map_entries(
-                                    args.first().unwrap_or(&Value::Undefined),
-                                );
-                                self.push(make_map_object(entries))?;
+                                let arg = args.first().cloned().unwrap_or(Value::Undefined);
+                                let entries = build_map_entries(&arg, &mut self.heap);
+                                let m = make_map_object(entries, &mut self.heap);
+                                self.push(m)?;
                                 return Ok(None);
                             }
                             "Set" => {
                                 // Accepts an array, string, Set, or Map.
-                                let items =
-                                    iterable_items(args.first().unwrap_or(&Value::Undefined));
-                                self.push(make_set_object(items))?;
+                                let arg = args.first().cloned().unwrap_or(Value::Undefined);
+                                let items = iterable_items(&arg, &mut self.heap);
+                                let s = make_set_object(items, &mut self.heap);
+                                self.push(s)?;
                                 return Ok(None);
                             }
                             "Date" => {
-                                self.push(construct_date(&args))?;
+                                let d = construct_date(&args, &mut self.heap);
+                                self.push(d)?;
                                 return Ok(None);
                             }
                             "Error" | "TypeError" | "RangeError" | "SyntaxError"
                             | "ReferenceError" => {
-                                let msg =
-                                    args.first().map(|v| v.to_js_string()).unwrap_or_default();
-                                self.push(make_error_object(name.as_ref(), &msg))?;
+                                let msg = args
+                                    .first()
+                                    .map(|v| v.to_js_string(&self.heap))
+                                    .unwrap_or_default();
+                                let e = make_error_object(name.as_ref(), &msg, &mut self.heap);
+                                self.push(e)?;
                                 return Ok(None);
                             }
                             "AggregateError" => {
                                 // new AggregateError(errors, message)
-                                let errors =
-                                    args.first().cloned().unwrap_or(Value::Array(Vec::new()));
-                                let msg = args.get(1).map(|v| v.to_js_string()).unwrap_or_default();
-                                let mut e = make_error_object("AggregateError", &msg);
-                                if let Value::Object(ref mut m) = e {
-                                    m.insert(Arc::from("errors"), errors);
+                                let errors = match args.first().cloned() {
+                                    Some(v) => v,
+                                    None => Value::Array(self.heap.alloc_array(Vec::new())),
+                                };
+                                let msg = args
+                                    .get(1)
+                                    .map(|v| v.to_js_string(&self.heap))
+                                    .unwrap_or_default();
+                                let e = make_error_object("AggregateError", &msg, &mut self.heap);
+                                if let Value::Object(m) = &e {
+                                    if let Some(map) = self.heap.object_mut(*m) {
+                                        map.insert(Arc::from("errors"), errors);
+                                    }
                                 }
                                 self.push(e)?;
                                 return Ok(None);
@@ -3456,7 +3486,8 @@ impl Vm {
                                     },
                                     other => other.to_vec(),
                                 };
-                                self.push(Value::Array(arr))?;
+                                let h = self.heap.alloc_array(arr);
+                                self.push(Value::Array(h))?;
                                 return Ok(None);
                             }
                             "Object" => {
@@ -3464,7 +3495,10 @@ impl Vm {
                                     Some(v @ (Value::Object(_) | Value::Array(_))) => {
                                         self.push(v.clone())?
                                     }
-                                    _ => self.push(Value::Object(IndexMap::new()))?,
+                                    _ => {
+                                        let h = self.heap.alloc_object(IndexMap::new());
+                                        self.push(Value::Object(h))?
+                                    }
                                 }
                                 return Ok(None);
                             }
@@ -3473,14 +3507,17 @@ impl Vm {
                     }
                 }
 
+                let is_user_class = matches!(&callee, Value::Object(h)
+                    if self.heap.object(*h).is_some_and(|m| m.contains_key("__class_name__")));
                 match &callee {
-                    Value::Object(class_obj) if class_obj.contains_key("__class_name__") => {
+                    Value::Object(class_h) if is_user_class => {
+                        let class_obj = self.heap.object_map(*class_h);
                         // Create a new instance object
                         let mut instance = IndexMap::new();
 
                         // Copy prototype methods onto the instance
-                        if let Some(Value::Object(proto)) = class_obj.get("__prototype__") {
-                            for (k, v) in proto {
+                        if let Some(Value::Object(proto_h)) = class_obj.get("__prototype__") {
+                            for (k, v) in self.heap.object_map(*proto_h) {
                                 instance.insert(k.clone(), v.clone());
                             }
                         }
@@ -3493,12 +3530,12 @@ impl Vm {
                             instance.insert(Arc::from("__class_chain__"), chain.clone());
                         }
 
-                        let instance_val = Value::Object(instance);
+                        let instance_val = Value::Object(self.heap.alloc_object(instance));
 
                         // Call the constructor with `this` bound to the instance.
                         // A subclass with no own constructor forwards to the nearest
                         // ancestor constructor (implicit `constructor(...a){ super(...a) }`).
-                        match find_class_constructor(class_obj) {
+                        match find_class_constructor(&class_obj, &self.heap) {
                             Some(Value::Function(closure)) => {
                                 // Clear receiver source — constructors should not
                                 // write back to a receiver variable.
@@ -3513,13 +3550,15 @@ impl Vm {
                     }
                     Value::Function(closure) => {
                         // `new` on a plain function — just call it
-                        self.push_call_frame(closure, &args, None)?;
+                        let closure = closure.clone();
+                        self.push_call_frame(&closure, &args, None)?;
                         self.last_receiver = None;
                     }
                     _ => {
+                        let msg = callee.to_js_string(&self.heap);
                         return Err(ZapcodeError::TypeError(format!(
                             "{} is not a constructor",
-                            callee.to_js_string()
+                            msg
                         )));
                     }
                 }
@@ -3571,13 +3610,31 @@ impl Vm {
                 // The super class info is stored on the class object.
                 // We'll look through globals for the class that has __super__.
                 let mut super_ctor = None;
-                for val in self.globals.values() {
-                    if let Value::Object(obj) = val {
-                        if let Some(Value::Object(super_class)) = obj.get("__super__") {
-                            if let Some(ctor) = super_class.get("__constructor__") {
-                                super_ctor = Some(ctor.clone());
-                                break;
-                            }
+                let global_objs: Vec<Handle> = self
+                    .globals
+                    .values()
+                    .filter_map(|v| match v {
+                        Value::Object(h) => Some(*h),
+                        _ => None,
+                    })
+                    .collect();
+                for obj_h in global_objs {
+                    let super_h = self
+                        .heap
+                        .object(obj_h)
+                        .and_then(|m| m.get("__super__"))
+                        .and_then(|v| match v {
+                            Value::Object(sh) => Some(*sh),
+                            _ => None,
+                        });
+                    if let Some(super_h) = super_h {
+                        if let Some(ctor) = self
+                            .heap
+                            .object(super_h)
+                            .and_then(|m| m.get("__constructor__").cloned())
+                        {
+                            super_ctor = Some(ctor);
+                            break;
                         }
                     }
                 }
