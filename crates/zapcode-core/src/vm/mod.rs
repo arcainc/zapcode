@@ -2574,25 +2574,37 @@ impl Vm {
                                 }
                             }
                             "__number__" => {
-                                let n =
-                                    receiver.as_ref().map(|v| v.to_number()).unwrap_or(f64::NAN);
+                                let n = receiver
+                                    .as_ref()
+                                    .map(|v| v.to_number_heap(&self.heap))
+                                    .unwrap_or(f64::NAN);
                                 builtins::call_number_method(n, &method_name, &args)?
                             }
                             "__object__" => match (&receiver, method_name.as_ref()) {
                                 (Some(Value::Object(map)), "hasOwnProperty") => {
-                                    let key =
-                                        args.first().map(|v| v.to_js_string()).unwrap_or_default();
-                                    Some(Value::Bool(map.contains_key(key.as_str())))
+                                    let key = args
+                                        .first()
+                                        .map(|v| v.to_js_string(&self.heap))
+                                        .unwrap_or_default();
+                                    let has = self
+                                        .heap
+                                        .object(*map)
+                                        .is_some_and(|m| m.contains_key(key.as_str()));
+                                    Some(Value::Bool(has))
                                 }
                                 _ => None,
                             },
                             "__regexp__" => {
-                                match receiver.as_ref().and_then(builtins::regexp_parts) {
+                                match receiver
+                                    .as_ref()
+                                    .and_then(|v| builtins::regexp_parts(v, &self.heap))
+                                {
                                     Some((pat, flags)) => builtins::call_regexp_method(
                                         &pat,
                                         &flags,
                                         &method_name,
                                         &args,
+                                        &mut self.heap,
                                     )?,
                                     None => None,
                                 }
@@ -2648,67 +2660,74 @@ impl Vm {
                                 }
                             }
                             "__map__" => {
+                                // Map is a heap handle; mutating methods edit the
+                                // backing slot in place (reference semantics), so
+                                // no `place` write-back is needed.
+                                let _ = &place;
                                 if let Some(Value::Object(map)) = receiver {
                                     if method_name.as_ref() == "forEach" {
                                         // cb(value, key, map) — needs guest closure.
                                         let cb = args.first().cloned().unwrap_or(Value::Undefined);
-                                        let entries = match map.get("__entries__") {
-                                            Some(Value::Array(e)) => e.clone(),
-                                            _ => Vec::new(),
-                                        };
-                                        for entry in &entries {
-                                            if let Value::Object(e) = entry {
-                                                let v = e
-                                                    .get("value")
+                                        let pairs = map_entry_pairs(
+                                            &Value::Object(map),
+                                            &mut self.heap,
+                                        );
+                                        for pair in pairs {
+                                            if let Value::Array(ph) = pair {
+                                                let kv = self.heap.array_vec(ph);
+                                                let k = kv
+                                                    .first()
                                                     .cloned()
                                                     .unwrap_or(Value::Undefined);
-                                                let k = e
-                                                    .get("key")
+                                                let v = kv
+                                                    .get(1)
                                                     .cloned()
                                                     .unwrap_or(Value::Undefined);
                                                 self.call_function_internal(
                                                     &cb,
-                                                    vec![v, k, Value::Object(map.clone())],
+                                                    vec![v, k, Value::Object(map)],
                                                 )?;
                                             }
                                         }
                                         Some(Value::Undefined)
                                     } else {
-                                        let (result, updated) =
-                                            execute_map_method(map, &method_name, &args);
-                                        if let (Some(p), Some(updated)) = (&place, updated) {
-                                            self.write_place(p, Value::Object(updated));
-                                        }
-                                        result
+                                        execute_map_method(
+                                            map,
+                                            &method_name,
+                                            &args,
+                                            &mut self.heap,
+                                        )
                                     }
                                 } else {
                                     None
                                 }
                             }
                             "__set__" => {
+                                let _ = &place;
                                 if let Some(Value::Object(map)) = receiver {
                                     if method_name.as_ref() == "forEach" {
                                         // cb(value, value, set) — needs guest closure.
                                         let cb = args.first().cloned().unwrap_or(Value::Undefined);
-                                        let items = set_items(&map);
+                                        let items =
+                                            set_items(&Value::Object(map), &self.heap);
                                         for item in items {
                                             self.call_function_internal(
                                                 &cb,
                                                 vec![
                                                     item.clone(),
                                                     item.clone(),
-                                                    Value::Object(map.clone()),
+                                                    Value::Object(map),
                                                 ],
                                             )?;
                                         }
                                         Some(Value::Undefined)
                                     } else {
-                                        let (result, updated) =
-                                            execute_set_method(map, &method_name, &args);
-                                        if let (Some(p), Some(updated)) = (&place, updated) {
-                                            self.write_place(p, Value::Object(updated));
-                                        }
-                                        result
+                                        execute_set_method(
+                                            map,
+                                            &method_name,
+                                            &args,
+                                            &mut self.heap,
+                                        )
                                     }
                                 } else {
                                     None
@@ -2716,7 +2735,8 @@ impl Vm {
                             }
                             "__date__" => {
                                 if let Some(Value::Object(date)) = receiver {
-                                    execute_date_method(&date, &method_name)
+                                    let map = self.heap.object_map(date);
+                                    execute_date_method(&map, &method_name)
                                 } else {
                                     None
                                 }
@@ -2735,19 +2755,22 @@ impl Vm {
                             {
                                 let src = builtins::array_from_source(
                                     args.first().unwrap_or(&Value::Undefined),
+                                    &mut self.heap,
                                 );
                                 let map_fn = args[1].clone();
                                 let mut out = Vec::with_capacity(src.len());
                                 for (i, item) in src.iter().enumerate() {
                                     out.push(self.call_element_callback(&map_fn, item, i)?);
                                 }
-                                Some(Value::Array(out))
+                                let h = self.heap.alloc_array(out);
+                                Some(Value::Array(h))
                             }
                             global_name => builtins::call_global_method(
                                 global_name,
                                 &method_name,
                                 &args,
                                 &mut self.stdout,
+                                &mut self.heap,
                             )?,
                         };
                         match result {
@@ -2762,19 +2785,22 @@ impl Vm {
                     }
                     // Bare type-conversion functions: String(x)/Number(x)/Boolean(x),
                     // represented as objects carrying a "__global_fn__" marker.
-                    Value::Object(ref map) if map.contains_key("__global_fn__") => {
-                        let kind = match map.get("__global_fn__") {
+                    Value::Object(h)
+                        if self
+                            .heap
+                            .object(h)
+                            .is_some_and(|m| m.contains_key("__global_fn__")) =>
+                    {
+                        let kind = match self.heap.object(h).and_then(|m| m.get("__global_fn__")) {
                             Some(Value::String(s)) => s.clone(),
                             _ => Arc::from(""),
                         };
-                        let value = builtins::call_global_fn(kind.as_ref(), &args)?;
+                        let value = builtins::call_global_fn(kind.as_ref(), &args, &mut self.heap)?;
                         self.push(value)?;
                     }
                     _ => {
-                        return Err(ZapcodeError::TypeError(format!(
-                            "{} is not a function",
-                            callee.to_js_string()
-                        )));
+                        let msg = callee.to_js_string(&self.heap);
+                        return Err(ZapcodeError::TypeError(format!("{} is not a function", msg)));
                     }
                 }
             }
