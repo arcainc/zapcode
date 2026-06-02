@@ -1496,7 +1496,7 @@ impl Vm {
                                 .iter()
                                 .find(|(n, _)| n == name)
                                 .map(|(_, v)| v.clone())
-                                .unwrap_or(Value::Array(Vec::new()));
+                                .unwrap_or_else(|| Value::Array(self.heap.alloc_array(Vec::new())));
                             locals.push(val);
                         }
                         _ => {
@@ -1657,11 +1657,11 @@ impl Vm {
         }
     }
 
-    fn make_iterator_result(&self, value: Value, done: bool) -> Value {
+    fn make_iterator_result(&mut self, value: Value, done: bool) -> Value {
         let mut obj = IndexMap::new();
         obj.insert(Arc::from("value"), value);
         obj.insert(Arc::from("done"), Value::Bool(done));
-        Value::Object(obj)
+        Value::Object(self.heap.alloc_object(obj))
     }
 
     fn dispatch(&mut self, instr: Instruction) -> Result<Option<VmState>> {
@@ -1781,7 +1781,7 @@ impl Vm {
                     (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 + b),
                     (Value::Float(a), Value::Int(b)) => Value::Float(a + *b as f64),
                     (Value::String(a), _) => {
-                        let rhs = right.to_js_string();
+                        let rhs = right.to_js_string(&self.heap);
                         let new_len = a.len().saturating_add(rhs.len());
                         if new_len > 10_000_000 {
                             return Err(ZapcodeError::AllocationLimitExceeded);
@@ -1791,7 +1791,7 @@ impl Vm {
                         Value::String(Arc::from(s.as_str()))
                     }
                     (_, Value::String(b)) => {
-                        let lhs = left.to_js_string();
+                        let lhs = left.to_js_string(&self.heap);
                         let new_len = lhs.len().saturating_add(b.len());
                         if new_len > 10_000_000 {
                             return Err(ZapcodeError::AllocationLimitExceeded);
@@ -1804,8 +1804,8 @@ impl Vm {
                     // plain objects), the whole expression is string concatenation
                     // (e.g. `[1,2]+[3]` -> "1,23", `[]+{}` -> "[object Object]").
                     _ if coerces_to_string_in_add(&left) || coerces_to_string_in_add(&right) => {
-                        let lhs = left.to_js_string();
-                        let rhs = right.to_js_string();
+                        let lhs = left.to_js_string(&self.heap);
+                        let rhs = right.to_js_string(&self.heap);
                         let new_len = lhs.len().saturating_add(rhs.len());
                         if new_len > 10_000_000 {
                             return Err(ZapcodeError::AllocationLimitExceeded);
@@ -1814,7 +1814,9 @@ impl Vm {
                         s.push_str(&rhs);
                         Value::String(Arc::from(s.as_str()))
                     }
-                    _ => Value::Float(left.to_number() + right.to_number()),
+                    _ => Value::Float(
+                        left.to_number_heap(&self.heap) + right.to_number_heap(&self.heap),
+                    ),
                 };
                 self.push(result)?;
             }
@@ -1826,7 +1828,9 @@ impl Vm {
                         Some(r) => Value::Int(r),
                         None => Value::Float(*a as f64 - *b as f64),
                     },
-                    _ => Value::Float(left.to_number() - right.to_number()),
+                    _ => Value::Float(
+                        left.to_number_heap(&self.heap) - right.to_number_heap(&self.heap),
+                    ),
                 };
                 self.push(result)?;
             }
@@ -1838,14 +1842,18 @@ impl Vm {
                         Some(r) => Value::Int(r),
                         None => Value::Float(*a as f64 * *b as f64),
                     },
-                    _ => Value::Float(left.to_number() * right.to_number()),
+                    _ => Value::Float(
+                        left.to_number_heap(&self.heap) * right.to_number_heap(&self.heap),
+                    ),
                 };
                 self.push(result)?;
             }
             Instruction::Div => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                let result = Value::Float(left.to_number() / right.to_number());
+                let result = Value::Float(
+                    left.to_number_heap(&self.heap) / right.to_number_heap(&self.heap),
+                );
                 self.push(result)?;
             }
             Instruction::Rem => {
@@ -1853,67 +1861,75 @@ impl Vm {
                 let left = self.pop()?;
                 let result = match (&left, &right) {
                     (Value::Int(a), Value::Int(b)) if *b != 0 => Value::Int(a % b),
-                    _ => Value::Float(left.to_number() % right.to_number()),
+                    _ => Value::Float(
+                        left.to_number_heap(&self.heap) % right.to_number_heap(&self.heap),
+                    ),
                 };
                 self.push(result)?;
             }
             Instruction::Pow => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                let result = Value::Float(left.to_number().powf(right.to_number()));
+                let result = Value::Float(
+                    left.to_number_heap(&self.heap)
+                        .powf(right.to_number_heap(&self.heap)),
+                );
                 self.push(result)?;
             }
             Instruction::Neg => {
                 let val = self.pop()?;
                 let result = match val {
                     Value::Int(n) => Value::Int(-n),
-                    _ => Value::Float(-val.to_number()),
+                    _ => Value::Float(-val.to_number_heap(&self.heap)),
                 };
                 self.push(result)?;
             }
             Instruction::BitNot => {
                 let val = self.pop()?;
-                let n = js_to_int32(val.to_number());
+                let n = js_to_int32(val.to_number_heap(&self.heap));
                 self.push(Value::Int(!n as i64))?;
             }
             Instruction::BitAnd => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                let result = js_to_int32(left.to_number()) & js_to_int32(right.to_number());
+                let result = js_to_int32(left.to_number_heap(&self.heap))
+                    & js_to_int32(right.to_number_heap(&self.heap));
                 self.push(Value::Int(result as i64))?;
             }
             Instruction::BitOr => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                let result = js_to_int32(left.to_number()) | js_to_int32(right.to_number());
+                let result = js_to_int32(left.to_number_heap(&self.heap))
+                    | js_to_int32(right.to_number_heap(&self.heap));
                 self.push(Value::Int(result as i64))?;
             }
             Instruction::BitXor => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                let result = js_to_int32(left.to_number()) ^ js_to_int32(right.to_number());
+                let result = js_to_int32(left.to_number_heap(&self.heap))
+                    ^ js_to_int32(right.to_number_heap(&self.heap));
                 self.push(Value::Int(result as i64))?;
             }
             Instruction::Shl => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                let shift = js_to_uint32(right.to_number()) & 0x1f;
-                let result = js_to_int32(left.to_number()).wrapping_shl(shift);
+                let shift = js_to_uint32(right.to_number_heap(&self.heap)) & 0x1f;
+                let result = js_to_int32(left.to_number_heap(&self.heap)).wrapping_shl(shift);
                 self.push(Value::Int(result as i64))?;
             }
             Instruction::Shr => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                let shift = js_to_uint32(right.to_number()) & 0x1f;
-                let result = js_to_int32(left.to_number()).wrapping_shr(shift);
+                let shift = js_to_uint32(right.to_number_heap(&self.heap)) & 0x1f;
+                let result = js_to_int32(left.to_number_heap(&self.heap)).wrapping_shr(shift);
                 self.push(Value::Int(result as i64))?;
             }
             Instruction::Ushr => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                let shift = js_to_uint32(right.to_number()) & 0x1f;
+                let shift = js_to_uint32(right.to_number_heap(&self.heap)) & 0x1f;
                 // ToUint32 semantics: negative operands wrap (e.g. -1 >>> 0 === 4294967295).
-                let result = js_to_uint32(left.to_number()).wrapping_shr(shift);
+                let result = js_to_uint32(left.to_number_heap(&self.heap)).wrapping_shr(shift);
                 self.push(Value::Int(result as i64))?;
             }
 
@@ -1941,23 +1957,23 @@ impl Vm {
             Instruction::Lt => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                self.push(Value::Bool(js_less_than(&left, &right)))?;
+                self.push(Value::Bool(js_less_than(&left, &right, &self.heap)))?;
             }
             Instruction::Lte => {
                 let right = self.pop()?;
                 let left = self.pop()?;
                 // a <= b  <=>  !(b < a), but NaN must make it false either way.
-                self.push(Value::Bool(js_less_than_or_equal(&left, &right)))?;
+                self.push(Value::Bool(js_less_than_or_equal(&left, &right, &self.heap)))?;
             }
             Instruction::Gt => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                self.push(Value::Bool(js_less_than(&right, &left)))?;
+                self.push(Value::Bool(js_less_than(&right, &left, &self.heap)))?;
             }
             Instruction::Gte => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                self.push(Value::Bool(js_less_than_or_equal(&right, &left)))?;
+                self.push(Value::Bool(js_less_than_or_equal(&right, &left, &self.heap)))?;
             }
 
             // Logical
@@ -1975,7 +1991,8 @@ impl Vm {
                     arr.push(self.pop()?);
                 }
                 arr.reverse();
-                self.push(Value::Array(arr))?;
+                let h = self.heap.alloc_array(arr);
+                self.push(Value::Array(h))?;
             }
             Instruction::CreateObject(count) => {
                 self.tracker.track_allocation(&self.limits)?;
@@ -1994,17 +2011,20 @@ impl Vm {
                             obj.insert(k, val);
                         }
                         _ => {
-                            let k: Arc<str> = Arc::from(key.to_js_string().as_str());
+                            let k: Arc<str> = Arc::from(key.to_js_string(&self.heap).as_str());
                             obj.insert(k, val);
                         }
                     }
                 }
-                self.push(Value::Object(obj))?;
+                let h = self.heap.alloc_object(obj);
+                self.push(Value::Object(h))?;
             }
             Instruction::ObjectRest(excluded) => {
                 let source = self.pop()?;
-                let rest = match source {
-                    Value::Object(map) => map
+                let rest: IndexMap<Arc<str>, Value> = match source {
+                    Value::Object(h) => self
+                        .heap
+                        .object_map(h)
                         .into_iter()
                         .filter(|(key, _)| {
                             !excluded.iter().any(|excluded| excluded == key.as_ref())
@@ -2012,7 +2032,8 @@ impl Vm {
                         .collect(),
                     _ => IndexMap::new(),
                 };
-                self.push(Value::Object(rest))?;
+                let h = self.heap.alloc_object(rest);
+                self.push(Value::Object(h))?;
             }
             Instruction::GetProperty(name) => {
                 let obj = self.pop()?;
@@ -3742,19 +3763,19 @@ fn js_to_uint32(n: f64) -> u32 {
 /// JS abstract relational comparison `left < right`. When both operands are
 /// strings the comparison is lexicographic; otherwise it is numeric (NaN
 /// operands make the result false, as `f64` ordering already does).
-fn js_less_than(left: &Value, right: &Value) -> bool {
+fn js_less_than(left: &Value, right: &Value, heap: &Heap) -> bool {
     if let (Value::String(a), Value::String(b)) = (left, right) {
         return a.as_ref() < b.as_ref();
     }
-    left.to_number() < right.to_number()
+    left.to_number_heap(heap) < right.to_number_heap(heap)
 }
 
 /// JS `left <= right` (lexicographic for two strings, numeric otherwise).
-fn js_less_than_or_equal(left: &Value, right: &Value) -> bool {
+fn js_less_than_or_equal(left: &Value, right: &Value, heap: &Heap) -> bool {
     if let (Value::String(a), Value::String(b)) = (left, right) {
         return a.as_ref() <= b.as_ref();
     }
-    left.to_number() <= right.to_number()
+    left.to_number_heap(heap) <= right.to_number_heap(heap)
 }
 
 /// True for reference values that coerce to a string in JS `+` (their
