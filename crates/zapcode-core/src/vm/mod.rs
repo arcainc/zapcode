@@ -7,6 +7,7 @@ use indexmap::IndexMap;
 use crate::compiler::instruction::{Constant, Instruction};
 use crate::compiler::CompiledProgram;
 use crate::error::{Result, ZapcodeError};
+use crate::heap::{Handle, Heap};
 use crate::sandbox::{ResourceLimits, ResourceTracker};
 use crate::snapshot::ZapcodeSnapshot;
 use crate::trace::{ExecutionTrace, SpanBuilder, TraceStatus};
@@ -135,6 +136,10 @@ pub struct Vm {
     /// here once boxed; every closure and frame referencing it shares the id, so
     /// the sharing survives serialization (ids are reconstructed on load).
     pub(crate) cells: Vec<Value>,
+    /// The object heap: backing store for all array/object values. Handles in
+    /// `Value::Array`/`Object` index into it; shared handles give reference
+    /// semantics. Serialized with the snapshot so identity survives resume.
+    pub(crate) heap: Heap,
     pub(crate) stdout: String,
     pub(crate) limits: ResourceLimits,
     pub(crate) tracker: ResourceTracker,
@@ -198,9 +203,10 @@ impl Vm {
         external_functions: HashSet<String>,
     ) -> Self {
         let mut globals = HashMap::new();
+        let mut heap = Heap::new();
 
         // Register built-in globals
-        builtins::register_globals(&mut globals);
+        builtins::register_globals(&mut globals, &mut heap);
 
         Self {
             programs,
@@ -208,6 +214,7 @@ impl Vm {
             frames: Vec::new(),
             globals,
             cells: Vec::new(),
+            heap,
             stdout: String::new(),
             limits,
             tracker: ResourceTracker::default(),
@@ -274,10 +281,12 @@ impl Vm {
         last_receiver_source: Option<ReceiverSource>,
         last_global_name: Option<String>,
         last_load_source: Option<ReceiverSource>,
+        heap: Heap,
     ) -> Self {
         let mut globals = HashMap::new();
-        // Re-register builtins first
-        builtins::register_globals(&mut globals);
+        let mut heap = heap;
+        // Re-register builtins first (appended to the restored heap).
+        builtins::register_globals(&mut globals, &mut heap);
         // Then overlay user globals (user globals take precedence if names collide)
         for (k, v) in user_globals {
             globals.insert(k, v);
@@ -289,6 +298,7 @@ impl Vm {
             frames,
             globals,
             cells: Vec::new(),
+            heap,
             stdout,
             limits,
             tracker: ResourceTracker::default(),

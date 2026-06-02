@@ -4,19 +4,24 @@ use std::sync::Arc;
 use indexmap::IndexMap;
 
 use crate::error::{Result, ZapcodeError};
+use crate::heap::Heap;
 use crate::sandbox::ResourceLimits;
 use crate::value::Value;
 
-/// Register built-in global objects and functions.
-pub fn register_globals(globals: &mut HashMap<String, Value>) {
-    // Register known globals as empty objects — method calls are intercepted by the VM
-    globals.insert("console".to_string(), Value::Object(IndexMap::new()));
-    globals.insert("JSON".to_string(), Value::Object(IndexMap::new()));
-    globals.insert("Object".to_string(), builtin_constructor("Object"));
-    globals.insert("Array".to_string(), builtin_constructor("Array"));
-    globals.insert("Promise".to_string(), Value::Object(IndexMap::new()));
-    globals.insert("Map".to_string(), builtin_constructor("Map"));
-    globals.insert("Set".to_string(), builtin_constructor("Set"));
+/// Register built-in global objects and functions, allocating their backing
+/// objects in `heap`.
+pub fn register_globals(globals: &mut HashMap<String, Value>, heap: &mut Heap) {
+    // Register known globals as objects — method calls are intercepted by the VM.
+    let empty = heap.alloc_object(IndexMap::new());
+    globals.insert("console".to_string(), Value::Object(empty));
+    let empty = heap.alloc_object(IndexMap::new());
+    globals.insert("JSON".to_string(), Value::Object(empty));
+    globals.insert("Object".to_string(), builtin_constructor("Object", heap));
+    globals.insert("Array".to_string(), builtin_constructor("Array", heap));
+    let empty = heap.alloc_object(IndexMap::new());
+    globals.insert("Promise".to_string(), Value::Object(empty));
+    globals.insert("Map".to_string(), builtin_constructor("Map", heap));
+    globals.insert("Set".to_string(), builtin_constructor("Set", heap));
     globals.insert("Date".to_string(), {
         let mut d = IndexMap::new();
         d.insert(
@@ -25,11 +30,9 @@ pub fn register_globals(globals: &mut HashMap<String, Value>) {
         );
         // Static methods Date.now()/Date.parse()/Date.UTC() (callable globals).
         for (prop, target) in [("now", "Date.now"), ("parse", "Date.parse"), ("UTC", "Date.UTC")] {
-            let mut s = IndexMap::new();
-            s.insert(Arc::from("__global_fn__"), Value::String(Arc::from(target)));
-            d.insert(Arc::from(prop), Value::Object(s));
+            d.insert(Arc::from(prop), global_fn_marker(target, heap));
         }
-        Value::Object(d)
+        Value::Object(heap.alloc_object(d))
     });
     for err in [
         "Error",
@@ -39,7 +42,7 @@ pub fn register_globals(globals: &mut HashMap<String, Value>) {
         "ReferenceError",
         "AggregateError",
     ] {
-        globals.insert(err.to_string(), builtin_constructor(err));
+        globals.insert(err.to_string(), builtin_constructor(err, heap));
     }
 
     // Callable bare globals (type conversions + numeric parsing/predicates),
@@ -54,7 +57,8 @@ pub fn register_globals(globals: &mut HashMap<String, Value>) {
         "isFinite",
         "structuredClone",
     ] {
-        globals.insert(name.to_string(), global_fn(name));
+        let v = global_fn(name, heap);
+        globals.insert(name.to_string(), v);
     }
 
     // Math gets its constants as real properties
@@ -70,23 +74,30 @@ pub fn register_globals(globals: &mut HashMap<String, Value>) {
         Arc::from("SQRT1_2"),
         Value::Float(1.0 / std::f64::consts::SQRT_2),
     );
-    globals.insert("Math".to_string(), Value::Object(math));
+    globals.insert("Math".to_string(), Value::Object(heap.alloc_object(math)));
 }
 
-fn builtin_constructor(name: &str) -> Value {
+/// A `{ __global_fn__: target }` marker object (a callable static), heap-allocated.
+fn global_fn_marker(target: &str, heap: &mut Heap) -> Value {
+    let mut s = IndexMap::new();
+    s.insert(Arc::from("__global_fn__"), Value::String(Arc::from(target)));
+    Value::Object(heap.alloc_object(s))
+}
+
+fn builtin_constructor(name: &str, heap: &mut Heap) -> Value {
     let mut obj = IndexMap::new();
     obj.insert(
         Arc::from("__builtin_constructor__"),
         Value::String(Arc::from(name)),
     );
-    Value::Object(obj)
+    Value::Object(heap.alloc_object(obj))
 }
 
 /// A bare type-conversion function (`String`/`Number`/`Boolean`), represented as
 /// an object so it can be both *called* (via the `__global_fn__` marker, handled
 /// in the VM's Call instruction) and carry static properties (e.g.
 /// `Number.MAX_SAFE_INTEGER`).
-fn global_fn(name: &str) -> Value {
+fn global_fn(name: &str, heap: &mut Heap) -> Value {
     let mut obj = IndexMap::new();
     obj.insert(Arc::from("__global_fn__"), Value::String(Arc::from(name)));
     if name == "String" {
@@ -94,12 +105,7 @@ fn global_fn(name: &str) -> Value {
             ("fromCharCode", "String.fromCharCode"),
             ("fromCodePoint", "String.fromCodePoint"),
         ] {
-            let mut s = IndexMap::new();
-            s.insert(
-                Arc::from("__global_fn__"),
-                Value::String(Arc::from(target)),
-            );
-            obj.insert(Arc::from(prop), Value::Object(s));
+            obj.insert(Arc::from(prop), global_fn_marker(target, heap));
         }
     }
     if name == "Number" {
@@ -129,10 +135,10 @@ fn global_fn(name: &str) -> Value {
             "parseInt",
             "parseFloat",
         ] {
-            obj.insert(Arc::from(m), global_fn(&format!("Number.{m}")));
+            obj.insert(Arc::from(m), global_fn_marker(&format!("Number.{m}"), heap));
         }
     }
-    Value::Object(obj)
+    Value::Object(heap.alloc_object(obj))
 }
 
 /// Parse the leading integer of a string (JS `parseInt` semantics, base 10 or a

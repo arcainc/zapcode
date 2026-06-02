@@ -1,4 +1,4 @@
-use indexmap::IndexMap;
+use crate::heap::{Handle, Heap};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
@@ -11,8 +11,10 @@ pub enum Value {
     Int(i64),
     Float(f64),
     String(Arc<str>),
-    Array(Vec<Value>),
-    Object(IndexMap<Arc<str>, Value>),
+    /// Reference to an array slot in the [`Heap`]. Cloning shares the handle.
+    Array(Handle),
+    /// Reference to an object slot in the [`Heap`].
+    Object(Handle),
     Function(Closure),
     /// A generator object — calling function* creates one of these.
     Generator(GeneratorObject),
@@ -145,6 +147,9 @@ impl Value {
         }
     }
 
+    /// Numeric coercion for primitives. Reference values (array/object) need the
+    /// heap to inspect their contents — use [`Value::to_number_heap`] for those;
+    /// here they coerce to NaN.
     pub fn to_number(&self) -> f64 {
         match self {
             Value::Undefined => f64::NAN,
@@ -154,16 +159,22 @@ impl Value {
             Value::Int(n) => *n as f64,
             Value::Float(n) => *n,
             Value::String(s) => Self::parse_number_str(s),
-            // JS ToNumber(array) = ToNumber(ToPrimitive(array)) = ToNumber(array.toString()):
-            // [] -> "" -> 0, [5] -> "5" -> 5, [1,2] -> "1,2" -> NaN.
-            Value::Array(_) => Self::parse_number_str(&self.to_js_string()),
-            // A Date coerces to its epoch-millis (so `d2 - d1`, `+d`, `<`/`>` work).
-            Value::Object(map) => match map.get("__date_ms__") {
+            _ => f64::NAN,
+        }
+    }
+
+    /// Full JS numeric coercion, including reference values:
+    /// `ToNumber(array)` via its `toString` ([] -> 0, [5] -> 5, [1,2] -> NaN),
+    /// and a Date to its epoch-millis (so `d2 - d1`, `+d`, `<`/`>` work).
+    pub fn to_number_heap(&self, heap: &Heap) -> f64 {
+        match self {
+            Value::Array(_) => Self::parse_number_str(&self.to_js_string(heap)),
+            Value::Object(h) => match heap.object(*h).and_then(|m| m.get("__date_ms__")) {
                 Some(Value::Int(ms)) => *ms as f64,
                 Some(Value::Float(ms)) => *ms,
                 _ => f64::NAN,
             },
-            _ => f64::NAN,
+            _ => self.to_number(),
         }
     }
 
@@ -199,7 +210,7 @@ impl Value {
         t.parse::<f64>().unwrap_or(f64::NAN)
     }
 
-    pub fn to_js_string(&self) -> String {
+    pub fn to_js_string(&self, heap: &Heap) -> String {
         match self {
             Value::Undefined => "undefined".to_string(),
             Value::Null => "null".to_string(),
@@ -220,19 +231,23 @@ impl Value {
                 }
             }
             Value::String(s) => s.to_string(),
-            Value::Array(arr) => {
+            Value::Array(h) => {
                 // JS Array.prototype.toString renders null/undefined (and holes)
                 // as the empty string, not the literal "null"/"undefined".
-                let items: Vec<String> = arr
+                let items: Vec<String> = heap
+                    .array(*h)
                     .iter()
                     .map(|v| match v {
                         Value::Null | Value::Undefined => String::new(),
-                        _ => v.to_js_string(),
+                        _ => v.to_js_string(heap),
                     })
                     .collect();
                 items.join(",")
             }
-            Value::Object(map) => {
+            Value::Object(h) => {
+                let Some(map) = heap.object(*h) else {
+                    return "[object Object]".to_string();
+                };
                 // A Date stringifies to its ISO form (rather than [object Object]).
                 if let Some(ms) = map.get("__date_ms__") {
                     let ms = match ms {
@@ -249,11 +264,11 @@ impl Value {
                 if matches!(map.get("__error__"), Some(Value::Bool(true))) {
                     let name = map
                         .get("name")
-                        .map(|v| v.to_js_string())
+                        .map(|v| v.to_js_string(heap))
                         .unwrap_or_else(|| "Error".to_string());
                     let message = map
                         .get("message")
-                        .map(|v| v.to_js_string())
+                        .map(|v| v.to_js_string(heap))
                         .unwrap_or_default();
                     if message.is_empty() {
                         name
@@ -270,7 +285,7 @@ impl Value {
         }
     }
 
-    /// Strict equality (===)
+    /// Strict equality (===). Arrays/objects compare by identity (handle).
     pub fn strict_eq(&self, other: &Value) -> bool {
         match (self, other) {
             (Value::Undefined, Value::Undefined) | (Value::Null, Value::Null) => true,
@@ -280,7 +295,9 @@ impl Value {
             (Value::Int(a), Value::Float(b)) => (*a as f64) == *b,
             (Value::Float(a), Value::Int(b)) => *a == (*b as f64),
             (Value::String(a), Value::String(b)) => a == b,
-            // Reference equality for arrays/objects
+            // Reference identity for arrays/objects (same heap slot).
+            (Value::Array(a), Value::Array(b)) => a == b,
+            (Value::Object(a), Value::Object(b)) => a == b,
             _ => false,
         }
     }
@@ -288,7 +305,7 @@ impl Value {
     /// JS abstract (loose) equality (`==`). Performs type coercion between
     /// numbers, strings, and booleans; `null`/`undefined` are loosely equal to
     /// each other and to nothing else. Object/array operands fall back to
-    /// reference equality (no `toPrimitive` coercion).
+    /// reference identity (no `toPrimitive` coercion).
     pub fn loose_eq(&self, other: &Value) -> bool {
         match (self, other) {
             // null and undefined are loosely equal to each other only.
@@ -310,15 +327,22 @@ impl Value {
             // boolean coerces to number, then compare.
             (Value::Bool(_), _) => Value::Float(self.to_number()).loose_eq(other),
             (_, Value::Bool(_)) => self.loose_eq(&Value::Float(other.to_number())),
-            // Arrays/objects: reference equality only.
+            // Arrays/objects: reference identity only.
             _ => self.strict_eq(other),
         }
     }
 }
 
 impl fmt::Display for Value {
+    /// Heap-free best-effort rendering for diagnostics. Array/object contents
+    /// aren't available without the heap; use [`Value::to_js_string`] for real
+    /// string coercion of those.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.to_js_string())
+        match self {
+            Value::Array(_) => write!(f, "[object Array]"),
+            Value::Object(_) => write!(f, "[object Object]"),
+            other => write!(f, "{}", other.to_js_string(&Heap::new())),
+        }
     }
 }
 
