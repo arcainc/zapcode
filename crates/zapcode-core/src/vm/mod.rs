@@ -2281,7 +2281,7 @@ impl Vm {
             Instruction::ArrayAppend => {
                 self.tracker.track_allocation(&self.limits)?;
                 let value = self.pop()?;
-                let mut acc = match self.pop()? {
+                let acc = match self.pop()? {
                     Value::Array(a) => a,
                     other => {
                         return Err(ZapcodeError::TypeError(format!(
@@ -2290,13 +2290,15 @@ impl Vm {
                         )))
                     }
                 };
-                acc.push(value);
+                if let Some(v) = self.heap.array_mut(acc) {
+                    v.push(value);
+                }
                 self.push(Value::Array(acc))?;
             }
             Instruction::ArraySpreadAppend => {
                 self.tracker.track_allocation(&self.limits)?;
                 let iterable = self.pop()?;
-                let mut acc = match self.pop()? {
+                let acc = match self.pop()? {
                     Value::Array(a) => a,
                     other => {
                         return Err(ZapcodeError::TypeError(format!(
@@ -2305,15 +2307,17 @@ impl Vm {
                         )))
                     }
                 };
-                match iterable {
-                    Value::Array(items) => acc.extend(items),
-                    Value::String(s) => acc.extend(
-                        s.chars()
-                            .map(|c| Value::String(Arc::from(c.to_string().as_str()))),
-                    ),
-                    Value::Object(ref m) if is_set_object(&iterable) => acc.extend(set_items(m)),
-                    Value::Object(ref m) if is_map_object(&iterable) => {
-                        acc.extend(map_entry_pairs(m))
+                let extra: Vec<Value> = match &iterable {
+                    Value::Array(items) => self.heap.array_vec(*items),
+                    Value::String(s) => s
+                        .chars()
+                        .map(|c| Value::String(Arc::from(c.to_string().as_str())))
+                        .collect(),
+                    Value::Object(_) if is_set_object(&iterable, &self.heap) => {
+                        set_items(&iterable, &self.heap)
+                    }
+                    Value::Object(_) if is_map_object(&iterable, &self.heap) => {
+                        map_entry_pairs(&iterable, &mut self.heap)
                     }
                     other => {
                         return Err(ZapcodeError::TypeError(format!(
@@ -2321,24 +2325,28 @@ impl Vm {
                             other.type_name()
                         )))
                     }
+                };
+                if let Some(v) = self.heap.array_mut(acc) {
+                    v.extend(extra);
                 }
                 self.push(Value::Array(acc))?;
             }
             Instruction::ArrayRestFrom(from) => {
                 self.tracker.track_allocation(&self.limits)?;
                 let value = self.pop()?;
-                let rest = match value {
+                let rest: Vec<Value> = match value {
                     Value::Array(items) => {
-                        Value::Array(items.into_iter().skip(from).collect())
+                        self.heap.array_vec(items).into_iter().skip(from).collect()
                     }
-                    _ => Value::Array(Vec::new()),
+                    _ => Vec::new(),
                 };
-                self.push(rest)?;
+                let h = self.heap.alloc_array(rest);
+                self.push(Value::Array(h))?;
             }
             Instruction::ObjectInsert => {
                 let value = self.pop()?;
                 let key = self.pop()?;
-                let mut acc = match self.pop()? {
+                let acc = match self.pop()? {
                     Value::Object(o) => o,
                     other => {
                         return Err(ZapcodeError::TypeError(format!(
@@ -2349,14 +2357,16 @@ impl Vm {
                 };
                 let key: Arc<str> = match key {
                     Value::String(k) => k,
-                    other => Arc::from(other.to_js_string().as_str()),
+                    other => Arc::from(other.to_js_string(&self.heap).as_str()),
                 };
-                acc.insert(key, value);
+                if let Some(map) = self.heap.object_mut(acc) {
+                    map.insert(key, value);
+                }
                 self.push(Value::Object(acc))?;
             }
             Instruction::ObjectSpreadAssign => {
                 let source = self.pop()?;
-                let mut acc = match self.pop()? {
+                let acc = match self.pop()? {
                     Value::Object(o) => o,
                     other => {
                         return Err(ZapcodeError::TypeError(format!(
@@ -2366,9 +2376,12 @@ impl Vm {
                     }
                 };
                 match source {
-                    Value::Object(map) => {
-                        for (k, v) in map {
-                            acc.insert(k, v);
+                    Value::Object(h) => {
+                        let entries = self.heap.object_map(h);
+                        if let Some(map) = self.heap.object_mut(acc) {
+                            for (k, v) in entries {
+                                map.insert(k, v);
+                            }
                         }
                     }
                     // Spreading null/undefined is a no-op in JS; ignore others.
@@ -2381,13 +2394,13 @@ impl Vm {
                 let right = self.pop()?;
                 let left = self.pop()?;
                 let result = match &right {
-                    Value::Object(map) => {
-                        let key = left.to_js_string();
-                        map.contains_key(key.as_str())
+                    Value::Object(h) => {
+                        let key = left.to_js_string(&self.heap);
+                        self.heap.object(*h).is_some_and(|m| m.contains_key(key.as_str()))
                     }
-                    Value::Array(arr) => {
+                    Value::Array(h) => {
                         if let Value::Int(i) = left {
-                            (i as usize) < arr.len()
+                            (i as usize) < self.heap.array(*h).len()
                         } else {
                             false
                         }
@@ -2399,8 +2412,13 @@ impl Vm {
             Instruction::InstanceOf => {
                 let right = self.pop()?;
                 let left = self.pop()?;
+                // Helper: does object handle `h` have key `k`?
+                let has_key = |h: Handle, k: &str, heap: &Heap| -> bool {
+                    heap.object(h).is_some_and(|m| m.contains_key(k))
+                };
                 // Check if left's __class__ matches right's __class_name__
-                let result = if let Value::Object(class_obj) = &right {
+                let result = if let Value::Object(class_h) = &right {
+                    let class_obj = self.heap.object_map(*class_h);
                     if let Some(Value::String(ctor)) = class_obj.get("__builtin_constructor__") {
                         // Builtin constructors. Object matches any object/array/function;
                         // Array matches arrays; Error matches any error object; a specific
@@ -2412,28 +2430,37 @@ impl Vm {
                             ),
                             "Array" => matches!(left, Value::Array(_)),
                             "Error" => {
-                                matches!(&left, Value::Object(i) if i.contains_key("__error__"))
+                                matches!(&left, Value::Object(i) if has_key(*i, "__error__", &self.heap))
                             }
                             "TypeError" | "RangeError" | "SyntaxError" | "ReferenceError"
-                            | "AggregateError" => {
-                                matches!(&left, Value::Object(i)
-                                    if i.get("name")
-                                        == Some(&Value::String(Arc::from(ctor.as_ref()))))
+                            | "AggregateError" => match &left {
+                                Value::Object(i) => {
+                                    self.heap.object(*i).and_then(|m| m.get("name"))
+                                        == Some(&Value::String(Arc::from(ctor.as_ref())))
+                                }
+                                _ => false,
+                            },
+                            "Map" => {
+                                matches!(&left, Value::Object(i) if has_key(*i, "__map__", &self.heap))
                             }
-                            "Map" => matches!(&left, Value::Object(i) if i.contains_key("__map__")),
-                            "Set" => matches!(&left, Value::Object(i) if i.contains_key("__set__")),
+                            "Set" => {
+                                matches!(&left, Value::Object(i) if has_key(*i, "__set__", &self.heap))
+                            }
                             "Date" => {
-                                matches!(&left, Value::Object(i) if i.contains_key("__date_ms__"))
+                                matches!(&left, Value::Object(i) if has_key(*i, "__date_ms__", &self.heap))
                             }
                             _ => false,
                         }
                     } else if let (Value::Object(instance), Some(class_name)) =
                         (&left, class_obj.get("__class_name__"))
                     {
+                        let inst = self.heap.object_map(*instance);
                         // Match the instance's class or any of its ancestors.
-                        match instance.get("__class_chain__") {
-                            Some(Value::Array(chain)) => chain.contains(class_name),
-                            _ => instance.get("__class__") == Some(class_name),
+                        match inst.get("__class_chain__") {
+                            Some(Value::Array(chain)) => {
+                                self.heap.array(*chain).contains(class_name)
+                            }
+                            _ => inst.get("__class__") == Some(class_name),
                         }
                     } else {
                         false
@@ -2479,7 +2506,8 @@ impl Vm {
                                     }
                                     ParamPattern::Rest(name) => {
                                         let rest: Vec<Value> = args[i..].to_vec();
-                                        captured.push((name.clone(), Value::Array(rest)));
+                                        let h = self.heap.alloc_array(rest);
+                                        captured.push((name.clone(), Value::Array(h)));
                                     }
                                     _ => {}
                                 }
