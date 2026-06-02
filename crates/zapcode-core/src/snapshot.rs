@@ -45,6 +45,11 @@ pub(crate) struct VmSnapshot {
     /// sequence is stable across a dump/load/resume.
     #[serde(default)]
     pub(crate) rng_state: u64,
+    /// The object heap: backing store for all array/object values referenced by
+    /// handles in `stack`/`frames`/`globals`/`cells`. Must travel with the
+    /// snapshot or those handles dangle on resume.
+    #[serde(default)]
+    pub(crate) heap: crate::heap::Heap,
 }
 
 impl VmSnapshot {
@@ -88,6 +93,7 @@ impl VmSnapshot {
             pending_batch: vm.pending_batch.clone(),
             allocations: vm.tracker.allocations,
             rng_state: vm.rng_state,
+            heap: vm.heap.clone(),
         }
     }
 
@@ -110,6 +116,7 @@ impl VmSnapshot {
             self.last_receiver_source,
             self.last_global_name,
             self.last_load_source,
+            self.heap,
         );
         // Restore batched-call state (kept off the long from_snapshot signature).
         vm.pending_calls = self.pending_calls;

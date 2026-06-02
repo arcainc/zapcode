@@ -250,7 +250,7 @@ fn build_session_state(
     transient_input_names: Vec<String>,
 ) -> Result<ZapcodeSessionState> {
     let stdout = vm.stdout.get(stdout_prefix_len..).unwrap_or("").to_string();
-    ensure_serializable_globals(&vm.globals)?;
+    ensure_serializable_globals(&vm.globals, &vm.heap)?;
 
     match state {
         VmState::Complete(output) => Ok(ZapcodeSessionState::Complete {
@@ -469,7 +469,10 @@ fn is_valid_identifier(name: &str) -> bool {
     !RESERVED_JS_WORDS.contains(&name)
 }
 
-fn ensure_serializable_globals(globals: &HashMap<String, Value>) -> Result<()> {
+fn ensure_serializable_globals(
+    globals: &HashMap<String, Value>,
+    heap: &crate::heap::Heap,
+) -> Result<()> {
     let builtin_names: HashSet<&str> = Vm::BUILTIN_GLOBAL_NAMES.iter().copied().collect();
     for (name, value) in globals {
         // Builtins (including the String/Number/Boolean BuiltinMethod globals)
@@ -477,7 +480,7 @@ fn ensure_serializable_globals(globals: &HashMap<String, Value>) -> Result<()> {
         if builtin_names.contains(name.as_str()) {
             continue;
         }
-        ensure_serializable_value(value).map_err(|err| {
+        ensure_serializable_value(value, heap).map_err(|err| {
             ZapcodeError::SnapshotError(format!(
                 "cannot persist session global '{}': {}",
                 name, err
@@ -487,7 +490,7 @@ fn ensure_serializable_globals(globals: &HashMap<String, Value>) -> Result<()> {
     Ok(())
 }
 
-fn ensure_serializable_value(value: &Value) -> Result<()> {
+fn ensure_serializable_value(value: &Value, heap: &crate::heap::Heap) -> Result<()> {
     match value {
         Value::Undefined
         | Value::Null
@@ -495,21 +498,23 @@ fn ensure_serializable_value(value: &Value) -> Result<()> {
         | Value::Int(_)
         | Value::Float(_)
         | Value::String(_) => Ok(()),
-        Value::Array(items) => {
-            for item in items {
-                ensure_serializable_value(item)?;
+        Value::Array(h) => {
+            for item in heap.array(*h) {
+                ensure_serializable_value(item, heap)?;
             }
             Ok(())
         }
-        Value::Object(map) => {
-            for value in map.values() {
-                ensure_serializable_value(value)?;
+        Value::Object(h) => {
+            if let Some(map) = heap.object(*h) {
+                for value in map.values() {
+                    ensure_serializable_value(value, heap)?;
+                }
             }
             Ok(())
         }
         Value::Function(closure) => {
             for (_, captured) in &closure.captured {
-                ensure_serializable_value(captured)?;
+                ensure_serializable_value(captured, heap)?;
             }
             Ok(())
         }
