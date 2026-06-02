@@ -4,17 +4,20 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString};
 
+use zapcode_core::heap::Heap;
 use zapcode_core::{
-    ExecutionTrace, ResourceLimits, TraceSpan as CoreTraceSpan, TraceStatus, Value, VmState,
-    ZapcodeError, ZapcodeSnapshot as CoreSnapshot,
+    ExecutionTrace, ResourceLimits, RunResult, TraceSpan as CoreTraceSpan, TraceStatus, Value,
+    VmState, ZapcodeError, ZapcodeSnapshot as CoreSnapshot,
 };
 
 // ---------------------------------------------------------------------------
 // Value conversion: zapcode_core::Value <-> Python object
 // ---------------------------------------------------------------------------
 
-/// Convert a Python object to a `zapcode_core::Value`.
-fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
+/// Convert a Python object to a `zapcode_core::Value`, allocating any
+/// list/dict into `heap` (array/object `Value`s carry a `Handle`, not inline
+/// contents).
+fn py_to_value(obj: &Bound<'_, PyAny>, heap: &mut Heap) -> PyResult<Value> {
     if obj.is_none() {
         Ok(Value::Null)
     } else if let Ok(b) = obj.downcast::<PyBool>() {
@@ -29,16 +32,19 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
         let val: String = s.extract()?;
         Ok(Value::String(Arc::from(val.as_str())))
     } else if let Ok(list) = obj.downcast::<PyList>() {
-        let items: PyResult<Vec<Value>> = list.iter().map(|item| py_to_value(&item)).collect();
-        Ok(Value::Array(items?))
+        let mut items = Vec::with_capacity(list.len());
+        for item in list.iter() {
+            items.push(py_to_value(&item, heap)?);
+        }
+        Ok(Value::Array(heap.alloc_array(items)))
     } else if let Ok(dict) = obj.downcast::<PyDict>() {
         let mut map = indexmap::IndexMap::new();
         for (k, v) in dict.iter() {
             let key: String = k.extract()?;
-            let val = py_to_value(&v)?;
+            let val = py_to_value(&v, heap)?;
             map.insert(Arc::from(key.as_str()), val);
         }
-        Ok(Value::Object(map))
+        Ok(Value::Object(heap.alloc_object(map)))
     } else {
         Err(PyRuntimeError::new_err(format!(
             "cannot convert Python type '{}' to Zapcode value",
@@ -47,25 +53,28 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     }
 }
 
-/// Convert a `zapcode_core::Value` to a Python object.
-fn value_to_py(py: Python<'_>, val: &Value) -> PyResult<PyObject> {
+/// Convert a `zapcode_core::Value` to a Python object, dereferencing
+/// array/object handles through `heap`.
+fn value_to_py(py: Python<'_>, val: &Value, heap: &Heap) -> PyResult<PyObject> {
     match val {
         Value::Undefined | Value::Null => Ok(py.None()),
         Value::Bool(b) => Ok(b.into_pyobject(py)?.to_owned().into_any().unbind()),
         Value::Int(n) => Ok(n.into_pyobject(py)?.into_any().unbind()),
         Value::Float(n) => Ok(n.into_pyobject(py)?.into_any().unbind()),
         Value::String(s) => Ok(s.as_ref().into_pyobject(py)?.into_any().unbind()),
-        Value::Array(arr) => {
+        Value::Array(h) => {
             let list = PyList::empty(py);
-            for item in arr {
-                list.append(value_to_py(py, item)?)?;
+            for item in heap.array(*h) {
+                list.append(value_to_py(py, item, heap)?)?;
             }
             Ok(list.into_pyobject(py)?.into_any().unbind())
         }
-        Value::Object(map) => {
+        Value::Object(h) => {
             let dict = PyDict::new(py);
-            for (k, v) in map {
-                dict.set_item(k.as_ref(), value_to_py(py, v)?)?;
+            if let Some(map) = heap.object(*h) {
+                for (k, v) in map {
+                    dict.set_item(k.as_ref(), value_to_py(py, v, heap)?)?;
+                }
             }
             Ok(dict.into_pyobject(py)?.into_any().unbind())
         }
@@ -84,20 +93,21 @@ fn zapcode_err(e: ZapcodeError) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
-/// Extract input key-value pairs from an optional Python dict into `Vec<(String, Value)>`.
-fn extract_inputs(inputs: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<(String, Value)>> {
-    match inputs {
-        None => Ok(Vec::new()),
-        Some(dict) => {
-            let mut out = Vec::new();
-            for (k, v) in dict.iter() {
-                let key: String = k.extract()?;
-                let val = py_to_value(&v)?;
-                out.push((key, val));
-            }
-            Ok(out)
+/// Extract input key-value pairs from an optional Python dict into
+/// `Vec<(String, Value)>`, allocating any list/dict inputs into a fresh `Heap`.
+/// The heap is returned alongside so the caller can pass it to the heap-seeding
+/// core entry point (`run_with_input_heap`); the input handles are valid there.
+fn extract_inputs(inputs: Option<&Bound<'_, PyDict>>) -> PyResult<(Vec<(String, Value)>, Heap)> {
+    let mut heap = Heap::new();
+    let mut out = Vec::new();
+    if let Some(dict) = inputs {
+        for (k, v) in dict.iter() {
+            let key: String = k.extract()?;
+            let val = py_to_value(&v, &mut heap)?;
+            out.push((key, val));
         }
     }
+    Ok((out, heap))
 }
 
 // ---------------------------------------------------------------------------
@@ -161,9 +171,12 @@ impl Zapcode {
     ///     "suspended", "function_name", "args", and "snapshot" keys instead.
     #[pyo3(signature = (inputs=None))]
     fn run(&self, py: Python<'_>, inputs: Option<&Bound<'_, PyDict>>) -> PyResult<PyObject> {
-        let input_values = extract_inputs(inputs)?;
-        let result = self.inner.run(input_values).map_err(zapcode_err)?;
-        run_result_to_py(py, result.state, &result.stdout, Some(&result.trace))
+        let (input_values, input_heap) = extract_inputs(inputs)?;
+        let result = self
+            .inner
+            .run_with_input_heap(input_values, input_heap)
+            .map_err(zapcode_err)?;
+        full_run_result_to_py(py, result, true)
     }
 
     /// Start execution, returning raw state (for suspension / snapshot handling).
@@ -175,9 +188,12 @@ impl Zapcode {
     ///     Same shape as `run()`.
     #[pyo3(signature = (inputs=None))]
     fn start(&self, py: Python<'_>, inputs: Option<&Bound<'_, PyDict>>) -> PyResult<PyObject> {
-        let input_values = extract_inputs(inputs)?;
-        let result = self.inner.run(input_values).map_err(zapcode_err)?;
-        run_result_to_py(py, result.state, &result.stdout, Some(&result.trace))
+        let (input_values, input_heap) = extract_inputs(inputs)?;
+        let result = self
+            .inner
+            .run_with_input_heap(input_values, input_heap)
+            .map_err(zapcode_err)?;
+        full_run_result_to_py(py, result, true)
     }
 }
 
@@ -208,17 +224,20 @@ fn trace_span_to_py(py: Python<'_>, span: &CoreTraceSpan) -> PyResult<PyObject> 
     Ok(dict.into_pyobject(py)?.into_any().unbind())
 }
 
-/// Convert a `VmState` (+ optional stdout + trace) to a Python dict.
+/// Convert a `VmState` (+ optional stdout + trace) to a Python dict. `heap`
+/// resolves the array/object handles in the completed output or a suspension's
+/// args/calls.
 fn run_result_to_py(
     py: Python<'_>,
     state: VmState,
+    heap: &Heap,
     stdout: &str,
     trace: Option<&ExecutionTrace>,
 ) -> PyResult<PyObject> {
     let dict = PyDict::new(py);
     match state {
         VmState::Complete(value) => {
-            dict.set_item("output", value_to_py(py, &value)?)?;
+            dict.set_item("output", value_to_py(py, &value, heap)?)?;
             dict.set_item("stdout", stdout)?;
         }
         VmState::Suspended {
@@ -230,7 +249,7 @@ fn run_result_to_py(
             dict.set_item("function_name", &function_name)?;
             let py_args = PyList::empty(py);
             for arg in &args {
-                py_args.append(value_to_py(py, arg)?)?;
+                py_args.append(value_to_py(py, arg, heap)?)?;
             }
             dict.set_item("args", py_args)?;
             dict.set_item("snapshot", ZapcodeSnapshot { inner: snapshot })?;
@@ -245,7 +264,7 @@ fn run_result_to_py(
                 call_dict.set_item("name", &call.name)?;
                 let py_args = PyList::empty(py);
                 for arg in &call.args {
-                    py_args.append(value_to_py(py, arg)?)?;
+                    py_args.append(value_to_py(py, arg, heap)?)?;
                 }
                 call_dict.set_item("args", py_args)?;
                 py_calls.append(call_dict)?;
@@ -259,6 +278,23 @@ fn run_result_to_py(
         dict.set_item("trace", trace_span_to_py(py, &t.root)?)?;
     }
     Ok(dict.into_pyobject(py)?.into_any().unbind())
+}
+
+/// Marshal a whole [`RunResult`] (state + heap + stdout + optional trace) into a
+/// Python dict.
+fn full_run_result_to_py(
+    py: Python<'_>,
+    result: RunResult,
+    include_trace: bool,
+) -> PyResult<PyObject> {
+    let RunResult {
+        state,
+        heap,
+        stdout,
+        trace,
+    } = result;
+    let trace_ref = if include_trace { Some(&trace) } else { None };
+    run_result_to_py(py, state, &heap, &stdout, trace_ref)
 }
 
 // ---------------------------------------------------------------------------
@@ -292,36 +328,33 @@ impl ZapcodeSnapshot {
     /// Returns:
     ///     A dict with either "output" or "suspended" keys (same shape as Zapcode.run()).
     fn resume(&self, py: Python<'_>, return_value: &Bound<'_, PyAny>) -> PyResult<PyObject> {
-        let val = py_to_value(return_value)?;
-        let state = self.inner.clone().resume(val).map_err(zapcode_err)?;
-        run_result_to_py(py, state, "", None)
+        // Allocate any list/dict in the return value into the snapshot's own heap
+        // so its handles are valid when the snapshot is restored on resume.
+        let mut snapshot = self.inner.clone();
+        let val = py_to_value(return_value, snapshot.heap_mut())?;
+        let result = snapshot.resume(val).map_err(zapcode_err)?;
+        full_run_result_to_py(py, result, false)
     }
 
     /// Resume by raising an error at the suspended external call (a failed
     /// tool). Catchable by a surrounding try/catch in the guest.
     fn resume_error(&self, py: Python<'_>, error: &Bound<'_, PyAny>) -> PyResult<PyObject> {
-        let val = py_to_value(error)?;
-        let state = self
-            .inner
-            .clone()
-            .resume_with_error(val)
-            .map_err(zapcode_err)?;
-        run_result_to_py(py, state, "", None)
+        let mut snapshot = self.inner.clone();
+        let val = py_to_value(error, snapshot.heap_mut())?;
+        let result = snapshot.resume_with_error(val).map_err(zapcode_err)?;
+        full_run_result_to_py(py, result, false)
     }
 
     /// Resume a `Promise.all` batch suspension with one result per call, in the
     /// order the calls were presented.
     fn resume_many(&self, py: Python<'_>, results: &Bound<'_, PyList>) -> PyResult<PyObject> {
+        let mut snapshot = self.inner.clone();
         let mut values = Vec::with_capacity(results.len());
         for item in results.iter() {
-            values.push(py_to_value(&item)?);
+            values.push(py_to_value(&item, snapshot.heap_mut())?);
         }
-        let state = self
-            .inner
-            .clone()
-            .resume_many(values)
-            .map_err(zapcode_err)?;
-        run_result_to_py(py, state, "", None)
+        let result = snapshot.resume_many(values).map_err(zapcode_err)?;
+        full_run_result_to_py(py, result, false)
     }
 }
 

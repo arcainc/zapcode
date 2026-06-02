@@ -1,0 +1,15 @@
+# macOS-only linker flags for the pyo3 extension module (`zapcode-py`).
+#
+# pyo3's `extension-module` feature deliberately does NOT link libpython: the
+# Python C-API symbols (`_Py*`) are resolved at load time by the host
+# interpreter. On macOS that requires telling the linker to defer those
+# undefined symbols with `-undefined dynamic_lookup`. `maturin` injects this flag
+# when it builds the wheel, but a plain `cargo build`/`cargo test` at the
+# workspace root does not — so without this the cdylib fails to link with
+# "Undefined symbols: _PyBool_Type, ...". Scoped to the Apple targets so the
+# wasm and Linux builds are unaffected.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]

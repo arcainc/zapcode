@@ -4614,6 +4614,19 @@ impl ZapcodeRun {
     }
 
     pub fn run(&self, input_values: Vec<(String, Value)>) -> Result<RunResult> {
+        self.run_with_input_heap(input_values, Heap::new())
+    }
+
+    /// Like [`run`], but seeds the VM with `input_heap` — the heap that backs any
+    /// array/object `Value`s in `input_values`. Builtin globals are appended on
+    /// top of this heap (see [`Vm::with_programs_and_heap`]) so the handles in the
+    /// supplied inputs remain valid. Host bindings allocate compound inputs into a
+    /// fresh heap and pass it here so the handles line up.
+    pub fn run_with_input_heap(
+        &self,
+        input_values: Vec<(String, Value)>,
+        input_heap: Heap,
+    ) -> Result<RunResult> {
         let mut root_span = SpanBuilder::new("zapcode.run");
 
         // Parse
@@ -4651,7 +4664,13 @@ impl ZapcodeRun {
 
         // Execute
         let execute_span = SpanBuilder::new("execute");
-        let mut vm = Vm::new(compiled, self.limits.clone(), ext_set);
+        // An empty input heap is the common case (primitive or no inputs); take
+        // the plain constructor so the seeded-heap path stays opt-in.
+        let mut vm = if input_heap.is_empty() {
+            Vm::new(compiled, self.limits.clone(), ext_set)
+        } else {
+            Vm::with_programs_and_heap(vec![compiled], self.limits.clone(), ext_set, input_heap)
+        };
 
         for (name, value) in input_values {
             vm.globals.insert(name, value);

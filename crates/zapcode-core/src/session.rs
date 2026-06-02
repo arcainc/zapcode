@@ -76,6 +76,19 @@ pub enum ZapcodeSessionState {
     },
 }
 
+impl ZapcodeSessionState {
+    /// Borrow the object heap that resolves the array/object handles in this
+    /// state's `output` / `args` / `calls`. Hosts need it to marshal those
+    /// results out to JSON.
+    pub fn heap(&self) -> &crate::heap::Heap {
+        match self {
+            ZapcodeSessionState::Complete { session, .. }
+            | ZapcodeSessionState::Suspended { session, .. }
+            | ZapcodeSessionState::SuspendedMany { session, .. } => session.heap(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZapcodeSessionSnapshot {
     data: SessionSnapshotData,
@@ -142,6 +155,17 @@ impl ZapcodeSessionSnapshot {
         Ok(crate::wire::encode_frame(FrameKind::Session, &payload))
     }
 
+    /// Borrow the object heap backing this session. Array/object `Value`s held in
+    /// the session's globals — or returned in a [`ZapcodeSessionState`]'s
+    /// `output`/`args`/`calls` — carry `Handle`s into this heap, so a host needs
+    /// it to read their elements / fields when marshalling results out.
+    pub fn heap(&self) -> &crate::heap::Heap {
+        match &self.data {
+            SessionSnapshotData::Idle(idle) => &idle.heap,
+            SessionSnapshotData::Suspended(s) => &s.vm.heap,
+        }
+    }
+
     fn max_snapshot_bytes(&self) -> usize {
         match &self.data {
             SessionSnapshotData::Idle(idle) => idle.limits.max_snapshot_bytes,
@@ -160,7 +184,20 @@ impl ZapcodeSessionSnapshot {
         source: String,
         input_values: Vec<(String, Value)>,
     ) -> Result<ZapcodeSessionState> {
-        let idle = match self.data.clone() {
+        self.run_chunk_with_input_heap(source, input_values, crate::heap::Heap::new())
+    }
+
+    /// Like [`run_chunk`], but `input_heap` backs any array/object `Value`s in
+    /// `input_values`. The input heap is merged into the session's live heap and
+    /// the input handles are rebased so they stay valid. Host bindings allocate
+    /// compound inputs into a fresh heap and pass it here.
+    pub fn run_chunk_with_input_heap(
+        &self,
+        source: String,
+        mut input_values: Vec<(String, Value)>,
+        input_heap: crate::heap::Heap,
+    ) -> Result<ZapcodeSessionState> {
+        let mut idle = match self.data.clone() {
             SessionSnapshotData::Idle(idle) => idle,
             SessionSnapshotData::Suspended(_) => {
                 return Err(ZapcodeError::RuntimeError(
@@ -169,6 +206,15 @@ impl ZapcodeSessionSnapshot {
                 ))
             }
         };
+
+        // Merge the host-supplied input heap into the session's live heap and
+        // rebase the input handles so any array/object inputs stay valid.
+        if !input_heap.is_empty() {
+            let offset = idle.heap.absorb(input_heap);
+            for (_, value) in input_values.iter_mut() {
+                *value = crate::heap::Heap::rebase_handles(value.clone(), offset);
+            }
+        }
 
         let transient_input_names = validate_input_values(&idle, &input_values)?;
 
@@ -202,8 +248,21 @@ impl ZapcodeSessionSnapshot {
     }
 
     pub fn resume(&self, return_value: Value) -> Result<ZapcodeSessionState> {
+        self.resume_with_input_heap(return_value, crate::heap::Heap::new())
+    }
+
+    /// Like [`resume`], but `value_heap` backs any array/object handles in
+    /// `return_value`. It is merged into the suspended VM's heap and the return
+    /// value rebased so the handles stay valid. Host bindings allocate compound
+    /// resume values into a fresh heap and pass it here.
+    pub fn resume_with_input_heap(
+        &self,
+        return_value: Value,
+        value_heap: crate::heap::Heap,
+    ) -> Result<ZapcodeSessionState> {
         self.drive_resume(|vm| {
-            vm.stack.push(return_value);
+            let value = absorb_into_vm(vm, return_value, value_heap);
+            vm.stack.push(value);
             vm.resume_execution()
         })
     }
@@ -213,13 +272,39 @@ impl ZapcodeSessionSnapshot {
     /// in the chunk; otherwise it propagates to the host. Use when a tool /
     /// Temporal activity failed.
     pub fn resume_with_error(&self, error: Value) -> Result<ZapcodeSessionState> {
-        self.drive_resume(|vm| vm.resume_with_error(error))
+        self.resume_with_error_in_heap(error, crate::heap::Heap::new())
+    }
+
+    /// Like [`resume_with_error`], but `value_heap` backs any array/object
+    /// handles in `error`.
+    pub fn resume_with_error_in_heap(
+        &self,
+        error: Value,
+        value_heap: crate::heap::Heap,
+    ) -> Result<ZapcodeSessionState> {
+        self.drive_resume(|vm| {
+            let value = absorb_into_vm(vm, error, value_heap);
+            vm.resume_with_error(value)
+        })
     }
 
     /// Resume a session suspended on a `Promise.all` batch with one result per
     /// call, in order. Use when the host ran the batched calls in parallel.
     pub fn resume_many(&self, results: Vec<Value>) -> Result<ZapcodeSessionState> {
-        self.drive_resume(|vm| vm.resume_many(results))
+        self.resume_many_with_input_heap(results, crate::heap::Heap::new())
+    }
+
+    /// Like [`resume_many`], but `value_heap` backs any array/object handles in
+    /// `results`.
+    pub fn resume_many_with_input_heap(
+        &self,
+        results: Vec<Value>,
+        value_heap: crate::heap::Heap,
+    ) -> Result<ZapcodeSessionState> {
+        self.drive_resume(|vm| {
+            let values = absorb_many_into_vm(vm, results, value_heap);
+            vm.resume_many(values)
+        })
     }
 
     fn drive_resume(
@@ -247,6 +332,33 @@ impl ZapcodeSessionSnapshot {
             suspended.transient_input_names,
         )
     }
+}
+
+/// Merge a host-supplied `value_heap` into the live VM heap and rebase `value`'s
+/// top-level array/object handle so it points into the merged heap. A no-op for
+/// primitives or an empty heap.
+fn absorb_into_vm(vm: &mut Vm, value: Value, value_heap: crate::heap::Heap) -> Value {
+    if value_heap.is_empty() {
+        return value;
+    }
+    let offset = vm.heap.absorb(value_heap);
+    crate::heap::Heap::rebase_handles(value, offset)
+}
+
+/// Like [`absorb_into_vm`] for a batch of resume values sharing one heap.
+fn absorb_many_into_vm(
+    vm: &mut Vm,
+    values: Vec<Value>,
+    value_heap: crate::heap::Heap,
+) -> Vec<Value> {
+    if value_heap.is_empty() {
+        return values;
+    }
+    let offset = vm.heap.absorb(value_heap);
+    values
+        .into_iter()
+        .map(|v| crate::heap::Heap::rebase_handles(v, offset))
+        .collect()
 }
 
 fn build_session_state(

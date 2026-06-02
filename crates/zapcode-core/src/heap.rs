@@ -115,6 +115,48 @@ impl Heap {
         matches!(self.slots.get(handle as usize), Some(HeapSlot::Array(_)))
     }
 
+    /// Append every slot from `other` into this heap, rebasing the handles those
+    /// slots carry by the offset where they land. Returns the offset (the index
+    /// of `other`'s old handle 0 in this heap), so the caller can rebase any
+    /// top-level `Value` handles that referenced `other` with
+    /// [`Self::rebase_handles`].
+    ///
+    /// Used at the host boundary: a binding builds compound inputs / resume
+    /// values into a standalone heap (handles `0..n`), then merges that heap into
+    /// the live VM heap which already holds builtin and user slots.
+    pub fn absorb(&mut self, other: Heap) -> Handle {
+        let offset = self.slots.len() as Handle;
+        for slot in other.slots {
+            let rebased = match slot {
+                HeapSlot::Array(items) => HeapSlot::Array(
+                    items
+                        .into_iter()
+                        .map(|v| Self::rebase_handles(v, offset))
+                        .collect(),
+                ),
+                HeapSlot::Object(fields) => HeapSlot::Object(
+                    fields
+                        .into_iter()
+                        .map(|(k, v)| (k, Self::rebase_handles(v, offset)))
+                        .collect(),
+                ),
+            };
+            self.slots.push(rebased);
+        }
+        offset
+    }
+
+    /// Add `offset` to the handle of an `Array`/`Object` value (recursively for
+    /// any nested handles). Other value kinds are returned unchanged. Pairs with
+    /// [`Self::absorb`] to rebase values that referenced the absorbed heap.
+    pub fn rebase_handles(value: Value, offset: Handle) -> Value {
+        match value {
+            Value::Array(h) => Value::Array(h + offset),
+            Value::Object(h) => Value::Object(h + offset),
+            other => other,
+        }
+    }
+
     /// Recursively copy a value into fresh heap slots (independent of the
     /// original), for `structuredClone` and other deep-copy semantics.
     pub fn deep_clone(&mut self, value: &Value) -> Value {
@@ -134,5 +176,61 @@ impl Heap {
             }
             other => other.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Merging a host-built input heap into a live heap must rebase the input's
+    // handles past the slots already present, and keep nested handles valid —
+    // this is what the language bindings rely on for array/object inputs and
+    // resume values.
+    #[test]
+    fn absorb_rebases_top_level_and_nested_handles() {
+        // Live heap already holds one slot (e.g. a builtin / existing global).
+        let mut live = Heap::new();
+        let existing = live.alloc_array(vec![Value::Int(1)]);
+        assert_eq!(existing, 0);
+
+        // Host builds inputs in a standalone heap: an object { inner: [10, 20] }.
+        let mut input = Heap::new();
+        let inner = input.alloc_array(vec![Value::Int(10), Value::Int(20)]);
+        let mut fields = IndexMap::new();
+        fields.insert(Arc::from("inner"), Value::Array(inner));
+        let outer = input.alloc_object(fields);
+        let input_value = Value::Object(outer);
+
+        let offset = live.absorb(input);
+        assert_eq!(offset, 1, "input handle 0 lands at live.len() == 1");
+
+        let rebased = Heap::rebase_handles(input_value, offset);
+        let outer_h = match rebased {
+            Value::Object(h) => h,
+            _ => panic!("expected object"),
+        };
+        // The object's own handle was rebased, and the live slot it now points
+        // at still holds the nested array handle rebased to a valid slot.
+        let obj = live.object(outer_h).expect("object present after absorb");
+        let nested = match obj.get("inner").unwrap() {
+            Value::Array(h) => *h,
+            _ => panic!("expected nested array"),
+        };
+        assert_eq!(live.array(nested), &[Value::Int(10), Value::Int(20)]);
+        // The pre-existing live slot is untouched.
+        assert_eq!(live.array(existing), &[Value::Int(1)]);
+    }
+
+    #[test]
+    fn rebase_leaves_primitives_unchanged() {
+        assert!(matches!(
+            Heap::rebase_handles(Value::Int(5), 7),
+            Value::Int(5)
+        ));
+        assert!(matches!(
+            Heap::rebase_handles(Value::Array(2), 3),
+            Value::Array(5)
+        ));
     }
 }

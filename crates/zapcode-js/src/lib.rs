@@ -4,8 +4,9 @@ use std::sync::Arc;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
+use zapcode_core::heap::Heap;
 use zapcode_core::{
-    ExecutionTrace, ResourceLimits, TraceSpan, TraceStatus, Value, VmState, ZapcodeRun,
+    ExecutionTrace, ResourceLimits, RunResult, TraceSpan, TraceStatus, Value, VmState, ZapcodeRun,
     ZapcodeSessionSnapshot, ZapcodeSessionState, ZapcodeSnapshot,
 };
 
@@ -183,10 +184,11 @@ impl ZapcodeSnapshotHandle {
         &self,
         return_value: serde_json::Value,
     ) -> napi::Result<Either3<ZapcodeResult, ZapcodeSuspension, ZapcodeBatchSuspension>> {
-        let value = json_to_value(&return_value);
-        let state = self
-            .inner
-            .clone()
+        // Allocate any array/object in the return value into the snapshot's own
+        // heap so its handles are valid when the snapshot is restored on resume.
+        let mut snapshot = self.inner.clone();
+        let value = json_to_value(&return_value, snapshot.heap_mut());
+        let result = snapshot
             .resume(value)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
         // resume() doesn't produce a full trace yet — use an empty one
@@ -201,7 +203,7 @@ impl ZapcodeSnapshotHandle {
                 children: Vec::new(),
             },
         };
-        vm_state_to_either(state, String::new(), trace)
+        run_result_to_either(result, trace)
     }
 
     /// Resume execution by *raising* an error at the suspended external call,
@@ -213,10 +215,9 @@ impl ZapcodeSnapshotHandle {
         &self,
         error: serde_json::Value,
     ) -> napi::Result<Either3<ZapcodeResult, ZapcodeSuspension, ZapcodeBatchSuspension>> {
-        let value = json_to_value(&error);
-        let state = self
-            .inner
-            .clone()
+        let mut snapshot = self.inner.clone();
+        let value = json_to_value(&error, snapshot.heap_mut());
+        let result = snapshot
             .resume_with_error(value)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
         let trace = ExecutionTrace {
@@ -230,7 +231,7 @@ impl ZapcodeSnapshotHandle {
                 children: Vec::new(),
             },
         };
-        vm_state_to_either(state, String::new(), trace)
+        run_result_to_either(result, trace)
     }
 
     /// Resume a batch suspension (`ZapcodeBatchSuspension`) with one result per
@@ -241,10 +242,12 @@ impl ZapcodeSnapshotHandle {
         &self,
         results: Vec<serde_json::Value>,
     ) -> napi::Result<Either3<ZapcodeResult, ZapcodeSuspension, ZapcodeBatchSuspension>> {
-        let values: Vec<Value> = results.iter().map(json_to_value).collect();
-        let state = self
-            .inner
-            .clone()
+        let mut snapshot = self.inner.clone();
+        let values: Vec<Value> = results
+            .iter()
+            .map(|v| json_to_value(v, snapshot.heap_mut()))
+            .collect();
+        let result = snapshot
             .resume_many(values)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
         let trace = ExecutionTrace {
@@ -258,7 +261,7 @@ impl ZapcodeSnapshotHandle {
                 children: Vec::new(),
             },
         };
-        vm_state_to_either(state, String::new(), trace)
+        run_result_to_either(result, trace)
     }
 }
 
@@ -313,10 +316,10 @@ impl ZapcodeSessionHandle {
         code: String,
         inputs: Option<HashMap<String, serde_json::Value>>,
     ) -> napi::Result<SessionEither> {
-        let input_values = inputs_to_vec(inputs);
+        let (input_values, input_heap) = inputs_to_vec(inputs);
         let state = self
             .inner
-            .run_chunk(code, input_values)
+            .run_chunk_with_input_heap(code, input_values, input_heap)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
         session_state_to_either(state)
@@ -326,10 +329,10 @@ impl ZapcodeSessionHandle {
         ts_return_type = "ZapcodeSessionResult | ZapcodeSessionSuspension | ZapcodeSessionBatchSuspension"
     )]
     pub fn resume(&self, return_value: serde_json::Value) -> napi::Result<SessionEither> {
-        let value = json_to_value(&return_value);
+        let (value, value_heap) = json_value_with_heap(&return_value);
         let state = self
             .inner
-            .resume(value)
+            .resume_with_input_heap(value, value_heap)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
         session_state_to_either(state)
@@ -342,10 +345,10 @@ impl ZapcodeSessionHandle {
         ts_return_type = "ZapcodeSessionResult | ZapcodeSessionSuspension | ZapcodeSessionBatchSuspension"
     )]
     pub fn resume_error(&self, error: serde_json::Value) -> napi::Result<SessionEither> {
-        let value = json_to_value(&error);
+        let (value, value_heap) = json_value_with_heap(&error);
         let state = self
             .inner
-            .resume_with_error(value)
+            .resume_with_error_in_heap(value, value_heap)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
         session_state_to_either(state)
@@ -357,10 +360,10 @@ impl ZapcodeSessionHandle {
         ts_return_type = "ZapcodeSessionResult | ZapcodeSessionSuspension | ZapcodeSessionBatchSuspension"
     )]
     pub fn resume_many(&self, results: Vec<serde_json::Value>) -> napi::Result<SessionEither> {
-        let values: Vec<Value> = results.iter().map(json_to_value).collect();
+        let (values, value_heap) = json_values_with_heap(&results);
         let state = self
             .inner
-            .resume_many(values)
+            .resume_many_with_input_heap(values, value_heap)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
         session_state_to_either(state)
@@ -409,19 +412,25 @@ impl Zapcode {
         &self,
         inputs: Option<HashMap<String, serde_json::Value>>,
     ) -> napi::Result<ZapcodeResult> {
-        let input_values = inputs_to_vec(inputs);
+        let (input_values, input_heap) = inputs_to_vec(inputs);
         let result = self
             .inner
-            .run(input_values)
+            .run_with_input_heap(input_values, input_heap)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
-        match result.state {
+        let RunResult {
+            state,
+            heap,
+            stdout,
+            trace,
+        } = result;
+        match state {
             VmState::Complete(v) => Ok(ZapcodeResult {
                 kind: "complete".to_string(),
                 completed: true,
-                output: value_to_json(&v),
-                stdout: result.stdout,
-                trace: trace_to_js(&result.trace),
+                output: value_to_json(&v, &heap),
+                stdout,
+                trace: trace_to_js(&trace),
             }),
             VmState::Suspended { function_name, .. } => Err(napi::Error::from_reason(format!(
                 "execution suspended on external function '{}' -- use start() instead",
@@ -441,13 +450,13 @@ impl Zapcode {
         &self,
         inputs: Option<HashMap<String, serde_json::Value>>,
     ) -> napi::Result<Either3<ZapcodeResult, ZapcodeSuspension, ZapcodeBatchSuspension>> {
-        let input_values = inputs_to_vec(inputs);
+        let (input_values, input_heap) = inputs_to_vec(inputs);
         let result = self
             .inner
-            .run(input_values)
+            .run_with_input_heap(input_values, input_heap)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
-        vm_state_to_either(result.state, result.stdout, result.trace)
+        run_result_to_either_with_stdout(result)
     }
 }
 
@@ -455,13 +464,36 @@ impl Zapcode {
 // Conversion helpers
 // ---------------------------------------------------------------------------
 
-/// Convert a JS inputs map to the `Vec<(String, Value)>` that zapcode-core expects.
-fn inputs_to_vec(inputs: Option<HashMap<String, serde_json::Value>>) -> Vec<(String, Value)> {
-    inputs
+/// Convert a JS inputs map to the `Vec<(String, Value)>` that zapcode-core
+/// expects, allocating any array/object inputs into a fresh `Heap`. The heap is
+/// returned alongside so callers can hand it to the heap-seeding core entry
+/// points (`run_with_input_heap` / `run_chunk_with_input_heap`); the input
+/// handles are valid in that heap.
+fn inputs_to_vec(
+    inputs: Option<HashMap<String, serde_json::Value>>,
+) -> (Vec<(String, Value)>, Heap) {
+    let mut heap = Heap::new();
+    let values = inputs
         .unwrap_or_default()
         .into_iter()
-        .map(|(k, v)| (k, json_to_value(&v)))
-        .collect()
+        .map(|(k, v)| (k, json_to_value(&v, &mut heap)))
+        .collect();
+    (values, heap)
+}
+
+/// Convert a single host JSON value into a `Value`, allocating into a fresh heap
+/// that the caller then merges into the target VM heap.
+fn json_value_with_heap(json: &serde_json::Value) -> (Value, Heap) {
+    let mut heap = Heap::new();
+    let value = json_to_value(json, &mut heap);
+    (value, heap)
+}
+
+/// Convert a list of host JSON values into `Value`s sharing one fresh heap.
+fn json_values_with_heap(values: &[serde_json::Value]) -> (Vec<Value>, Heap) {
+    let mut heap = Heap::new();
+    let converted = values.iter().map(|v| json_to_value(v, &mut heap)).collect();
+    (converted, heap)
 }
 
 fn resource_limits_from_options(opts: &ZapcodeOptions) -> ResourceLimits {
@@ -486,8 +518,11 @@ fn resource_limits_from_session_options(opts: &ZapcodeSessionOptions) -> Resourc
     limits
 }
 
-/// Convert a `serde_json::Value` to a `zapcode_core::Value`.
-fn json_to_value(json: &serde_json::Value) -> Value {
+/// Convert a `serde_json::Value` to a `zapcode_core::Value`, allocating any
+/// array/object into `heap`. Array/object `Value`s carry a `Handle` into the
+/// heap rather than owning their contents, so a heap is required at the host
+/// boundary.
+fn json_to_value(json: &serde_json::Value, heap: &mut Heap) -> Value {
     match json {
         serde_json::Value::Null => Value::Null,
         serde_json::Value::Bool(b) => Value::Bool(*b),
@@ -501,19 +536,23 @@ fn json_to_value(json: &serde_json::Value) -> Value {
             }
         }
         serde_json::Value::String(s) => Value::String(Arc::from(s.as_str())),
-        serde_json::Value::Array(arr) => Value::Array(arr.iter().map(json_to_value).collect()),
+        serde_json::Value::Array(arr) => {
+            let items: Vec<Value> = arr.iter().map(|v| json_to_value(v, heap)).collect();
+            Value::Array(heap.alloc_array(items))
+        }
         serde_json::Value::Object(obj) => {
             let map = obj
                 .iter()
-                .map(|(k, v)| (Arc::from(k.as_str()), json_to_value(v)))
+                .map(|(k, v)| (Arc::from(k.as_str()), json_to_value(v, heap)))
                 .collect();
-            Value::Object(map)
+            Value::Object(heap.alloc_object(map))
         }
     }
 }
 
-/// Convert a `zapcode_core::Value` to a `serde_json::Value`.
-fn value_to_json(value: &Value) -> serde_json::Value {
+/// Convert a `zapcode_core::Value` to a `serde_json::Value`, dereferencing
+/// array/object handles through `heap`.
+fn value_to_json(value: &Value, heap: &Heap) -> serde_json::Value {
     match value {
         Value::Undefined | Value::Null => serde_json::Value::Null,
         Value::Bool(b) => serde_json::Value::Bool(*b),
@@ -527,12 +566,18 @@ fn value_to_json(value: &Value) -> serde_json::Value {
             }
         }
         Value::String(s) => serde_json::Value::String(s.to_string()),
-        Value::Array(arr) => serde_json::Value::Array(arr.iter().map(value_to_json).collect()),
-        Value::Object(obj) => {
-            let map: serde_json::Map<String, serde_json::Value> = obj
-                .iter()
-                .map(|(k, v)| (k.to_string(), value_to_json(v)))
-                .collect();
+        Value::Array(h) => serde_json::Value::Array(
+            heap.array(*h).iter().map(|v| value_to_json(v, heap)).collect(),
+        ),
+        Value::Object(h) => {
+            let map: serde_json::Map<String, serde_json::Value> = heap
+                .object(*h)
+                .map(|obj| {
+                    obj.iter()
+                        .map(|(k, v)| (k.to_string(), value_to_json(v, heap)))
+                        .collect()
+                })
+                .unwrap_or_default();
             serde_json::Value::Object(map)
         }
         Value::Function(_) | Value::BuiltinMethod { .. } => {
@@ -568,17 +613,69 @@ fn trace_to_js(trace: &ExecutionTrace) -> JsTraceSpan {
     trace_span_to_js(&trace.root)
 }
 
-/// Package a `VmState` into a complete / single-suspension / batch-suspension result.
-fn vm_state_to_either(
-    state: VmState,
-    stdout: String,
+/// Package a [`RunResult`] into a complete / single-suspension / batch-suspension
+/// result. The result's `heap` resolves the handles in `state` (the completed
+/// output, or a suspension's args/calls), so it is threaded through every
+/// value-to-JSON conversion.
+fn run_result_to_either(
+    result: RunResult,
     trace: ExecutionTrace,
 ) -> napi::Result<Either3<ZapcodeResult, ZapcodeSuspension, ZapcodeBatchSuspension>> {
+    let RunResult { state, heap, .. } = result;
     match state {
         VmState::Complete(v) => Ok(Either3::A(ZapcodeResult {
             kind: "complete".to_string(),
             completed: true,
-            output: value_to_json(&v),
+            output: value_to_json(&v, &heap),
+            stdout: String::new(),
+            trace: trace_to_js(&trace),
+        })),
+        VmState::Suspended {
+            function_name,
+            args,
+            snapshot,
+        } => {
+            let snap_bytes = snapshot
+                .dump()
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            Ok(Either3::B(ZapcodeSuspension {
+                kind: "suspended".to_string(),
+                completed: false,
+                function_name,
+                args: args.iter().map(|v| value_to_json(v, &heap)).collect(),
+                snapshot: Buffer::from(snap_bytes),
+            }))
+        }
+        VmState::SuspendedMany { calls, snapshot } => {
+            let snap_bytes = snapshot
+                .dump()
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            Ok(Either3::C(ZapcodeBatchSuspension {
+                kind: "suspended_many".to_string(),
+                completed: false,
+                calls: external_calls_to_js(&calls, &heap),
+                snapshot: Buffer::from(snap_bytes),
+            }))
+        }
+    }
+}
+
+/// Like [`run_result_to_either`] but carries the captured stdout into the
+/// completed result (used by `start()`, which produces a full trace + stdout).
+fn run_result_to_either_with_stdout(
+    result: RunResult,
+) -> napi::Result<Either3<ZapcodeResult, ZapcodeSuspension, ZapcodeBatchSuspension>> {
+    let RunResult {
+        state,
+        heap,
+        stdout,
+        trace,
+    } = result;
+    match state {
+        VmState::Complete(v) => Ok(Either3::A(ZapcodeResult {
+            kind: "complete".to_string(),
+            completed: true,
+            output: value_to_json(&v, &heap),
             stdout,
             trace: trace_to_js(&trace),
         })),
@@ -594,7 +691,7 @@ fn vm_state_to_either(
                 kind: "suspended".to_string(),
                 completed: false,
                 function_name,
-                args: args.iter().map(value_to_json).collect(),
+                args: args.iter().map(|v| value_to_json(v, &heap)).collect(),
                 snapshot: Buffer::from(snap_bytes),
             }))
         }
@@ -605,19 +702,19 @@ fn vm_state_to_either(
             Ok(Either3::C(ZapcodeBatchSuspension {
                 kind: "suspended_many".to_string(),
                 completed: false,
-                calls: external_calls_to_js(&calls),
+                calls: external_calls_to_js(&calls, &heap),
                 snapshot: Buffer::from(snap_bytes),
             }))
         }
     }
 }
 
-fn external_calls_to_js(calls: &[zapcode_core::ExternalCall]) -> Vec<JsExternalCall> {
+fn external_calls_to_js(calls: &[zapcode_core::ExternalCall], heap: &Heap) -> Vec<JsExternalCall> {
     calls
         .iter()
         .map(|c| JsExternalCall {
             name: c.name.clone(),
-            args: c.args.iter().map(value_to_json).collect(),
+            args: c.args.iter().map(|v| value_to_json(v, heap)).collect(),
         })
         .collect()
 }
@@ -626,6 +723,9 @@ type SessionEither =
     Either3<ZapcodeSessionResult, ZapcodeSessionSuspension, ZapcodeSessionBatchSuspension>;
 
 fn session_state_to_either(state: ZapcodeSessionState) -> napi::Result<SessionEither> {
+    // Clone the session's heap up front: it resolves the handles in
+    // `output`/`args`/`calls` and is moved into the dumped session below.
+    let heap = state.heap().clone();
     match state {
         ZapcodeSessionState::Complete {
             output,
@@ -638,7 +738,7 @@ fn session_state_to_either(state: ZapcodeSessionState) -> napi::Result<SessionEi
             Ok(Either3::A(ZapcodeSessionResult {
                 kind: "complete".to_string(),
                 completed: true,
-                output: value_to_json(&output),
+                output: value_to_json(&output, &heap),
                 stdout,
                 session: Buffer::from(bytes),
             }))
@@ -656,7 +756,7 @@ fn session_state_to_either(state: ZapcodeSessionState) -> napi::Result<SessionEi
                 kind: "suspended".to_string(),
                 completed: false,
                 function_name,
-                args: args.iter().map(value_to_json).collect(),
+                args: args.iter().map(|v| value_to_json(v, &heap)).collect(),
                 stdout,
                 session: Buffer::from(bytes),
             }))
@@ -672,7 +772,7 @@ fn session_state_to_either(state: ZapcodeSessionState) -> napi::Result<SessionEi
             Ok(Either3::C(ZapcodeSessionBatchSuspension {
                 kind: "suspended_many".to_string(),
                 completed: false,
-                calls: external_calls_to_js(&calls),
+                calls: external_calls_to_js(&calls, &heap),
                 stdout,
                 session: Buffer::from(bytes),
             }))
