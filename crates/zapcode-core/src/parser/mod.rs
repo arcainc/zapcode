@@ -640,9 +640,14 @@ impl<'a> AstLowerer<'a> {
     fn lower_func_decl(&mut self, func: &ast::Function<'_>) -> Result<Statement> {
         let span = self.span(func.span);
         let func_def = self.lower_function(func)?;
+        let name = func_def.name.clone();
         let func_index = self.functions.len();
         self.functions.push(func_def);
-        Ok(Statement::FunctionDecl { func_index, span })
+        Ok(Statement::FunctionDecl {
+            func_index,
+            name,
+            span,
+        })
     }
 
     fn lower_function(&mut self, func: &ast::Function<'_>) -> Result<FunctionDef> {

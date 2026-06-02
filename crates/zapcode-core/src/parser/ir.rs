@@ -136,6 +136,9 @@ pub enum Statement {
     },
     FunctionDecl {
         func_index: usize,
+        /// The declared name, carried here so the compiler can bind it without a
+        /// lookup into a (per-function-scope) compiled-function table.
+        name: Option<String>,
         span: Span,
     },
     Switch {

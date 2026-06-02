@@ -55,6 +55,9 @@ struct Compiler {
     top_level_bindings: HashMap<String, TopLevelBindingKind>,
     /// Label attached to the next loop (from a `label:` statement), if any.
     pending_label: Option<String>,
+    /// Function-declaration indices already bound by the scope's hoist pass, so
+    /// the in-source-order `FunctionDecl` statement is a no-op for them.
+    hoisted_funcs: std::collections::HashSet<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +84,7 @@ impl Compiler {
             mode: CompilerMode::Standard,
             top_level_bindings: HashMap::new(),
             pending_label: None,
+            hoisted_funcs: std::collections::HashSet::new(),
         }
     }
 
@@ -98,6 +102,7 @@ impl Compiler {
             mode: CompilerMode::SessionChunk,
             top_level_bindings,
             pending_label: None,
+            hoisted_funcs: std::collections::HashSet::new(),
         }
     }
 
@@ -175,7 +180,9 @@ impl Compiler {
             self.functions.push(compiled);
         }
 
-        // Second pass: compile body
+        // Second pass: compile body. Hoist top-level function declarations first
+        // so forward references and mutual recursion resolve.
+        self.hoist_function_decls(&program.body)?;
         // For the last statement, if it's an expression, keep the value on the stack
         let len = program.body.len();
         for (i, stmt) in program.body.iter().enumerate() {
@@ -249,6 +256,8 @@ impl Compiler {
             }
         }
 
+        // Hoist this function body's own nested function declarations.
+        func_compiler.hoist_function_decls(&func.body)?;
         for stmt in &func.body {
             func_compiler.compile_statement(stmt)?;
         }
@@ -585,27 +594,14 @@ impl Compiler {
                 self.compile_statement(body)?;
                 self.pending_label = None;
             }
-            Statement::FunctionDecl { func_index, .. } => {
-                self.emit(Instruction::CreateClosure(*func_index));
-                let name = if *func_index < self.functions.len() {
-                    self.functions[*func_index].name.clone()
-                } else {
-                    None
-                };
-                if let Some(name) = name {
-                    if self.is_session_chunk() {
-                        self.record_top_level_binding(&name, TopLevelBindingKind::Function)?;
-                        self.emit(Instruction::StoreGlobal(name));
-                    } else {
-                        // Store as both local and global so recursion works
-                        self.emit(Instruction::Dup);
-                        let idx = self.declare_local(&name);
-                        self.emit(Instruction::StoreLocal(idx));
-                        self.emit(Instruction::StoreGlobal(name));
-                    }
-                } else {
-                    self.emit(Instruction::Pop);
+            Statement::FunctionDecl {
+                func_index, name, ..
+            } => {
+                // Already bound by the enclosing scope's hoist pass — no-op.
+                if self.hoisted_funcs.contains(func_index) {
+                    return Ok(());
                 }
+                self.emit_function_decl_binding(*func_index, name)?;
             }
             Statement::ClassDecl {
                 name,
@@ -700,6 +696,47 @@ impl Compiler {
                     self.patch_jump(jump_end, body_starts[default_idx]);
                 } else {
                     self.patch_jump(jump_end, end);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Emit the closure creation + name binding for a function declaration.
+    fn emit_function_decl_binding(
+        &mut self,
+        func_index: usize,
+        name: &Option<String>,
+    ) -> Result<()> {
+        self.emit(Instruction::CreateClosure(func_index));
+        if let Some(name) = name {
+            if self.is_session_chunk() {
+                self.record_top_level_binding(name, TopLevelBindingKind::Function)?;
+                self.emit(Instruction::StoreGlobal(name.clone()));
+            } else {
+                // Store as both local and global so recursion + globals resolve.
+                self.emit(Instruction::Dup);
+                let idx = self.declare_local(name);
+                self.emit(Instruction::StoreLocal(idx));
+                self.emit(Instruction::StoreGlobal(name.clone()));
+            }
+        } else {
+            self.emit(Instruction::Pop);
+        }
+        Ok(())
+    }
+
+    /// Hoist top-level function declarations of a body: bind each before the
+    /// body's other statements run, so forward references and mutual recursion
+    /// resolve (JS function-declaration hoisting).
+    fn hoist_function_decls(&mut self, stmts: &[Statement]) -> Result<()> {
+        for stmt in stmts {
+            if let Statement::FunctionDecl {
+                func_index, name, ..
+            } = stmt
+            {
+                if self.hoisted_funcs.insert(*func_index) {
+                    self.emit_function_decl_binding(*func_index, name)?;
                 }
             }
         }
