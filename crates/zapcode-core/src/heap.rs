@@ -114,4 +114,25 @@ impl Heap {
     pub fn is_array(&self, handle: Handle) -> bool {
         matches!(self.slots.get(handle as usize), Some(HeapSlot::Array(_)))
     }
+
+    /// Recursively copy a value into fresh heap slots (independent of the
+    /// original), for `structuredClone` and other deep-copy semantics.
+    pub fn deep_clone(&mut self, value: &Value) -> Value {
+        match value {
+            Value::Array(h) => {
+                let items = self.array_vec(*h);
+                let cloned: Vec<Value> = items.iter().map(|v| self.deep_clone(v)).collect();
+                Value::Array(self.alloc_array(cloned))
+            }
+            Value::Object(h) => {
+                let map = self.object_map(*h);
+                let cloned: IndexMap<Arc<str>, Value> = map
+                    .iter()
+                    .map(|(k, v)| (k.clone(), self.deep_clone(v)))
+                    .collect();
+                Value::Object(self.alloc_object(cloned))
+            }
+            other => other.clone(),
+        }
+    }
 }
