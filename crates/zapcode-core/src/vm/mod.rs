@@ -3993,58 +3993,65 @@ fn set_items(value: &Value, heap: &Heap) -> Vec<Value> {
     }
 }
 
-/// Execute a Set method, returning (result, updated-set-for-write-back).
+/// Execute a Set method. The set object is a heap handle; mutations edit its
+/// internal `__items__` array in place, so changes are visible through aliases.
 fn execute_set_method(
-    map: IndexMap<Arc<str>, Value>,
+    set_handle: Handle,
     method: &str,
     args: &[Value],
-) -> (Option<Value>, Option<IndexMap<Arc<str>, Value>>) {
-    let mut items = set_items(&map);
+    heap: &mut Heap,
+) -> Option<Value> {
+    // The handle of the inner `__items__` array.
+    let items_handle = match heap.object(set_handle).and_then(|m| m.get("__items__")) {
+        Some(Value::Array(ih)) => *ih,
+        _ => return None,
+    };
+    let items = heap.array_vec(items_handle);
     let arg = args.first().cloned().unwrap_or(Value::Undefined);
     match method {
-        "has" => (
-            Some(Value::Bool(items.iter().any(|i| same_value_zero(i, &arg)))),
-            None,
-        ),
+        "has" => Some(Value::Bool(items.iter().any(|i| same_value_zero(i, &arg)))),
         "add" => {
             if !items.iter().any(|i| same_value_zero(i, &arg)) {
-                items.push(arg);
+                if let Some(v) = heap.array_mut(items_handle) {
+                    v.push(arg);
+                }
             }
-            let mut m = map;
-            m.insert(Arc::from("__items__"), Value::Array(items));
-            (Some(Value::Object(m.clone())), Some(m))
+            Some(Value::Object(set_handle))
         }
         "delete" => {
-            let before = items.len();
-            items.retain(|i| !same_value_zero(i, &arg));
-            let removed = items.len() != before;
-            let mut m = map;
-            m.insert(Arc::from("__items__"), Value::Array(items));
-            (Some(Value::Bool(removed)), Some(m))
+            let mut removed = false;
+            if let Some(v) = heap.array_mut(items_handle) {
+                let before = v.len();
+                v.retain(|i| !same_value_zero(i, &arg));
+                removed = v.len() != before;
+            }
+            Some(Value::Bool(removed))
         }
         "clear" => {
-            let mut m = map;
-            m.insert(Arc::from("__items__"), Value::Array(Vec::new()));
-            (Some(Value::Undefined), Some(m))
+            heap.set_array(items_handle, Vec::new());
+            Some(Value::Undefined)
         }
-        "values" | "keys" => (Some(Value::Array(items)), None),
-        _ => (None, None),
+        "values" | "keys" => Some(Value::Array(heap.alloc_array(items))),
+        _ => None,
     }
 }
 
 /// The constructor a class should run: its own, or (for a subclass with no own
 /// constructor) the nearest ancestor's, so args forward to `super`.
-fn find_class_constructor(class_obj: &IndexMap<Arc<str>, Value>) -> Option<Value> {
+fn find_class_constructor(class_obj: &IndexMap<Arc<str>, Value>, heap: &Heap) -> Option<Value> {
     match class_obj.get("__constructor__") {
         Some(Value::Function(c)) => Some(Value::Function(c.clone())),
         _ => match class_obj.get("__super__") {
-            Some(Value::Object(sc)) => find_class_constructor(sc),
+            Some(Value::Object(sc)) => {
+                let parent = heap.object(*sc)?.clone();
+                find_class_constructor(&parent, heap)
+            }
             _ => None,
         },
     }
 }
 
-fn make_error_object(name: &str, message: &str) -> Value {
+fn make_error_object(name: &str, message: &str, heap: &mut Heap) -> Value {
     let mut obj = IndexMap::new();
     obj.insert(Arc::from("__error__"), Value::Bool(true));
     obj.insert(Arc::from("name"), Value::String(Arc::from(name)));
@@ -4053,127 +4060,135 @@ fn make_error_object(name: &str, message: &str) -> Value {
         Arc::from("stack"),
         Value::String(Arc::from(format!("{}: {}", name, message).as_str())),
     );
-    Value::Object(obj)
+    Value::Object(heap.alloc_object(obj))
 }
 
+/// Execute a Map method. The map object is a heap handle; mutations edit its
+/// internal `__entries__` array (and entry objects) in place via the heap, so
+/// changes are visible through every alias (reference semantics).
 fn execute_map_method(
-    mut map: IndexMap<Arc<str>, Value>,
+    map_handle: Handle,
     method: &str,
     args: &[Value],
-) -> (Option<Value>, Option<IndexMap<Arc<str>, Value>>) {
-    let entries = match map.get("__entries__") {
-        Some(Value::Array(entries)) => entries.clone(),
-        _ => Vec::new(),
+    heap: &mut Heap,
+) -> Option<Value> {
+    let entries_handle = match heap.object(map_handle).and_then(|m| m.get("__entries__")) {
+        Some(Value::Array(eh)) => *eh,
+        _ => return None,
     };
+    let entries = heap.array_vec(entries_handle);
     let key = args.first().cloned().unwrap_or(Value::Undefined);
+
+    // Locate the entry-object handle whose "key" matches `key` (SameValueZero).
+    let find_entry = |entries: &[Value], heap: &Heap| -> Option<Handle> {
+        entries.iter().find_map(|entry| match entry {
+            Value::Object(eh)
+                if heap
+                    .object(*eh)
+                    .and_then(|e| e.get("key"))
+                    .is_some_and(|item| same_value_zero(item, &key)) =>
+            {
+                Some(*eh)
+            }
+            _ => None,
+        })
+    };
 
     match method {
         "get" => {
-            let value = entries
-                .iter()
-                .find_map(|entry| match entry {
-                    Value::Object(entry)
-                        if entry.get("key").is_some_and(|item| same_value_zero(item, &key)) =>
-                    {
-                        entry.get("value").cloned()
-                    }
-                    _ => None,
-                })
+            let value = find_entry(&entries, heap)
+                .and_then(|eh| heap.object(eh).and_then(|e| e.get("value").cloned()))
                 .unwrap_or(Value::Undefined);
-            (Some(value), None)
+            Some(value)
         }
-        "has" => {
-            let has_key = entries.iter().any(|entry| match entry {
-                Value::Object(entry) => entry.get("key").is_some_and(|item| same_value_zero(item, &key)),
-                _ => false,
-            });
-            (Some(Value::Bool(has_key)), None)
-        }
+        "has" => Some(Value::Bool(find_entry(&entries, heap).is_some())),
         "set" => {
             let value = args.get(1).cloned().unwrap_or(Value::Undefined);
-            let mut updated_entries = entries;
-            let mut replaced = false;
-            for entry in &mut updated_entries {
-                if let Value::Object(entry) = entry {
-                    if entry.get("key").is_some_and(|item| same_value_zero(item, &key)) {
-                        entry.insert(Arc::from("value"), value.clone());
-                        replaced = true;
-                        break;
-                    }
+            if let Some(eh) = find_entry(&entries, heap) {
+                if let Some(e) = heap.object_mut(eh) {
+                    e.insert(Arc::from("value"), value);
                 }
-            }
-            if !replaced {
+            } else {
                 let mut entry = IndexMap::new();
                 entry.insert(Arc::from("key"), key);
                 entry.insert(Arc::from("value"), value);
-                updated_entries.push(Value::Object(entry));
+                let eh = heap.alloc_object(entry);
+                if let Some(v) = heap.array_mut(entries_handle) {
+                    v.push(Value::Object(eh));
+                }
             }
-            map.insert(Arc::from("__entries__"), Value::Array(updated_entries));
-            (Some(Value::Object(map.clone())), Some(map))
+            Some(Value::Object(map_handle))
         }
         "delete" => {
-            let mut updated_entries = entries;
-            let before = updated_entries.len();
-            updated_entries.retain(|entry| match entry {
-                Value::Object(entry) => !entry.get("key").is_some_and(|item| same_value_zero(item, &key)),
-                _ => true,
-            });
-            let deleted = updated_entries.len() != before;
-            map.insert(Arc::from("__entries__"), Value::Array(updated_entries));
-            (Some(Value::Bool(deleted)), Some(map))
+            let target = find_entry(&entries, heap);
+            let mut deleted = false;
+            if let Some(eh) = target {
+                if let Some(v) = heap.array_mut(entries_handle) {
+                    let before = v.len();
+                    v.retain(|e| !matches!(e, Value::Object(h) if *h == eh));
+                    deleted = v.len() != before;
+                }
+            }
+            Some(Value::Bool(deleted))
         }
         "clear" => {
-            map.insert(Arc::from("__entries__"), Value::Array(Vec::new()));
-            (Some(Value::Undefined), Some(map))
+            heap.set_array(entries_handle, Vec::new());
+            Some(Value::Undefined)
         }
         "keys" => {
-            let keys = entries
+            let keys: Vec<Value> = entries
                 .iter()
                 .filter_map(|e| match e {
-                    Value::Object(e) => e.get("key").cloned(),
+                    Value::Object(eh) => heap.object(*eh).and_then(|m| m.get("key").cloned()),
                     _ => None,
                 })
                 .collect();
-            (Some(Value::Array(keys)), None)
+            Some(Value::Array(heap.alloc_array(keys)))
         }
         "values" => {
-            let vals = entries
+            let vals: Vec<Value> = entries
                 .iter()
                 .filter_map(|e| match e {
-                    Value::Object(e) => e.get("value").cloned(),
+                    Value::Object(eh) => heap.object(*eh).and_then(|m| m.get("value").cloned()),
                     _ => None,
                 })
                 .collect();
-            (Some(Value::Array(vals)), None)
+            Some(Value::Array(heap.alloc_array(vals)))
         }
         "entries" => {
-            let pairs = entries
+            let pairs: Vec<(Value, Value)> = entries
                 .iter()
                 .filter_map(|e| match e {
-                    Value::Object(e) => Some(Value::Array(vec![
-                        e.get("key").cloned().unwrap_or(Value::Undefined),
-                        e.get("value").cloned().unwrap_or(Value::Undefined),
-                    ])),
+                    Value::Object(eh) => heap.object(*eh).map(|m| {
+                        (
+                            m.get("key").cloned().unwrap_or(Value::Undefined),
+                            m.get("value").cloned().unwrap_or(Value::Undefined),
+                        )
+                    }),
                     _ => None,
                 })
                 .collect();
-            (Some(Value::Array(pairs)), None)
+            let out: Vec<Value> = pairs
+                .into_iter()
+                .map(|(k, v)| Value::Array(heap.alloc_array(vec![k, v])))
+                .collect();
+            Some(Value::Array(heap.alloc_array(out)))
         }
-        _ => (None, None),
+        _ => None,
     }
 }
 
-fn make_date_object(millis: i64) -> Value {
+fn make_date_object(millis: i64, heap: &mut Heap) -> Value {
     let mut obj = IndexMap::new();
     obj.insert(Arc::from("__date_ms__"), Value::Int(millis));
-    Value::Object(obj)
+    Value::Object(heap.alloc_object(obj))
 }
 
 /// An Invalid Date (its time value is NaN).
-fn make_invalid_date() -> Value {
+fn make_invalid_date(heap: &mut Heap) -> Value {
     let mut obj = IndexMap::new();
     obj.insert(Arc::from("__date_ms__"), Value::Float(f64::NAN));
-    Value::Object(obj)
+    Value::Object(heap.alloc_object(obj))
 }
 
 /// Build a Date from constructor arguments:
@@ -4181,20 +4196,20 @@ fn make_invalid_date() -> Value {
 /// - one string: parse it (ISO / `YYYY-MM-DD`); invalid -> Invalid Date;
 /// - one number: epoch millis;
 /// - 2+ numbers: `(year, monthIndex, day, hours, minutes, seconds, ms)` in UTC.
-fn construct_date(args: &[Value]) -> Value {
+fn construct_date(args: &[Value], heap: &mut Heap) -> Value {
     match args {
-        [] => make_date_object(0),
+        [] => make_date_object(0, heap),
         [single] => match single {
             Value::String(s) => match parse_date_string(s) {
-                Some(ms) => make_date_object(ms),
-                None => make_invalid_date(),
+                Some(ms) => make_date_object(ms, heap),
+                None => make_invalid_date(heap),
             },
             other => {
                 let n = other.to_number();
                 if n.is_finite() {
-                    make_date_object(n as i64)
+                    make_date_object(n as i64, heap)
                 } else {
-                    make_invalid_date()
+                    make_invalid_date(heap)
                 }
             }
         },
@@ -4215,7 +4230,7 @@ fn construct_date(args: &[Value]) -> Value {
                 + minutes * 60_000
                 + seconds * 1_000
                 + ms;
-            make_date_object(millis)
+            make_date_object(millis, heap)
         }
     }
 }
