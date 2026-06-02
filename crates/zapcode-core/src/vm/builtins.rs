@@ -711,6 +711,20 @@ fn call_json_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
     match method {
         "stringify" => {
             let val = args.first().unwrap_or(&Value::Undefined);
+            // Second arg may be an array replacer (whitelist of keys to keep).
+            let whitelist: Option<Vec<String>> = match args.get(1) {
+                Some(Value::Array(items)) => Some(
+                    items
+                        .iter()
+                        .filter_map(|v| match v {
+                            Value::String(s) => Some(s.to_string()),
+                            Value::Int(n) => Some(n.to_string()),
+                            _ => None,
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            };
             // Third arg `space` enables pretty-printing (number of spaces or a string).
             let indent = match args.get(2) {
                 Some(Value::Int(n)) if *n > 0 => Some(" ".repeat((*n).min(10) as usize)),
@@ -718,11 +732,11 @@ fn call_json_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
                 Some(Value::String(s)) if !s.is_empty() => Some(s.to_string()),
                 _ => None,
             };
-            let json = match indent {
-                Some(unit) => value_to_json_pretty(val, &unit, 0),
-                None => value_to_json(val),
-            };
-            Ok(Some(Value::String(Arc::from(json.as_str()))))
+            match serialize_json(val, whitelist.as_deref(), indent.as_deref(), 0) {
+                // JSON.stringify(undefined) / of a function returns the value undefined.
+                Some(s) => Ok(Some(Value::String(Arc::from(s.as_str())))),
+                None => Ok(Some(Value::Undefined)),
+            }
         }
         "parse" => {
             let s = match args.first() {
@@ -740,66 +754,129 @@ fn call_json_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
     }
 }
 
-fn value_to_json(val: &Value) -> String {
+/// JSON-escape a string, including control characters (`\n`, `\t`, …) which
+/// must not appear raw in valid JSON.
+fn json_escape_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Serialize a value to JSON. Returns `None` for values JSON omits (undefined,
+/// functions) so callers can drop object properties / emit `null` in arrays.
+/// `whitelist` is the array-replacer key filter; `indent` enables pretty output.
+fn serialize_json(
+    val: &Value,
+    whitelist: Option<&[String]>,
+    indent: Option<&str>,
+    depth: usize,
+) -> Option<String> {
     match val {
-        Value::Undefined => "undefined".to_string(),
-        Value::Null => "null".to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Int(n) => n.to_string(),
-        Value::Float(n) => {
-            if n.is_nan() || n.is_infinite() {
-                "null".to_string()
-            } else {
-                n.to_string()
-            }
-        }
-        Value::String(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
-        Value::Array(arr) => {
-            let items: Vec<String> = arr.iter().map(value_to_json).collect();
-            format!("[{}]", items.join(","))
-        }
-        Value::Object(map) => {
-            let pairs: Vec<String> = map
-                .iter()
-                .map(|(k, v)| format!("\"{}\":{}", k, value_to_json(v)))
-                .collect();
-            format!("{{{}}}", pairs.join(","))
-        }
-        Value::Function(_)
+        Value::Undefined
+        | Value::Function(_)
         | Value::BuiltinMethod { .. }
         | Value::Generator(_)
-        | Value::Pending(_) => "undefined".to_string(),
+        | Value::Pending(_) => None,
+        Value::Null => Some("null".to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Int(n) => Some(n.to_string()),
+        Value::Float(n) => Some(if n.is_finite() {
+            format_number(*n)
+        } else {
+            "null".to_string()
+        }),
+        Value::String(s) => Some(json_escape_string(s)),
+        // Date -> ISO string (matches Date.prototype.toJSON).
+        Value::Object(map) if map.contains_key("__date_ms__") => {
+            let ms = map.get("__date_ms__").map(|v| v.to_number() as i64).unwrap_or(0);
+            Some(json_escape_string(&crate::vm::unix_millis_to_iso(ms)))
+        }
+        // Map/Set/RegExp/Error have no enumerable own data properties in JS.
+        Value::Object(map)
+            if map.contains_key("__map__")
+                || map.contains_key("__set__")
+                || map.contains_key("__regexp__")
+                || map.contains_key("__error__") =>
+        {
+            Some("{}".to_string())
+        }
+        Value::Array(arr) => {
+            let items: Vec<String> = arr
+                .iter()
+                .map(|v| serialize_json(v, whitelist, indent, depth + 1).unwrap_or_else(|| "null".to_string()))
+                .collect();
+            Some(join_json_array(&items, indent, depth))
+        }
+        Value::Object(map) => {
+            let pairs: Vec<(String, String)> = map
+                .iter()
+                .filter(|(k, _)| !k.starts_with("__"))
+                .filter(|(k, _)| whitelist.map_or(true, |w| w.iter().any(|x| x == k.as_ref())))
+                .filter_map(|(k, v)| {
+                    serialize_json(v, whitelist, indent, depth + 1).map(|s| (k.to_string(), s))
+                })
+                .collect();
+            Some(join_json_object(&pairs, indent, depth))
+        }
     }
 }
 
-/// Pretty-printing JSON with an indent unit (the `space` arg of JSON.stringify).
-fn value_to_json_pretty(val: &Value, unit: &str, depth: usize) -> String {
-    let pad = unit.repeat(depth + 1);
-    let close_pad = unit.repeat(depth);
-    match val {
-        Value::Array(arr) if !arr.is_empty() => {
-            let items: Vec<String> = arr
+fn join_json_array(items: &[String], indent: Option<&str>, depth: usize) -> String {
+    if items.is_empty() {
+        return "[]".to_string();
+    }
+    match indent {
+        None => format!("[{}]", items.join(",")),
+        Some(unit) => {
+            let pad = unit.repeat(depth + 1);
+            let close = unit.repeat(depth);
+            let body = items
                 .iter()
-                .map(|v| format!("{}{}", pad, value_to_json_pretty(v, unit, depth + 1)))
-                .collect();
-            format!("[\n{}\n{}]", items.join(",\n"), close_pad)
+                .map(|i| format!("{}{}", pad, i))
+                .collect::<Vec<_>>()
+                .join(",\n");
+            format!("[\n{}\n{}]", body, close)
         }
-        Value::Object(map) if !map.is_empty() => {
-            let pairs: Vec<String> = map
+    }
+}
+
+fn join_json_object(pairs: &[(String, String)], indent: Option<&str>, depth: usize) -> String {
+    if pairs.is_empty() {
+        return "{}".to_string();
+    }
+    match indent {
+        None => format!(
+            "{{{}}}",
+            pairs
                 .iter()
-                .map(|(k, v)| {
-                    format!(
-                        "{}\"{}\": {}",
-                        pad,
-                        k,
-                        value_to_json_pretty(v, unit, depth + 1)
-                    )
-                })
-                .collect();
-            format!("{{\n{}\n{}}}", pairs.join(",\n"), close_pad)
+                .map(|(k, v)| format!("{}:{}", json_escape_string(k), v))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Some(unit) => {
+            let pad = unit.repeat(depth + 1);
+            let close = unit.repeat(depth);
+            let body = pairs
+                .iter()
+                .map(|(k, v)| format!("{}{}: {}", pad, json_escape_string(k), v))
+                .collect::<Vec<_>>()
+                .join(",\n");
+            format!("{{\n{}\n{}}}", body, close)
         }
-        // Scalars (and empty containers) render the same as compact JSON.
-        other => value_to_json(other),
     }
 }
 

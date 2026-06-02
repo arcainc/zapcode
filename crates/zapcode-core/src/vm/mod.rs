@@ -4211,7 +4211,7 @@ fn execute_date_method(map: &IndexMap<Arc<str>, Value>, method: &str) -> Option<
     }
 }
 
-fn unix_millis_to_iso(millis: i64) -> String {
+pub(crate) fn unix_millis_to_iso(millis: i64) -> String {
     let seconds = millis.div_euclid(1000);
     let ms = millis.rem_euclid(1000);
     let days = seconds.div_euclid(86_400);
