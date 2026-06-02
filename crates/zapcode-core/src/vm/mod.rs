@@ -2941,7 +2941,8 @@ impl Vm {
                 obj.insert(Arc::from("__promise__"), Value::Bool(true));
                 obj.insert(Arc::from("status"), Value::String(Arc::from("pending_all")));
                 obj.insert(Arc::from("items"), items_arr);
-                self.push(Value::Object(self.heap.alloc_object(obj)))?;
+                let h = self.heap.alloc_object(obj);
+                self.push(Value::Object(h))?;
             }
 
             // Control flow
@@ -3395,7 +3396,8 @@ impl Vm {
                     class_obj.insert(k, v);
                 }
 
-                self.push(Value::Object(self.heap.alloc_object(class_obj)))?;
+                let h = self.heap.alloc_object(class_obj);
+                self.push(Value::Object(h))?;
             }
 
             Instruction::Construct(arg_count) => {
@@ -3658,12 +3660,13 @@ impl Vm {
         if matches!(obj, Value::Null | Value::Undefined) {
             return Err(ZapcodeError::TypeError(format!(
                 "Cannot read properties of {} (reading '{}')",
-                obj.to_js_string(),
+                obj.to_js_string(&self.heap),
                 name
             )));
         }
         match obj {
-            Value::Object(map) => {
+            Value::Object(h) => {
+                let map = self.heap.object_map(*h);
                 // Check if property exists as a real value on the object
                 if let Some(val) = map.get(name) {
                     if !matches!(val, Value::Undefined) {
@@ -3671,16 +3674,13 @@ impl Vm {
                     }
                 }
                 // Check if this is a promise instance — expose .then/.catch/.finally
-                if builtins::is_promise(obj) && is_promise_method(name) {
+                if builtins::is_promise(obj, &self.heap) && is_promise_method(name) {
                     return Ok(builtin_method("__promise__", name));
                 }
-                if is_map_object(obj) {
+                if is_map_object(obj, &self.heap) {
                     if name == "size" {
-                        let n = match obj {
-                            Value::Object(m) => match m.get("__entries__") {
-                                Some(Value::Array(e)) => e.len(),
-                                _ => 0,
-                            },
+                        let n = match map.get("__entries__") {
+                            Some(Value::Array(e)) => self.heap.array(*e).len(),
                             _ => 0,
                         };
                         return Ok(Value::Int(n as i64));
@@ -3689,22 +3689,21 @@ impl Vm {
                         return Ok(builtin_method("__map__", name));
                     }
                 }
-                if is_set_object(obj) {
+                if is_set_object(obj, &self.heap) {
                     if name == "size" {
-                        let n = match obj {
-                            Value::Object(m) => set_items(m).len(),
-                            _ => 0,
-                        };
+                        let n = set_items(obj, &self.heap).len();
                         return Ok(Value::Int(n as i64));
                     }
                     if is_set_method(name) {
                         return Ok(builtin_method("__set__", name));
                     }
                 }
-                if is_date_object(obj) && is_date_method(name) {
+                if is_date_object(obj, &self.heap) && is_date_method(name) {
                     return Ok(builtin_method("__date__", name));
                 }
-                if builtins::regexp_parts(obj).is_some() && matches!(name, "test" | "exec") {
+                if builtins::regexp_parts(obj, &self.heap).is_some()
+                    && matches!(name, "test" | "exec")
+                {
                     return Ok(builtin_method("__regexp__", name));
                 }
                 // Check if this is a known global object — return builtin method handle
@@ -3719,12 +3718,12 @@ impl Vm {
                 }
                 Ok(Value::Undefined)
             }
-            Value::Array(arr) => match name {
-                "length" => Ok(Value::Int(arr.len() as i64)),
+            Value::Array(h) => match name {
+                "length" => Ok(Value::Int(self.heap.array(*h).len() as i64)),
                 _ if is_array_method(name) => Ok(builtin_method("__array__", name)),
                 _ => {
                     if let Ok(idx) = name.parse::<usize>() {
-                        Ok(arr.get(idx).cloned().unwrap_or(Value::Undefined))
+                        Ok(self.heap.array(*h).get(idx).cloned().unwrap_or(Value::Undefined))
                     } else {
                         Ok(Value::Undefined)
                     }
@@ -4384,8 +4383,11 @@ pub(crate) fn parse_date_string(s: &str) -> Option<i64> {
     Some(millis)
 }
 
-fn is_date_object(value: &Value) -> bool {
-    matches!(value, Value::Object(map) if map.contains_key("__date_ms__"))
+fn is_date_object(value: &Value, heap: &Heap) -> bool {
+    match value {
+        Value::Object(h) => heap.object(*h).is_some_and(|m| m.contains_key("__date_ms__")),
+        _ => false,
+    }
 }
 
 fn is_date_method(name: &str) -> bool {
