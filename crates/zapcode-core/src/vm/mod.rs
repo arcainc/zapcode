@@ -467,11 +467,24 @@ impl Vm {
     }
 
     /// The value a `catch` block should bind: the original guest-thrown value if
-    /// this came from `throw`, otherwise the stringified runtime error.
+    /// this came from `throw`, otherwise a real Error object built from the
+    /// runtime error (so `e.name`/`e.message` and `e instanceof Error` work).
     fn caught_error_value(&mut self, err: &ZapcodeError) -> Value {
-        self.pending_throw
-            .take()
-            .unwrap_or_else(|| Value::String(Arc::from(err.to_string().as_str())))
+        if let Some(v) = self.pending_throw.take() {
+            return v;
+        }
+        let (name, message) = match err {
+            ZapcodeError::TypeError(s) => ("TypeError", s.clone()),
+            ZapcodeError::ReferenceError(s) => {
+                ("ReferenceError", format!("{} is not defined", s))
+            }
+            ZapcodeError::UnknownExternalFunction(s) => {
+                ("ReferenceError", format!("{} is not defined", s))
+            }
+            ZapcodeError::RuntimeError(s) | ZapcodeError::ExternalError(s) => ("Error", s.clone()),
+            other => ("Error", other.to_string()),
+        };
+        make_error_object(name, &message)
     }
 
     fn write_receiver_source(&mut self, source: &ReceiverSource, value: Value) {
