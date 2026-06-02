@@ -749,8 +749,8 @@ fn call_json_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<Opt
             let val = args.first().unwrap_or(&Value::Undefined);
             // Second arg may be an array replacer (whitelist of keys to keep).
             let whitelist: Option<Vec<String>> = match args.get(1) {
-                Some(Value::Array(items)) => Some(
-                    items
+                Some(Value::Array(h)) => Some(
+                    heap.array(*h)
                         .iter()
                         .filter_map(|v| match v {
                             Value::String(s) => Some(s.to_string()),
@@ -768,7 +768,7 @@ fn call_json_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<Opt
                 Some(Value::String(s)) if !s.is_empty() => Some(s.to_string()),
                 _ => None,
             };
-            match serialize_json(val, whitelist.as_deref(), indent.as_deref(), 0) {
+            match serialize_json(val, whitelist.as_deref(), indent.as_deref(), 0, heap) {
                 // JSON.stringify(undefined) / of a function returns the value undefined.
                 Some(s) => Ok(Some(Value::String(Arc::from(s.as_str())))),
                 None => Ok(Some(Value::Undefined)),
@@ -783,7 +783,7 @@ fn call_json_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<Opt
                     ))
                 }
             };
-            let val = json_to_value(&s)?;
+            let val = json_to_value(&s, heap)?;
             Ok(Some(val))
         }
         _ => Ok(None),
@@ -820,6 +820,7 @@ fn serialize_json(
     whitelist: Option<&[String]>,
     indent: Option<&str>,
     depth: usize,
+    heap: &Heap,
 ) -> Option<String> {
     match val {
         Value::Undefined
@@ -836,34 +837,38 @@ fn serialize_json(
             "null".to_string()
         }),
         Value::String(s) => Some(json_escape_string(s)),
-        // Date -> ISO string (matches Date.prototype.toJSON).
-        Value::Object(map) if map.contains_key("__date_ms__") => {
-            let ms = map.get("__date_ms__").map(|v| v.to_number() as i64).unwrap_or(0);
-            Some(json_escape_string(&crate::vm::unix_millis_to_iso(ms)))
-        }
-        // Map/Set/RegExp/Error have no enumerable own data properties in JS.
-        Value::Object(map)
-            if map.contains_key("__map__")
-                || map.contains_key("__set__")
-                || map.contains_key("__regexp__")
-                || map.contains_key("__error__") =>
-        {
-            Some("{}".to_string())
-        }
-        Value::Array(arr) => {
-            let items: Vec<String> = arr
+        Value::Array(h) => {
+            let items: Vec<String> = heap
+                .array(*h)
                 .iter()
-                .map(|v| serialize_json(v, whitelist, indent, depth + 1).unwrap_or_else(|| "null".to_string()))
+                .map(|v| {
+                    serialize_json(v, whitelist, indent, depth + 1, heap)
+                        .unwrap_or_else(|| "null".to_string())
+                })
                 .collect();
             Some(join_json_array(&items, indent, depth))
         }
-        Value::Object(map) => {
+        Value::Object(h) => {
+            let map = heap.object(*h)?;
+            // Date -> ISO string (matches Date.prototype.toJSON).
+            if map.contains_key("__date_ms__") {
+                let ms = map.get("__date_ms__").map(|v| v.to_number() as i64).unwrap_or(0);
+                return Some(json_escape_string(&crate::vm::unix_millis_to_iso(ms)));
+            }
+            // Map/Set/RegExp/Error have no enumerable own data properties in JS.
+            if map.contains_key("__map__")
+                || map.contains_key("__set__")
+                || map.contains_key("__regexp__")
+                || map.contains_key("__error__")
+            {
+                return Some("{}".to_string());
+            }
             let pairs: Vec<(String, String)> = map
                 .iter()
                 .filter(|(k, _)| !k.starts_with("__"))
                 .filter(|(k, _)| whitelist.map_or(true, |w| w.iter().any(|x| x == k.as_ref())))
                 .filter_map(|(k, v)| {
-                    serialize_json(v, whitelist, indent, depth + 1).map(|s| (k.to_string(), s))
+                    serialize_json(v, whitelist, indent, depth + 1, heap).map(|s| (k.to_string(), s))
                 })
                 .collect();
             Some(join_json_object(&pairs, indent, depth))
@@ -919,11 +924,11 @@ fn join_json_object(pairs: &[(String, String)], indent: Option<&str>, depth: usi
 /// Maximum nesting depth for JSON parsing to prevent stack overflow.
 const JSON_MAX_DEPTH: usize = 64;
 
-fn json_to_value(s: &str) -> Result<Value> {
-    json_to_value_depth(s, 0)
+fn json_to_value(s: &str, heap: &mut Heap) -> Result<Value> {
+    json_to_value_depth(s, 0, heap)
 }
 
-fn json_to_value_depth(s: &str, depth: usize) -> Result<Value> {
+fn json_to_value_depth(s: &str, depth: usize, heap: &mut Heap) -> Result<Value> {
     if depth > JSON_MAX_DEPTH {
         return Err(ZapcodeError::RuntimeError(
             "JSON nesting depth exceeded (max 64)".to_string(),
@@ -955,30 +960,30 @@ fn json_to_value_depth(s: &str, depth: usize) -> Result<Value> {
         return Ok(Value::Float(n));
     }
     if s.starts_with('[') {
-        return parse_json_array(s, depth);
+        return parse_json_array(s, depth, heap);
     }
     if s.starts_with('{') {
-        return parse_json_object(s, depth);
+        return parse_json_object(s, depth, heap);
     }
     Err(ZapcodeError::RuntimeError(format!("Invalid JSON: {}", s)))
 }
 
-fn parse_json_array(s: &str, depth: usize) -> Result<Value> {
+fn parse_json_array(s: &str, depth: usize, heap: &mut Heap) -> Result<Value> {
     let inner = &s[1..s.len() - 1].trim();
     if inner.is_empty() {
-        return Ok(Value::Array(Vec::new()));
+        return Ok(Value::Array(heap.alloc_array(Vec::new())));
     }
     let mut items = Vec::new();
     for part in split_json_top_level(inner) {
-        items.push(json_to_value_depth(part.trim(), depth + 1)?);
+        items.push(json_to_value_depth(part.trim(), depth + 1, heap)?);
     }
-    Ok(Value::Array(items))
+    Ok(Value::Array(heap.alloc_array(items)))
 }
 
-fn parse_json_object(s: &str, depth: usize) -> Result<Value> {
+fn parse_json_object(s: &str, depth: usize, heap: &mut Heap) -> Result<Value> {
     let inner = &s[1..s.len() - 1].trim();
     if inner.is_empty() {
-        return Ok(Value::Object(IndexMap::new()));
+        return Ok(Value::Object(heap.alloc_object(IndexMap::new())));
     }
     let mut map = IndexMap::new();
     for part in split_json_top_level(inner) {
@@ -991,10 +996,10 @@ fn parse_json_object(s: &str, depth: usize) -> Result<Value> {
             } else {
                 key
             };
-            map.insert(Arc::from(key), json_to_value_depth(val, depth + 1)?);
+            map.insert(Arc::from(key), json_to_value_depth(val, depth + 1, heap)?);
         }
     }
-    Ok(Value::Object(map))
+    Ok(Value::Object(heap.alloc_object(map)))
 }
 
 /// Count consecutive backslashes preceding position `i` in `bytes`.
@@ -1062,7 +1067,8 @@ fn find_json_colon(s: &str) -> Option<usize> {
 
 /// Extract `(pattern, flags)` if `v` is a regex literal object `{__regexp__, …}`.
 pub fn regexp_parts(v: &Value, heap: &Heap) -> Option<(String, String)> {
-    if let Value::Object(map) = v {
+    if let Value::Object(h) = v {
+        let map = heap.object(*h)?;
         if matches!(map.get("__regexp__"), Some(Value::Bool(true))) {
             let pat = match map.get("pattern") {
                 Some(Value::String(s)) => s.to_string(),
