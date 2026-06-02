@@ -902,7 +902,8 @@ impl Vm {
         // Unwrap internal promise values: async callbacks return
         // {__promise__: true, status: "resolved", value: X} or {status: "rejected", ...}.
         // Only unwrap objects with the __promise__ marker to avoid mangling user objects.
-        let callback_result = if let Value::Object(ref map) = callback_result {
+        let callback_result = if let Value::Object(h) = &callback_result {
+            let map = self.heap.object_map(*h);
             if !matches!(map.get("__promise__"), Some(Value::Bool(true))) {
                 // Not an internal promise — leave untouched
                 callback_result
@@ -913,11 +914,12 @@ impl Vm {
                     }
                     Some(Value::String(s)) if s.as_ref() == "rejected" => {
                         let reason = map.get("reason").cloned().unwrap_or(Value::Undefined);
+                        let reason = reason.to_js_string(&self.heap);
                         // Clean up the continuation before returning error
                         self.continuations.pop();
                         return Err(ZapcodeError::RuntimeError(format!(
                             "Unhandled promise rejection: {}",
-                            reason.to_js_string()
+                            reason
                         )));
                     }
                     _ => callback_result,
@@ -1391,7 +1393,8 @@ impl Vm {
         method: &str,
         args: Vec<Value>,
     ) -> Result<Option<Value>> {
-        let (status, value, reason) = if let Value::Object(ref map) = promise {
+        let (status, value, reason) = if let Value::Object(h) = &promise {
+            let map = self.heap.object_map(*h);
             let status = match map.get("status") {
                 Some(Value::String(s)) => s.to_string(),
                 _ => "pending".to_string(),
@@ -1411,7 +1414,7 @@ impl Vm {
                 if status == "resolved" {
                     if matches!(on_fulfilled, Value::Function(_)) {
                         let result = self.call_function_internal(&on_fulfilled, vec![value])?;
-                        Ok(Some(builtins::make_resolved_promise(result)))
+                        Ok(Some(builtins::make_resolved_promise(result, &mut self.heap)))
                     } else {
                         // No callback — pass through the promise
                         Ok(Some(promise))
@@ -1419,7 +1422,7 @@ impl Vm {
                 } else if status == "rejected" {
                     if matches!(on_rejected, Value::Function(_)) {
                         let result = self.call_function_internal(&on_rejected, vec![reason])?;
-                        Ok(Some(builtins::make_resolved_promise(result)))
+                        Ok(Some(builtins::make_resolved_promise(result, &mut self.heap)))
                     } else {
                         // No onRejected — pass through the rejection
                         Ok(Some(promise))
@@ -1433,7 +1436,7 @@ impl Vm {
                     let handler = args.first().cloned().unwrap_or(Value::Undefined);
                     if matches!(handler, Value::Function(_)) {
                         let result = self.call_function_internal(&handler, vec![reason])?;
-                        Ok(Some(builtins::make_resolved_promise(result)))
+                        Ok(Some(builtins::make_resolved_promise(result, &mut self.heap)))
                     } else {
                         Ok(Some(promise))
                     }
@@ -2888,7 +2891,7 @@ impl Vm {
             // increment the re-dispatched instruction performs.
             Instruction::CallSpread => {
                 let items = match self.pop()? {
-                    Value::Array(a) => a,
+                    Value::Array(a) => self.heap.array_vec(a),
                     _ => Vec::new(),
                 };
                 let n = items.len();
@@ -2900,7 +2903,7 @@ impl Vm {
             }
             Instruction::CallExternalSpread(name) => {
                 let items = match self.pop()? {
-                    Value::Array(a) => a,
+                    Value::Array(a) => self.heap.array_vec(a),
                     _ => Vec::new(),
                 };
                 let n = items.len();
@@ -2932,11 +2935,12 @@ impl Vm {
                 }
                 items.reverse();
                 // Mark as a pending-all batch promise; the await resolves it.
+                let items_arr = Value::Array(self.heap.alloc_array(items));
                 let mut obj = IndexMap::new();
                 obj.insert(Arc::from("__promise__"), Value::Bool(true));
                 obj.insert(Arc::from("status"), Value::String(Arc::from("pending_all")));
-                obj.insert(Arc::from("items"), Value::Array(items));
-                self.push(Value::Object(obj))?;
+                obj.insert(Arc::from("items"), items_arr);
+                self.push(Value::Object(self.heap.alloc_object(obj)))?;
             }
 
             // Control flow
@@ -2971,10 +2975,17 @@ impl Vm {
             // Iterators
             Instruction::GetIterator => {
                 let val = self.pop()?;
+                // Build an iterator object `[items_array, index]` from the items.
+                let iter_from_items = |items: Vec<Value>, heap: &mut Heap| -> Value {
+                    let inner = Value::Array(heap.alloc_array(items));
+                    Value::Array(heap.alloc_array(vec![inner, Value::Int(0)]))
+                };
                 match val {
                     Value::Array(arr) => {
-                        // Push an iterator object: [array, index]
-                        let iter_obj = Value::Array(vec![Value::Array(arr), Value::Int(0)]);
+                        // Push an iterator object: [array, index]. Reuse the array
+                        // handle so iteration sees live elements.
+                        let iter_obj =
+                            Value::Array(self.heap.alloc_array(vec![Value::Array(arr), Value::Int(0)]));
                         self.push(iter_obj)?;
                     }
                     Value::String(s) => {
@@ -2982,38 +2993,26 @@ impl Vm {
                             .chars()
                             .map(|c| Value::String(Arc::from(c.to_string().as_str())))
                             .collect();
-                        let iter_obj = Value::Array(vec![Value::Array(chars), Value::Int(0)]);
+                        let iter_obj = iter_from_items(chars, &mut self.heap);
                         self.push(iter_obj)?;
                     }
                     Value::Generator(gen_obj) => {
-                        let iter_obj = Value::Array(vec![
+                        let iter_obj = Value::Array(self.heap.alloc_array(vec![
                             Value::String(Arc::from("__gen__")),
                             Value::Int(gen_obj.id as i64),
                             Value::Bool(false),
-                        ]);
+                        ]));
                         self.push(iter_obj)?;
                     }
                     // Map iterates as [key, value] pairs; Set as its items.
-                    Value::Object(ref m) if is_set_object(&val) => {
-                        let iter_obj =
-                            Value::Array(vec![Value::Array(set_items(m)), Value::Int(0)]);
+                    Value::Object(_) if is_set_object(&val, &self.heap) => {
+                        let items = set_items(&val, &self.heap);
+                        let iter_obj = iter_from_items(items, &mut self.heap);
                         self.push(iter_obj)?;
                     }
-                    Value::Object(ref m) if is_map_object(&val) => {
-                        let pairs: Vec<Value> = match m.get("__entries__") {
-                            Some(Value::Array(entries)) => entries
-                                .iter()
-                                .filter_map(|e| match e {
-                                    Value::Object(e) => Some(Value::Array(vec![
-                                        e.get("key").cloned().unwrap_or(Value::Undefined),
-                                        e.get("value").cloned().unwrap_or(Value::Undefined),
-                                    ])),
-                                    _ => None,
-                                })
-                                .collect(),
-                            _ => Vec::new(),
-                        };
-                        let iter_obj = Value::Array(vec![Value::Array(pairs), Value::Int(0)]);
+                    Value::Object(_) if is_map_object(&val, &self.heap) => {
+                        let pairs = map_entry_pairs(&val, &mut self.heap);
+                        let iter_obj = iter_from_items(pairs, &mut self.heap);
                         self.push(iter_obj)?;
                     }
                     _ => {
@@ -3026,134 +3025,124 @@ impl Vm {
             }
             Instruction::IteratorNext => {
                 let iter = self.pop()?;
+                let items = match &iter {
+                    Value::Array(h) => self.heap.array_vec(*h),
+                    _ => return Err(ZapcodeError::RuntimeError("invalid iterator state".into())),
+                };
                 // Check for generator iterator (3-element sentinel)
-                if let Value::Array(ref items) = iter {
-                    if items.len() == 3 {
-                        if let Value::String(ref s) = items[0] {
-                            if s.as_ref() == "__gen__" {
-                                let gen_id = match &items[1] {
-                                    Value::Int(id) => *id as u64,
-                                    _ => {
-                                        return Err(ZapcodeError::RuntimeError(
-                                            "bad gen iter".into(),
-                                        ))
-                                    }
-                                };
-                                let gen_key = format!("__gen_{}", gen_id);
-                                let gen_obj = if let Some(Value::Generator(g)) =
-                                    self.globals.remove(&gen_key)
-                                {
-                                    g
-                                } else {
-                                    self.push(Value::Array(vec![
-                                        Value::String(Arc::from("__gen__")),
-                                        Value::Int(gen_id as i64),
-                                        Value::Bool(true),
-                                    ]))?;
-                                    self.push(Value::Undefined)?;
-                                    return Ok(None);
-                                };
-                                let result = self.generator_next(gen_obj, Value::Undefined)?;
-                                if let Value::Object(ref obj) = result {
-                                    let done = obj
-                                        .get("done")
-                                        .is_some_and(|v| matches!(v, Value::Bool(true)));
-                                    let value =
-                                        obj.get("value").cloned().unwrap_or(Value::Undefined);
-                                    self.push(Value::Array(vec![
-                                        Value::String(Arc::from("__gen__")),
-                                        Value::Int(gen_id as i64),
-                                        Value::Bool(done),
-                                    ]))?;
-                                    self.push(value)?;
-                                } else {
-                                    self.push(iter)?;
-                                    self.push(Value::Undefined)?;
-                                }
+                if items.len() == 3 {
+                    if let Value::String(s) = &items[0] {
+                        if s.as_ref() == "__gen__" {
+                            let gen_id = match &items[1] {
+                                Value::Int(id) => *id as u64,
+                                _ => return Err(ZapcodeError::RuntimeError("bad gen iter".into())),
+                            };
+                            let gen_key = format!("__gen_{}", gen_id);
+                            let gen_obj = if let Some(Value::Generator(g)) =
+                                self.globals.remove(&gen_key)
+                            {
+                                g
+                            } else {
+                                let done_iter = self.heap.alloc_array(vec![
+                                    Value::String(Arc::from("__gen__")),
+                                    Value::Int(gen_id as i64),
+                                    Value::Bool(true),
+                                ]);
+                                self.push(Value::Array(done_iter))?;
+                                self.push(Value::Undefined)?;
                                 return Ok(None);
+                            };
+                            let result = self.generator_next(gen_obj, Value::Undefined)?;
+                            if let Value::Object(obj_h) = &result {
+                                let obj = self.heap.object_map(*obj_h);
+                                let done = obj
+                                    .get("done")
+                                    .is_some_and(|v| matches!(v, Value::Bool(true)));
+                                let value = obj.get("value").cloned().unwrap_or(Value::Undefined);
+                                let new_iter = self.heap.alloc_array(vec![
+                                    Value::String(Arc::from("__gen__")),
+                                    Value::Int(gen_id as i64),
+                                    Value::Bool(done),
+                                ]);
+                                self.push(Value::Array(new_iter))?;
+                                self.push(value)?;
+                            } else {
+                                self.push(iter)?;
+                                self.push(Value::Undefined)?;
                             }
+                            return Ok(None);
                         }
                     }
                 }
-                match iter {
-                    Value::Array(ref items) if items.len() == 2 => {
-                        let arr = match &items[0] {
-                            Value::Array(a) => a,
-                            _ => return Err(ZapcodeError::RuntimeError("invalid iterator".into())),
-                        };
-                        let idx = match &items[1] {
-                            Value::Int(i) => *i as usize,
-                            _ => return Err(ZapcodeError::RuntimeError("invalid iterator".into())),
-                        };
-                        if idx < arr.len() {
-                            let value = arr[idx].clone();
-                            // Update iterator
-                            let new_iter =
-                                Value::Array(vec![items[0].clone(), Value::Int((idx + 1) as i64)]);
-                            // Push updated iterator back, then the value
-                            self.push(new_iter)?;
-                            self.push(value)?;
-                        } else {
-                            // Done — increment index past the end so IteratorDone sees idx > len
-                            let new_iter =
-                                Value::Array(vec![items[0].clone(), Value::Int((idx + 1) as i64)]);
-                            self.push(new_iter)?;
-                            self.push(Value::Undefined)?;
-                        }
-                    }
-                    _ => {
-                        return Err(ZapcodeError::RuntimeError("invalid iterator state".into()));
-                    }
+                if items.len() == 2 {
+                    let inner = match &items[0] {
+                        Value::Array(a) => *a,
+                        _ => return Err(ZapcodeError::RuntimeError("invalid iterator".into())),
+                    };
+                    let idx = match &items[1] {
+                        Value::Int(i) => *i as usize,
+                        _ => return Err(ZapcodeError::RuntimeError("invalid iterator".into())),
+                    };
+                    let value = self.heap.array(inner).get(idx).cloned();
+                    // Update iterator: same inner array handle, advanced index.
+                    let new_iter = self
+                        .heap
+                        .alloc_array(vec![Value::Array(inner), Value::Int((idx + 1) as i64)]);
+                    self.push(Value::Array(new_iter))?;
+                    self.push(value.unwrap_or(Value::Undefined))?;
+                } else {
+                    return Err(ZapcodeError::RuntimeError("invalid iterator state".into()));
                 }
             }
             Instruction::IteratorDone => {
                 let value = self.pop()?;
-                let iter = self.peek()?;
-                // Check for generator iterator first
-                if let Value::Array(items) = iter {
-                    if items.len() == 3 {
-                        if let Value::String(ref s) = items[0] {
-                            if s.as_ref() == "__gen__" {
-                                let done = matches!(&items[2], Value::Bool(true));
-                                if !done {
-                                    self.push(value)?;
-                                }
-                                self.push(Value::Bool(done))?;
-                                return Ok(None);
-                            }
-                        }
-                    }
-                }
-                let iter = self.peek()?;
-                match iter {
-                    Value::Array(items) if items.len() == 2 => {
-                        let arr = match &items[0] {
-                            Value::Array(a) => a,
-                            _ => {
-                                self.push(value)?;
-                                self.push(Value::Bool(true))?;
-                                return Ok(None);
-                            }
-                        };
-                        let idx = match &items[1] {
-                            Value::Int(i) => *i as usize,
-                            _ => {
-                                self.push(value)?;
-                                self.push(Value::Bool(true))?;
-                                return Ok(None);
-                            }
-                        };
-                        let done = idx > arr.len();
-                        if !done {
-                            // Push value back for the binding
-                            self.push(value)?;
-                        }
-                        self.push(Value::Bool(done))?;
-                    }
+                let items = match self.peek()? {
+                    Value::Array(h) => self.heap.array_vec(*h),
                     _ => {
                         self.push(value)?;
                         self.push(Value::Bool(true))?;
+                        return Ok(None);
                     }
+                };
+                // Check for generator iterator first
+                if items.len() == 3 {
+                    if let Value::String(s) = &items[0] {
+                        if s.as_ref() == "__gen__" {
+                            let done = matches!(&items[2], Value::Bool(true));
+                            if !done {
+                                self.push(value)?;
+                            }
+                            self.push(Value::Bool(done))?;
+                            return Ok(None);
+                        }
+                    }
+                }
+                if items.len() == 2 {
+                    let inner = match &items[0] {
+                        Value::Array(a) => *a,
+                        _ => {
+                            self.push(value)?;
+                            self.push(Value::Bool(true))?;
+                            return Ok(None);
+                        }
+                    };
+                    let idx = match &items[1] {
+                        Value::Int(i) => *i as usize,
+                        _ => {
+                            self.push(value)?;
+                            self.push(Value::Bool(true))?;
+                            return Ok(None);
+                        }
+                    };
+                    let done = idx > self.heap.array(inner).len();
+                    if !done {
+                        // Push value back for the binding
+                        self.push(value)?;
+                    }
+                    self.push(Value::Bool(done))?;
+                } else {
+                    self.push(value)?;
+                    self.push(Value::Bool(true))?;
                 }
             }
 
