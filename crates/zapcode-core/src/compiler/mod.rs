@@ -796,6 +796,88 @@ impl Compiler {
         Ok(())
     }
 
+    /// Compile a complete optional chain (`a?.b.c`, `x?.f()`, `arr?.[i]`, …).
+    /// Every link is evaluated left-to-right; an optional link that sees a
+    /// nullish receiver jumps to a single landing that yields `undefined`,
+    /// skipping all remaining links (later non-optional accesses and calls).
+    fn compile_optional_chain(&mut self, top: &Expr) -> Result<()> {
+        let mut short_circuits: Vec<usize> = Vec::new();
+        self.compile_chain_link(top, &mut short_circuits)?;
+        let done = self.emit(Instruction::Jump(0));
+        // Short-circuit landing: the guard left [.., obj, obj] on the stack
+        // (Dup + peeked-nullish), so drop both and yield undefined.
+        let sc_target = self.current_offset();
+        for j in &short_circuits {
+            self.patch_jump(*j, sc_target);
+        }
+        self.emit(Instruction::Pop);
+        self.emit(Instruction::Pop);
+        self.emit(Instruction::Push(Constant::Undefined));
+        let end = self.current_offset();
+        self.patch_jump(done, end);
+        Ok(())
+    }
+
+    /// Compile one link of an optional chain, recursing into its object/callee
+    /// first. A non-chain head is compiled normally. Each link keeps exactly one
+    /// value on the stack; an optional link guards its receiver and records a
+    /// short-circuit jump (taken with `[.., obj, obj]` on the stack).
+    fn compile_chain_link(&mut self, expr: &Expr, sc: &mut Vec<usize>) -> Result<()> {
+        match expr {
+            Expr::Member {
+                object,
+                property,
+                optional,
+            } => {
+                self.compile_chain_link(object, sc)?;
+                if *optional {
+                    self.emit(Instruction::Dup);
+                    sc.push(self.emit(Instruction::JumpIfNullish(0)));
+                    self.emit(Instruction::Pop);
+                }
+                self.emit(Instruction::GetProperty(property.clone()));
+            }
+            Expr::ComputedMember {
+                object,
+                property,
+                optional,
+            } => {
+                self.compile_chain_link(object, sc)?;
+                if *optional {
+                    self.emit(Instruction::Dup);
+                    sc.push(self.emit(Instruction::JumpIfNullish(0)));
+                    self.emit(Instruction::Pop);
+                }
+                self.compile_expr(property)?;
+                self.emit(Instruction::GetIndex);
+            }
+            Expr::Call {
+                callee,
+                args,
+                optional,
+            } => {
+                self.compile_chain_link(callee, sc)?;
+                if *optional {
+                    self.emit(Instruction::Dup);
+                    sc.push(self.emit(Instruction::JumpIfNullish(0)));
+                    self.emit(Instruction::Pop);
+                }
+                if args.iter().any(|a| matches!(a, Expr::Spread(_))) {
+                    self.compile_spread_args(args)?;
+                    self.emit(Instruction::CallSpread);
+                } else {
+                    for arg in args {
+                        self.compile_expr(arg)?;
+                    }
+                    self.emit(Instruction::Call(args.len()));
+                }
+            }
+            // The head of the chain (e.g. an identifier) — compile normally.
+            other => self.compile_expr(other)?,
+        }
+        Ok(())
+    }
+
     /// Emit the closure creation + name binding for a function declaration.
     fn emit_function_decl_binding(
         &mut self,
@@ -1450,6 +1532,12 @@ impl Compiler {
                 property,
                 optional,
             } => {
+                // An optional chain short-circuits the *whole* chain (incl. later
+                // non-optional accesses/calls) to undefined when a `?.` link is
+                // nullish, so it's compiled as a unit.
+                if expr_is_optional_chain(expr) {
+                    return self.compile_optional_chain(expr);
+                }
                 self.compile_expr(object)?;
                 if *optional {
                     self.emit(Instruction::Dup);
@@ -1473,6 +1561,9 @@ impl Compiler {
                 property,
                 optional,
             } => {
+                if expr_is_optional_chain(expr) {
+                    return self.compile_optional_chain(expr);
+                }
                 self.compile_expr(object)?;
                 if *optional {
                     self.emit(Instruction::Dup);
@@ -1494,6 +1585,9 @@ impl Compiler {
                 }
             }
             Expr::Call { callee, args, .. } => {
+                if expr_is_optional_chain(expr) {
+                    return self.compile_optional_chain(expr);
+                }
                 // Check for `Promise.all([ ...direct external calls... ])` — when
                 // any element is a direct external call, compile the elements as
                 // deferred calls so the host can run them in parallel.
@@ -1789,6 +1883,23 @@ fn is_place_expr(expr: &Expr) -> bool {
         expr,
         Expr::Ident(_) | Expr::Member { .. } | Expr::ComputedMember { .. }
     )
+}
+
+/// Whether an expression's access/call spine contains an optional (`?.`) link,
+/// i.e. it is the top of an optional chain and must short-circuit as a whole.
+fn expr_is_optional_chain(expr: &Expr) -> bool {
+    match expr {
+        Expr::Member {
+            object, optional, ..
+        }
+        | Expr::ComputedMember {
+            object, optional, ..
+        } => *optional || expr_is_optional_chain(object),
+        Expr::Call {
+            callee, optional, ..
+        } => *optional || expr_is_optional_chain(callee),
+        _ => false,
+    }
 }
 
 pub fn compile(program: &Program) -> Result<CompiledProgram> {
