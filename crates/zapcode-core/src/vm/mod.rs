@@ -2399,7 +2399,8 @@ impl Vm {
                             "Error" => {
                                 matches!(&left, Value::Object(i) if i.contains_key("__error__"))
                             }
-                            "TypeError" | "RangeError" | "SyntaxError" | "ReferenceError" => {
+                            "TypeError" | "RangeError" | "SyntaxError" | "ReferenceError"
+                            | "AggregateError" => {
                                 matches!(&left, Value::Object(i)
                                     if i.get("name")
                                         == Some(&Value::String(Arc::from(ctor.as_ref()))))
@@ -3384,6 +3385,18 @@ impl Vm {
                                 let msg =
                                     args.first().map(|v| v.to_js_string()).unwrap_or_default();
                                 self.push(make_error_object(name.as_ref(), &msg))?;
+                                return Ok(None);
+                            }
+                            "AggregateError" => {
+                                // new AggregateError(errors, message)
+                                let errors =
+                                    args.first().cloned().unwrap_or(Value::Array(Vec::new()));
+                                let msg = args.get(1).map(|v| v.to_js_string()).unwrap_or_default();
+                                let mut e = make_error_object("AggregateError", &msg);
+                                if let Value::Object(ref mut m) = e {
+                                    m.insert(Arc::from("errors"), errors);
+                                }
+                                self.push(e)?;
                                 return Ok(None);
                             }
                             "Array" => {

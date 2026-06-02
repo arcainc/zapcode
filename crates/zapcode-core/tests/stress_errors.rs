@@ -42,3 +42,12 @@ fn guest_thrown_values_still_passthrough() {
     assert_eq!(run_str("let e2; try { throw 42; } catch (e) { e2 = e; } e2"), "42");
     assert_eq!(run_str("let m; try { throw new Error('x'); } catch (e) { m = e.message; } m"), "x");
 }
+
+#[test]
+fn aggregate_error() {
+    assert_eq!(run_str("const e = new AggregateError([1,2], 'all failed'); e.name"), "AggregateError");
+    assert_eq!(run_str("const e = new AggregateError([1,2], 'all failed'); e.message"), "all failed");
+    assert_eq!(run_str("const e = new AggregateError([1,2], 'x'); e.errors.length"), "2");
+    assert_eq!(run_str("const e = new AggregateError([], 'x'); e instanceof Error"), "true");
+    assert_eq!(run_str("const e = new AggregateError([], 'x'); e instanceof AggregateError"), "true");
+}

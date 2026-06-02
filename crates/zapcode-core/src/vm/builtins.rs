@@ -37,6 +37,7 @@ pub fn register_globals(globals: &mut HashMap<String, Value>) {
         "RangeError",
         "SyntaxError",
         "ReferenceError",
+        "AggregateError",
     ] {
         globals.insert(err.to_string(), builtin_constructor(err));
     }
