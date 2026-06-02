@@ -359,7 +359,7 @@ impl Vm {
                 self.execute()
             }
             // No handler — the failure is the program's failure.
-            None => Err(ZapcodeError::ExternalError(error.to_js_string())),
+            None => Err(ZapcodeError::ExternalError(error.to_js_string(&self.heap))),
         }
     }
 
@@ -388,7 +388,8 @@ impl Vm {
         // Drop the now-resolved pending calls.
         let resolved_ids: HashSet<u64> = batch.call_ids.iter().copied().collect();
         self.pending_calls.retain(|c| !resolved_ids.contains(&c.id));
-        self.push(Value::Array(array))?;
+        let h = self.heap.alloc_array(array);
+        self.push(Value::Array(h))?;
         self.execute()
     }
 
@@ -406,19 +407,23 @@ impl Vm {
                     })?;
                     array.push(value);
                 }
-                Value::Object(ref map) if builtins::is_promise(&item) => match map.get("status") {
-                    Some(Value::String(s)) if s.as_ref() == "resolved" => {
-                        array.push(map.get("value").cloned().unwrap_or(Value::Undefined));
+                Value::Object(h) if builtins::is_promise(&item, &self.heap) => {
+                    let map = self.heap.object_map(h);
+                    match map.get("status") {
+                        Some(Value::String(s)) if s.as_ref() == "resolved" => {
+                            array.push(map.get("value").cloned().unwrap_or(Value::Undefined));
+                        }
+                        Some(Value::String(s)) if s.as_ref() == "rejected" => {
+                            let reason = map.get("reason").cloned().unwrap_or(Value::Undefined);
+                            let reason = reason.to_js_string(&self.heap);
+                            return Err(ZapcodeError::RuntimeError(format!(
+                                "Unhandled promise rejection: {}",
+                                reason
+                            )));
+                        }
+                        _ => array.push(item),
                     }
-                    Some(Value::String(s)) if s.as_ref() == "rejected" => {
-                        let reason = map.get("reason").cloned().unwrap_or(Value::Undefined);
-                        return Err(ZapcodeError::RuntimeError(format!(
-                            "Unhandled promise rejection: {}",
-                            reason.to_js_string()
-                        )));
-                    }
-                    _ => array.push(item),
-                },
+                }
                 other => array.push(other),
             }
         }
@@ -440,7 +445,8 @@ impl Vm {
 
         if call_ids.is_empty() {
             let array = self.build_batch_array(items)?;
-            self.push(Value::Array(array))?;
+            let h = self.heap.alloc_array(array);
+            self.push(Value::Array(h))?;
             return Ok(None);
         }
 
@@ -494,7 +500,7 @@ impl Vm {
             ZapcodeError::RuntimeError(s) | ZapcodeError::ExternalError(s) => ("Error", s.clone()),
             other => ("Error", other.to_string()),
         };
-        make_error_object(name, &message)
+        make_error_object(name, &message, &mut self.heap)
     }
 
     fn write_receiver_source(&mut self, source: &ReceiverSource, value: Value) {
@@ -510,75 +516,6 @@ impl Vm {
                     *slot_ref = value;
                 }
             }
-        }
-    }
-
-    /// Read the root variable of a [`Place`].
-    fn read_place_root(&self, root: &PlaceRoot) -> Option<Value> {
-        match root {
-            PlaceRoot::Global(name) => self.globals.get(name).cloned(),
-            PlaceRoot::Local { frame_index, slot } => {
-                if self.frames.get(*frame_index).is_some() {
-                    Some(self.read_local(*frame_index, *slot))
-                } else {
-                    None
-                }
-            }
-            PlaceRoot::Cell(id) => self.cells.get(*id as usize).cloned(),
-            PlaceRoot::This => self.frames.iter().rev().find_map(|f| f.this_value.clone()),
-        }
-    }
-
-    fn write_place_root(&mut self, root: &PlaceRoot, value: Value) {
-        let source = match root {
-            PlaceRoot::Global(name) => ReceiverSource::Global(name.clone()),
-            PlaceRoot::Local { frame_index, slot } => ReceiverSource::Local {
-                frame_index: *frame_index,
-                slot: *slot,
-            },
-            PlaceRoot::Cell(id) => ReceiverSource::Cell(*id),
-            PlaceRoot::This => {
-                // Update the nearest enclosing `this`; the method-return path then
-                // persists it to the original receiver.
-                for frame in self.frames.iter_mut().rev() {
-                    if frame.this_value.is_some() {
-                        frame.this_value = Some(value);
-                        break;
-                    }
-                }
-                return;
-            }
-        };
-        self.write_receiver_source(&source, value);
-    }
-
-    /// Persist a mutated receiver back to its place: the root variable, navigated
-    /// through the property/index path. Handles nested `obj.items.push(...)`.
-    /// Read the current value at a place, if it resolves. Used to confirm a
-    /// mutating method's receiver is still the live lvalue before writing back.
-    fn read_place(&self, place: &Place) -> Option<Value> {
-        let root = self.read_place_root(&place.root)?;
-        let mut cur = &root;
-        for seg in &place.path {
-            cur = match (cur, seg) {
-                (Value::Object(m), PlaceSeg::Prop(k)) => m.get(k.as_str())?,
-                (Value::Array(a), PlaceSeg::Index(i)) => a.get(*i)?,
-                _ => return None,
-            };
-        }
-        Some(cur.clone())
-    }
-
-    fn write_place(&mut self, place: &Place, value: Value) {
-        if place.path.is_empty() {
-            self.write_place_root(&place.root, value);
-            return;
-        }
-        let Some(mut root_val) = self.read_place_root(&place.root) else {
-            return;
-        };
-        if set_in_place(&mut root_val, &place.path, value) {
-            self.write_place_root(&place.root, root_val);
         }
     }
 
@@ -3759,49 +3696,6 @@ fn extract_object_fields(fields: &[DestructureField], value: &Value, out: &mut V
 
 /// Navigate `path` within `target` and store `value` at the leaf. Returns whether
 /// the write succeeded (false if the path doesn't resolve).
-fn set_in_place(target: &mut Value, path: &[PlaceSeg], value: Value) -> bool {
-    let Some((last, prefix)) = path.split_last() else {
-        return false;
-    };
-    let mut cur = target;
-    for seg in prefix {
-        cur = match nav_mut(cur, seg) {
-            Some(c) => c,
-            None => return false,
-        };
-    }
-    set_seg(cur, last, value)
-}
-
-fn nav_mut<'a>(v: &'a mut Value, seg: &PlaceSeg) -> Option<&'a mut Value> {
-    match (v, seg) {
-        (Value::Object(map), PlaceSeg::Prop(k)) => map.get_mut(k.as_str()),
-        (Value::Array(arr), PlaceSeg::Index(i)) => arr.get_mut(*i),
-        _ => None,
-    }
-}
-
-fn set_seg(v: &mut Value, seg: &PlaceSeg, value: Value) -> bool {
-    match (v, seg) {
-        (Value::Object(map), PlaceSeg::Prop(k)) => {
-            map.insert(Arc::from(k.as_str()), value);
-            true
-        }
-        (Value::Array(arr), PlaceSeg::Index(i)) => {
-            if *i < arr.len() {
-                arr[*i] = value;
-                true
-            } else if *i == arr.len() {
-                arr.push(value);
-                true
-            } else {
-                false
-            }
-        }
-        _ => false,
-    }
-}
-
 fn normalize_array_index(idx: i64, len: i64) -> usize {
     if idx < 0 {
         (len + idx).max(0) as usize
