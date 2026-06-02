@@ -1808,6 +1808,20 @@ impl Vm {
                         s.push_str(b);
                         Value::String(Arc::from(s.as_str()))
                     }
+                    // JS `+`: if either operand ToPrimitives to a string (arrays,
+                    // plain objects), the whole expression is string concatenation
+                    // (e.g. `[1,2]+[3]` -> "1,23", `[]+{}` -> "[object Object]").
+                    _ if coerces_to_string_in_add(&left) || coerces_to_string_in_add(&right) => {
+                        let lhs = left.to_js_string();
+                        let rhs = right.to_js_string();
+                        let new_len = lhs.len().saturating_add(rhs.len());
+                        if new_len > 10_000_000 {
+                            return Err(ZapcodeError::AllocationLimitExceeded);
+                        }
+                        let mut s = lhs;
+                        s.push_str(&rhs);
+                        Value::String(Arc::from(s.as_str()))
+                    }
                     _ => Value::Float(left.to_number() + right.to_number()),
                 };
                 self.push(result)?;
@@ -1867,49 +1881,47 @@ impl Vm {
             }
             Instruction::BitNot => {
                 let val = self.pop()?;
-                let n = val.to_number() as i32;
+                let n = js_to_int32(val.to_number());
                 self.push(Value::Int(!n as i64))?;
             }
             Instruction::BitAnd => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                let result = (left.to_number() as i32) & (right.to_number() as i32);
+                let result = js_to_int32(left.to_number()) & js_to_int32(right.to_number());
                 self.push(Value::Int(result as i64))?;
             }
             Instruction::BitOr => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                let result = (left.to_number() as i32) | (right.to_number() as i32);
+                let result = js_to_int32(left.to_number()) | js_to_int32(right.to_number());
                 self.push(Value::Int(result as i64))?;
             }
             Instruction::BitXor => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                let result = (left.to_number() as i32) ^ (right.to_number() as i32);
+                let result = js_to_int32(left.to_number()) ^ js_to_int32(right.to_number());
                 self.push(Value::Int(result as i64))?;
             }
             Instruction::Shl => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                let shift = (right.to_number() as u32) & 0x1f;
-                let result = (left.to_number() as i32) << shift;
+                let shift = js_to_uint32(right.to_number()) & 0x1f;
+                let result = js_to_int32(left.to_number()).wrapping_shl(shift);
                 self.push(Value::Int(result as i64))?;
             }
             Instruction::Shr => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                let shift = (right.to_number() as u32) & 0x1f;
-                let result = (left.to_number() as i32) >> shift;
+                let shift = js_to_uint32(right.to_number()) & 0x1f;
+                let result = js_to_int32(left.to_number()).wrapping_shr(shift);
                 self.push(Value::Int(result as i64))?;
             }
             Instruction::Ushr => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                let shift = (right.to_number() as u32) & 0x1f;
-                // ToUint32: cast through i64 so negative operands wrap (JS
-                // semantics) rather than saturating to 0 as a direct f64->u32
-                // cast would (e.g. -1 >>> 0 === 4294967295).
-                let result = (left.to_number() as i64 as u32) >> shift;
+                let shift = js_to_uint32(right.to_number()) & 0x1f;
+                // ToUint32 semantics: negative operands wrap (e.g. -1 >>> 0 === 4294967295).
+                let result = js_to_uint32(left.to_number()).wrapping_shr(shift);
                 self.push(Value::Int(result as i64))?;
             }
 
@@ -1937,22 +1949,23 @@ impl Vm {
             Instruction::Lt => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                self.push(Value::Bool(left.to_number() < right.to_number()))?;
+                self.push(Value::Bool(js_less_than(&left, &right)))?;
             }
             Instruction::Lte => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                self.push(Value::Bool(left.to_number() <= right.to_number()))?;
+                // a <= b  <=>  !(b < a), but NaN must make it false either way.
+                self.push(Value::Bool(js_less_than_or_equal(&left, &right)))?;
             }
             Instruction::Gt => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                self.push(Value::Bool(left.to_number() > right.to_number()))?;
+                self.push(Value::Bool(js_less_than(&right, &left)))?;
             }
             Instruction::Gte => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                self.push(Value::Bool(left.to_number() >= right.to_number()))?;
+                self.push(Value::Bool(js_less_than_or_equal(&right, &left)))?;
             }
 
             // Logical
@@ -3775,6 +3788,62 @@ fn normalize_array_index(idx: i64, len: i64) -> usize {
     } else {
         (idx as usize).min(len as usize)
     }
+}
+
+/// JS `ToInt32`: truncate, take modulo 2^32, then interpret as a signed 32-bit
+/// integer. A plain `f64 as i32` cast in Rust *saturates* at i32::MIN/MAX, which
+/// is wrong for operands >= 2^31 (e.g. `4294967296 | 0` must be 0, not i32::MAX).
+fn js_to_int32(n: f64) -> i32 {
+    if !n.is_finite() || n == 0.0 {
+        return 0;
+    }
+    let m = n.trunc().rem_euclid(4_294_967_296.0); // [0, 2^32)
+    if m >= 2_147_483_648.0 {
+        (m - 4_294_967_296.0) as i32
+    } else {
+        m as i32
+    }
+}
+
+/// JS `ToUint32`: like [`js_to_int32`] but the result is an unsigned 32-bit value.
+fn js_to_uint32(n: f64) -> u32 {
+    if !n.is_finite() || n == 0.0 {
+        return 0;
+    }
+    n.trunc().rem_euclid(4_294_967_296.0) as u32
+}
+
+/// JS abstract relational comparison `left < right`. When both operands are
+/// strings the comparison is lexicographic; otherwise it is numeric (NaN
+/// operands make the result false, as `f64` ordering already does).
+fn js_less_than(left: &Value, right: &Value) -> bool {
+    if let (Value::String(a), Value::String(b)) = (left, right) {
+        return a.as_ref() < b.as_ref();
+    }
+    left.to_number() < right.to_number()
+}
+
+/// JS `left <= right` (lexicographic for two strings, numeric otherwise).
+fn js_less_than_or_equal(left: &Value, right: &Value) -> bool {
+    if let (Value::String(a), Value::String(b)) = (left, right) {
+        return a.as_ref() <= b.as_ref();
+    }
+    left.to_number() <= right.to_number()
+}
+
+/// True for reference values that coerce to a string in JS `+` (their
+/// `ToPrimitive` with a default hint yields a string for the built-in cases:
+/// arrays join, plain objects become `[object Object]`).
+fn coerces_to_string_in_add(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::Array(_)
+            | Value::Object(_)
+            | Value::Function(_)
+            | Value::BuiltinMethod { .. }
+            | Value::Generator(_)
+            | Value::Pending(_)
+    )
 }
 
 fn make_map_object(entries: Vec<Value>) -> Value {

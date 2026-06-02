@@ -1172,7 +1172,14 @@ fn call_array_method(
             } else {
                 arg_str(args, 0)
             };
-            let joined: Vec<String> = arr.iter().map(|v| v.to_js_string()).collect();
+            // JS Array.prototype.join renders null/undefined (and holes) as "".
+            let joined: Vec<String> = arr
+                .iter()
+                .map(|v| match v {
+                    Value::Null | Value::Undefined => String::new(),
+                    _ => v.to_js_string(),
+                })
+                .collect();
             Value::String(Arc::from(joined.join(&sep).as_str()))
         }
         "slice" => {

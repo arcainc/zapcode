@@ -153,17 +153,44 @@ impl Value {
             Value::Bool(false) => 0.0,
             Value::Int(n) => *n as f64,
             Value::Float(n) => *n,
-            Value::String(s) => {
-                // JS: empty / whitespace-only string coerces to 0, not NaN.
-                let t = s.trim();
-                if t.is_empty() {
-                    0.0
-                } else {
-                    t.parse::<f64>().unwrap_or(f64::NAN)
-                }
-            }
+            Value::String(s) => Self::parse_number_str(s),
+            // JS ToNumber(array) = ToNumber(ToPrimitive(array)) = ToNumber(array.toString()):
+            // [] -> "" -> 0, [5] -> "5" -> 5, [1,2] -> "1,2" -> NaN.
+            Value::Array(_) => Self::parse_number_str(&self.to_js_string()),
             _ => f64::NAN,
         }
+    }
+
+    /// JS string-to-number coercion (`Number("...")`), supporting the numeric
+    /// forms Node accepts: empty/whitespace -> 0, decimal/float, hex `0x`,
+    /// binary `0b`, octal `0o`, and `Infinity`. Anything else -> NaN.
+    fn parse_number_str(s: &str) -> f64 {
+        let t = s.trim();
+        if t.is_empty() {
+            return 0.0;
+        }
+        match t {
+            "Infinity" | "+Infinity" => return f64::INFINITY,
+            "-Infinity" => return f64::NEG_INFINITY,
+            _ => {}
+        }
+        // Radix prefixes (no sign allowed by spec for these forms).
+        let radix = if let Some(rest) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+            Some((rest, 16))
+        } else if let Some(rest) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
+            Some((rest, 2))
+        } else if let Some(rest) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
+            Some((rest, 8))
+        } else {
+            None
+        };
+        if let Some((digits, base)) = radix {
+            return match u64::from_str_radix(digits, base) {
+                Ok(n) => n as f64,
+                Err(_) => f64::NAN,
+            };
+        }
+        t.parse::<f64>().unwrap_or(f64::NAN)
     }
 
     pub fn to_js_string(&self) -> String {
@@ -188,7 +215,15 @@ impl Value {
             }
             Value::String(s) => s.to_string(),
             Value::Array(arr) => {
-                let items: Vec<String> = arr.iter().map(|v| v.to_js_string()).collect();
+                // JS Array.prototype.toString renders null/undefined (and holes)
+                // as the empty string, not the literal "null"/"undefined".
+                let items: Vec<String> = arr
+                    .iter()
+                    .map(|v| match v {
+                        Value::Null | Value::Undefined => String::new(),
+                        _ => v.to_js_string(),
+                    })
+                    .collect();
                 items.join(",")
             }
             Value::Object(map) => {
