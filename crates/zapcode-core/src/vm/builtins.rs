@@ -1394,6 +1394,40 @@ fn call_string_method(
 
 // ── Array methods ────────────────────────────────────────────────────
 
+/// Resolve an optional `fromIndex` argument (as used by indexOf/includes) into
+/// a non-negative start offset. Negative values count from the end.
+fn array_from_index(arg: Option<&Value>, len: usize) -> usize {
+    match arg {
+        None | Some(Value::Undefined) => 0,
+        Some(v) => {
+            let n = v.to_number();
+            if n < 0.0 {
+                (len as i64 + n as i64).max(0) as usize
+            } else {
+                (n as usize).min(len)
+            }
+        }
+    }
+}
+
+/// SameValueZero comparison: like `===` but `NaN` equals `NaN`.
+fn same_value_zero(a: &Value, b: &Value) -> bool {
+    if a.strict_eq(b) {
+        return true;
+    }
+    matches!((a, b), (Value::Float(x), Value::Float(y)) if x.is_nan() && y.is_nan())
+}
+
+/// Recursive helper for `Array.prototype.flat(depth)`.
+fn flatten_into(arr: &[Value], depth: i64, out: &mut Vec<Value>) {
+    for item in arr {
+        match item {
+            Value::Array(inner) if depth > 0 => flatten_into(inner, depth - 1, out),
+            other => out.push(other.clone()),
+        }
+    }
+}
+
 fn call_array_method(
     arr: &[Value],
     method: &str,
@@ -1404,7 +1438,13 @@ fn call_array_method(
         "length" => Value::Int(arr.len() as i64),
         "indexOf" => {
             let search = args.first().unwrap_or(&Value::Undefined);
-            let pos = arr.iter().position(|v| v.strict_eq(search));
+            let from = array_from_index(args.get(1), arr.len());
+            let pos = arr
+                .iter()
+                .enumerate()
+                .skip(from)
+                .find(|(_, v)| v.strict_eq(search))
+                .map(|(i, _)| i);
             Value::Int(pos.map(|p| p as i64).unwrap_or(-1))
         }
         "lastIndexOf" => {
@@ -1413,8 +1453,10 @@ fn call_array_method(
             Value::Int(pos.map(|p| p as i64).unwrap_or(-1))
         }
         "includes" => {
+            // includes uses SameValueZero (NaN matches NaN) and honors fromIndex.
             let search = args.first().unwrap_or(&Value::Undefined);
-            Value::Bool(arr.iter().any(|v| v.strict_eq(search)))
+            let from = array_from_index(args.get(1), arr.len());
+            Value::Bool(arr.iter().skip(from).any(|v| same_value_zero(v, search)))
         }
         "join" => {
             let sep = if args.is_empty() {
@@ -1462,13 +1504,19 @@ fn call_array_method(
             Value::Array(result)
         }
         "flat" => {
-            let mut result = Vec::new();
-            for item in arr {
-                match item {
-                    Value::Array(inner) => result.extend_from_slice(inner),
-                    other => result.push(other.clone()),
+            let depth = match args.first() {
+                None | Some(Value::Undefined) => 1,
+                Some(v) => {
+                    let n = v.to_number();
+                    if n.is_infinite() && n > 0.0 {
+                        i64::MAX
+                    } else {
+                        n as i64
+                    }
                 }
-            }
+            };
+            let mut result = Vec::new();
+            flatten_into(arr, depth, &mut result);
             Value::Array(result)
         }
         "at" => {

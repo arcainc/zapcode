@@ -2269,6 +2269,9 @@ impl Vm {
                             .map(|c| Value::String(Arc::from(c.to_string().as_str()))),
                     ),
                     Value::Object(ref m) if is_set_object(&iterable) => acc.extend(set_items(m)),
+                    Value::Object(ref m) if is_map_object(&iterable) => {
+                        acc.extend(map_entry_pairs(m))
+                    }
                     other => {
                         return Err(ZapcodeError::TypeError(format!(
                             "{} is not iterable (spread)",
@@ -2483,6 +2486,16 @@ impl Vm {
                                     };
                                     if let (Some(p), Some(updated)) = (&place, receiver_update) {
                                         self.write_place(p, Value::Array(updated));
+                                    }
+                                    // sort() mutates the array in place (the
+                                    // comparator path produces the sorted array
+                                    // but isn't covered by mutated_array_receiver).
+                                    if method_name.as_ref() == "sort" {
+                                        if let (Some(p), Some(Value::Array(sorted))) =
+                                            (&place, &result)
+                                        {
+                                            self.write_place(p, Value::Array(sorted.clone()));
+                                        }
                                     }
                                     result
                                 } else {
@@ -3277,34 +3290,17 @@ impl Vm {
                     if let Some(Value::String(name)) = obj.get("__builtin_constructor__") {
                         match name.as_ref() {
                             "Map" => {
-                                // new Map([[k, v], ...]) seeds {key,value} entries.
-                                let entries = match args.first() {
-                                    Some(Value::Array(pairs)) => pairs
-                                        .iter()
-                                        .map(|p| {
-                                            let (k, v) = match p {
-                                                Value::Array(kv) => (
-                                                    kv.first().cloned().unwrap_or(Value::Undefined),
-                                                    kv.get(1).cloned().unwrap_or(Value::Undefined),
-                                                ),
-                                                _ => (Value::Undefined, Value::Undefined),
-                                            };
-                                            let mut e = IndexMap::new();
-                                            e.insert(Arc::from("key"), k);
-                                            e.insert(Arc::from("value"), v);
-                                            Value::Object(e)
-                                        })
-                                        .collect(),
-                                    _ => Vec::new(),
-                                };
+                                // Accepts an array of [k, v] pairs OR another Map.
+                                let entries = build_map_entries(
+                                    args.first().unwrap_or(&Value::Undefined),
+                                );
                                 self.push(make_map_object(entries))?;
                                 return Ok(None);
                             }
                             "Set" => {
-                                let items = match args.first() {
-                                    Some(Value::Array(items)) => items.clone(),
-                                    _ => Vec::new(),
-                                };
+                                // Accepts an array, string, Set, or Map.
+                                let items =
+                                    iterable_items(args.first().unwrap_or(&Value::Undefined));
                                 self.push(make_set_object(items))?;
                                 return Ok(None);
                             }
@@ -3846,6 +3842,79 @@ fn coerces_to_string_in_add(v: &Value) -> bool {
     )
 }
 
+/// SameValueZero comparison (`===` but `NaN` equals `NaN`). Used for Map keys
+/// and Set membership so `NaN` behaves as a single value, like JS.
+fn same_value_zero(a: &Value, b: &Value) -> bool {
+    if a.strict_eq(b) {
+        return true;
+    }
+    matches!((a, b), (Value::Float(x), Value::Float(y)) if x.is_nan() && y.is_nan())
+}
+
+/// Coerce a constructor argument into a list of items for `new Set(...)`:
+/// arrays yield their elements, strings their characters, Sets their items, and
+/// Maps their `[key, value]` pairs.
+fn iterable_items(v: &Value) -> Vec<Value> {
+    match v {
+        Value::Array(a) => a.clone(),
+        Value::String(s) => s
+            .chars()
+            .map(|c| Value::String(Arc::from(c.to_string().as_str())))
+            .collect(),
+        Value::Object(m) if is_set_object(v) => set_items(m),
+        Value::Object(m) if is_map_object(v) => map_entry_pairs(m),
+        _ => Vec::new(),
+    }
+}
+
+/// The `[key, value]` array pairs of a Map object's internal entries.
+fn map_entry_pairs(m: &IndexMap<Arc<str>, Value>) -> Vec<Value> {
+    match m.get("__entries__") {
+        Some(Value::Array(entries)) => entries
+            .iter()
+            .filter_map(|e| match e {
+                Value::Object(em) => Some(Value::Array(vec![
+                    em.get("key").cloned().unwrap_or(Value::Undefined),
+                    em.get("value").cloned().unwrap_or(Value::Undefined),
+                ])),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Build Map entry objects from a constructor argument (an array of `[k, v]`
+/// pairs, or another Map). Later duplicate keys overwrite earlier ones.
+fn build_map_entries(arg: &Value) -> Vec<Value> {
+    let pairs = iterable_items(arg);
+    let mut entries: Vec<Value> = Vec::new();
+    for p in pairs {
+        let (k, v) = match p {
+            Value::Array(kv) => (
+                kv.first().cloned().unwrap_or(Value::Undefined),
+                kv.get(1).cloned().unwrap_or(Value::Undefined),
+            ),
+            _ => (Value::Undefined, Value::Undefined),
+        };
+        let existing = entries.iter_mut().find_map(|e| match e {
+            Value::Object(em) if em.get("key").is_some_and(|ek| same_value_zero(ek, &k)) => {
+                Some(em)
+            }
+            _ => None,
+        });
+        if let Some(em) = existing {
+            em.insert(Arc::from("value"), v);
+        } else {
+            let mut em = IndexMap::new();
+            em.insert(Arc::from("key"), k);
+            em.insert(Arc::from("value"), v);
+            entries.push(Value::Object(em));
+        }
+    }
+    entries
+}
+
 fn make_map_object(entries: Vec<Value>) -> Value {
     let mut obj = IndexMap::new();
     obj.insert(Arc::from("__map__"), Value::Bool(true));
@@ -3879,7 +3948,7 @@ fn is_set_method(name: &str) -> bool {
 fn make_set_object(items: Vec<Value>) -> Value {
     let mut unique: Vec<Value> = Vec::new();
     for item in items {
-        if !unique.iter().any(|u| u.strict_eq(&item)) {
+        if !unique.iter().any(|u| same_value_zero(u, &item)) {
             unique.push(item);
         }
     }
@@ -3906,11 +3975,11 @@ fn execute_set_method(
     let arg = args.first().cloned().unwrap_or(Value::Undefined);
     match method {
         "has" => (
-            Some(Value::Bool(items.iter().any(|i| i.strict_eq(&arg)))),
+            Some(Value::Bool(items.iter().any(|i| same_value_zero(i, &arg)))),
             None,
         ),
         "add" => {
-            if !items.iter().any(|i| i.strict_eq(&arg)) {
+            if !items.iter().any(|i| same_value_zero(i, &arg)) {
                 items.push(arg);
             }
             let mut m = map;
@@ -3919,7 +3988,7 @@ fn execute_set_method(
         }
         "delete" => {
             let before = items.len();
-            items.retain(|i| !i.strict_eq(&arg));
+            items.retain(|i| !same_value_zero(i, &arg));
             let removed = items.len() != before;
             let mut m = map;
             m.insert(Arc::from("__items__"), Value::Array(items));
@@ -3964,7 +4033,7 @@ fn execute_map_method(
                 .iter()
                 .find_map(|entry| match entry {
                     Value::Object(entry)
-                        if entry.get("key").is_some_and(|item| item.strict_eq(&key)) =>
+                        if entry.get("key").is_some_and(|item| same_value_zero(item, &key)) =>
                     {
                         entry.get("value").cloned()
                     }
@@ -3975,7 +4044,7 @@ fn execute_map_method(
         }
         "has" => {
             let has_key = entries.iter().any(|entry| match entry {
-                Value::Object(entry) => entry.get("key").is_some_and(|item| item.strict_eq(&key)),
+                Value::Object(entry) => entry.get("key").is_some_and(|item| same_value_zero(item, &key)),
                 _ => false,
             });
             (Some(Value::Bool(has_key)), None)
@@ -3986,7 +4055,7 @@ fn execute_map_method(
             let mut replaced = false;
             for entry in &mut updated_entries {
                 if let Value::Object(entry) = entry {
-                    if entry.get("key").is_some_and(|item| item.strict_eq(&key)) {
+                    if entry.get("key").is_some_and(|item| same_value_zero(item, &key)) {
                         entry.insert(Arc::from("value"), value.clone());
                         replaced = true;
                         break;
@@ -4006,7 +4075,7 @@ fn execute_map_method(
             let mut updated_entries = entries;
             let before = updated_entries.len();
             updated_entries.retain(|entry| match entry {
-                Value::Object(entry) => !entry.get("key").is_some_and(|item| item.strict_eq(&key)),
+                Value::Object(entry) => !entry.get("key").is_some_and(|item| same_value_zero(item, &key)),
                 _ => true,
             });
             let deleted = updated_entries.len() != before;
