@@ -194,6 +194,9 @@ pub enum AssignTarget {
     Ident(String),
     ObjectDestructure(Vec<DestructureField>),
     ArrayDestructure(Vec<Option<AssignTarget>>),
+    /// Array-rest binding `...name`; only valid as the last element of an
+    /// `ArrayDestructure`.
+    Rest(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

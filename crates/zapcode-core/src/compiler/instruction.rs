@@ -65,6 +65,9 @@ pub enum Instruction {
     ArrayAppend,
     /// Spread an iterable into an accumulator array: `[acc, iterable] -> [acc']`.
     ArraySpreadAppend,
+    /// Replace the array on top of the stack with a new array of its elements
+    /// from the given index onward (array-rest destructuring `[a, ...rest]`).
+    ArrayRestFrom(usize),
     /// Insert a key/value into an accumulator object: `[acc, key, value] -> [acc']`.
     ObjectInsert,
     /// Merge a source object's entries into an accumulator object: `[acc, src] -> [acc']`.

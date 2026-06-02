@@ -2281,6 +2281,17 @@ impl Vm {
                 }
                 self.push(Value::Array(acc))?;
             }
+            Instruction::ArrayRestFrom(from) => {
+                self.tracker.track_allocation(&self.limits)?;
+                let value = self.pop()?;
+                let rest = match value {
+                    Value::Array(items) => {
+                        Value::Array(items.into_iter().skip(from).collect())
+                    }
+                    _ => Value::Array(Vec::new()),
+                };
+                self.push(rest)?;
+            }
             Instruction::ObjectInsert => {
                 let value = self.pop()?;
                 let key = self.pop()?;
@@ -3599,6 +3610,17 @@ fn extract_pattern(pattern: &ParamPattern, value: &Value, out: &mut Vec<Value>) 
         ParamPattern::ArrayDestructure(elems) => {
             for (i, elem) in elems.iter().enumerate() {
                 if let Some(p) = elem {
+                    if matches!(p, ParamPattern::Rest(_)) {
+                        // `...rest`: collect the remaining elements as an array.
+                        let rest = match value {
+                            Value::Array(a) => {
+                                Value::Array(a.iter().skip(i).cloned().collect())
+                            }
+                            _ => Value::Array(Vec::new()),
+                        };
+                        out.push(rest);
+                        continue;
+                    }
                     let item = match value {
                         Value::Array(a) => a.get(i).cloned().unwrap_or(Value::Undefined),
                         _ => Value::Undefined,

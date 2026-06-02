@@ -359,6 +359,16 @@ impl<'a> AstLowerer<'a> {
                         None => elements.push(None),
                     }
                 }
+                if let Some(rest) = &arr.rest {
+                    if let ast::BindingPattern::BindingIdentifier(id) = &rest.argument {
+                        elements.push(Some(AssignTarget::Rest(id.name.to_string())));
+                    } else {
+                        return Err(self.unsupported(
+                            rest.span,
+                            "only identifier array rest destructuring is supported",
+                        ));
+                    }
+                }
                 Ok(AssignTarget::ArrayDestructure(elements))
             }
             ast::BindingPattern::AssignmentPattern(assign) => {
@@ -448,6 +458,16 @@ impl<'a> AstLowerer<'a> {
                     match elem {
                         Some(p) => elems.push(Some(self.lower_binding_pattern_to_param(p)?)),
                         None => elems.push(None),
+                    }
+                }
+                if let Some(rest) = &arr.rest {
+                    if let ast::BindingPattern::BindingIdentifier(id) = &rest.argument {
+                        elems.push(Some(ParamPattern::Rest(id.name.to_string())));
+                    } else {
+                        return Err(self.unsupported(
+                            rest.span,
+                            "only identifier array rest destructuring is supported",
+                        ));
                     }
                 }
                 Ok(ParamPattern::ArrayDestructure(elems))

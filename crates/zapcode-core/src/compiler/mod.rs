@@ -217,7 +217,7 @@ impl Compiler {
                 }
                 ParamPattern::ArrayDestructure(elems) => {
                     for elem in elems.iter().flatten() {
-                        if let ParamPattern::Ident(name) = elem {
+                        if let ParamPattern::Ident(name) | ParamPattern::Rest(name) = elem {
                             func_compiler.declare_local(name);
                         }
                     }
@@ -743,6 +743,13 @@ impl Compiler {
                 }
                 for (i, elem) in elems.iter().enumerate() {
                     if let Some(target) = elem {
+                        if let AssignTarget::Rest(name) = target {
+                            // `...rest`: bind the remaining elements as an array.
+                            self.emit(Instruction::Dup);
+                            self.emit(Instruction::ArrayRestFrom(i));
+                            self.store_binding(name, kind)?;
+                            continue;
+                        }
                         self.emit(Instruction::Dup);
                         self.emit(Instruction::Push(Constant::Int(i as i64)));
                         self.emit(Instruction::GetIndex);
@@ -758,6 +765,9 @@ impl Compiler {
                 }
                 self.emit(Instruction::Pop); // pop source array
             }
+            // A bare `...rest` is only valid inside an array pattern, never as a
+            // top-level declaration target.
+            AssignTarget::Rest(_) => {}
         }
         Ok(())
     }
@@ -814,6 +824,12 @@ impl Compiler {
             ParamPattern::ArrayDestructure(elems) => {
                 for (i, elem) in elems.iter().enumerate() {
                     let Some(p) = elem else { continue };
+                    if let ParamPattern::Rest(name) = p {
+                        self.emit(Instruction::Dup);
+                        self.emit(Instruction::ArrayRestFrom(i));
+                        self.store_binding(name, kind)?;
+                        continue;
+                    }
                     self.emit(Instruction::Dup);
                     self.emit(Instruction::Push(Constant::Int(i as i64)));
                     self.emit(Instruction::GetIndex);
