@@ -2414,7 +2414,11 @@ impl Vm {
                     } else if let (Value::Object(instance), Some(class_name)) =
                         (&left, class_obj.get("__class_name__"))
                     {
-                        instance.get("__class__") == Some(class_name)
+                        // Match the instance's class or any of its ancestors.
+                        match instance.get("__class_chain__") {
+                            Some(Value::Array(chain)) => chain.contains(class_name),
+                            _ => instance.get("__class__") == Some(class_name),
+                        }
                     } else {
                         false
                     }
@@ -3307,12 +3311,27 @@ impl Vm {
                     }
                 }
 
+                // The inheritance chain of class names (self first), so
+                // `instanceof` matches ancestor classes too.
+                let mut chain = vec![Value::String(Arc::from(name.as_str()))];
+                if let Some(Value::Object(sc)) = &super_class {
+                    match sc.get("__class_chain__") {
+                        Some(Value::Array(c)) => chain.extend(c.iter().cloned()),
+                        _ => {
+                            if let Some(n) = sc.get("__class_name__") {
+                                chain.push(n.clone());
+                            }
+                        }
+                    }
+                }
+
                 // Build the class object
                 let mut class_obj = IndexMap::new();
                 class_obj.insert(
                     Arc::from("__class_name__"),
                     Value::String(Arc::from(name.as_str())),
                 );
+                class_obj.insert(Arc::from("__class_chain__"), Value::Array(chain));
                 class_obj.insert(Arc::from("__constructor__"), constructor);
                 class_obj.insert(Arc::from("__prototype__"), Value::Object(prototype));
 
@@ -3414,28 +3433,30 @@ impl Vm {
                             }
                         }
 
-                        // Store class reference for instanceof
+                        // Store class reference(s) for instanceof.
                         if let Some(class_name) = class_obj.get("__class_name__") {
                             instance.insert(Arc::from("__class__"), class_name.clone());
+                        }
+                        if let Some(chain) = class_obj.get("__class_chain__") {
+                            instance.insert(Arc::from("__class_chain__"), chain.clone());
                         }
 
                         let instance_val = Value::Object(instance);
 
-                        // Call the constructor with `this` bound to the instance
-                        if let Some(ctor) = class_obj.get("__constructor__") {
-                            if let Value::Function(closure) = ctor {
+                        // Call the constructor with `this` bound to the instance.
+                        // A subclass with no own constructor forwards to the nearest
+                        // ancestor constructor (implicit `constructor(...a){ super(...a) }`).
+                        match find_class_constructor(class_obj) {
+                            Some(Value::Function(closure)) => {
                                 // Clear receiver source — constructors should not
                                 // write back to a receiver variable.
                                 self.last_receiver_source = None;
-                                self.push_call_frame(closure, &args, Some(instance_val))?;
+                                self.push_call_frame(&closure, &args, Some(instance_val))?;
                                 self.last_receiver = None;
-                            } else {
-                                // No valid constructor, just return the instance
+                            }
+                            _ => {
                                 self.push(instance_val)?;
                             }
-                        } else {
-                            // No constructor, just return the instance
-                            self.push(instance_val)?;
                         }
                     }
                     Value::Function(closure) => {
@@ -4068,6 +4089,18 @@ fn execute_set_method(
         }
         "values" | "keys" => (Some(Value::Array(items)), None),
         _ => (None, None),
+    }
+}
+
+/// The constructor a class should run: its own, or (for a subclass with no own
+/// constructor) the nearest ancestor's, so args forward to `super`.
+fn find_class_constructor(class_obj: &IndexMap<Arc<str>, Value>) -> Option<Value> {
+    match class_obj.get("__constructor__") {
+        Some(Value::Function(c)) => Some(Value::Function(c.clone())),
+        _ => match class_obj.get("__super__") {
+            Some(Value::Object(sc)) => find_class_constructor(sc),
+            _ => None,
+        },
     }
 }
 
