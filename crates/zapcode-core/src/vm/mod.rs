@@ -2080,10 +2080,14 @@ impl Vm {
                 let obj_val = self.pop()?;
                 let value = self.pop()?;
                 match obj_val {
-                    Value::Object(mut obj) => {
-                        obj.insert(Arc::from(name.as_str()), value);
-                        // Push modified object back so compile_store can store it
-                        self.push(Value::Object(obj))?;
+                    Value::Object(h) => {
+                        // Mutate the heap slot in place; the handle is shared so the
+                        // write is visible through every alias (reference semantics).
+                        if let Some(obj) = self.heap.object_mut(h) {
+                            obj.insert(Arc::from(name.as_str()), value);
+                        }
+                        // Push the (same) object handle back so compile_store can store it.
+                        self.push(Value::Object(h))?;
                     }
                     _ => {
                         return Err(ZapcodeError::TypeError(format!(
@@ -2107,22 +2111,35 @@ impl Vm {
                         Some(PlaceSeg::Index(*f as usize))
                     }
                     (Value::Object(_), Value::String(key)) => Some(PlaceSeg::Prop(key.to_string())),
-                    (Value::Object(_), _) => Some(PlaceSeg::Prop(index.to_js_string())),
+                    (Value::Object(_), _) => {
+                        Some(PlaceSeg::Prop(index.to_js_string(&self.heap)))
+                    }
                     _ => None,
                 };
                 let result = match (&obj, &index) {
-                    (Value::Array(arr), Value::Int(i)) => {
-                        arr.get(*i as usize).cloned().unwrap_or(Value::Undefined)
-                    }
-                    (Value::Array(arr), Value::Float(f)) => {
-                        arr.get(*f as usize).cloned().unwrap_or(Value::Undefined)
-                    }
-                    (Value::Object(map), Value::String(key)) => {
-                        map.get(key.as_ref()).cloned().unwrap_or(Value::Undefined)
-                    }
-                    (Value::Object(map), _) => {
-                        let key: Arc<str> = Arc::from(index.to_js_string().as_str());
-                        map.get(key.as_ref()).cloned().unwrap_or(Value::Undefined)
+                    (Value::Array(h), Value::Int(i)) => self
+                        .heap
+                        .array(*h)
+                        .get(*i as usize)
+                        .cloned()
+                        .unwrap_or(Value::Undefined),
+                    (Value::Array(h), Value::Float(f)) => self
+                        .heap
+                        .array(*h)
+                        .get(*f as usize)
+                        .cloned()
+                        .unwrap_or(Value::Undefined),
+                    (Value::Object(h), Value::String(key)) => self
+                        .heap
+                        .object(*h)
+                        .and_then(|m| m.get(key.as_ref()).cloned())
+                        .unwrap_or(Value::Undefined),
+                    (Value::Object(h), _) => {
+                        let key: Arc<str> = Arc::from(index.to_js_string(&self.heap).as_str());
+                        self.heap
+                            .object(*h)
+                            .and_then(|m| m.get(key.as_ref()).cloned())
+                            .unwrap_or(Value::Undefined)
                     }
                     (Value::String(s), Value::Int(i)) => s
                         .chars()
@@ -2165,10 +2182,11 @@ impl Vm {
             }
             Instruction::SetIndex => {
                 let index = self.pop()?;
-                let mut obj = self.pop()?;
+                let obj = self.pop()?;
                 let value = self.pop()?;
-                match &mut obj {
-                    Value::Array(arr) => {
+                match &obj {
+                    Value::Array(h) => {
+                        let cur_len = self.heap.array(*h).len();
                         let idx = match &index {
                             Value::Int(i) if *i >= 0 => *i as usize,
                             Value::Float(f) if *f >= 0.0 && *f == (*f as usize as f64) => {
@@ -2181,25 +2199,29 @@ impl Vm {
                             }
                         };
                         // Cap maximum sparse array growth to prevent memory exhaustion
-                        if idx > arr.len() + 1024 {
+                        if idx > cur_len + 1024 {
                             return Err(ZapcodeError::RuntimeError(format!(
                                 "array index {} too far beyond length {}",
-                                idx,
-                                arr.len()
+                                idx, cur_len
                             )));
                         }
-                        while arr.len() <= idx {
-                            arr.push(Value::Undefined);
+                        // Mutate the heap slot in place (reference semantics).
+                        if let Some(arr) = self.heap.array_mut(*h) {
+                            while arr.len() <= idx {
+                                arr.push(Value::Undefined);
+                            }
+                            arr[idx] = value;
                         }
-                        arr[idx] = value;
                     }
-                    Value::Object(map) => {
-                        let key: Arc<str> = Arc::from(index.to_js_string().as_str());
-                        map.insert(key, value);
+                    Value::Object(h) => {
+                        let key: Arc<str> = Arc::from(index.to_js_string(&self.heap).as_str());
+                        if let Some(map) = self.heap.object_mut(*h) {
+                            map.insert(key, value);
+                        }
                     }
                     _ => {}
                 }
-                // Push modified object back so compile_store can store it to the variable
+                // Push the (same) handle back so compile_store can store it to the variable.
                 self.push(obj)?;
             }
             Instruction::FreshenBinding(slot) => {
@@ -2217,26 +2239,34 @@ impl Vm {
                 }
             }
             Instruction::DeleteProperty(name) => {
-                let mut obj = self.pop()?;
-                if let Value::Object(map) = &mut obj {
-                    map.shift_remove(name.as_str());
+                let obj = self.pop()?;
+                if let Value::Object(h) = &obj {
+                    if let Some(map) = self.heap.object_mut(*h) {
+                        map.shift_remove(name.as_str());
+                    }
                 }
                 self.push(obj)?;
             }
             Instruction::DeleteIndex => {
                 let key = self.pop()?;
-                let mut obj = self.pop()?;
-                match &mut obj {
-                    Value::Object(map) => {
-                        let k = key.to_js_string();
-                        map.shift_remove(k.as_str());
+                let obj = self.pop()?;
+                match &obj {
+                    Value::Object(h) => {
+                        let k = key.to_js_string(&self.heap);
+                        if let Some(map) = self.heap.object_mut(*h) {
+                            map.shift_remove(k.as_str());
+                        }
                     }
-                    Value::Array(arr) => {
+                    Value::Array(h) => {
                         // `delete arr[i]` leaves a hole (undefined) without
                         // changing length, matching JS.
                         if let Value::Int(i) = &key {
-                            if *i >= 0 && (*i as usize) < arr.len() {
-                                arr[*i as usize] = Value::Undefined;
+                            if *i >= 0 {
+                                if let Some(arr) = self.heap.array_mut(*h) {
+                                    if (*i as usize) < arr.len() {
+                                        arr[*i as usize] = Value::Undefined;
+                                    }
+                                }
                             }
                         }
                     }
