@@ -2,6 +2,111 @@
 
 ## Fix status (in progress)
 
+**Round 6 (branch `arca/heap-handles-rewrite`) — deferred-five final disposition + O4 security-regression fix:**
+
+This round finishes the "deferred five" (G4 / O4 / G9 / N9 / N5) and, critically,
+*repairs a GREEN-suite regression* that Round 5 had left in (and mis-labelled as
+"pre-existing"). Final per-item status:
+
+- **G4 — FIXED (with documented architectural residual).** `match()` (non-global)
+  and each `matchAll()` element expose `.index`, `.input`, `.groups`, `m[0..n]`,
+  and `.length`; named captures populate `.groups`. The non-global result is an
+  *array-like heap object* rather than a true `Array` (heap arrays are `Vec`-backed
+  and cannot carry the extra named props the spec attaches to a match result), so
+  `Array.isArray(nonGlobalMatch) === false` and array methods aren't available on
+  it (use indexed access or spread `matchAll`). The global `match(/…/g)` still
+  returns a plain array of matched strings, exactly like JS. *Residual is purely
+  the value's brand (object vs Array); every property the feature targeted works.*
+  Making it a real Array-with-props would require changing the heap's `Array`
+  variant to carry a side map of named properties — a core-value-model change that
+  ripples through serialization/cloning/equality/all array builtins, i.e. exactly
+  the kind of destabilizing rewrite the GREEN guarantee says to avoid. Tests:
+  `stress_match_groups.rs`.
+
+- **O4 — FIXED (valueOf/toString fully landed + now cyclic-safe); `Symbol.toPrimitive` documented residual.**
+  User `valueOf`/`toString` hooks are honored at every coercion point (`+`, the
+  arithmetic/relational operators, string concat / template literals, and
+  `String()`/`Number()`), with the correct per-hint method order. **Round 6 fixed a
+  real regression this introduced:** a self-referential hook
+  (`toString(){ return "" + this }`) recursed *past* the previous 200-deep
+  `to_primitive` guard and **overflowed the native Rust stack, aborting the whole
+  `security` test binary (SIGABRT)** — i.e. the suite was NOT actually green at the
+  Round-5 HEAD, contrary to the note Round 4 left below. Fix:
+    1. Lowered the ToPrimitive recursion guard from 200 → 8 (each level nests a full
+       guest-call interpreter loop on the native stack; 8 is far above any
+       legitimate valueOf→toString fallback yet well below native-stack
+       exhaustion), so a cyclic hook now surfaces a clean, catchable
+       `RuntimeError("ToPrimitive recursion limit exceeded …")` instead of crashing
+       the host.
+    2. Fixed `call_closure_internal`'s error path to (a) only catch a `try` block
+       that lives *inside* the internal call (`frame_depth > target_frame_depth`)
+       and (b) unwind the frames it pushed before propagating — previously a nested
+       internal call that errored left orphaned frames and later panicked at
+       `frames.last().unwrap()`.
+    3. Replaced the obsolete `test_tostring_not_invoked_during_coercion` security
+       test (it asserted the *pre-O4* "never invoke toString, always
+       `[object Object]`" stance, which O4 deliberately superseded) with three tests
+       matching the real contract: a non-cyclic hook IS honored, a cyclic hook is
+       *bounded, not fatal*, and the resulting error is *catchable from inside the
+       guest*. Invoking the hook is not a sandbox escape (it runs under the same
+       limits); the only real security concern — unbounded recursion DoS — is now
+       handled cleanly. (`crates/zapcode-core/tests/security.rs`.)
+  *Residual (deferred):* `[Symbol.toPrimitive]` is still not dispatched. It depends
+  on real well-known-symbol keying (O8): the crate's `Symbol` is a stub whose
+  values are `__symbol__`-tagged heap objects, and the four computed-property-key
+  sites all coerce keys via `to_js_string`, so a `[Symbol.toPrimitive]` key can't be
+  matched without a shared property-key mapping change across the get/set/define
+  paths — moderate blast radius for a niche hook, deliberately left out to protect
+  the GREEN suite. The common `valueOf`/`toString` path covers the realistic cases.
+
+- **G9 — DOCUMENTED RESIDUAL (intentionally not landed).** Strings remain indexed by
+  Unicode *code point* (Rust `chars()`), not UTF-16 code units, so `"😀".length` is
+  `1` (JS: `2`) and `"😀".charCodeAt(0)` is `128512` (JS: `55357`, the high
+  surrogate). This is *self-consistent* across `length`, indexing `s[i]`, `charAt`,
+  `charCodeAt`, `codePointAt`, `at`, `slice`, `substring`, `substr`,
+  `indexOf`/`lastIndexOf`, and the regex/match `.index` (all code-point based).
+  Converting to UTF-16 is a broad, mutually-coupled change across ~15 call sites in
+  `vm/mod.rs` and `vm/builtins.rs` plus the byte↔char-count match machinery; there
+  is **no safe partial** — converting only some of those methods would make
+  `s.length` disagree with `s[i]`/`slice`, introducing a *new* divergence worse than
+  the current consistent model. Only BMP characters are exercised by the suite (and
+  the one e2e `charCodeAt` test uses A/B/Z), so no test currently depends on either
+  semantics. Per the GREEN guarantee, the full UTF-16 rewrite is left as the
+  documented residual rather than shipped half-done. *Practical impact:* correct for
+  all BMP text (the overwhelming majority of agent input); diverges only on astral
+  (non-BMP) characters — emoji, some CJK-extension and math-script code points.
+
+- **N9 — FIXED (with pre-existing generator residual).** `for await (const x of …)`
+  awaits each iterated value (arrays of promises/values, mixed, destructuring,
+  break/continue, nesting, rejection-in-loop, and suspend/resume across an external
+  call in the body), and async-generator *consumption* via for-await drives the
+  iterator and awaits each yielded value. *Residual (unchanged, pre-existing):* an
+  `async function*` that suspends on an *external host call mid-iteration* errors
+  `cannot suspend inside a generator` — a generator-engine limitation (generators
+  run synchronously via `generator_next`, which can't capture/resume a host-call
+  suspension across `yield`), not specific to for-await. Pinned by
+  `async_generator_external_suspension_is_the_documented_gap` in `stress_for_await.rs`.
+
+- **N5 — FIXED (fully, including stringification).** A bare (un-awaited) tool call is
+  a real deferred Promise object (`typeof === "object"`, host call held until
+  awaited / `.then`/`.catch`/`.finally`-ed / returned-and-awaited), with `.then`
+  chaining, callback-internal tool calls, thenable adoption, and snapshot
+  round-trip. **Round 6 closed the last residual:** a `__promise__`-tagged heap
+  object now string-coerces to the spec's `[object Promise]` (via a `to_js_string`
+  special-case mirroring `__date_ms__`/`__error__`), instead of leaking
+  `[object Object]`. So `"" + tool()` → `"[object Promise]"`. (`stress_call_promise.rs`.)
+
+**Net for the deferred five:** G4, O4, N9, N5 are fully landed (each with a small,
+honestly-documented residual that is architectural / pre-existing, not a gap in the
+targeted behavior); N5's previously-documented stringification residual is now also
+closed. **G9 is the one item deliberately left as a documented residual** because no
+correctness-preserving partial exists and the full UTF-16 conversion would
+destabilize the suite. The suite is now **fully green** (it was *not* at the Round-5
+HEAD — the `security` binary was aborting on the cyclic-toString case; that is fixed
+here). 634 core tests pass (0 failed), `cargo build --workspace` is clean (0
+warnings), and the JS `test:scenarios3` (77 checks) + `test:e2e` (all suites incl.
+`stress`/`parallel`/`marshalling`) are green with the native binding rebuilt.
+
 **Round 5 (branch `arca/heap-handles-rewrite`) — N5 bare tool-call as a deferred Promise:**
 - **N5 — FIXED (general case).** A bare (un-awaited) tool-call expression now
   evaluates to a real *deferred* Promise object instead of an eagerly-resolved
@@ -109,16 +214,18 @@
 - **Verified:** 579 core tests (0 failed) + `cargo build --workspace` clean (0 warnings) +
   full JS `test:scenarios3` (10 scenarios) and `test:e2e` (all suites incl. `parallel`/
   `stress`/`marshalling`) green.
-- **Pre-existing `security` test issue (NOT a N9/for-await regression):** as of the
-  HEAD commit `O4: honor user valueOf/toString (ToPrimitive)`, the `security` test
-  binary is not clean on this platform. At the default test-thread stack
-  `test_weakref_escape` overflows the stack (SIGABRT), and with a larger stack
-  (`RUST_MIN_STACK=64M`) `test_tostring_not_invoked_during_coercion` fails the
-  assertion at `crates/zapcode-core/tests/security.rs:170` with
-  `ToPrimitive recursion limit exceeded (cyclic valueOf/toString?)` — the O4 hook now
-  invokes a `toString` the test expected to stay dormant during coercion. Confirmed
-  identical on a clean `git stash` of the N9 work; every other test binary (incl. the
-  new `stress_for_await.rs`, `async_await`, `generators`, all `stress_*`) is green.
+- **`security` test issue — RESOLVED in Round 6 (it was an O4 regression, not "pre-existing").**
+  As of the Round-5 HEAD, the `security` binary aborted (SIGABRT) on
+  `test_tostring_not_invoked_during_coercion`: the O4 hook invoked a self-referential
+  `toString(){ return "" + this }`, which recursed past the (then 200-deep)
+  ToPrimitive guard and overflowed the native stack — taking the whole binary down
+  (so `test_weakref_escape`, run earlier in the same process, also appeared to
+  "fail"). This was a genuine O4-introduced regression, *not* a pre-existing /
+  platform issue. Round 6 fixes it (recursion guard 200→8 so it errors cleanly,
+  `call_closure_internal` frame-unwind on the error path, and the obsolete test
+  replaced by three tests asserting the real bounded/catchable/honored contract).
+  The full suite — including `security`, `stress_for_await.rs`, `async_await`,
+  `generators`, and all `stress_*` — is now green.
 
 **Round 3 (branch `arca/heap-handles-rewrite`) — the heap-with-handles rewrite:**
 - **A (reference semantics) — FIXED.** `Value::Array`/`Object` now carry a `Handle`
