@@ -1,5 +1,25 @@
-use zapcode_core::vm::{eval_ts, eval_ts_with_output};
-use zapcode_core::Value;
+use zapcode_core::heap::Heap;
+use zapcode_core::vm::{eval_ts, eval_ts_with_output, VmState};
+use zapcode_core::{ResourceLimits, Value, ZapcodeRun};
+
+/// Run `code` and return the completion value plus the heap that backs any
+/// array/object handles in it (needed since `Value::Array`/`Value::Object`
+/// only carry a handle into the heap now).
+fn run(code: &str) -> (Value, Heap) {
+    let result = ZapcodeRun::new(
+        code.to_string(),
+        Vec::new(),
+        Vec::new(),
+        ResourceLimits::default(),
+    )
+    .unwrap()
+    .run(Vec::new())
+    .unwrap();
+    match result.state {
+        VmState::Complete(v) => (v, result.heap),
+        other => panic!("expected completion, got {other:?}"),
+    }
+}
 
 // ── Console ──────────────────────────────────────────────────────────
 
@@ -120,9 +140,10 @@ fn test_string_trim() {
 
 #[test]
 fn test_string_split() {
-    let result = eval_ts("\"a,b,c\".split(\",\")").unwrap();
+    let (result, heap) = run("\"a,b,c\".split(\",\")");
     match result {
-        Value::Array(arr) => {
+        Value::Array(h) => {
+            let arr = heap.array_vec(h);
             assert_eq!(arr.len(), 3);
             assert_eq!(arr[0], Value::String("a".into()));
             assert_eq!(arr[1], Value::String("b".into()));
@@ -172,9 +193,10 @@ fn test_array_join() {
 
 #[test]
 fn test_array_slice() {
-    let result = eval_ts("[1, 2, 3, 4, 5].slice(1, 4)").unwrap();
+    let (result, heap) = run("[1, 2, 3, 4, 5].slice(1, 4)");
     match result {
-        Value::Array(arr) => {
+        Value::Array(h) => {
+            let arr = heap.array_vec(h);
             assert_eq!(arr.len(), 3);
             assert_eq!(arr[0], Value::Int(2));
         }
@@ -184,18 +206,19 @@ fn test_array_slice() {
 
 #[test]
 fn test_array_concat() {
-    let result = eval_ts("[1, 2].concat([3, 4])").unwrap();
+    let (result, heap) = run("[1, 2].concat([3, 4])");
     match result {
-        Value::Array(arr) => assert_eq!(arr.len(), 4),
+        Value::Array(h) => assert_eq!(heap.array_vec(h).len(), 4),
         other => panic!("expected array, got {:?}", other),
     }
 }
 
 #[test]
 fn test_array_reverse() {
-    let result = eval_ts("[1, 2, 3].reverse()").unwrap();
+    let (result, heap) = run("[1, 2, 3].reverse()");
     match result {
-        Value::Array(arr) => {
+        Value::Array(h) => {
+            let arr = heap.array_vec(h);
             assert_eq!(arr[0], Value::Int(3));
             assert_eq!(arr[1], Value::Int(2));
             assert_eq!(arr[2], Value::Int(1));
@@ -222,9 +245,10 @@ fn test_json_parse() {
 
 #[test]
 fn test_object_keys() {
-    let result = eval_ts("Object.keys({a: 1, b: 2, c: 3})").unwrap();
+    let (result, heap) = run("Object.keys({a: 1, b: 2, c: 3})");
     match result {
-        Value::Array(arr) => {
+        Value::Array(h) => {
+            let arr = heap.array_vec(h);
             assert_eq!(arr.len(), 3);
             assert_eq!(arr[0], Value::String("a".into()));
         }
@@ -234,9 +258,10 @@ fn test_object_keys() {
 
 #[test]
 fn test_object_values() {
-    let result = eval_ts("Object.values({a: 1, b: 2})").unwrap();
+    let (result, heap) = run("Object.values({a: 1, b: 2})");
     match result {
-        Value::Array(arr) => {
+        Value::Array(h) => {
+            let arr = heap.array_vec(h);
             assert_eq!(arr.len(), 2);
             assert_eq!(arr[0], Value::Int(1));
         }
@@ -302,9 +327,10 @@ fn test_array_unshift() {
 
 #[test]
 fn test_array_splice() {
-    let result = eval_ts("[1, 2, 3, 4, 5].splice(1, 2)").unwrap();
+    let (result, heap) = run("[1, 2, 3, 4, 5].splice(1, 2)");
     match result {
-        Value::Array(arr) => {
+        Value::Array(h) => {
+            let arr = heap.array_vec(h);
             assert_eq!(arr.len(), 2);
             assert_eq!(arr[0], Value::Int(2));
             assert_eq!(arr[1], Value::Int(3));
@@ -315,9 +341,10 @@ fn test_array_splice() {
 
 #[test]
 fn test_array_splice_with_insert() {
-    let result = eval_ts("[1, 2, 3].splice(1, 1, 10, 20)").unwrap();
+    let (result, heap) = run("[1, 2, 3].splice(1, 1, 10, 20)");
     match result {
-        Value::Array(arr) => {
+        Value::Array(h) => {
+            let arr = heap.array_vec(h);
             assert_eq!(arr.len(), 1);
             assert_eq!(arr[0], Value::Int(2));
         }
@@ -329,9 +356,10 @@ fn test_array_splice_with_insert() {
 
 #[test]
 fn test_array_map() {
-    let result = eval_ts("[1, 2, 3].map((x) => x * 2)").unwrap();
+    let (result, heap) = run("[1, 2, 3].map((x) => x * 2)");
     match result {
-        Value::Array(arr) => {
+        Value::Array(h) => {
+            let arr = heap.array_vec(h);
             assert_eq!(arr.len(), 3);
             assert_eq!(arr[0], Value::Int(2));
             assert_eq!(arr[1], Value::Int(4));
@@ -343,9 +371,10 @@ fn test_array_map() {
 
 #[test]
 fn test_array_map_with_index() {
-    let result = eval_ts("[10, 20, 30].map((x, i) => i)").unwrap();
+    let (result, heap) = run("[10, 20, 30].map((x, i) => i)");
     match result {
-        Value::Array(arr) => {
+        Value::Array(h) => {
+            let arr = heap.array_vec(h);
             assert_eq!(arr[0], Value::Int(0));
             assert_eq!(arr[1], Value::Int(1));
             assert_eq!(arr[2], Value::Int(2));
@@ -356,9 +385,10 @@ fn test_array_map_with_index() {
 
 #[test]
 fn test_array_filter() {
-    let result = eval_ts("[1, 2, 3, 4, 5].filter((x) => x > 3)").unwrap();
+    let (result, heap) = run("[1, 2, 3, 4, 5].filter((x) => x > 3)");
     match result {
-        Value::Array(arr) => {
+        Value::Array(h) => {
+            let arr = heap.array_vec(h);
             assert_eq!(arr.len(), 2);
             assert_eq!(arr[0], Value::Int(4));
             assert_eq!(arr[1], Value::Int(5));
@@ -369,9 +399,9 @@ fn test_array_filter() {
 
 #[test]
 fn test_array_filter_empty_result() {
-    let result = eval_ts("[1, 2, 3].filter((x) => x > 10)").unwrap();
+    let (result, heap) = run("[1, 2, 3].filter((x) => x > 10)");
     match result {
-        Value::Array(arr) => assert_eq!(arr.len(), 0),
+        Value::Array(h) => assert_eq!(heap.array_vec(h).len(), 0),
         other => panic!("expected array, got {:?}", other),
     }
 }
@@ -457,9 +487,10 @@ fn test_array_some_false() {
 
 #[test]
 fn test_array_sort_default() {
-    let result = eval_ts(r#"["banana", "apple", "cherry"].sort()"#).unwrap();
+    let (result, heap) = run(r#"["banana", "apple", "cherry"].sort()"#);
     match result {
-        Value::Array(arr) => {
+        Value::Array(h) => {
+            let arr = heap.array_vec(h);
             assert_eq!(arr[0], Value::String("apple".into()));
             assert_eq!(arr[1], Value::String("banana".into()));
             assert_eq!(arr[2], Value::String("cherry".into()));
@@ -470,9 +501,10 @@ fn test_array_sort_default() {
 
 #[test]
 fn test_array_sort_with_comparator() {
-    let result = eval_ts("[3, 1, 4, 1, 5].sort((a, b) => a - b)").unwrap();
+    let (result, heap) = run("[3, 1, 4, 1, 5].sort((a, b) => a - b)");
     match result {
-        Value::Array(arr) => {
+        Value::Array(h) => {
+            let arr = heap.array_vec(h);
             assert_eq!(arr[0], Value::Int(1));
             assert_eq!(arr[1], Value::Int(1));
             assert_eq!(arr[2], Value::Int(3));
@@ -485,9 +517,10 @@ fn test_array_sort_with_comparator() {
 
 #[test]
 fn test_array_sort_descending() {
-    let result = eval_ts("[3, 1, 4, 1, 5].sort((a, b) => b - a)").unwrap();
+    let (result, heap) = run("[3, 1, 4, 1, 5].sort((a, b) => b - a)");
     match result {
-        Value::Array(arr) => {
+        Value::Array(h) => {
+            let arr = heap.array_vec(h);
             assert_eq!(arr[0], Value::Int(5));
             assert_eq!(arr[1], Value::Int(4));
             assert_eq!(arr[2], Value::Int(3));
@@ -500,9 +533,10 @@ fn test_array_sort_descending() {
 
 #[test]
 fn test_array_flat_map() {
-    let result = eval_ts("[1, 2, 3].flatMap((x) => [x, x * 2])").unwrap();
+    let (result, heap) = run("[1, 2, 3].flatMap((x) => [x, x * 2])");
     match result {
-        Value::Array(arr) => {
+        Value::Array(h) => {
+            let arr = heap.array_vec(h);
             assert_eq!(arr.len(), 6);
             assert_eq!(arr[0], Value::Int(1));
             assert_eq!(arr[1], Value::Int(2));
@@ -517,9 +551,10 @@ fn test_array_flat_map() {
 
 #[test]
 fn test_array_flat_map_non_array() {
-    let result = eval_ts("[1, 2, 3].flatMap((x) => x * 2)").unwrap();
+    let (result, heap) = run("[1, 2, 3].flatMap((x) => x * 2)");
     match result {
-        Value::Array(arr) => {
+        Value::Array(h) => {
+            let arr = heap.array_vec(h);
             assert_eq!(arr.len(), 3);
             assert_eq!(arr[0], Value::Int(2));
             assert_eq!(arr[1], Value::Int(4));
@@ -531,15 +566,15 @@ fn test_array_flat_map_non_array() {
 
 #[test]
 fn test_array_map_with_closure() {
-    let result = eval_ts(
+    let (result, heap) = run(
         r#"
         const multiplier = 10;
         [1, 2, 3].map((x) => x * multiplier)
         "#,
-    )
-    .unwrap();
+    );
     match result {
-        Value::Array(arr) => {
+        Value::Array(h) => {
+            let arr = heap.array_vec(h);
             assert_eq!(arr[0], Value::Int(10));
             assert_eq!(arr[1], Value::Int(20));
             assert_eq!(arr[2], Value::Int(30));
@@ -550,9 +585,10 @@ fn test_array_map_with_closure() {
 
 #[test]
 fn test_array_chained_methods() {
-    let result = eval_ts("[1, 2, 3, 4, 5].filter((x) => x % 2 === 0).map((x) => x * 10)").unwrap();
+    let (result, heap) = run("[1, 2, 3, 4, 5].filter((x) => x % 2 === 0).map((x) => x * 10)");
     match result {
-        Value::Array(arr) => {
+        Value::Array(h) => {
+            let arr = heap.array_vec(h);
             assert_eq!(arr.len(), 2);
             assert_eq!(arr[0], Value::Int(20));
             assert_eq!(arr[1], Value::Int(40));

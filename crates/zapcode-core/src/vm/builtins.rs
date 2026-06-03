@@ -4,28 +4,45 @@ use std::sync::Arc;
 use indexmap::IndexMap;
 
 use crate::error::{Result, ZapcodeError};
+use crate::heap::{Handle, Heap};
 use crate::sandbox::ResourceLimits;
 use crate::value::Value;
 
-/// Register built-in global objects and functions.
-pub fn register_globals(globals: &mut HashMap<String, Value>) {
-    // Register known globals as empty objects — method calls are intercepted by the VM
-    globals.insert("console".to_string(), Value::Object(IndexMap::new()));
-    globals.insert("JSON".to_string(), Value::Object(IndexMap::new()));
-    globals.insert("Object".to_string(), builtin_constructor("Object"));
-    globals.insert("Array".to_string(), builtin_constructor("Array"));
-    globals.insert("Promise".to_string(), Value::Object(IndexMap::new()));
-    globals.insert("Map".to_string(), builtin_constructor("Map"));
-    globals.insert("Set".to_string(), builtin_constructor("Set"));
-    globals.insert("Date".to_string(), builtin_constructor("Date"));
+/// Register built-in global objects and functions, allocating their backing
+/// objects in `heap`.
+pub fn register_globals(globals: &mut HashMap<String, Value>, heap: &mut Heap) {
+    // Register known globals as objects — method calls are intercepted by the VM.
+    let empty = heap.alloc_object(IndexMap::new());
+    globals.insert("console".to_string(), Value::Object(empty));
+    let empty = heap.alloc_object(IndexMap::new());
+    globals.insert("JSON".to_string(), Value::Object(empty));
+    globals.insert("Object".to_string(), builtin_constructor("Object", heap));
+    globals.insert("Array".to_string(), builtin_constructor("Array", heap));
+    let empty = heap.alloc_object(IndexMap::new());
+    globals.insert("Promise".to_string(), Value::Object(empty));
+    globals.insert("Map".to_string(), builtin_constructor("Map", heap));
+    globals.insert("Set".to_string(), builtin_constructor("Set", heap));
+    globals.insert("Date".to_string(), {
+        let mut d = IndexMap::new();
+        d.insert(
+            Arc::from("__builtin_constructor__"),
+            Value::String(Arc::from("Date")),
+        );
+        // Static methods Date.now()/Date.parse()/Date.UTC() (callable globals).
+        for (prop, target) in [("now", "Date.now"), ("parse", "Date.parse"), ("UTC", "Date.UTC")] {
+            d.insert(Arc::from(prop), global_fn_marker(target, heap));
+        }
+        Value::Object(heap.alloc_object(d))
+    });
     for err in [
         "Error",
         "TypeError",
         "RangeError",
         "SyntaxError",
         "ReferenceError",
+        "AggregateError",
     ] {
-        globals.insert(err.to_string(), builtin_constructor(err));
+        globals.insert(err.to_string(), builtin_constructor(err, heap));
     }
 
     // Callable bare globals (type conversions + numeric parsing/predicates),
@@ -39,8 +56,12 @@ pub fn register_globals(globals: &mut HashMap<String, Value>) {
         "isNaN",
         "isFinite",
         "structuredClone",
+        // Minimal Symbol factory (O8): callable, typeof === "function", and
+        // `Symbol()` yields a unique marker value.
+        "Symbol",
     ] {
-        globals.insert(name.to_string(), global_fn(name));
+        let v = global_fn(name, heap);
+        globals.insert(name.to_string(), v);
     }
 
     // Math gets its constants as real properties
@@ -56,23 +77,30 @@ pub fn register_globals(globals: &mut HashMap<String, Value>) {
         Arc::from("SQRT1_2"),
         Value::Float(1.0 / std::f64::consts::SQRT_2),
     );
-    globals.insert("Math".to_string(), Value::Object(math));
+    globals.insert("Math".to_string(), Value::Object(heap.alloc_object(math)));
 }
 
-fn builtin_constructor(name: &str) -> Value {
+/// A `{ __global_fn__: target }` marker object (a callable static), heap-allocated.
+fn global_fn_marker(target: &str, heap: &mut Heap) -> Value {
+    let mut s = IndexMap::new();
+    s.insert(Arc::from("__global_fn__"), Value::String(Arc::from(target)));
+    Value::Object(heap.alloc_object(s))
+}
+
+fn builtin_constructor(name: &str, heap: &mut Heap) -> Value {
     let mut obj = IndexMap::new();
     obj.insert(
         Arc::from("__builtin_constructor__"),
         Value::String(Arc::from(name)),
     );
-    Value::Object(obj)
+    Value::Object(heap.alloc_object(obj))
 }
 
 /// A bare type-conversion function (`String`/`Number`/`Boolean`), represented as
 /// an object so it can be both *called* (via the `__global_fn__` marker, handled
 /// in the VM's Call instruction) and carry static properties (e.g.
 /// `Number.MAX_SAFE_INTEGER`).
-fn global_fn(name: &str) -> Value {
+fn global_fn(name: &str, heap: &mut Heap) -> Value {
     let mut obj = IndexMap::new();
     obj.insert(Arc::from("__global_fn__"), Value::String(Arc::from(name)));
     if name == "String" {
@@ -80,12 +108,7 @@ fn global_fn(name: &str) -> Value {
             ("fromCharCode", "String.fromCharCode"),
             ("fromCodePoint", "String.fromCodePoint"),
         ] {
-            let mut s = IndexMap::new();
-            s.insert(
-                Arc::from("__global_fn__"),
-                Value::String(Arc::from(target)),
-            );
-            obj.insert(Arc::from(prop), Value::Object(s));
+            obj.insert(Arc::from(prop), global_fn_marker(target, heap));
         }
     }
     if name == "Number" {
@@ -115,10 +138,10 @@ fn global_fn(name: &str) -> Value {
             "parseInt",
             "parseFloat",
         ] {
-            obj.insert(Arc::from(m), global_fn(&format!("Number.{m}")));
+            obj.insert(Arc::from(m), global_fn_marker(&format!("Number.{m}"), heap));
         }
     }
-    Value::Object(obj)
+    Value::Object(heap.alloc_object(obj))
 }
 
 /// Parse the leading integer of a string (JS `parseInt` semantics, base 10 or a
@@ -443,11 +466,11 @@ fn format_number(n: f64) -> String {
 }
 
 /// Dispatch a callable bare global / Number static (see `global_fn`).
-pub fn call_global_fn(kind: &str, args: &[Value]) -> Result<Value> {
+pub fn call_global_fn(kind: &str, args: &[Value], heap: &mut Heap) -> Result<Value> {
     let arg = args.first().cloned().unwrap_or(Value::Undefined);
     Ok(match kind {
-        "String" => Value::String(Arc::from(arg.to_js_string().as_str())),
-        "Number" => finite_number(arg.to_number()),
+        "String" => Value::String(Arc::from(arg.to_js_string(heap).as_str())),
+        "Number" => finite_number(arg.to_number_heap(heap)),
         "Boolean" => Value::Bool(arg.is_truthy()),
         "parseInt" | "Number.parseInt" => {
             // radix 0 means "auto-detect": js_parse_int infers hex from a 0x
@@ -459,21 +482,21 @@ pub fn call_global_fn(kind: &str, args: &[Value]) -> Result<Value> {
             };
             let s = match &arg {
                 Value::String(s) => s.to_string(),
-                other => other.to_js_string(),
+                other => other.to_js_string(heap),
             };
             Value::Float(js_parse_int(&s, radix))
         }
         "parseFloat" | "Number.parseFloat" => {
             let s = match &arg {
                 Value::String(s) => s.to_string(),
-                other => other.to_js_string(),
+                other => other.to_js_string(heap),
             };
             Value::Float(js_parse_float(&s))
         }
-        "isNaN" => Value::Bool(arg.to_number().is_nan()),
-        "isFinite" => Value::Bool(arg.to_number().is_finite()),
-        // Values are deep-copied on assignment in this VM, so a clone suffices.
-        "structuredClone" => arg,
+        "isNaN" => Value::Bool(arg.to_number_heap(heap).is_nan()),
+        "isFinite" => Value::Bool(arg.to_number_heap(heap).is_finite()),
+        // Deep-copy so the result is independent of the original (reference semantics).
+        "structuredClone" => heap.deep_clone(&arg),
         "String.fromCharCode" => {
             let s: String = args
                 .iter()
@@ -488,6 +511,17 @@ pub fn call_global_fn(kind: &str, args: &[Value]) -> Result<Value> {
                 .collect();
             Value::String(Arc::from(s.as_str()))
         }
+        // Date statics. now() is 0 — the sandbox has no wall clock (deterministic
+        // replay); inject the current time via a host tool when needed.
+        "Date.now" => Value::Int(0),
+        "Date.parse" => {
+            let s = arg.to_js_string(heap);
+            match crate::vm::parse_date_string(&s) {
+                Some(ms) => Value::Int(ms),
+                None => Value::Float(f64::NAN),
+            }
+        }
+        "Date.UTC" => finite_number(crate::vm::date_utc_millis(args)),
         "Number.isNaN" => Value::Bool(matches!(arg, Value::Float(n) if n.is_nan())),
         "Number.isFinite" => Value::Bool(
             matches!(arg, Value::Int(_)) || matches!(arg, Value::Float(n) if n.is_finite()),
@@ -504,6 +538,25 @@ pub fn call_global_fn(kind: &str, args: &[Value]) -> Result<Value> {
             }
             _ => false,
         }),
+        // Minimal Symbol(): returns a fresh, unique primitive-ish marker so that
+        // feature-detection (`typeof Symbol === "function"`) and simple use don't
+        // throw (O8). Uniqueness comes from heap-handle identity — each call
+        // allocates a new object, so `Symbol() !== Symbol()` under `strict_eq`
+        // (reference equality), while a symbol equals itself. This is NOT full
+        // Symbol semantics (no global registry, no well-known symbols, no
+        // Symbol.toPrimitive dispatch).
+        "Symbol" => {
+            let mut s = IndexMap::new();
+            s.insert(Arc::from("__symbol__"), Value::Bool(true));
+            // Optional description, coerced to string per spec (undefined stays absent).
+            if !matches!(arg, Value::Undefined) {
+                s.insert(
+                    Arc::from("description"),
+                    Value::String(Arc::from(arg.to_js_string(heap).as_str())),
+                );
+            }
+            Value::Object(heap.alloc_object(s))
+        }
         other => {
             return Err(ZapcodeError::TypeError(format!(
                 "{} is not a function",
@@ -520,10 +573,11 @@ pub fn call_builtin(
     args: &[Value],
     limits: &ResourceLimits,
     _stdout: &mut String,
+    heap: &mut Heap,
 ) -> Result<Option<Value>> {
     match object {
-        Value::String(s) => call_string_method(s, method, args, limits),
-        Value::Array(arr) => call_array_method(arr, method, args, limits),
+        Value::String(s) => call_string_method(&s.clone(), method, args, limits, heap),
+        Value::Array(h) => call_array_method(*h, method, args, limits, heap),
         _ => Ok(None),
     }
 }
@@ -534,24 +588,25 @@ pub fn call_global_method(
     method: &str,
     args: &[Value],
     stdout: &mut String,
+    heap: &mut Heap,
 ) -> Result<Option<Value>> {
     match global_name {
-        "console" => call_console_method(method, args, stdout),
+        "console" => call_console_method(method, args, stdout, heap),
         "Math" => call_math_method(method, args),
-        "JSON" => call_json_method(method, args),
-        "Object" => call_object_method(method, args),
-        "Array" => call_array_static_method(method, args),
-        "Promise" => call_promise_method(method, args),
+        "JSON" => call_json_method(method, args, heap),
+        "Object" => call_object_method(method, args, heap),
+        "Array" => call_array_static_method(method, args, heap),
+        "Promise" => call_promise_method(method, args, heap),
         _ => Ok(None),
     }
 }
 
 // ── Console ──────────────────────────────────────────────────────────
 
-fn call_console_method(method: &str, args: &[Value], stdout: &mut String) -> Result<Option<Value>> {
+fn call_console_method(method: &str, args: &[Value], stdout: &mut String, heap: &Heap) -> Result<Option<Value>> {
     match method {
         "log" | "info" | "warn" | "error" | "debug" => {
-            let output: Vec<String> = args.iter().map(|v| v.to_js_string()).collect();
+            let output: Vec<String> = args.iter().map(|v| v.to_js_string(heap)).collect();
             let line = output.join(" ");
             stdout.push_str(&line);
             stdout.push('\n');
@@ -707,14 +762,14 @@ fn call_math_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
 
 // ── JSON ─────────────────────────────────────────────────────────────
 
-fn call_json_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
+fn call_json_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<Option<Value>> {
     match method {
         "stringify" => {
             let val = args.first().unwrap_or(&Value::Undefined);
             // Second arg may be an array replacer (whitelist of keys to keep).
             let whitelist: Option<Vec<String>> = match args.get(1) {
-                Some(Value::Array(items)) => Some(
-                    items
+                Some(Value::Array(h)) => Some(
+                    heap.array(*h)
                         .iter()
                         .filter_map(|v| match v {
                             Value::String(s) => Some(s.to_string()),
@@ -732,7 +787,7 @@ fn call_json_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
                 Some(Value::String(s)) if !s.is_empty() => Some(s.to_string()),
                 _ => None,
             };
-            match serialize_json(val, whitelist.as_deref(), indent.as_deref(), 0) {
+            match serialize_json(val, whitelist.as_deref(), indent.as_deref(), 0, heap) {
                 // JSON.stringify(undefined) / of a function returns the value undefined.
                 Some(s) => Ok(Some(Value::String(Arc::from(s.as_str())))),
                 None => Ok(Some(Value::Undefined)),
@@ -747,7 +802,7 @@ fn call_json_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
                     ))
                 }
             };
-            let val = json_to_value(&s)?;
+            let val = json_to_value(&s, heap)?;
             Ok(Some(val))
         }
         _ => Ok(None),
@@ -784,6 +839,7 @@ fn serialize_json(
     whitelist: Option<&[String]>,
     indent: Option<&str>,
     depth: usize,
+    heap: &Heap,
 ) -> Option<String> {
     match val {
         Value::Undefined
@@ -800,34 +856,38 @@ fn serialize_json(
             "null".to_string()
         }),
         Value::String(s) => Some(json_escape_string(s)),
-        // Date -> ISO string (matches Date.prototype.toJSON).
-        Value::Object(map) if map.contains_key("__date_ms__") => {
-            let ms = map.get("__date_ms__").map(|v| v.to_number() as i64).unwrap_or(0);
-            Some(json_escape_string(&crate::vm::unix_millis_to_iso(ms)))
-        }
-        // Map/Set/RegExp/Error have no enumerable own data properties in JS.
-        Value::Object(map)
-            if map.contains_key("__map__")
-                || map.contains_key("__set__")
-                || map.contains_key("__regexp__")
-                || map.contains_key("__error__") =>
-        {
-            Some("{}".to_string())
-        }
-        Value::Array(arr) => {
-            let items: Vec<String> = arr
+        Value::Array(h) => {
+            let items: Vec<String> = heap
+                .array(*h)
                 .iter()
-                .map(|v| serialize_json(v, whitelist, indent, depth + 1).unwrap_or_else(|| "null".to_string()))
+                .map(|v| {
+                    serialize_json(v, whitelist, indent, depth + 1, heap)
+                        .unwrap_or_else(|| "null".to_string())
+                })
                 .collect();
             Some(join_json_array(&items, indent, depth))
         }
-        Value::Object(map) => {
+        Value::Object(h) => {
+            let map = heap.object(*h)?;
+            // Date -> ISO string (matches Date.prototype.toJSON).
+            if map.contains_key("__date_ms__") {
+                let ms = map.get("__date_ms__").map(|v| v.to_number() as i64).unwrap_or(0);
+                return Some(json_escape_string(&crate::vm::unix_millis_to_iso(ms)));
+            }
+            // Map/Set/RegExp/Error have no enumerable own data properties in JS.
+            if map.contains_key("__map__")
+                || map.contains_key("__set__")
+                || map.contains_key("__regexp__")
+                || map.contains_key("__error__")
+            {
+                return Some("{}".to_string());
+            }
             let pairs: Vec<(String, String)> = map
                 .iter()
                 .filter(|(k, _)| !k.starts_with("__"))
                 .filter(|(k, _)| whitelist.map_or(true, |w| w.iter().any(|x| x == k.as_ref())))
                 .filter_map(|(k, v)| {
-                    serialize_json(v, whitelist, indent, depth + 1).map(|s| (k.to_string(), s))
+                    serialize_json(v, whitelist, indent, depth + 1, heap).map(|s| (k.to_string(), s))
                 })
                 .collect();
             Some(join_json_object(&pairs, indent, depth))
@@ -883,11 +943,11 @@ fn join_json_object(pairs: &[(String, String)], indent: Option<&str>, depth: usi
 /// Maximum nesting depth for JSON parsing to prevent stack overflow.
 const JSON_MAX_DEPTH: usize = 64;
 
-fn json_to_value(s: &str) -> Result<Value> {
-    json_to_value_depth(s, 0)
+fn json_to_value(s: &str, heap: &mut Heap) -> Result<Value> {
+    json_to_value_depth(s, 0, heap)
 }
 
-fn json_to_value_depth(s: &str, depth: usize) -> Result<Value> {
+fn json_to_value_depth(s: &str, depth: usize, heap: &mut Heap) -> Result<Value> {
     if depth > JSON_MAX_DEPTH {
         return Err(ZapcodeError::RuntimeError(
             "JSON nesting depth exceeded (max 64)".to_string(),
@@ -919,30 +979,30 @@ fn json_to_value_depth(s: &str, depth: usize) -> Result<Value> {
         return Ok(Value::Float(n));
     }
     if s.starts_with('[') {
-        return parse_json_array(s, depth);
+        return parse_json_array(s, depth, heap);
     }
     if s.starts_with('{') {
-        return parse_json_object(s, depth);
+        return parse_json_object(s, depth, heap);
     }
     Err(ZapcodeError::RuntimeError(format!("Invalid JSON: {}", s)))
 }
 
-fn parse_json_array(s: &str, depth: usize) -> Result<Value> {
+fn parse_json_array(s: &str, depth: usize, heap: &mut Heap) -> Result<Value> {
     let inner = &s[1..s.len() - 1].trim();
     if inner.is_empty() {
-        return Ok(Value::Array(Vec::new()));
+        return Ok(Value::Array(heap.alloc_array(Vec::new())));
     }
     let mut items = Vec::new();
     for part in split_json_top_level(inner) {
-        items.push(json_to_value_depth(part.trim(), depth + 1)?);
+        items.push(json_to_value_depth(part.trim(), depth + 1, heap)?);
     }
-    Ok(Value::Array(items))
+    Ok(Value::Array(heap.alloc_array(items)))
 }
 
-fn parse_json_object(s: &str, depth: usize) -> Result<Value> {
+fn parse_json_object(s: &str, depth: usize, heap: &mut Heap) -> Result<Value> {
     let inner = &s[1..s.len() - 1].trim();
     if inner.is_empty() {
-        return Ok(Value::Object(IndexMap::new()));
+        return Ok(Value::Object(heap.alloc_object(IndexMap::new())));
     }
     let mut map = IndexMap::new();
     for part in split_json_top_level(inner) {
@@ -955,10 +1015,10 @@ fn parse_json_object(s: &str, depth: usize) -> Result<Value> {
             } else {
                 key
             };
-            map.insert(Arc::from(key), json_to_value_depth(val, depth + 1)?);
+            map.insert(Arc::from(key), json_to_value_depth(val, depth + 1, heap)?);
         }
     }
-    Ok(Value::Object(map))
+    Ok(Value::Object(heap.alloc_object(map)))
 }
 
 /// Count consecutive backslashes preceding position `i` in `bytes`.
@@ -1025,8 +1085,9 @@ fn find_json_colon(s: &str) -> Option<usize> {
 // ── String methods ───────────────────────────────────────────────────
 
 /// Extract `(pattern, flags)` if `v` is a regex literal object `{__regexp__, …}`.
-pub fn regexp_parts(v: &Value) -> Option<(String, String)> {
-    if let Value::Object(map) = v {
+pub fn regexp_parts(v: &Value, heap: &Heap) -> Option<(String, String)> {
+    if let Value::Object(h) = v {
+        let map = heap.object(*h)?;
         if matches!(map.get("__regexp__"), Some(Value::Bool(true))) {
             let pat = match map.get("pattern") {
                 Some(Value::String(s)) => s.to_string(),
@@ -1062,22 +1123,116 @@ pub fn call_regexp_method(
     flags: &str,
     method: &str,
     args: &[Value],
+    // Heap handle of the regex object, so /g (and /y) `exec`/`test` can read and
+    // advance the mutable `lastIndex` cursor in place (G3). `None` only when the
+    // receiver is not a heap object (shouldn't happen for regex literals).
+    regex_handle: Option<Handle>,
+    heap: &mut Heap,
 ) -> Result<Option<Value>> {
-    let subject = arg_str(args, 0);
+    let subject = arg_str(args, 0, heap);
     let re = compile_regex(pattern, flags)?;
+    // /g and /y are "stateful": exec/test resume from `lastIndex` and advance it.
+    let stateful = flags.contains('g') || flags.contains('y');
+
+    // Read the current `lastIndex` (in chars) from the heap slot, if present.
+    let read_last_index = |heap: &Heap| -> usize {
+        regex_handle
+            .and_then(|h| heap.object(h))
+            .and_then(|m| m.get("lastIndex"))
+            .map(|v| v.to_number().max(0.0) as usize)
+            .unwrap_or(0)
+    };
+    // Write `lastIndex` (in chars) back into the heap slot.
+    let write_last_index = |heap: &mut Heap, idx: usize| {
+        if let Some(h) = regex_handle {
+            if let Some(map) = heap.object_mut(h) {
+                map.insert(Arc::from("lastIndex"), Value::Int(idx as i64));
+            }
+        }
+    };
+    // Map a char index into a byte offset within `subject`.
+    let char_to_byte = |s: &str, char_idx: usize| -> usize {
+        s.char_indices().nth(char_idx).map_or(s.len(), |(b, _)| b)
+    };
+
     Ok(match method {
-        "test" => Some(Value::Bool(re.is_match(&subject))),
-        "exec" => Some(match re.captures(&subject) {
-            Some(caps) => Value::Array(
-                caps.iter()
-                    .map(|c| {
-                        c.map(|m| Value::String(Arc::from(m.as_str())))
-                            .unwrap_or(Value::Undefined)
-                    })
-                    .collect(),
-            ),
-            None => Value::Null,
-        }),
+        "test" => {
+            if stateful {
+                let start_char = read_last_index(heap);
+                let start_byte = char_to_byte(&subject, start_char);
+                if start_byte > subject.len() {
+                    write_last_index(heap, 0);
+                    Some(Value::Bool(false))
+                } else {
+                    match re.find_at(&subject, start_byte) {
+                        Some(m) => {
+                            let end_char = subject[..m.end()].chars().count();
+                            write_last_index(heap, end_char);
+                            Some(Value::Bool(true))
+                        }
+                        None => {
+                            write_last_index(heap, 0);
+                            Some(Value::Bool(false))
+                        }
+                    }
+                }
+            } else {
+                Some(Value::Bool(re.is_match(&subject)))
+            }
+        }
+        "exec" => {
+            // Determine the byte offset to start matching from.
+            let start_byte = if stateful {
+                let start_char = read_last_index(heap);
+                char_to_byte(&subject, start_char)
+            } else {
+                0
+            };
+
+            let caps_opt = if start_byte > subject.len() {
+                None
+            } else {
+                re.captures_at(&subject, start_byte)
+            };
+
+            match caps_opt {
+                Some(caps) => {
+                    let full = caps.get(0);
+                    if stateful {
+                        // Advance lastIndex past the whole match so the next call
+                        // makes progress (and a zero-width match still terminates).
+                        let new_char = match full {
+                            Some(m) => {
+                                let end = m.end();
+                                let end_char = subject[..end].chars().count();
+                                if m.start() == end {
+                                    end_char + 1
+                                } else {
+                                    end_char
+                                }
+                            }
+                            None => read_last_index(heap) + 1,
+                        };
+                        write_last_index(heap, new_char);
+                    }
+                    let items: Vec<Value> = caps
+                        .iter()
+                        .map(|c| {
+                            c.map(|m| Value::String(Arc::from(m.as_str())))
+                                .unwrap_or(Value::Undefined)
+                        })
+                        .collect();
+                    Some(Value::Array(heap.alloc_array(items)))
+                }
+                None => {
+                    // No (further) match: reset the cursor and report exhaustion.
+                    if stateful {
+                        write_last_index(heap, 0);
+                    }
+                    Some(Value::Null)
+                }
+            }
+        }
         _ => None,
     })
 }
@@ -1131,11 +1286,66 @@ fn translate_replacement(repl: &str) -> String {
     out
 }
 
+/// Build a JS-style match result as an array-like heap object for a single
+/// `regex::Captures`. Vec-backed arrays can't carry the extra `.index`,
+/// `.input`, and `.groups` properties a JS match result has, so we model the
+/// result as an object with integer-string keys `"0".."n"` for the capture
+/// groups plus `length`, `index` (match start in *chars*), `input` (subject),
+/// and `groups` (object of named captures, or `undefined` if the pattern has
+/// none). `m[0]`, `m[1]`, `m.index`, `m.input`, `m.groups.name`, and `m.length`
+/// all resolve through normal object key access. `Array.isArray` is therefore
+/// `false` for this value — an accepted trade-off (see STRESS-PASS-BUGS.md).
+fn alloc_match_result(
+    re: &regex::Regex,
+    caps: &regex::Captures,
+    subject: &Arc<str>,
+    heap: &mut Heap,
+) -> Value {
+    let mut map: IndexMap<Arc<str>, Value> = IndexMap::new();
+    // Numbered capture groups, including group 0 (the whole match).
+    let len = caps.len();
+    for i in 0..len {
+        let v = caps
+            .get(i)
+            .map(|mm| Value::String(Arc::from(mm.as_str())))
+            .unwrap_or(Value::Undefined);
+        map.insert(Arc::from(i.to_string().as_str()), v);
+    }
+    map.insert(Arc::from("length"), Value::Int(len as i64));
+    // `index`: start of the whole match, in chars (JS uses code-unit/char index,
+    // not bytes). Convert the regex crate's byte offset.
+    let index_chars = caps
+        .get(0)
+        .map(|m| subject[..m.start()].chars().count())
+        .unwrap_or(0);
+    map.insert(Arc::from("index"), Value::Int(index_chars as i64));
+    map.insert(Arc::from("input"), Value::String(subject.clone()));
+    // Named capture groups -> `groups` object, or `undefined` if the pattern
+    // declares no named groups (matching JS semantics).
+    let named: Vec<&str> = re.capture_names().flatten().collect();
+    let groups_val = if named.is_empty() {
+        Value::Undefined
+    } else {
+        let mut g: IndexMap<Arc<str>, Value> = IndexMap::new();
+        for name in named {
+            let v = caps
+                .name(name)
+                .map(|mm| Value::String(Arc::from(mm.as_str())))
+                .unwrap_or(Value::Undefined);
+            g.insert(Arc::from(name), v);
+        }
+        Value::Object(heap.alloc_object(g))
+    };
+    map.insert(Arc::from("groups"), groups_val);
+    Value::Object(heap.alloc_object(map))
+}
+
 fn call_string_method(
     s: &Arc<str>,
     method: &str,
     args: &[Value],
     limits: &ResourceLimits,
+    heap: &mut Heap,
 ) -> Result<Option<Value>> {
     let result = match method {
         "length" => Value::Int(s.len() as i64),
@@ -1178,7 +1388,7 @@ fn call_string_method(
             Value::String(Arc::from(chars[start..end].iter().collect::<String>().as_str()))
         }
         "indexOf" => {
-            let search = arg_str(args, 0);
+            let search = arg_str(args, 0, heap);
             // Optional fromIndex (in chars). Search the remainder, then map the
             // byte position back to a char index.
             let from = match args.get(1) {
@@ -1192,24 +1402,24 @@ fn call_string_method(
             }
         }
         "lastIndexOf" => {
-            let search = arg_str(args, 0);
+            let search = arg_str(args, 0, heap);
             match s.rfind(&*search) {
                 Some(pos) => Value::Int(pos as i64),
                 None => Value::Int(-1),
             }
         }
         "includes" => {
-            let search = arg_str(args, 0);
+            let search = arg_str(args, 0, heap);
             Value::Bool(s.contains(&*search))
         }
         "startsWith" => {
-            let search = arg_str(args, 0);
+            let search = arg_str(args, 0, heap);
             let pos = args.get(1).map(|v| v.to_number().max(0.0) as usize).unwrap_or(0);
             let byte_start = s.char_indices().nth(pos).map_or(s.len(), |(i, _)| i);
             Value::Bool(s[byte_start..].starts_with(&*search))
         }
         "endsWith" => {
-            let search = arg_str(args, 0);
+            let search = arg_str(args, 0, heap);
             // The optional end position treats the string as if it were that many
             // characters long.
             let byte_end = match args.get(1) {
@@ -1254,7 +1464,7 @@ fn call_string_method(
         "toLowerCase" => Value::String(Arc::from(s.to_lowercase().as_str())),
         "localeCompare" => {
             // Codepoint ordering (no locale data); returns -1, 0, or 1.
-            let other = arg_str(args, 0);
+            let other = arg_str(args, 0, heap);
             let cmp = s.as_ref().cmp(other.as_str());
             Value::Int(match cmp {
                 std::cmp::Ordering::Less => -1,
@@ -1279,7 +1489,7 @@ fn call_string_method(
         "padStart" => {
             let target_len = arg_int(args, 0).max(0) as usize;
             let pad = if args.len() > 1 {
-                arg_str(args, 1)
+                arg_str(args, 1, heap)
             } else {
                 " ".to_string()
             };
@@ -1295,7 +1505,7 @@ fn call_string_method(
         "padEnd" => {
             let target_len = arg_int(args, 0).max(0) as usize;
             let pad = if args.len() > 1 {
-                arg_str(args, 1)
+                arg_str(args, 1, heap)
             } else {
                 " ".to_string()
             };
@@ -1315,9 +1525,9 @@ fn call_string_method(
                 Some(v) => v.to_number().max(0.0) as usize,
             };
             if limit == 0 {
-                return Ok(Some(Value::Array(Vec::new())));
+                return Ok(Some(Value::Array(heap.alloc_array(Vec::new()))));
             }
-            if let Some((pat, flags)) = args.first().and_then(regexp_parts) {
+            if let Some((pat, flags)) = args.first().and_then(|v| regexp_parts(v, heap)) {
                 let re = compile_regex(&pat, &flags)?;
                 // Splice in capture groups between the surrounding pieces, like JS.
                 let mut out: Vec<Value> = Vec::new();
@@ -1336,9 +1546,9 @@ fn call_string_method(
                 }
                 out.push(Value::String(Arc::from(&s[last..])));
                 out.truncate(limit);
-                return Ok(Some(Value::Array(out)));
+                return Ok(Some(Value::Array(heap.alloc_array(out))));
             }
-            let separator = arg_str(args, 0);
+            let separator = arg_str(args, 0, heap);
             let mut parts: Vec<Value> = if separator.is_empty() {
                 s.chars()
                     .map(|c| Value::String(Arc::from(c.to_string().as_str())))
@@ -1349,12 +1559,12 @@ fn call_string_method(
                     .collect()
             };
             parts.truncate(limit);
-            Value::Array(parts)
+            Value::Array(heap.alloc_array(parts))
         }
         "replace" => {
-            if let Some((pat, flags)) = args.first().and_then(regexp_parts) {
+            if let Some((pat, flags)) = args.first().and_then(|v| regexp_parts(v, heap)) {
                 let re = compile_regex(&pat, &flags)?;
-                let repl = translate_replacement(&arg_str(args, 1));
+                let repl = translate_replacement(&arg_str(args, 1, heap));
                 let out = if flags.contains('g') {
                     re.replace_all(s, repl.as_str())
                 } else {
@@ -1362,23 +1572,23 @@ fn call_string_method(
                 };
                 return Ok(Some(Value::String(Arc::from(out.as_ref()))));
             }
-            let search = arg_str(args, 0);
-            let replacement = arg_str(args, 1);
+            let search = arg_str(args, 0, heap);
+            let replacement = arg_str(args, 1, heap);
             Value::String(Arc::from(s.replacen(&*search, &replacement, 1).as_str()))
         }
         "replaceAll" => {
-            if let Some((pat, flags)) = args.first().and_then(regexp_parts) {
+            if let Some((pat, flags)) = args.first().and_then(|v| regexp_parts(v, heap)) {
                 let re = compile_regex(&pat, &flags)?;
-                let repl = translate_replacement(&arg_str(args, 1));
+                let repl = translate_replacement(&arg_str(args, 1, heap));
                 let out = re.replace_all(s, repl.as_str());
                 return Ok(Some(Value::String(Arc::from(out.as_ref()))));
             }
-            let search = arg_str(args, 0);
-            let replacement = arg_str(args, 1);
+            let search = arg_str(args, 0, heap);
+            let replacement = arg_str(args, 1, heap);
             Value::String(Arc::from(s.replace(&*search, &replacement).as_str()))
         }
         "match" => {
-            if let Some((pat, flags)) = args.first().and_then(regexp_parts) {
+            if let Some((pat, flags)) = args.first().and_then(|v| regexp_parts(v, heap)) {
                 let re = compile_regex(&pat, &flags)?;
                 if flags.contains('g') {
                     let all: Vec<Value> = re
@@ -1388,57 +1598,49 @@ fn call_string_method(
                     return Ok(Some(if all.is_empty() {
                         Value::Null
                     } else {
-                        Value::Array(all)
+                        Value::Array(heap.alloc_array(all))
                     }));
                 }
                 return Ok(Some(match re.captures(s) {
-                    Some(caps) => Value::Array(
-                        caps.iter()
-                            .map(|c| {
-                                c.map(|m| Value::String(Arc::from(m.as_str())))
-                                    .unwrap_or(Value::Undefined)
-                            })
-                            .collect(),
-                    ),
+                    // Non-global match: return an array-like object carrying
+                    // `.index`, `.input`, and named `.groups` (G4).
+                    Some(caps) => alloc_match_result(&re, &caps, s, heap),
                     None => Value::Null,
                 }));
             }
             // Non-regex arg: literal substring (kept for back-compat).
-            let pattern = args.first().map(|v| v.to_js_string()).unwrap_or_default();
+            let pattern = args.first().map(|v| v.to_js_string(heap)).unwrap_or_default();
             match s.find(&pattern) {
-                Some(_) => Value::Array(vec![Value::String(Arc::from(pattern.as_str()))]),
+                Some(_) => {
+                    let items = vec![Value::String(Arc::from(pattern.as_str()))];
+                    Value::Array(heap.alloc_array(items))
+                }
                 None => Value::Null,
             }
         }
         "matchAll" => {
-            if let Some((pat, flags)) = args.first().and_then(regexp_parts) {
+            if let Some((pat, flags)) = args.first().and_then(|v| regexp_parts(v, heap)) {
                 let re = compile_regex(&pat, &flags)?;
-                let all: Vec<Value> = re
-                    .captures_iter(s)
-                    .map(|caps| {
-                        Value::Array(
-                            caps.iter()
-                                .map(|c| {
-                                    c.map(|m| Value::String(Arc::from(m.as_str())))
-                                        .unwrap_or(Value::Undefined)
-                                })
-                                .collect(),
-                        )
-                    })
-                    .collect();
-                return Ok(Some(Value::Array(all)));
+                // Each yielded result is an array-like object carrying `.index`,
+                // `.input`, and named `.groups` (G4). `captures_iter` borrows only
+                // `re`/`s`, so we can allocate into the heap as we iterate.
+                let mut all: Vec<Value> = Vec::new();
+                for caps in re.captures_iter(s) {
+                    all.push(alloc_match_result(&re, &caps, s, heap));
+                }
+                return Ok(Some(Value::Array(heap.alloc_array(all))));
             }
-            Value::Array(Vec::new())
+            Value::Array(heap.alloc_array(Vec::new()))
         }
         "search" => {
-            if let Some((pat, flags)) = args.first().and_then(regexp_parts) {
+            if let Some((pat, flags)) = args.first().and_then(|v| regexp_parts(v, heap)) {
                 let re = compile_regex(&pat, &flags)?;
                 return Ok(Some(match re.find(s) {
                     Some(m) => Value::Int(m.start() as i64),
                     None => Value::Int(-1),
                 }));
             }
-            let pattern = arg_str(args, 0);
+            let pattern = arg_str(args, 0, heap);
             match s.find(&*pattern) {
                 Some(i) => Value::Int(i as i64),
                 None => Value::Int(-1),
@@ -1447,7 +1649,7 @@ fn call_string_method(
         "concat" => {
             let mut result = s.to_string();
             for arg in args {
-                result.push_str(&arg.to_js_string());
+                result.push_str(&arg.to_js_string(heap));
             }
             Value::String(Arc::from(result.as_str()))
         }
@@ -1496,21 +1698,29 @@ fn same_value_zero(a: &Value, b: &Value) -> bool {
 }
 
 /// Recursive helper for `Array.prototype.flat(depth)`.
-fn flatten_into(arr: &[Value], depth: i64, out: &mut Vec<Value>) {
+fn flatten_into(arr: &[Value], depth: i64, out: &mut Vec<Value>, heap: &Heap) {
     for item in arr {
         match item {
-            Value::Array(inner) if depth > 0 => flatten_into(inner, depth - 1, out),
+            Value::Array(inner) if depth > 0 => {
+                flatten_into(&heap.array_vec(*inner), depth - 1, out, heap)
+            }
             other => out.push(other.clone()),
         }
     }
 }
 
 fn call_array_method(
-    arr: &[Value],
+    handle: crate::heap::Handle,
     method: &str,
     args: &[Value],
     _limits: &ResourceLimits,
+    heap: &mut Heap,
 ) -> Result<Option<Value>> {
+    // Snapshot the elements for read-only methods. Mutating methods
+    // (push/pop/shift/unshift/splice/fill/reverse/copyWithin) edit the heap slot
+    // in place via `handle` so the change is visible through every alias.
+    let arr = heap.array_vec(handle);
+    let arr = arr.as_slice();
     let result = match method {
         "length" => Value::Int(arr.len() as i64),
         "indexOf" => {
@@ -1539,14 +1749,14 @@ fn call_array_method(
             let sep = if args.is_empty() {
                 ",".to_string()
             } else {
-                arg_str(args, 0)
+                arg_str(args, 0, heap)
             };
             // JS Array.prototype.join renders null/undefined (and holes) as "".
             let joined: Vec<String> = arr
                 .iter()
                 .map(|v| match v {
                     Value::Null | Value::Undefined => String::new(),
-                    _ => v.to_js_string(),
+                    _ => v.to_js_string(heap),
                 })
                 .collect();
             Value::String(Arc::from(joined.join(&sep).as_str()))
@@ -1560,25 +1770,27 @@ fn call_array_method(
                 len as usize
             };
             if start >= end {
-                Value::Array(Vec::new())
+                Value::Array(heap.alloc_array(Vec::new()))
             } else {
-                Value::Array(arr[start..end.min(arr.len())].to_vec())
+                Value::Array(heap.alloc_array(arr[start..end.min(arr.len())].to_vec()))
             }
         }
         "concat" => {
             let mut result = arr.to_vec();
             for arg in args {
                 match arg {
-                    Value::Array(other) => result.extend_from_slice(other),
+                    Value::Array(other) => result.extend(heap.array_vec(*other)),
                     other => result.push(other.clone()),
                 }
             }
-            Value::Array(result)
+            Value::Array(heap.alloc_array(result))
         }
         "reverse" => {
-            let mut result = arr.to_vec();
-            result.reverse();
-            Value::Array(result)
+            // Mutates in place and returns the (same) array.
+            if let Some(v) = heap.array_mut(handle) {
+                v.reverse();
+            }
+            Value::Array(handle)
         }
         "flat" => {
             let depth = match args.first() {
@@ -1593,8 +1805,8 @@ fn call_array_method(
                 }
             };
             let mut result = Vec::new();
-            flatten_into(arr, depth, &mut result);
-            Value::Array(result)
+            flatten_into(arr, depth, &mut result, heap);
+            Value::Array(heap.alloc_array(result))
         }
         "at" => {
             let idx = arg_int(args, 0);
@@ -1619,21 +1831,45 @@ fn call_array_method(
             } else {
                 len
             };
-            let mut result = arr.to_vec();
-            for item in result.iter_mut().take(end.min(len)).skip(start) {
-                *item = fill_val.clone();
+            if let Some(v) = heap.array_mut(handle) {
+                for item in v.iter_mut().take(end.min(len)).skip(start) {
+                    *item = fill_val.clone();
+                }
             }
-            Value::Array(result)
+            Value::Array(handle)
         }
         "push" => {
-            let new_len = (arr.len() + args.len()) as i64;
-            Value::Int(new_len)
+            if let Some(v) = heap.array_mut(handle) {
+                v.extend(args.iter().cloned());
+                Value::Int(v.len() as i64)
+            } else {
+                Value::Int(0)
+            }
         }
-        "pop" => arr.last().cloned().unwrap_or(Value::Undefined),
-        "shift" => arr.first().cloned().unwrap_or(Value::Undefined),
+        "pop" => heap
+            .array_mut(handle)
+            .and_then(|v| v.pop())
+            .unwrap_or(Value::Undefined),
+        "shift" => {
+            if let Some(v) = heap.array_mut(handle) {
+                if v.is_empty() {
+                    Value::Undefined
+                } else {
+                    v.remove(0)
+                }
+            } else {
+                Value::Undefined
+            }
+        }
         "unshift" => {
-            let new_len = (arr.len() + args.len()) as i64;
-            Value::Int(new_len)
+            if let Some(v) = heap.array_mut(handle) {
+                for (i, a) in args.iter().enumerate() {
+                    v.insert(i, a.clone());
+                }
+                Value::Int(v.len() as i64)
+            } else {
+                Value::Int(0)
+            }
         }
         "splice" => {
             let len = arr.len() as i64;
@@ -1648,8 +1884,17 @@ fn call_array_method(
             } else {
                 arr.len() - start
             };
-            let deleted: Vec<Value> = arr[start..start + delete_count].to_vec();
-            Value::Array(deleted)
+            let inserts: Vec<Value> = if args.len() > 2 {
+                args[2..].to_vec()
+            } else {
+                Vec::new()
+            };
+            let deleted: Vec<Value> = if let Some(v) = heap.array_mut(handle) {
+                v.splice(start..start + delete_count, inserts).collect()
+            } else {
+                Vec::new()
+            };
+            Value::Array(heap.alloc_array(deleted))
         }
         "copyWithin" => {
             let len = arr.len() as i64;
@@ -1664,31 +1909,36 @@ fn call_array_method(
             } else {
                 len as usize
             };
-            let mut result = arr.to_vec();
-            let slice: Vec<Value> = result
-                .get(start..end.min(result.len()))
-                .map(|s| s.to_vec())
-                .unwrap_or_default();
-            for (offset, val) in slice.into_iter().enumerate() {
-                let dst = target + offset;
-                if dst < result.len() {
-                    result[dst] = val;
-                } else {
-                    break;
+            if let Some(result) = heap.array_mut(handle) {
+                let slice: Vec<Value> = result
+                    .get(start..end.min(result.len()))
+                    .map(|s| s.to_vec())
+                    .unwrap_or_default();
+                for (offset, val) in slice.into_iter().enumerate() {
+                    let dst = target + offset;
+                    if dst < result.len() {
+                        result[dst] = val;
+                    } else {
+                        break;
+                    }
                 }
             }
-            Value::Array(result)
+            Value::Array(handle)
         }
         // Array iterators. JS returns iterator objects; we return plain arrays,
         // which spread (`[...arr.entries()]`) and for-of iterate identically.
-        "entries" => Value::Array(
-            arr.iter()
-                .enumerate()
-                .map(|(i, v)| Value::Array(vec![Value::Int(i as i64), v.clone()]))
-                .collect(),
-        ),
-        "keys" => Value::Array((0..arr.len()).map(|i| Value::Int(i as i64)).collect()),
-        "values" => Value::Array(arr.to_vec()),
+        "entries" => {
+            let mut out = Vec::with_capacity(arr.len());
+            for (i, v) in arr.iter().enumerate() {
+                let pair = heap.alloc_array(vec![Value::Int(i as i64), v.clone()]);
+                out.push(Value::Array(pair));
+            }
+            Value::Array(heap.alloc_array(out))
+        }
+        "keys" => {
+            Value::Array(heap.alloc_array((0..arr.len()).map(|i| Value::Int(i as i64)).collect()))
+        }
+        "values" => Value::Array(heap.alloc_array(arr.to_vec())),
         "every" | "some" | "map" | "filter" | "reduce" | "reduceRight" | "forEach" | "find"
         | "findIndex" | "findLast" | "findLastIndex" | "sort" | "flatMap" => {
             // These require function callbacks — handled in VM dispatch
@@ -1701,104 +1951,116 @@ fn call_array_method(
 
 // ── Object static methods ────────────────────────────────────────────
 
-fn call_object_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
+fn call_object_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<Option<Value>> {
+    let first = args.first().cloned().unwrap_or(Value::Undefined);
     match method {
         "keys" => {
-            let obj = args.first().unwrap_or(&Value::Undefined);
-            match obj {
-                Value::Object(map) => {
-                    let keys: Vec<Value> = map.keys().map(|k| Value::String(k.clone())).collect();
-                    Ok(Some(Value::Array(keys)))
-                }
+            let keys: Vec<Value> = match &first {
+                Value::Object(h) => heap
+                    .object(*h)
+                    .map(|m| m.keys().map(|k| Value::String(k.clone())).collect())
+                    .unwrap_or_default(),
                 // Object.keys([...]) yields index strings.
-                Value::Array(arr) => Ok(Some(Value::Array(
-                    (0..arr.len())
-                        .map(|i| Value::String(Arc::from(i.to_string().as_str())))
-                        .collect(),
-                ))),
-                _ => Ok(Some(Value::Array(Vec::new()))),
-            }
+                Value::Array(h) => (0..heap.array(*h).len())
+                    .map(|i| Value::String(Arc::from(i.to_string().as_str())))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            Ok(Some(Value::Array(heap.alloc_array(keys))))
         }
         "values" => {
-            let obj = args.first().unwrap_or(&Value::Undefined);
-            match obj {
-                Value::Object(map) => {
-                    let values: Vec<Value> = map.values().cloned().collect();
-                    Ok(Some(Value::Array(values)))
-                }
-                Value::Array(arr) => Ok(Some(Value::Array(arr.clone()))),
-                _ => Ok(Some(Value::Array(Vec::new()))),
-            }
+            let values: Vec<Value> = match &first {
+                Value::Object(h) => heap
+                    .object(*h)
+                    .map(|m| m.values().cloned().collect())
+                    .unwrap_or_default(),
+                Value::Array(h) => heap.array_vec(*h),
+                _ => Vec::new(),
+            };
+            Ok(Some(Value::Array(heap.alloc_array(values))))
         }
         "entries" => {
-            let obj = args.first().unwrap_or(&Value::Undefined);
-            match obj {
-                Value::Object(map) => {
-                    let entries: Vec<Value> = map
-                        .iter()
-                        .map(|(k, v)| Value::Array(vec![Value::String(k.clone()), v.clone()]))
-                        .collect();
-                    Ok(Some(Value::Array(entries)))
-                }
-                Value::Array(arr) => Ok(Some(Value::Array(
-                    arr.iter()
-                        .enumerate()
-                        .map(|(i, v)| {
-                            Value::Array(vec![
-                                Value::String(Arc::from(i.to_string().as_str())),
-                                v.clone(),
-                            ])
-                        })
-                        .collect(),
-                ))),
-                _ => Ok(Some(Value::Array(Vec::new()))),
-            }
+            let pairs: Vec<(Value, Value)> = match &first {
+                Value::Object(h) => heap
+                    .object(*h)
+                    .map(|m| {
+                        m.iter()
+                            .map(|(k, v)| (Value::String(k.clone()), v.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                Value::Array(h) => heap
+                    .array(*h)
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        (
+                            Value::String(Arc::from(i.to_string().as_str())),
+                            v.clone(),
+                        )
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let entries: Vec<Value> = pairs
+                .into_iter()
+                .map(|(k, v)| Value::Array(heap.alloc_array(vec![k, v])))
+                .collect();
+            Ok(Some(Value::Array(heap.alloc_array(entries))))
         }
         "hasOwn" => {
-            let has = match args.first() {
-                Some(Value::Object(map)) => {
-                    let key = args.get(1).map(|v| v.to_js_string()).unwrap_or_default();
-                    map.contains_key(key.as_str())
-                }
+            let key = args.get(1).map(|v| v.to_js_string(heap)).unwrap_or_default();
+            let has = match &first {
+                Value::Object(h) => heap
+                    .object(*h)
+                    .map(|m| m.contains_key(key.as_str()))
+                    .unwrap_or(false),
                 _ => false,
             };
             Ok(Some(Value::Bool(has)))
         }
         "assign" => {
-            let mut target = match args.first() {
-                Some(Value::Object(map)) => map.clone(),
+            let mut target = match &first {
+                Value::Object(h) => heap.object_map(*h),
                 _ => IndexMap::new(),
             };
             for src in args.iter().skip(1) {
-                if let Value::Object(map) = src {
-                    for (k, v) in map {
-                        target.insert(k.clone(), v.clone());
+                if let Value::Object(h) = src {
+                    for (k, v) in heap.object_map(*h) {
+                        target.insert(k, v);
                     }
                 }
             }
-            Ok(Some(Value::Object(target)))
+            // Object.assign mutates and returns the target; write back if it's an object.
+            if let Value::Object(h) = &first {
+                heap.set_object(*h, target);
+                Ok(Some(first))
+            } else {
+                Ok(Some(Value::Object(heap.alloc_object(target))))
+            }
         }
         "fromEntries" => {
             // Object.fromEntries([[k, v], ...]) — inverse of Object.entries.
             let mut obj = IndexMap::new();
-            if let Some(Value::Array(pairs)) = args.first() {
-                for pair in pairs {
-                    if let Value::Array(kv) = pair {
+            if let Value::Array(ph) = &first {
+                for pair in heap.array_vec(*ph) {
+                    if let Value::Array(kvh) = pair {
+                        let kv = heap.array_vec(kvh);
                         let key = kv.first().cloned().unwrap_or(Value::Undefined);
                         let val = kv.get(1).cloned().unwrap_or(Value::Undefined);
                         let key: Arc<str> = match key {
                             Value::String(s) => s,
-                            other => Arc::from(other.to_js_string().as_str()),
+                            other => Arc::from(other.to_js_string(heap).as_str()),
                         };
                         obj.insert(key, val);
                     }
                 }
             }
-            Ok(Some(Value::Object(obj)))
+            Ok(Some(Value::Object(heap.alloc_object(obj))))
         }
         "freeze" | "seal" => {
             // No-op in sandbox — return object as-is
-            Ok(args.first().cloned())
+            Ok(Some(first))
         }
         _ => Ok(None),
     }
@@ -1808,58 +2070,65 @@ fn call_object_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
 /// Handles arrays, strings (by char), built-in Set/Map, and `{ length: n }`
 /// array-likes. The optional mapFn is applied by the caller (it may be a
 /// guest closure that requires the VM).
-pub fn array_from_source(val: &Value) -> Vec<Value> {
+pub fn array_from_source(val: &Value, heap: &mut Heap) -> Vec<Value> {
     match val {
-        Value::Array(arr) => arr.clone(),
+        Value::Array(h) => heap.array_vec(*h),
         Value::String(s) => s
             .chars()
             .map(|c| Value::String(Arc::from(c.to_string().as_str())))
             .collect(),
-        Value::Object(m) if matches!(m.get("__set__"), Some(Value::Bool(true))) => {
-            match m.get("__items__") {
-                Some(Value::Array(items)) => items.clone(),
-                _ => Vec::new(),
+        Value::Object(h) => {
+            let map = heap.object_map(*h);
+            if matches!(map.get("__set__"), Some(Value::Bool(true))) {
+                return match map.get("__items__") {
+                    Some(Value::Array(ih)) => heap.array_vec(*ih),
+                    _ => Vec::new(),
+                };
             }
-        }
-        Value::Object(m) if matches!(m.get("__map__"), Some(Value::Bool(true))) => {
-            match m.get("__entries__") {
-                Some(Value::Array(entries)) => entries
-                    .iter()
-                    .filter_map(|e| match e {
-                        Value::Object(e) => Some(Value::Array(vec![
-                            e.get("key").cloned().unwrap_or(Value::Undefined),
-                            e.get("value").cloned().unwrap_or(Value::Undefined),
-                        ])),
-                        _ => None,
-                    })
-                    .collect(),
-                _ => Vec::new(),
+            if matches!(map.get("__map__"), Some(Value::Bool(true))) {
+                return match map.get("__entries__") {
+                    Some(Value::Array(eh)) => {
+                        let entries = heap.array_vec(*eh);
+                        let mut out = Vec::new();
+                        for e in entries {
+                            if let Value::Object(eo) = e {
+                                let em = heap.object_map(eo);
+                                let pair = heap.alloc_array(vec![
+                                    em.get("key").cloned().unwrap_or(Value::Undefined),
+                                    em.get("value").cloned().unwrap_or(Value::Undefined),
+                                ]);
+                                out.push(Value::Array(pair));
+                            }
+                        }
+                        out
+                    }
+                    _ => Vec::new(),
+                };
             }
-        }
-        // `{ length: n }` array-like: index into present keys, else undefined.
-        Value::Object(m) => match m.get("length") {
-            Some(len_val) => {
-                let n = len_val.to_number();
-                if n.is_finite() && n >= 0.0 {
-                    let len = n as usize;
-                    (0..len)
-                        .map(|i| {
-                            m.get(i.to_string().as_str())
-                                .cloned()
-                                .unwrap_or(Value::Undefined)
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
+            // `{ length: n }` array-like: index into present keys, else undefined.
+            match map.get("length") {
+                Some(len_val) => {
+                    let n = len_val.to_number();
+                    if n.is_finite() && n >= 0.0 {
+                        (0..n as usize)
+                            .map(|i| {
+                                map.get(i.to_string().as_str())
+                                    .cloned()
+                                    .unwrap_or(Value::Undefined)
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    }
                 }
+                None => Vec::new(),
             }
-            None => Vec::new(),
-        },
+        }
         _ => Vec::new(),
     }
 }
 
-fn call_array_static_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
+fn call_array_static_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<Option<Value>> {
     match method {
         "isArray" => {
             let val = args.first().unwrap_or(&Value::Undefined);
@@ -1868,29 +2137,95 @@ fn call_array_static_method(method: &str, args: &[Value]) -> Result<Option<Value
         "from" => {
             // Note: the (source, mapFn) form with a closure mapFn is intercepted
             // in the VM Call dispatch (it needs to invoke guest closures).
-            let val = args.first().unwrap_or(&Value::Undefined);
-            Ok(Some(Value::Array(array_from_source(val))))
+            let val = args.first().cloned().unwrap_or(Value::Undefined);
+            let items = array_from_source(&val, heap);
+            Ok(Some(Value::Array(heap.alloc_array(items))))
         }
-        "of" => Ok(Some(Value::Array(args.to_vec()))),
+        "of" => Ok(Some(Value::Array(heap.alloc_array(args.to_vec())))),
         _ => Ok(None),
     }
 }
 
 // ── Promise ──────────────────────────────────────────────────────────
 
-fn call_promise_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
+/// If a `Promise.{all,allSettled,race,any}(arr)` call's array contains any
+/// *deferred single-call promise* (N5 — a bare tool call collected dynamically,
+/// e.g. via `.map`), lower the whole call to a `pending_all` batch promise so the
+/// `Await` path forces every deferred call through the existing batch machinery
+/// (`await_batch`). Each `pending_call` element is replaced by the `Value::Pending`
+/// marker `await_batch` understands; non-deferred elements (resolved promises,
+/// plain values) pass through unchanged. Returns `None` when no element is a
+/// deferred call (so the normal synchronous combinator runs).
+fn try_lower_pending_call_batch(method: &str, args: &[Value], heap: &mut Heap) -> Option<Value> {
+    let kind = match method {
+        "all" => "all",
+        "allSettled" => "allSettled",
+        "race" => "race",
+        "any" => "any",
+        _ => return None,
+    };
+    let arr = match args.first() {
+        Some(Value::Array(h)) => heap.array_vec(*h),
+        _ => return None,
+    };
+    let has_pending_call = arr.iter().any(|item| {
+        matches!(item, Value::Object(h) if matches!(
+            heap.object(*h).and_then(|m| m.get("status")),
+            Some(Value::String(s)) if s.as_ref() == "pending_call"
+        ))
+    });
+    if !has_pending_call {
+        return None;
+    }
+    // Replace each deferred single-call promise with its `Value::Pending(id)`.
+    let items: Vec<Value> = arr
+        .into_iter()
+        .map(|item| {
+            if let Value::Object(h) = &item {
+                let map = heap.object_map(*h);
+                let is_pending_call = matches!(
+                    map.get("status"),
+                    Some(Value::String(s)) if s.as_ref() == "pending_call"
+                );
+                if is_pending_call {
+                    if let Some(Value::Int(id)) = map.get("__call_id__") {
+                        return Value::Pending(*id as u64);
+                    }
+                }
+            }
+            item
+        })
+        .collect();
+    let items_arr = Value::Array(heap.alloc_array(items));
+    let mut obj = IndexMap::new();
+    obj.insert(Arc::from("__promise__"), Value::Bool(true));
+    obj.insert(Arc::from("status"), Value::String(Arc::from("pending_all")));
+    obj.insert(Arc::from("__batch_kind__"), Value::String(Arc::from(kind)));
+    obj.insert(Arc::from("items"), items_arr);
+    Some(Value::Object(heap.alloc_object(obj)))
+}
+
+fn call_promise_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<Option<Value>> {
+    // Deferred single-call promises (N5) collected into a dynamic
+    // `Promise.{all,allSettled,race,any}(arr)` lower to a batch promise so the
+    // host runs all of their calls; this keeps `Promise.all(items.map(f))` working
+    // when `f` is a bare tool call. Literal-array combinators of *direct* external
+    // calls are already lowered at compile time (`MakeBatchPromise`).
+    if let Some(batch) = try_lower_pending_call_batch(method, args, heap) {
+        return Ok(Some(batch));
+    }
     match method {
         "resolve" => {
             let val = args.first().cloned().unwrap_or(Value::Undefined);
             // If the value is already a promise, return it as-is
-            if is_promise(&val) {
+            if is_promise(&val, heap) {
                 return Ok(Some(val));
             }
             let mut obj = IndexMap::new();
             obj.insert(Arc::from("__promise__"), Value::Bool(true));
             obj.insert(Arc::from("status"), Value::String(Arc::from("resolved")));
             obj.insert(Arc::from("value"), val);
-            Ok(Some(Value::Object(obj)))
+            Ok(Some(Value::Object(heap.alloc_object(obj))))
         }
         "reject" => {
             let reason = args.first().cloned().unwrap_or(Value::Undefined);
@@ -1898,19 +2233,20 @@ fn call_promise_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
             obj.insert(Arc::from("__promise__"), Value::Bool(true));
             obj.insert(Arc::from("status"), Value::String(Arc::from("rejected")));
             obj.insert(Arc::from("reason"), reason);
-            Ok(Some(Value::Object(obj)))
+            Ok(Some(Value::Object(heap.alloc_object(obj))))
         }
         "all" => {
             // Basic Promise.all: takes an array of resolved promises and returns
             // a resolved promise with an array of their values.
             let arr = match args.first() {
-                Some(Value::Array(arr)) => arr.clone(),
+                Some(Value::Array(h)) => heap.array_vec(*h),
                 _ => Vec::new(),
             };
             let mut results = Vec::with_capacity(arr.len());
             for item in &arr {
-                if is_promise(item) {
-                    if let Value::Object(map) = item {
+                if is_promise(item, heap) {
+                    if let Value::Object(h) = item {
+                        let map = heap.object_map(*h);
                         if let Some(Value::String(status)) = map.get("status") {
                             if status.as_ref() == "rejected" {
                                 // Promise.all rejects with the first rejection reason
@@ -1923,63 +2259,67 @@ fn call_promise_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
                     results.push(item.clone());
                 }
             }
+            let value_arr = Value::Array(heap.alloc_array(results));
             let mut obj = IndexMap::new();
             obj.insert(Arc::from("__promise__"), Value::Bool(true));
             obj.insert(Arc::from("status"), Value::String(Arc::from("resolved")));
-            obj.insert(Arc::from("value"), Value::Array(results));
-            Ok(Some(Value::Object(obj)))
+            obj.insert(Arc::from("value"), value_arr);
+            Ok(Some(Value::Object(heap.alloc_object(obj))))
         }
         "allSettled" => {
             let arr = match args.first() {
-                Some(Value::Array(arr)) => arr.clone(),
+                Some(Value::Array(h)) => heap.array_vec(*h),
                 _ => Vec::new(),
             };
-            let results: Vec<Value> = arr
-                .iter()
-                .map(|item| {
-                    let mut entry = IndexMap::new();
-                    if let Value::Object(map) = item {
-                        if matches!(map.get("status"), Some(Value::String(s)) if s.as_ref() == "rejected")
-                        {
-                            entry.insert(Arc::from("status"), Value::String(Arc::from("rejected")));
-                            entry.insert(
-                                Arc::from("reason"),
-                                map.get("reason").cloned().unwrap_or(Value::Undefined),
-                            );
-                            return Value::Object(entry);
-                        }
-                    }
-                    let value = match item {
-                        Value::Object(map) if is_promise(item) => {
-                            map.get("value").cloned().unwrap_or(Value::Undefined)
-                        }
-                        other => other.clone(),
-                    };
-                    entry.insert(Arc::from("status"), Value::String(Arc::from("fulfilled")));
-                    entry.insert(Arc::from("value"), value);
-                    Value::Object(entry)
-                })
-                .collect();
-            Ok(Some(make_resolved_promise(Value::Array(results))))
+            let mut results: Vec<Value> = Vec::with_capacity(arr.len());
+            for item in &arr {
+                let mut entry = IndexMap::new();
+                let map = match item {
+                    Value::Object(h) => heap.object_map(*h),
+                    _ => IndexMap::new(),
+                };
+                if matches!(map.get("status"), Some(Value::String(s)) if s.as_ref() == "rejected") {
+                    entry.insert(Arc::from("status"), Value::String(Arc::from("rejected")));
+                    entry.insert(
+                        Arc::from("reason"),
+                        map.get("reason").cloned().unwrap_or(Value::Undefined),
+                    );
+                    results.push(Value::Object(heap.alloc_object(entry)));
+                    continue;
+                }
+                let value = if is_promise(item, heap) {
+                    map.get("value").cloned().unwrap_or(Value::Undefined)
+                } else {
+                    item.clone()
+                };
+                entry.insert(Arc::from("status"), Value::String(Arc::from("fulfilled")));
+                entry.insert(Arc::from("value"), value);
+                results.push(Value::Object(heap.alloc_object(entry)));
+            }
+            let value_arr = Value::Array(heap.alloc_array(results));
+            Ok(Some(make_resolved_promise(value_arr, heap)))
         }
         "race" => {
             // Synchronous model: every input is already settled, so the first
             // element wins. Returns that promise (resolved or rejected).
-            match args.first() {
-                Some(Value::Array(arr)) if !arr.is_empty() => {
-                    let first = &arr[0];
-                    if is_promise(first) {
-                        Ok(Some(first.clone()))
+            let first = match args.first() {
+                Some(Value::Array(h)) => heap.array(*h).first().cloned(),
+                _ => None,
+            };
+            match first {
+                Some(first) => {
+                    if is_promise(&first, heap) {
+                        Ok(Some(first))
                     } else {
-                        Ok(Some(make_resolved_promise(first.clone())))
+                        Ok(Some(make_resolved_promise(first, heap)))
                     }
                 }
                 // An empty array races forever; surface a pending promise.
-                _ => {
+                None => {
                     let mut obj = IndexMap::new();
                     obj.insert(Arc::from("__promise__"), Value::Bool(true));
                     obj.insert(Arc::from("status"), Value::String(Arc::from("pending")));
-                    Ok(Some(Value::Object(obj)))
+                    Ok(Some(Value::Object(heap.alloc_object(obj))))
                 }
             }
         }
@@ -1987,25 +2327,29 @@ fn call_promise_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
             // First fulfilled value wins; if all reject, reject with an
             // AggregateError-shaped object.
             let arr = match args.first() {
-                Some(Value::Array(arr)) => arr.clone(),
+                Some(Value::Array(h)) => heap.array_vec(*h),
                 _ => Vec::new(),
             };
             let mut errors = Vec::with_capacity(arr.len());
             for item in &arr {
-                match item {
-                    Value::Object(map) if is_promise(item) => {
+                if is_promise(item, heap) {
+                    if let Value::Object(h) = item {
+                        let map = heap.object_map(*h);
                         if matches!(map.get("status"), Some(Value::String(s)) if s.as_ref() == "rejected")
                         {
                             errors.push(map.get("reason").cloned().unwrap_or(Value::Undefined));
                         } else {
                             return Ok(Some(make_resolved_promise(
                                 map.get("value").cloned().unwrap_or(Value::Undefined),
+                                heap,
                             )));
                         }
                     }
-                    other => return Ok(Some(make_resolved_promise(other.clone()))),
+                } else {
+                    return Ok(Some(make_resolved_promise(item.clone(), heap)));
                 }
             }
+            let errors_arr = Value::Array(heap.alloc_array(errors));
             let mut agg = IndexMap::new();
             agg.insert(
                 Arc::from("name"),
@@ -2015,37 +2359,50 @@ fn call_promise_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
                 Arc::from("message"),
                 Value::String(Arc::from("All promises were rejected")),
             );
-            agg.insert(Arc::from("errors"), Value::Array(errors));
+            agg.insert(Arc::from("errors"), errors_arr);
+            let agg_obj = Value::Object(heap.alloc_object(agg));
             let mut obj = IndexMap::new();
             obj.insert(Arc::from("__promise__"), Value::Bool(true));
             obj.insert(Arc::from("status"), Value::String(Arc::from("rejected")));
-            obj.insert(Arc::from("reason"), Value::Object(agg));
-            Ok(Some(Value::Object(obj)))
+            obj.insert(Arc::from("reason"), agg_obj);
+            Ok(Some(Value::Object(heap.alloc_object(obj))))
         }
         _ => Ok(None),
     }
 }
 
 /// Check if a value is a promise object (has __promise__: true).
-pub fn is_promise(val: &Value) -> bool {
-    if let Value::Object(map) = val {
-        matches!(map.get("__promise__"), Some(Value::Bool(true)))
+pub fn is_promise(val: &Value, heap: &Heap) -> bool {
+    if let Value::Object(h) = val {
+        matches!(
+            heap.object(*h).and_then(|m| m.get("__promise__")),
+            Some(Value::Bool(true))
+        )
     } else {
         false
     }
 }
 
 /// Create a resolved promise wrapping the given value.
-pub fn make_resolved_promise(val: Value) -> Value {
+pub fn make_resolved_promise(val: Value, heap: &mut Heap) -> Value {
     // If the value is already a promise, return it as-is (thenable unwrapping)
-    if is_promise(&val) {
+    if is_promise(&val, heap) {
         return val;
     }
     let mut obj = IndexMap::new();
     obj.insert(Arc::from("__promise__"), Value::Bool(true));
     obj.insert(Arc::from("status"), Value::String(Arc::from("resolved")));
     obj.insert(Arc::from("value"), val);
-    Value::Object(obj)
+    Value::Object(heap.alloc_object(obj))
+}
+
+/// Create a rejected promise carrying the given reason.
+pub fn make_rejected_promise(reason: Value, heap: &mut Heap) -> Value {
+    let mut obj = IndexMap::new();
+    obj.insert(Arc::from("__promise__"), Value::Bool(true));
+    obj.insert(Arc::from("status"), Value::String(Arc::from("rejected")));
+    obj.insert(Arc::from("reason"), reason);
+    Value::Object(heap.alloc_object(obj))
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -2063,8 +2420,10 @@ fn arg_int(args: &[Value], idx: usize) -> i64 {
         .unwrap_or(0)
 }
 
-fn arg_str(args: &[Value], idx: usize) -> String {
-    args.get(idx).map(|v| v.to_js_string()).unwrap_or_default()
+fn arg_str(args: &[Value], idx: usize, heap: &Heap) -> String {
+    args.get(idx)
+        .map(|v| v.to_js_string(heap))
+        .unwrap_or_default()
 }
 
 fn normalize_index(idx: i64, len: i64) -> usize {

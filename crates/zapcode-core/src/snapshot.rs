@@ -3,11 +3,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, ZapcodeError};
+use crate::heap::Heap;
 use crate::sandbox::ResourceLimits;
 use crate::value::Value;
 use crate::vm::{
-    CallFrame, Continuation, PendingBatch, PendingExternalCall, ReceiverSource, TryInfo, Vm,
-    VmState,
+    CallFrame, Continuation, PendingBatch, PendingExternalCall, ReceiverSource, ResumeAction,
+    RunResult, TryInfo, Vm,
 };
 use crate::wire::FrameKind;
 
@@ -38,6 +39,10 @@ pub(crate) struct VmSnapshot {
     pub(crate) resolved: BTreeMap<u64, Value>,
     pub(crate) next_call_id: u64,
     pub(crate) pending_batch: Option<PendingBatch>,
+    /// Deferred action for resuming a single-call-promise suspension (N5). New
+    /// field — defaults to `None` so snapshots written before N5 still load.
+    #[serde(default)]
+    pub(crate) resume_action: Option<ResumeAction>,
     /// Cumulative allocation count, carried across resumes so a long-running
     /// suspend/resume chain can't evade `max_allocations` by resetting it.
     pub(crate) allocations: usize,
@@ -45,6 +50,11 @@ pub(crate) struct VmSnapshot {
     /// sequence is stable across a dump/load/resume.
     #[serde(default)]
     pub(crate) rng_state: u64,
+    /// The object heap: backing store for all array/object values referenced by
+    /// handles in `stack`/`frames`/`globals`/`cells`. Must travel with the
+    /// snapshot or those handles dangle on resume.
+    #[serde(default)]
+    pub(crate) heap: crate::heap::Heap,
 }
 
 impl VmSnapshot {
@@ -86,8 +96,10 @@ impl VmSnapshot {
             resolved: vm.resolved.clone(),
             next_call_id: vm.next_call_id,
             pending_batch: vm.pending_batch.clone(),
+            resume_action: vm.resume_action.clone(),
             allocations: vm.tracker.allocations,
             rng_state: vm.rng_state,
+            heap: vm.heap.clone(),
         }
     }
 
@@ -110,12 +122,14 @@ impl VmSnapshot {
             self.last_receiver_source,
             self.last_global_name,
             self.last_load_source,
+            self.heap,
         );
         // Restore batched-call state (kept off the long from_snapshot signature).
         vm.pending_calls = self.pending_calls;
         vm.resolved = self.resolved;
         vm.next_call_id = self.next_call_id;
         vm.pending_batch = self.pending_batch;
+        vm.resume_action = self.resume_action;
         vm.tracker.allocations = self.allocations;
         vm.rng_state = self.rng_state;
         vm.cells = self.cells;
@@ -165,32 +179,51 @@ impl ZapcodeSnapshot {
         })
     }
 
+    /// Borrow the snapshot's object heap. A `Value::Array`/`Value::Object`
+    /// returned in a suspension's `args` carries a `Handle` into this heap;
+    /// use it to read array elements or object fields of those arguments.
+    pub fn heap(&self) -> &Heap {
+        &self.snapshot.heap
+    }
+
+    /// Mutably borrow the snapshot's object heap so a host can allocate a
+    /// compound return value (array/object) into the same heap before passing
+    /// the resulting `Value` (and its valid `Handle`) to one of the `resume`
+    /// methods. Primitive return values need no allocation.
+    pub fn heap_mut(&mut self) -> &mut Heap {
+        &mut self.snapshot.heap
+    }
+
     /// Resume execution with a return value from the external function.
-    /// Returns a `VmState` which may be `Complete` or another `Suspended`.
-    pub fn resume(self, return_value: Value) -> Result<VmState> {
+    /// Returns a [`RunResult`] whose `state` may be `Complete` or another
+    /// `Suspended`, and whose `heap` resolves any handles in that state.
+    pub fn resume(self, return_value: Value) -> Result<RunResult> {
         let mut vm = self.snapshot.restore_vm();
 
         // Push the return value onto the stack — this is the result the
         // `CallExternal` instruction was waiting for.
         vm.stack.push(return_value);
 
-        vm.resume_execution()
+        let state = vm.resume_execution()?;
+        Ok(RunResult::from_resume(state, vm))
     }
 
     /// Resume execution by raising `error` at the suspended external call,
     /// instead of returning a value. The error is catchable by a surrounding
     /// `try`/`catch` in the guest; if uncaught it propagates to the host. Use
     /// this when a host tool / Temporal activity failed.
-    pub fn resume_with_error(self, error: Value) -> Result<VmState> {
+    pub fn resume_with_error(self, error: Value) -> Result<RunResult> {
         let mut vm = self.snapshot.restore_vm();
-        vm.resume_with_error(error)
+        let state = vm.resume_with_error(error)?;
+        Ok(RunResult::from_resume(state, vm))
     }
 
     /// Resume a batch suspension (`VmState::SuspendedMany`) with one result per
     /// call, in the order the calls were presented. The host can run those
     /// calls in parallel and pass back all results at once.
-    pub fn resume_many(self, results: Vec<Value>) -> Result<VmState> {
+    pub fn resume_many(self, results: Vec<Value>) -> Result<RunResult> {
         let mut vm = self.snapshot.restore_vm();
-        vm.resume_many(results)
+        let state = vm.resume_many(results)?;
+        Ok(RunResult::from_resume(state, vm))
     }
 }

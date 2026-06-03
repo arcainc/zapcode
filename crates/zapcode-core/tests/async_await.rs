@@ -1,3 +1,4 @@
+use zapcode_core::heap::Heap;
 use zapcode_core::vm::eval_ts;
 use zapcode_core::vm::VmState;
 use zapcode_core::{ResourceLimits, Value, ZapcodeRun};
@@ -16,6 +17,39 @@ fn start_with_externals(
     )
     .unwrap();
     runner.start(inputs).unwrap()
+}
+
+/// Like `start_with_externals` but returns the full `RunResult` so the heap is
+/// available to resolve array/object handles when the program completes without
+/// suspending (e.g. an empty async map).
+fn run_with_externals(code: &str, external_fns: Vec<&str>) -> zapcode_core::RunResult {
+    ZapcodeRun::new(
+        code.to_string(),
+        Vec::new(),
+        external_fns.into_iter().map(|s| s.to_string()).collect(),
+        ResourceLimits::default(),
+    )
+    .unwrap()
+    .run(Vec::new())
+    .unwrap()
+}
+
+/// Run `code` to completion and return the value plus the heap that backs any
+/// array/object handles in it.
+fn run(code: &str) -> (Value, Heap) {
+    let result = ZapcodeRun::new(
+        code.to_string(),
+        Vec::new(),
+        Vec::new(),
+        ResourceLimits::default(),
+    )
+    .unwrap()
+    .run(Vec::new())
+    .unwrap();
+    match result.state {
+        VmState::Complete(v) => (v, result.heap),
+        other => panic!("expected completion, got {other:?}"),
+    }
 }
 
 // ── async function declaration ──────────────────────────────────────
@@ -242,7 +276,7 @@ fn test_promise_reject_caught() {
 
 #[test]
 fn test_promise_all_resolved() {
-    let result = eval_ts(
+    let (result, heap) = run(
         r#"
         const p1 = Promise.resolve(1);
         const p2 = Promise.resolve(2);
@@ -250,10 +284,10 @@ fn test_promise_all_resolved() {
         const all = await Promise.all([p1, p2, p3]);
         all
     "#,
-    )
-    .unwrap();
+    );
     match result {
-        Value::Array(arr) => {
+        Value::Array(h) => {
+            let arr = heap.array_vec(h);
             assert_eq!(arr.len(), 3);
             assert_eq!(arr[0], Value::Int(1));
             assert_eq!(arr[1], Value::Int(2));
@@ -265,15 +299,15 @@ fn test_promise_all_resolved() {
 
 #[test]
 fn test_promise_all_with_plain_values() {
-    let result = eval_ts(
+    let (result, heap) = run(
         r#"
         const all = await Promise.all([1, 2, 3]);
         all
     "#,
-    )
-    .unwrap();
+    );
     match result {
-        Value::Array(arr) => {
+        Value::Array(h) => {
+            let arr = heap.array_vec(h);
             assert_eq!(arr.len(), 3);
             assert_eq!(arr[0], Value::Int(1));
             assert_eq!(arr[1], Value::Int(2));
@@ -328,7 +362,8 @@ fn test_await_external_function_resume() {
         VmState::Suspended { snapshot, .. } => {
             let result = snapshot
                 .resume(Value::String("response body".into()))
-                .unwrap();
+                .unwrap()
+                .state;
 
             match result {
                 VmState::Complete(v) => {
@@ -390,7 +425,7 @@ fn test_multiple_external_awaits_suspend_resume() {
     };
 
     // Resume with result of getA
-    let state2 = snapshot.resume(Value::Int(100)).unwrap();
+    let state2 = snapshot.resume(Value::Int(100)).unwrap().state;
 
     // Second suspension: getB()
     let snapshot2 = match state2 {
@@ -407,7 +442,7 @@ fn test_multiple_external_awaits_suspend_resume() {
     };
 
     // Resume with result of getB
-    let final_state = snapshot2.resume(Value::Int(200)).unwrap();
+    let final_state = snapshot2.resume(Value::Int(200)).unwrap().state;
 
     match final_state {
         VmState::Complete(v) => {
@@ -473,16 +508,16 @@ fn test_await_in_expression() {
 
 #[test]
 fn test_promise_resolve_creates_object() {
-    let result = eval_ts(
+    let (result, heap) = run(
         r#"
         const p = Promise.resolve(42);
         p
     "#,
-    )
-    .unwrap();
+    );
     // Should be a promise object (not unwrapped)
     match result {
-        Value::Object(map) => {
+        Value::Object(h) => {
+            let map = heap.object_map(h);
             assert_eq!(map.get("__promise__"), Some(&Value::Bool(true)));
             assert_eq!(map.get("status"), Some(&Value::String("resolved".into())));
             assert_eq!(map.get("value"), Some(&Value::Int(42)));
@@ -685,7 +720,7 @@ fn test_sequential_external_calls_in_loop() {
         VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
-    let state2 = snap.resume(Value::String("rainy".into())).unwrap();
+    let state2 = snap.resume(Value::String("rainy".into())).unwrap().state;
     let snap2 = match state2 {
         VmState::Suspended {
             function_name,
@@ -700,7 +735,7 @@ fn test_sequential_external_calls_in_loop() {
         VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
-    let state3 = snap2.resume(Value::String("sunny".into())).unwrap();
+    let state3 = snap2.resume(Value::String("sunny".into())).unwrap().state;
     let snap3 = match state3 {
         VmState::Suspended {
             function_name,
@@ -716,8 +751,9 @@ fn test_sequential_external_calls_in_loop() {
     };
 
     let final_state = snap3.resume(Value::String("cloudy".into())).unwrap();
-    match final_state {
-        VmState::Complete(Value::Array(arr)) => {
+    match final_state.state {
+        VmState::Complete(Value::Array(h)) => {
+            let arr = final_state.heap.array_vec(h);
             assert_eq!(arr.len(), 3);
             assert_eq!(arr[0], Value::String("rainy".into()));
             assert_eq!(arr[1], Value::String("sunny".into()));
@@ -757,7 +793,7 @@ fn test_array_map_async_callback_with_external() {
     };
 
     // Resume with result for "a"
-    let state2 = snap.resume(Value::String("data_a".into())).unwrap();
+    let state2 = snap.resume(Value::String("data_a".into())).unwrap().state;
     let snap2 = match state2 {
         VmState::Suspended {
             function_name,
@@ -773,7 +809,7 @@ fn test_array_map_async_callback_with_external() {
     };
 
     // Resume with result for "b"
-    let state3 = snap2.resume(Value::String("data_b".into())).unwrap();
+    let state3 = snap2.resume(Value::String("data_b".into())).unwrap().state;
     let snap3 = match state3 {
         VmState::Suspended {
             function_name,
@@ -790,8 +826,9 @@ fn test_array_map_async_callback_with_external() {
 
     // Resume with result for "c"
     let final_state = snap3.resume(Value::String("data_c".into())).unwrap();
-    match final_state {
-        VmState::Complete(Value::Array(arr)) => {
+    match final_state.state {
+        VmState::Complete(Value::Array(h)) => {
+            let arr = final_state.heap.array_vec(h);
             assert_eq!(arr.len(), 3);
             assert_eq!(arr[0], Value::String("data_a".into()));
             assert_eq!(arr[1], Value::String("data_b".into()));
@@ -813,10 +850,10 @@ fn test_array_map_async_empty() {
         results
     "#;
 
-    let state = start_with_externals(code, vec!["fetchData"], Vec::new());
-    match state {
-        VmState::Complete(Value::Array(arr)) => {
-            assert_eq!(arr.len(), 0);
+    let result = run_with_externals(code, vec!["fetchData"]);
+    match &result.state {
+        VmState::Complete(Value::Array(h)) => {
+            assert_eq!(result.heap.array_vec(*h).len(), 0);
         }
         other => panic!("expected empty array, got {:?}", other),
     }
@@ -825,16 +862,16 @@ fn test_array_map_async_empty() {
 #[test]
 fn test_array_map_sync_still_works() {
     // Regression test: sync .map() must still work as before
-    let result = eval_ts(
+    let (result, heap) = run(
         r#"
         const nums = [1, 2, 3];
         const doubled = nums.map(x => x * 2);
         doubled
     "#,
-    )
-    .unwrap();
+    );
     match result {
-        Value::Array(arr) => {
+        Value::Array(h) => {
+            let arr = heap.array_vec(h);
             assert_eq!(arr, vec![Value::Int(2), Value::Int(4), Value::Int(6)]);
         }
         other => panic!("expected array, got {:?}", other),
@@ -868,8 +905,9 @@ fn test_array_map_async_single_element() {
     };
 
     let final_state = snap.resume(Value::String("result".into())).unwrap();
-    match final_state {
-        VmState::Complete(Value::Array(arr)) => {
+    match final_state.state {
+        VmState::Complete(Value::Array(h)) => {
+            let arr = final_state.heap.array_vec(h);
             assert_eq!(arr.len(), 1);
             assert_eq!(arr[0], Value::String("result".into()));
         }
@@ -899,10 +937,11 @@ fn test_array_for_each_async_callback_with_external() {
                 snapshot,
             } => {
                 assert_eq!(function_name, "processItem");
-                assert_eq!(args[0].to_js_string(), *expected);
+                assert_eq!(args[0], Value::String((*expected).into()));
                 state = snapshot
                     .resume(Value::String(format!("processed_{}", expected).into()))
-                    .unwrap();
+                    .unwrap()
+                    .state;
             }
             VmState::Complete(_) => panic!("expected suspension for {}", expected),
             VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
@@ -1007,24 +1046,28 @@ fn test_callback_result_user_object_not_unwrapped() {
     "#;
 
     let state = start_with_externals(code, vec!["fetchData"], Vec::new());
-    let snap = match state {
+    let mut snap = match state {
         VmState::Suspended { snapshot, .. } => snapshot,
         VmState::Complete(_) => panic!("expected suspension"),
         VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
-    // Return a user object that looks like a promise but lacks __promise__
-    let user_obj = Value::Object(indexmap::indexmap! {
+    // Return a user object that looks like a promise but lacks __promise__.
+    // Allocate it into the snapshot's heap so the handle is valid on resume.
+    let user_obj = Value::Object(snap.heap_mut().alloc_object(indexmap::indexmap! {
         "status".into() => Value::String("resolved".into()),
         "value".into() => Value::Int(42),
-    });
+    }));
     let final_state = snap.resume(user_obj).unwrap();
-    match final_state {
-        VmState::Complete(Value::Array(arr)) => {
+    let heap = &final_state.heap;
+    match &final_state.state {
+        VmState::Complete(Value::Array(h)) => {
+            let arr = heap.array_vec(*h);
             assert_eq!(arr.len(), 1);
             // The user object should be preserved as-is, not unwrapped to 42
             match &arr[0] {
-                Value::Object(map) => {
+                Value::Object(inner) => {
+                    let map = heap.object_map(*inner);
                     assert_eq!(map.get("status"), Some(&Value::String("resolved".into())));
                     assert_eq!(map.get("value"), Some(&Value::Int(42)));
                     // Must NOT have been unwrapped — it's still an object, not Int(42)
@@ -1061,7 +1104,7 @@ fn test_for_of_sync_counter() {
 
 #[test]
 fn test_for_of_sync_push() {
-    let result = eval_ts(
+    let (result, heap) = run(
         r#"
         const cities = ["a", "b", "c"];
         const results: string[] = [];
@@ -1070,10 +1113,10 @@ fn test_for_of_sync_push() {
         }
         results
     "#,
-    )
-    .unwrap();
+    );
     match result {
-        Value::Array(arr) => {
+        Value::Array(h) => {
+            let arr = heap.array_vec(h);
             assert_eq!(arr.len(), 3);
         }
         other => panic!("expected array, got {:?}", other),
@@ -1111,7 +1154,8 @@ fn test_for_of_with_external_calls_terminates() {
                 assert_eq!(args[0], Value::String((*expected_city).into()));
                 state = snapshot
                     .resume(Value::String(format!("weather_{}", expected_city).into()))
-                    .unwrap();
+                    .unwrap()
+                    .state;
             }
             VmState::Complete(ref v) => panic!(
                 "expected suspension for {} but got completion: {:?}",
@@ -1165,7 +1209,8 @@ fn test_for_of_with_multiple_externals_per_iteration() {
                 assert_eq!(function_name, "getWeather");
                 state = snapshot
                     .resume(Value::String(format!("w_{}", city).into()))
-                    .unwrap();
+                    .unwrap()
+                    .state;
             }
             other => panic!(
                 "expected getWeather suspension for {}, got {:?}",
@@ -1182,7 +1227,8 @@ fn test_for_of_with_multiple_externals_per_iteration() {
                 assert_eq!(function_name, "getFlights");
                 state = snapshot
                     .resume(Value::String(format!("f_{}", city).into()))
-                    .unwrap();
+                    .unwrap()
+                    .state;
             }
             other => panic!(
                 "expected getFlights suspension for {}, got {:?}",

@@ -4,9 +4,10 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 
-use crate::compiler::instruction::{Constant, Instruction};
+use crate::compiler::instruction::{BatchKind, Constant, Instruction};
 use crate::compiler::CompiledProgram;
 use crate::error::{Result, ZapcodeError};
+use crate::heap::{Handle, Heap};
 use crate::sandbox::{ResourceLimits, ResourceTracker};
 use crate::snapshot::ZapcodeSnapshot;
 use crate::trace::{ExecutionTrace, SpanBuilder, TraceStatus};
@@ -25,11 +26,15 @@ pub enum VmState {
         args: Vec<Value>,
         snapshot: ZapcodeSnapshot,
     },
-    /// Suspended on a batch of external calls (`Promise.all([...])`) that the
-    /// host can run in parallel. Resume with `resume_many` passing one result
-    /// per call, in order.
+    /// Suspended on a batch of external calls (`Promise.{all,race,any,
+    /// allSettled}([...])`) that the host can run in parallel. `combinator`
+    /// tells the host which `Promise.*` settle semantics to apply. Resume with
+    /// `resume_many` passing the settled values the combinator produced (for
+    /// `all`/`allSettled` one entry per call in order; for `race`/`any` a single
+    /// entry), or `resume_with_error` on rejection.
     SuspendedMany {
         calls: Vec<ExternalCall>,
+        combinator: BatchKind,
         snapshot: ZapcodeSnapshot,
     },
 }
@@ -50,14 +55,29 @@ pub(crate) struct PendingExternalCall {
     pub(crate) args: Vec<Value>,
 }
 
-/// The structure of an in-flight `Promise.all` batch, captured at the await so
-/// resume can rebuild the result array in element order.
+/// The structure of an in-flight `Promise.*` batch, captured at the await so
+/// resume can assemble the final promise value per the combinator.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PendingBatch {
+    /// Which combinator produced this batch (`all`/`race`/`any`/`allSettled`).
+    /// Defaults to `All` so snapshots written before this field existed still
+    /// load with the historical behavior.
+    #[serde(default = "batch_kind_all")]
+    pub(crate) kind: BatchKind,
     /// Original array elements (some are `Value::Pending`).
     pub(crate) items: Vec<Value>,
     /// Call ids being awaited, in the order presented to the host.
     pub(crate) call_ids: Vec<u64>,
+}
+
+fn batch_kind_all() -> BatchKind {
+    BatchKind::All
+}
+
+/// The result of classifying an already-settled batch element.
+enum SettledOutcome {
+    Fulfilled(Value),
+    Rejected(Value),
 }
 
 /// Tracks where a method receiver originated so that mutations to `this`
@@ -123,6 +143,49 @@ pub(crate) enum Continuation {
         caller_frame_depth: usize,
         callback_frame_index: usize,
     },
+    /// Running a `.then()`/`.catch()`/`.finally()` callback that may itself make
+    /// an external (tool) call and therefore must be able to suspend. The main
+    /// `execute()` loop drives the callback the same way it drives array
+    /// callbacks; when the callback's frame pops, the continuation shapes the
+    /// result into the promise the chain expects and pushes it. Because the
+    /// continuation is part of the serialized VM state, a suspension mid-callback
+    /// resumes cleanly and finishes the chain.
+    PromiseCallback {
+        /// How to turn the callback's return value into the chain's result.
+        mode: PromiseCallbackMode,
+        /// The original promise (used by `finally`, which passes it through).
+        original_promise: Value,
+        caller_frame_depth: usize,
+        callback_frame_index: usize,
+    },
+}
+
+/// What a [`Continuation::PromiseCallback`] does with the callback's return value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum PromiseCallbackMode {
+    /// `.then(onFulfilled)` / `.then(_, onRejected)` / `.catch(onRejected)`:
+    /// wrap the callback's return value in a resolved promise (thenables pass
+    /// through unwrapped via `make_resolved_promise`).
+    WrapResult,
+    /// `.finally(onFinally)`: discard the callback's return value and pass the
+    /// original promise through unchanged.
+    PassThrough,
+}
+
+/// Outcome of dispatching a `.then`/`.catch`/`.finally` method. See
+/// [`Vm::execute_promise_method`].
+enum PromiseMethodOutcome {
+    /// Completed synchronously (no callback ran); the value should be pushed.
+    Value(Value),
+    /// A callback frame + [`Continuation::PromiseCallback`] were pushed; the
+    /// dispatch caller must return `Ok(None)` so the main loop drives it.
+    ContinuationStarted,
+    /// The method was called on a deferred single-call promise (N5), forcing its
+    /// host call: the VM must suspend on it. The dispatch caller returns this
+    /// `VmState` up to the host; on resume, `resume_action` finishes the method.
+    Suspend(VmState),
+    /// The receiver was not a promise, or the method is unknown.
+    NotAPromise,
 }
 
 /// The Zapcode VM.
@@ -135,6 +198,10 @@ pub struct Vm {
     /// here once boxed; every closure and frame referencing it shares the id, so
     /// the sharing survives serialization (ids are reconstructed on load).
     pub(crate) cells: Vec<Value>,
+    /// The object heap: backing store for all array/object values. Handles in
+    /// `Value::Array`/`Object` index into it; shared handles give reference
+    /// semantics. Serialized with the snapshot so identity survives resume.
+    pub(crate) heap: Heap,
     pub(crate) stdout: String,
     pub(crate) limits: ResourceLimits,
     pub(crate) tracker: ResourceTracker,
@@ -174,6 +241,56 @@ pub struct Vm {
     /// value (string, object, …) rather than a stringified error. Transient —
     /// set by `Throw`, consumed by the catch handler; never crosses a suspension.
     pub(crate) pending_throw: Option<Value>,
+    /// Re-entrancy depth of the ToPrimitive machinery. A user `valueOf`/`toString`
+    /// hook can itself trigger another coercion (e.g. by returning/operating on
+    /// another object); this bounds that recursion so a pathological hook can't
+    /// loop forever. Transient — never serialized.
+    pub(crate) to_primitive_depth: u32,
+    /// What to do with the value the host pushes when resuming a suspension that
+    /// was triggered by *consuming a deferred single-call promise* (N5). For a
+    /// plain `await p` this is `None` (the pushed value is exactly the await
+    /// result). For `p.then(cb)`/`.catch`/`.finally` it carries the promise
+    /// method + callbacks so the resumed value is wrapped in a settled promise
+    /// and the callback chain runs. Serialized so it survives dump/load/resume.
+    pub(crate) resume_action: Option<ResumeAction>,
+}
+
+/// Deferred action applied to the value the host delivers when resuming a
+/// single-call-promise suspension. See [`Vm::resume_action`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) enum ResumeAction {
+    /// The suspension was driven by a `.then`/`.catch`/`.finally` on a deferred
+    /// single-call promise. On resume, wrap the host value in a settled promise
+    /// (`resolved` on success; the error path uses `resume_with_error` instead)
+    /// and run `method` with `args`, threading through the normal promise-method
+    /// machinery (which supports tool calls inside the callback, per N4).
+    PromiseMethod { method: String, args: Vec<Value> },
+    /// The suspension was driven by a promise callback *returning* a deferred
+    /// single-call promise (thenable adoption): the chain forced that call. On
+    /// resume, the settled promise becomes (or is folded into) the chain's
+    /// result per `mode`. See the `PromiseCallback` arm of `process_continuation`.
+    ChainResult {
+        mode: PromiseCallbackMode,
+        original_promise: Value,
+    },
+    /// A plain `await p` on a deferred single-call promise forced its call. The
+    /// resumed value is the await result (pushed by the host) — but we also cache
+    /// it under the call id so a *second* `await p` / `p.then(...)` on the same
+    /// promise reuses the settled value instead of re-invoking the host (matching
+    /// JS, where a promise settles once).
+    CacheValue { id: u64 },
+}
+
+/// The preferred type passed to [`Vm::to_primitive`], mirroring the JS
+/// `ToPrimitive` hint. Determines whether `valueOf` or `toString` is tried first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToPrimitiveHint {
+    /// `Number(x)`, arithmetic, relational comparisons.
+    Number,
+    /// `String(x)`, template literals.
+    String,
+    /// `+` (string-or-number) — same method order as Number per spec.
+    Default,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -197,10 +314,25 @@ impl Vm {
         limits: ResourceLimits,
         external_functions: HashSet<String>,
     ) -> Self {
+        Self::with_programs_and_heap(programs, limits, external_functions, Heap::new())
+    }
+
+    /// Like [`with_programs`] but seeds the VM with an existing heap (e.g. the
+    /// heap carried forward between session chunks, which backs the persisted
+    /// array/object globals). Builtin globals are re-registered, appending fresh
+    /// slots to the supplied heap — the same approach as [`from_snapshot`] — so
+    /// user handles in the restored heap remain valid.
+    pub(crate) fn with_programs_and_heap(
+        programs: Vec<CompiledProgram>,
+        limits: ResourceLimits,
+        external_functions: HashSet<String>,
+        heap: Heap,
+    ) -> Self {
         let mut globals = HashMap::new();
+        let mut heap = heap;
 
         // Register built-in globals
-        builtins::register_globals(&mut globals);
+        builtins::register_globals(&mut globals, &mut heap);
 
         Self {
             programs,
@@ -208,6 +340,7 @@ impl Vm {
             frames: Vec::new(),
             globals,
             cells: Vec::new(),
+            heap,
             stdout: String::new(),
             limits,
             tracker: ResourceTracker::default(),
@@ -226,6 +359,8 @@ impl Vm {
             pending_batch: None,
             rng_state: 0,
             pending_throw: None,
+            to_primitive_depth: 0,
+            resume_action: None,
         }
     }
 
@@ -274,10 +409,12 @@ impl Vm {
         last_receiver_source: Option<ReceiverSource>,
         last_global_name: Option<String>,
         last_load_source: Option<ReceiverSource>,
+        heap: Heap,
     ) -> Self {
         let mut globals = HashMap::new();
-        // Re-register builtins first
-        builtins::register_globals(&mut globals);
+        let mut heap = heap;
+        // Re-register builtins first (appended to the restored heap).
+        builtins::register_globals(&mut globals, &mut heap);
         // Then overlay user globals (user globals take precedence if names collide)
         for (k, v) in user_globals {
             globals.insert(k, v);
@@ -289,6 +426,7 @@ impl Vm {
             frames,
             globals,
             cells: Vec::new(),
+            heap,
             stdout,
             limits,
             tracker: ResourceTracker::default(),
@@ -307,6 +445,8 @@ impl Vm {
             pending_batch: None,
             rng_state: 0,
             pending_throw: None,
+            to_primitive_depth: 0,
+            resume_action: None,
         }
     }
 
@@ -325,7 +465,107 @@ impl Vm {
     /// the external function should already be pushed onto the stack.
     pub(crate) fn resume_execution(&mut self) -> Result<VmState> {
         self.tracker.start();
+        // If this suspension was a `.then`/`.catch`/`.finally` forcing a deferred
+        // single-call promise (N5), the host value on the stack is the call's
+        // *fulfilled* result. Shape it into a resolved promise and run the
+        // method, so the callback chain proceeds (possibly suspending again for
+        // a tool call inside the callback). A plain `await` has no resume_action,
+        // so the value is already the await result — fall through to `execute`.
+        if let Some(action) = self.resume_action.take() {
+            match action {
+                // Plain `await p`: the host value on the stack IS the await result.
+                // Cache it under the call id (so a later await/then on the same
+                // promise settles once) and leave it on the stack.
+                ResumeAction::CacheValue { id } => {
+                    let value = self.peek()?.clone();
+                    self.resolved.insert(id, value);
+                }
+                other => {
+                    let value = self.pop()?;
+                    let settled = builtins::make_resolved_promise(value, &mut self.heap);
+                    if let Some(state) = self.run_resume_action(other, settled)? {
+                        return Ok(state);
+                    }
+                }
+            }
+        }
         self.execute()
+    }
+
+    /// Apply a [`ResumeAction`] to the settled (resolved/rejected) promise that a
+    /// resumed single-call promise produced, dispatching the deferred promise
+    /// method. Returns `Some(state)` if running the method itself suspends (a
+    /// tool call inside the callback) and `None` once the method's result has
+    /// been pushed / a callback continuation has been started (in which case the
+    /// caller drives the main loop). Used by both the success and error resume
+    /// paths.
+    fn run_resume_action(
+        &mut self,
+        action: ResumeAction,
+        settled: Value,
+    ) -> Result<Option<VmState>> {
+        match action {
+            ResumeAction::PromiseMethod { method, args } => {
+                match self.execute_promise_method(settled.clone(), &method, args)? {
+                    // The method completed synchronously — push its promise and
+                    // let the following instructions (typically `Await`) consume.
+                    PromiseMethodOutcome::Value(v) => {
+                        self.push(v)?;
+                        Ok(None)
+                    }
+                    // A callback frame + continuation were started; the main loop
+                    // drives them.
+                    PromiseMethodOutcome::ContinuationStarted => Ok(None),
+                    // The callback itself was a tool call that suspended again.
+                    PromiseMethodOutcome::Suspend(state) => Ok(Some(state)),
+                    PromiseMethodOutcome::NotAPromise => {
+                        // Should not happen — `make_resolved_promise` always yields
+                        // a promise. Push the settled value defensively.
+                        self.push(settled)?;
+                        Ok(None)
+                    }
+                }
+            }
+            ResumeAction::ChainResult {
+                mode,
+                original_promise,
+            } => {
+                // A promise callback returned a deferred single-call promise; its
+                // host call has now settled into `settled`. Fold it into the chain
+                // result per the callback mode, then continue the execute loop.
+                let is_rejected = matches!(
+                    &settled,
+                    Value::Object(h) if matches!(
+                        self.heap.object(*h).and_then(|m| m.get("status")),
+                        Some(Value::String(s)) if s.as_ref() == "rejected"
+                    )
+                );
+                let chain_result = match mode {
+                    // `.then`/`.catch`: adopt the settled promise as the chain's
+                    // next promise (resolved value flows on; a rejection rejects).
+                    PromiseCallbackMode::WrapResult => settled,
+                    // `.finally`: the returned promise is awaited but its *value*
+                    // is discarded — the original promise passes through on
+                    // success; a rejection from the cleanup promise wins.
+                    PromiseCallbackMode::PassThrough => {
+                        if is_rejected {
+                            settled
+                        } else {
+                            original_promise
+                        }
+                    }
+                };
+                self.push(chain_result)?;
+                Ok(None)
+            }
+            // `CacheValue` is handled inline by `resume_execution` /
+            // `resume_with_error` (it needs the raw value / throw path), never via
+            // this helper. Push the settled promise defensively if it ever arrives.
+            ResumeAction::CacheValue { .. } => {
+                self.push(settled)?;
+                Ok(None)
+            }
+        }
     }
 
     /// Resume a suspended external call by making it *throw* `error` instead of
@@ -335,6 +575,24 @@ impl Vm {
     /// how a real failing tool/activity should look to agent-written code.
     pub(crate) fn resume_with_error(&mut self, error: Value) -> Result<VmState> {
         self.tracker.start();
+        // If this suspension was a `.then`/`.catch`/`.finally` forcing a deferred
+        // single-call promise (N5), a rejection becomes a *rejected* promise and
+        // the method runs so a `.catch`/onRejected can handle it — rather than
+        // propagating the error out of the chain.
+        if let Some(action) = self.resume_action.take() {
+            // A plain `await p` whose deferred call rejected: fall through to the
+            // normal throw-at-await-site path below (the error surfaces in guest
+            // try/catch or propagates to the host), exactly like `await tool()`.
+            if matches!(action, ResumeAction::CacheValue { .. }) {
+                // (no shaping needed — the error is raised at the await site)
+            } else {
+                let rejected = builtins::make_rejected_promise(error.clone(), &mut self.heap);
+                return match self.run_resume_action(action, rejected)? {
+                    Some(state) => Ok(state),
+                    None => self.execute(),
+                };
+            }
+        }
         match self.try_stack.pop() {
             Some(try_info) => {
                 // Unwind frames and stack to the nearest enclosing try block,
@@ -349,13 +607,23 @@ impl Vm {
                 self.execute()
             }
             // No handler — the failure is the program's failure.
-            None => Err(ZapcodeError::ExternalError(error.to_js_string())),
+            None => Err(ZapcodeError::ExternalError(error.to_js_string(&self.heap))),
         }
     }
 
-    /// Resume a batch suspension (`Promise.all([...])`) with one result per
-    /// pending call, in the order the calls were presented to the host. The
-    /// resolved array is pushed and execution continues after the await.
+    /// Resume a batch suspension with the values the host's combinator produced.
+    ///
+    /// The shape of `results` depends on the batch's combinator (carried in
+    /// `pending_batch.kind`):
+    /// - `all`: one resolved value per pending call, in the order the calls were
+    ///   presented. The VM rebuilds the full result array in element order
+    ///   (deferred calls substituted, plain-promise/value elements unwrapped).
+    /// - `allSettled`: one settled object (`{status,value}` / `{status,reason}`)
+    ///   per pending call, in order; merged into the element-order array.
+    /// - `race`/`any`: a single entry — the one settled value the host chose. It
+    ///   becomes the promise value directly.
+    ///
+    /// A rejection is delivered via `resume_with_error` instead.
     pub(crate) fn resume_many(&mut self, results: Vec<Value>) -> Result<VmState> {
         self.tracker.start();
         let batch = self.pending_batch.take().ok_or_else(|| {
@@ -363,23 +631,99 @@ impl Vm {
                 "resume_many called but the VM is not suspended on a batch".to_string(),
             )
         })?;
-        if results.len() != batch.call_ids.len() {
-            return Err(ZapcodeError::RuntimeError(format!(
-                "resume_many expected {} results but got {}",
-                batch.call_ids.len(),
-                results.len()
-            )));
-        }
-        for (id, value) in batch.call_ids.iter().zip(results) {
-            self.resolved.insert(*id, value);
-        }
-        // Rebuild the result array in element order, substituting resolved values.
-        let array = self.build_batch_array(batch.items)?;
-        // Drop the now-resolved pending calls.
+
+        // Drop the now-resolved pending calls regardless of combinator.
         let resolved_ids: HashSet<u64> = batch.call_ids.iter().copied().collect();
         self.pending_calls.retain(|c| !resolved_ids.contains(&c.id));
-        self.push(Value::Array(array))?;
-        self.execute()
+
+        match batch.kind {
+            // race/any settle to a single value supplied by the host's real JS
+            // combinator; push it directly (no element-order reassembly).
+            BatchKind::Race | BatchKind::Any => {
+                if results.len() != 1 {
+                    return Err(ZapcodeError::RuntimeError(format!(
+                        "resume_many for {} expected 1 result but got {}",
+                        batch.kind.as_str(),
+                        results.len()
+                    )));
+                }
+                let value = results.into_iter().next().unwrap_or(Value::Undefined);
+                self.push(value)?;
+                self.execute()
+            }
+            // all/allSettled deliver one settled entry per pending call, in the
+            // order the calls were presented; reassemble in element order.
+            BatchKind::All | BatchKind::AllSettled => {
+                if results.len() != batch.call_ids.len() {
+                    return Err(ZapcodeError::RuntimeError(format!(
+                        "resume_many expected {} results but got {}",
+                        batch.call_ids.len(),
+                        results.len()
+                    )));
+                }
+                for (id, value) in batch.call_ids.iter().zip(results) {
+                    self.resolved.insert(*id, value);
+                }
+                let array = match batch.kind {
+                    BatchKind::AllSettled => self.build_settled_array(batch.items)?,
+                    _ => self.build_batch_array(batch.items)?,
+                };
+                let h = self.heap.alloc_array(array);
+                self.push(Value::Array(h))?;
+                self.execute()
+            }
+        }
+    }
+
+    /// Build a `Promise.allSettled` result array from its elements: deferred
+    /// calls are replaced by the host-supplied settled object as-is; plain
+    /// promise/value elements are coerced to `{status,value}` /
+    /// `{status,reason}` settled objects. Never throws.
+    fn build_settled_array(&mut self, items: Vec<Value>) -> Result<Vec<Value>> {
+        let mut array = Vec::with_capacity(items.len());
+        for item in items {
+            match item {
+                Value::Pending(id) => {
+                    // Host already produced the settled object for this call.
+                    let value = self.resolved.remove(&id).ok_or_else(|| {
+                        ZapcodeError::RuntimeError(format!("missing result for call {}", id))
+                    })?;
+                    array.push(value);
+                }
+                Value::Object(h) if builtins::is_promise(&item, &self.heap) => {
+                    let map = self.heap.object_map(h);
+                    let mut entry = IndexMap::new();
+                    match map.get("status") {
+                        Some(Value::String(s)) if s.as_ref() == "rejected" => {
+                            entry.insert(Arc::from("status"), Value::String(Arc::from("rejected")));
+                            entry.insert(
+                                Arc::from("reason"),
+                                map.get("reason").cloned().unwrap_or(Value::Undefined),
+                            );
+                        }
+                        _ => {
+                            entry.insert(
+                                Arc::from("status"),
+                                Value::String(Arc::from("fulfilled")),
+                            );
+                            entry.insert(
+                                Arc::from("value"),
+                                map.get("value").cloned().unwrap_or(Value::Undefined),
+                            );
+                        }
+                    }
+                    array.push(Value::Object(self.heap.alloc_object(entry)));
+                }
+                other => {
+                    // Plain value: fulfilled.
+                    let mut entry = IndexMap::new();
+                    entry.insert(Arc::from("status"), Value::String(Arc::from("fulfilled")));
+                    entry.insert(Arc::from("value"), other);
+                    array.push(Value::Object(self.heap.alloc_object(entry)));
+                }
+            }
+        }
+        Ok(array)
     }
 
     /// Build a `Promise.all` result array from its elements: deferred calls are
@@ -396,29 +740,34 @@ impl Vm {
                     })?;
                     array.push(value);
                 }
-                Value::Object(ref map) if builtins::is_promise(&item) => match map.get("status") {
-                    Some(Value::String(s)) if s.as_ref() == "resolved" => {
-                        array.push(map.get("value").cloned().unwrap_or(Value::Undefined));
+                Value::Object(h) if builtins::is_promise(&item, &self.heap) => {
+                    let map = self.heap.object_map(h);
+                    match map.get("status") {
+                        Some(Value::String(s)) if s.as_ref() == "resolved" => {
+                            array.push(map.get("value").cloned().unwrap_or(Value::Undefined));
+                        }
+                        Some(Value::String(s)) if s.as_ref() == "rejected" => {
+                            let reason = map.get("reason").cloned().unwrap_or(Value::Undefined);
+                            let reason = reason.to_js_string(&self.heap);
+                            return Err(ZapcodeError::RuntimeError(format!(
+                                "Unhandled promise rejection: {}",
+                                reason
+                            )));
+                        }
+                        _ => array.push(item),
                     }
-                    Some(Value::String(s)) if s.as_ref() == "rejected" => {
-                        let reason = map.get("reason").cloned().unwrap_or(Value::Undefined);
-                        return Err(ZapcodeError::RuntimeError(format!(
-                            "Unhandled promise rejection: {}",
-                            reason.to_js_string()
-                        )));
-                    }
-                    _ => array.push(item),
-                },
+                }
                 other => array.push(other),
             }
         }
         Ok(array)
     }
 
-    /// Await a `Promise.all` batch. If any element is an unresolved deferred
-    /// call, suspend once with the whole batch so the host can run the calls in
-    /// parallel; otherwise build and push the result array inline.
-    fn await_batch(&mut self, items: Vec<Value>) -> Result<Option<VmState>> {
+    /// Await a `Promise.{all,race,any,allSettled}` batch. If any element is an
+    /// unresolved deferred call, suspend once with the whole batch (tagged with
+    /// `kind`) so the host can run the calls in parallel and settle them with
+    /// the real JS combinator; otherwise assemble and push the value inline.
+    fn await_batch(&mut self, kind: BatchKind, items: Vec<Value>) -> Result<Option<VmState>> {
         let mut call_ids = Vec::new();
         for item in &items {
             if let Value::Pending(id) = item {
@@ -429,8 +778,8 @@ impl Vm {
         }
 
         if call_ids.is_empty() {
-            let array = self.build_batch_array(items)?;
-            self.push(Value::Array(array))?;
+            // Every element already settled — assemble inline without the host.
+            self.assemble_batch_inline(kind, items)?;
             return Ok(None);
         }
 
@@ -450,9 +799,142 @@ impl Vm {
             });
         }
 
-        self.pending_batch = Some(PendingBatch { items, call_ids });
+        self.pending_batch = Some(PendingBatch { kind, items, call_ids });
         let snapshot = ZapcodeSnapshot::capture(self)?;
-        Ok(Some(VmState::SuspendedMany { calls, snapshot }))
+        Ok(Some(VmState::SuspendedMany {
+            calls,
+            combinator: kind,
+            snapshot,
+        }))
+    }
+
+    /// Suspend on a deferred single-call promise's host call (N5). The call was
+    /// registered by `CallExternalDeferred` and is held in `pending_calls`. We
+    /// present it to the host as an ordinary single suspension (`name`/`args`),
+    /// so the existing host bridge resolves it exactly like `await tool()`. The
+    /// pending-call record is removed so it can't be invoked twice. The resumed
+    /// value is pushed onto the stack; any post-resume shaping (for
+    /// `.then`/`.catch`/`.finally`) is governed by `self.resume_action`.
+    fn suspend_on_pending_call(&mut self, id: u64) -> Result<Option<VmState>> {
+        let pos = self
+            .pending_calls
+            .iter()
+            .position(|c| c.id == id)
+            .ok_or_else(|| {
+                ZapcodeError::RuntimeError(format!("unknown pending call {}", id))
+            })?;
+        let pc = self.pending_calls.remove(pos);
+        let snapshot = ZapcodeSnapshot::capture(self)?;
+        Ok(Some(VmState::Suspended {
+            function_name: pc.name,
+            args: pc.args,
+            snapshot,
+        }))
+    }
+
+    /// Assemble and push the batch value when every element is already settled
+    /// (no host round-trip needed). Mirrors the per-combinator builtin
+    /// semantics in `builtins::call_promise_method`.
+    fn assemble_batch_inline(&mut self, kind: BatchKind, items: Vec<Value>) -> Result<()> {
+        match kind {
+            BatchKind::All => {
+                let array = self.build_batch_array(items)?;
+                let h = self.heap.alloc_array(array);
+                self.push(Value::Array(h))?;
+            }
+            BatchKind::AllSettled => {
+                let array = self.build_settled_array(items)?;
+                let h = self.heap.alloc_array(array);
+                self.push(Value::Array(h))?;
+            }
+            BatchKind::Race => {
+                // First element wins (already settled). Resolve → push value;
+                // reject → propagate as an unhandled rejection.
+                match items.into_iter().next() {
+                    Some(first) => {
+                        let value = self.unwrap_settled_or_propagate(first)?;
+                        self.push(value)?;
+                    }
+                    None => {
+                        // Empty race never settles in real JS; surface undefined
+                        // rather than hang the deterministic VM.
+                        self.push(Value::Undefined)?;
+                    }
+                }
+            }
+            BatchKind::Any => {
+                // First fulfilled value wins; if all reject, reject with an
+                // AggregateError-shaped value.
+                let mut errors = Vec::new();
+                let mut chosen: Option<Value> = None;
+                for item in items {
+                    match self.settled_outcome(&item) {
+                        SettledOutcome::Fulfilled(v) => {
+                            chosen = Some(v);
+                            break;
+                        }
+                        SettledOutcome::Rejected(reason) => errors.push(reason),
+                    }
+                }
+                match chosen {
+                    Some(v) => self.push(v)?,
+                    None => {
+                        let errors_arr = Value::Array(self.heap.alloc_array(errors));
+                        let mut agg = IndexMap::new();
+                        agg.insert(
+                            Arc::from("name"),
+                            Value::String(Arc::from("AggregateError")),
+                        );
+                        agg.insert(
+                            Arc::from("message"),
+                            Value::String(Arc::from("All promises were rejected")),
+                        );
+                        agg.insert(Arc::from("errors"), errors_arr);
+                        let reason = Value::Object(self.heap.alloc_object(agg));
+                        let reason = reason.to_js_string(&self.heap);
+                        return Err(ZapcodeError::RuntimeError(format!(
+                            "Unhandled promise rejection: {}",
+                            reason
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Classify an already-settled element (plain value or promise object) as
+    /// fulfilled or rejected, cloning out the relevant payload.
+    fn settled_outcome(&self, item: &Value) -> SettledOutcome {
+        if let Value::Object(h) = item {
+            if builtins::is_promise(item, &self.heap) {
+                let map = self.heap.object_map(*h);
+                if matches!(map.get("status"), Some(Value::String(s)) if s.as_ref() == "rejected") {
+                    return SettledOutcome::Rejected(
+                        map.get("reason").cloned().unwrap_or(Value::Undefined),
+                    );
+                }
+                return SettledOutcome::Fulfilled(
+                    map.get("value").cloned().unwrap_or(Value::Undefined),
+                );
+            }
+        }
+        SettledOutcome::Fulfilled(item.clone())
+    }
+
+    /// Unwrap an already-settled element: resolved promise → its value, plain
+    /// value → itself, rejected promise → propagate as an unhandled rejection.
+    fn unwrap_settled_or_propagate(&mut self, item: Value) -> Result<Value> {
+        match self.settled_outcome(&item) {
+            SettledOutcome::Fulfilled(v) => Ok(v),
+            SettledOutcome::Rejected(reason) => {
+                let reason = reason.to_js_string(&self.heap);
+                Err(ZapcodeError::RuntimeError(format!(
+                    "Unhandled promise rejection: {}",
+                    reason
+                )))
+            }
+        }
     }
 
     fn push(&mut self, value: Value) -> Result<()> {
@@ -467,11 +949,24 @@ impl Vm {
     }
 
     /// The value a `catch` block should bind: the original guest-thrown value if
-    /// this came from `throw`, otherwise the stringified runtime error.
+    /// this came from `throw`, otherwise a real Error object built from the
+    /// runtime error (so `e.name`/`e.message` and `e instanceof Error` work).
     fn caught_error_value(&mut self, err: &ZapcodeError) -> Value {
-        self.pending_throw
-            .take()
-            .unwrap_or_else(|| Value::String(Arc::from(err.to_string().as_str())))
+        if let Some(v) = self.pending_throw.take() {
+            return v;
+        }
+        let (name, message) = match err {
+            ZapcodeError::TypeError(s) => ("TypeError", s.clone()),
+            ZapcodeError::ReferenceError(s) => {
+                ("ReferenceError", format!("{} is not defined", s))
+            }
+            ZapcodeError::UnknownExternalFunction(s) => {
+                ("ReferenceError", format!("{} is not defined", s))
+            }
+            ZapcodeError::RuntimeError(s) | ZapcodeError::ExternalError(s) => ("Error", s.clone()),
+            other => ("Error", other.to_string()),
+        };
+        make_error_object(name, &message, &mut self.heap)
     }
 
     fn write_receiver_source(&mut self, source: &ReceiverSource, value: Value) {
@@ -487,75 +982,6 @@ impl Vm {
                     *slot_ref = value;
                 }
             }
-        }
-    }
-
-    /// Read the root variable of a [`Place`].
-    fn read_place_root(&self, root: &PlaceRoot) -> Option<Value> {
-        match root {
-            PlaceRoot::Global(name) => self.globals.get(name).cloned(),
-            PlaceRoot::Local { frame_index, slot } => {
-                if self.frames.get(*frame_index).is_some() {
-                    Some(self.read_local(*frame_index, *slot))
-                } else {
-                    None
-                }
-            }
-            PlaceRoot::Cell(id) => self.cells.get(*id as usize).cloned(),
-            PlaceRoot::This => self.frames.iter().rev().find_map(|f| f.this_value.clone()),
-        }
-    }
-
-    fn write_place_root(&mut self, root: &PlaceRoot, value: Value) {
-        let source = match root {
-            PlaceRoot::Global(name) => ReceiverSource::Global(name.clone()),
-            PlaceRoot::Local { frame_index, slot } => ReceiverSource::Local {
-                frame_index: *frame_index,
-                slot: *slot,
-            },
-            PlaceRoot::Cell(id) => ReceiverSource::Cell(*id),
-            PlaceRoot::This => {
-                // Update the nearest enclosing `this`; the method-return path then
-                // persists it to the original receiver.
-                for frame in self.frames.iter_mut().rev() {
-                    if frame.this_value.is_some() {
-                        frame.this_value = Some(value);
-                        break;
-                    }
-                }
-                return;
-            }
-        };
-        self.write_receiver_source(&source, value);
-    }
-
-    /// Persist a mutated receiver back to its place: the root variable, navigated
-    /// through the property/index path. Handles nested `obj.items.push(...)`.
-    /// Read the current value at a place, if it resolves. Used to confirm a
-    /// mutating method's receiver is still the live lvalue before writing back.
-    fn read_place(&self, place: &Place) -> Option<Value> {
-        let root = self.read_place_root(&place.root)?;
-        let mut cur = &root;
-        for seg in &place.path {
-            cur = match (cur, seg) {
-                (Value::Object(m), PlaceSeg::Prop(k)) => m.get(k.as_str())?,
-                (Value::Array(a), PlaceSeg::Index(i)) => a.get(*i)?,
-                _ => return None,
-            };
-        }
-        Some(cur.clone())
-    }
-
-    fn write_place(&mut self, place: &Place, value: Value) {
-        if place.path.is_empty() {
-            self.write_place_root(&place.root, value);
-            return;
-        }
-        let Some(mut root_val) = self.read_place_root(&place.root) else {
-            return;
-        };
-        if set_in_place(&mut root_val, &place.path, value) {
-            self.write_place_root(&place.root, root_val);
         }
     }
 
@@ -720,7 +1146,12 @@ impl Vm {
 
     /// Build the locals vec by binding `args` to the function's declared `params`.
     /// Handles positional, rest, and default-value patterns.
-    fn bind_params(params: &[ParamPattern], args: &[Value], local_count: usize) -> Vec<Value> {
+    fn bind_params(
+        params: &[ParamPattern],
+        args: &[Value],
+        local_count: usize,
+        heap: &mut Heap,
+    ) -> Vec<Value> {
         let mut locals = Vec::with_capacity(local_count);
         for (i, param) in params.iter().enumerate() {
             match param {
@@ -729,7 +1160,7 @@ impl Vm {
                 }
                 ParamPattern::Rest(_) => {
                     let rest: Vec<Value> = args.get(i..).map(|s| s.to_vec()).unwrap_or_default();
-                    locals.push(Value::Array(rest));
+                    locals.push(Value::Array(heap.alloc_array(rest)));
                 }
                 ParamPattern::DefaultValue { .. } => {
                     let val = args.get(i).cloned().unwrap_or(Value::Undefined);
@@ -740,7 +1171,7 @@ impl Vm {
                 // extract the fields from the argument into those slots.
                 ParamPattern::ObjectDestructure(_) | ParamPattern::ArrayDestructure(_) => {
                     let arg = args.get(i).cloned().unwrap_or(Value::Undefined);
-                    extract_pattern(param, &arg, &mut locals);
+                    extract_pattern(param, &arg, &mut locals, heap);
                 }
             }
         }
@@ -765,7 +1196,9 @@ impl Vm {
         }
 
         let func = self.current_function(closure.func_ref);
-        let locals = Self::bind_params(&func.params, args, func.local_count);
+        let params = func.params.clone();
+        let local_count = func.local_count;
+        let locals = Self::bind_params(&params, args, local_count, &mut self.heap);
 
         // If this is a method call (has this_value from a receiver), transfer
         // the receiver source so we can write back mutations on return.
@@ -850,7 +1283,9 @@ impl Vm {
                         self.push(Value::Undefined)?;
                     }
                     // Check if a continuation callback just completed
-                    self.process_continuation()?;
+                    if let Some(state) = self.process_continuation()? {
+                        return Ok(state);
+                    }
                     continue;
                 }
             }
@@ -862,9 +1297,11 @@ impl Vm {
                 Ok(Some(state)) => return Ok(state),
                 Ok(None) => {
                     // After dispatch, check if a continuation callback returned
-                    // (via Return instruction or ip overflow)
-                    if self.process_continuation()? {
-                        continue;
+                    // (via Return instruction or ip overflow). A continuation may
+                    // itself suspend — e.g. a promise callback that returned a
+                    // deferred single-call promise, which must be forced (N5).
+                    if let Some(state) = self.process_continuation()? {
+                        return Ok(state);
                     }
                 }
                 Err(err) => {
@@ -892,12 +1329,15 @@ impl Vm {
     }
 
     /// Process the top continuation if the current frame depth indicates a callback
-    /// has returned. Returns `true` if a continuation was processed (caller should
-    /// `continue` the execute loop).
-    fn process_continuation(&mut self) -> Result<bool> {
+    /// has returned. Returns `Ok(Some(state))` if processing the continuation must
+    /// suspend the VM (e.g. a promise callback returned a deferred single-call
+    /// promise that has to be forced), otherwise `Ok(None)` (the caller simply
+    /// proceeds to the next execute-loop iteration, whether or not a continuation
+    /// was advanced).
+    fn process_continuation(&mut self) -> Result<Option<VmState>> {
         let cont = match self.continuations.last() {
             Some(c) => c,
-            None => return Ok(false),
+            None => return Ok(None),
         };
 
         // Check if the callback's specific frame has been popped — only then
@@ -914,17 +1354,22 @@ impl Vm {
                 caller_frame_depth,
                 ..
             } => (*callback_frame_index, *caller_frame_depth),
+            Continuation::PromiseCallback {
+                callback_frame_index,
+                caller_frame_depth,
+                ..
+            } => (*callback_frame_index, *caller_frame_depth),
         };
 
         // The callback frame is still active — not done yet
         if self.frames.len() > callback_frame_index {
-            return Ok(false);
+            return Ok(None);
         }
 
         // Guard against stale continuations on stack unwinds — we must be
         // back at the original caller's frame depth.
         if self.frames.len() != caller_frame_depth {
-            return Ok(false);
+            return Ok(None);
         }
 
         // The callback just returned — collect its result from the stack.
@@ -932,10 +1377,24 @@ impl Vm {
         // so an empty stack here indicates a VM bug.
         let callback_result = self.pop()?;
 
+        // `PromiseCallback` continuations re-wrap the callback's return value
+        // into the chain's next promise (see `make_resolved_promise`), so we
+        // must NOT eagerly unwrap/error on internal promises here — that is the
+        // promise-arm's job. Array continuations, by contrast, expect a plain
+        // value per element, so they unwrap a resolved promise and treat a
+        // rejected one as an unhandled rejection.
+        let is_promise_cont = matches!(
+            self.continuations.last(),
+            Some(Continuation::PromiseCallback { .. })
+        );
+
         // Unwrap internal promise values: async callbacks return
         // {__promise__: true, status: "resolved", value: X} or {status: "rejected", ...}.
         // Only unwrap objects with the __promise__ marker to avoid mangling user objects.
-        let callback_result = if let Value::Object(ref map) = callback_result {
+        let callback_result = if is_promise_cont {
+            callback_result
+        } else if let Value::Object(h) = &callback_result {
+            let map = self.heap.object_map(*h);
             if !matches!(map.get("__promise__"), Some(Value::Bool(true))) {
                 // Not an internal promise — leave untouched
                 callback_result
@@ -946,11 +1405,12 @@ impl Vm {
                     }
                     Some(Value::String(s)) if s.as_ref() == "rejected" => {
                         let reason = map.get("reason").cloned().unwrap_or(Value::Undefined);
+                        let reason = reason.to_js_string(&self.heap);
                         // Clean up the continuation before returning error
                         self.continuations.pop();
                         return Err(ZapcodeError::RuntimeError(format!(
                             "Unhandled promise rejection: {}",
-                            reason.to_js_string()
+                            reason
                         )));
                     }
                     _ => callback_result,
@@ -993,11 +1453,12 @@ impl Vm {
                         caller_frame_depth,
                         callback_frame_index: new_frame_index,
                     });
-                    Ok(true)
+                    Ok(None)
                 } else {
-                    // All done — push final array, no clone needed
-                    self.push(Value::Array(results))?;
-                    Ok(true)
+                    // All done — push final array.
+                    let h = self.heap.alloc_array(results);
+                    self.push(Value::Array(h))?;
+                    Ok(None)
                 }
             }
             Continuation::ArrayForEach {
@@ -1024,30 +1485,170 @@ impl Vm {
                         caller_frame_depth,
                         callback_frame_index: new_frame_index,
                     });
-                    Ok(true)
+                    Ok(None)
                 } else {
                     self.push(Value::Undefined)?;
-                    Ok(true)
+                    Ok(None)
                 }
             }
+            Continuation::PromiseCallback {
+                mode,
+                original_promise,
+                ..
+            } => {
+                // If the callback returned a *deferred single-call promise* (a bare
+                // tool call, N5), the chain must adopt it: force its host call now
+                // and let the settled value flow into the chain. This makes
+                // `.then(() => tool())`, `.catch(() => tool())`, and
+                // `.finally(() => tool())` all drive the deferred call (matching JS
+                // thenable adoption), and preserves the pre-N5 eager behavior where
+                // a bare tool call inside a callback ran the tool.
+                if let Value::Object(h) = &callback_result {
+                    let is_pending_call = matches!(
+                        self.heap.object(*h).and_then(|m| m.get("status")),
+                        Some(Value::String(s)) if s.as_ref() == "pending_call"
+                    );
+                    if is_pending_call {
+                        let id = match self.heap.object(*h).and_then(|m| m.get("__call_id__")) {
+                            Some(Value::Int(n)) => *n as u64,
+                            _ => {
+                                return Err(ZapcodeError::RuntimeError(
+                                    "internal error: pending_call promise missing __call_id__"
+                                        .to_string(),
+                                ))
+                            }
+                        };
+                        self.resume_action = Some(ResumeAction::ChainResult {
+                            mode,
+                            original_promise,
+                        });
+                        return self.suspend_on_pending_call(id);
+                    }
+                }
+                // The promise callback finished (possibly after suspending for a
+                // tool call). Shape its result into the chain's next promise.
+                let chain_result = match mode {
+                    // `.then`/`.catch`: the callback's return value becomes the
+                    // resolved value of the next promise. `make_resolved_promise`
+                    // unwraps a returned promise (thenable) so chaining works.
+                    PromiseCallbackMode::WrapResult => {
+                        builtins::make_resolved_promise(callback_result, &mut self.heap)
+                    }
+                    // `.finally`: ignore the callback's return value and pass the
+                    // original promise through unchanged.
+                    PromiseCallbackMode::PassThrough => original_promise,
+                };
+                self.push(chain_result)?;
+                Ok(None)
+            }
         }
+    }
+
+    /// JS ToPrimitive ([Symbol.toPrimitive] / valueOf / toString) for a heap
+    /// Object that defines a callable hook. Returns the primitive a user hook
+    /// produced, or the original value unchanged when no usable hook exists (so
+    /// the caller's built-in `to_js_string` / `to_number_heap` still applies —
+    /// e.g. a plain `{}` becomes `"[object Object]"` / `NaN`).
+    ///
+    /// Only `Value::Object` carries user hooks; everything else (primitives,
+    /// arrays, functions, dates) is returned as-is so existing coercion behavior
+    /// is untouched. Per spec the method order is valueOf-then-toString for the
+    /// "number"/"default" hints and toString-then-valueOf for the "string" hint;
+    /// a method whose result is itself an object is skipped.
+    ///
+    /// Symbol.toPrimitive is not dispatched: this crate's Symbol support is a
+    /// stub (no well-known symbols, object property keys are strings), so a
+    /// `[Symbol.toPrimitive]` computed key can't be reliably matched. See
+    /// STRESS-PASS-BUGS.md.
+    fn to_primitive(&mut self, value: &Value, hint: ToPrimitiveHint) -> Result<Value> {
+        let handle = match value {
+            Value::Object(h) => *h,
+            // No user hooks on non-objects; let the built-in coercion handle it.
+            _ => return Ok(value.clone()),
+        };
+
+        // Order the method names per the requested hint.
+        let methods: [&str; 2] = match hint {
+            ToPrimitiveHint::String => ["toString", "valueOf"],
+            ToPrimitiveHint::Number | ToPrimitiveHint::Default => ["valueOf", "toString"],
+        };
+
+        // Bound the re-entrancy so a hook that itself coerces objects can't loop
+        // forever (and so a tool-call-suspending hook is caught at a shallow depth).
+        // Each level nests a full guest-call interpreter loop on the *native* stack,
+        // so the cap must be low enough that a cyclic hook (e.g.
+        // `toString(){ return "" + this }`) is caught with a clean RuntimeError
+        // rather than overflowing the Rust stack and aborting the host process.
+        // 8 is far above any legitimate valueOf->toString fallback nesting (which
+        // is at most a couple of levels) yet well below native-stack exhaustion.
+        if self.to_primitive_depth >= 8 {
+            return Err(ZapcodeError::RuntimeError(
+                "ToPrimitive recursion limit exceeded (cyclic valueOf/toString?)".to_string(),
+            ));
+        }
+
+        for name in methods {
+            // Read the hook out of the object (clone-out to avoid borrowing the
+            // heap across the guest call). Only an own callable field counts.
+            let hook = match self.heap.object(handle).and_then(|m| m.get(name)) {
+                Some(Value::Function(c)) => Value::Function(c.clone()),
+                _ => continue,
+            };
+
+            self.to_primitive_depth += 1;
+            let called = self.call_method_internal(&hook, value.clone(), Vec::new());
+            self.to_primitive_depth -= 1;
+            let result = called?;
+
+            // A primitive result wins; an object/array result is ignored (try the
+            // next hook), matching OrdinaryToPrimitive.
+            if !matches!(result, Value::Object(_) | Value::Array(_)) {
+                return Ok(result);
+            }
+        }
+
+        // No hook produced a primitive: fall back to the original object so the
+        // caller's built-in coercion runs (plain object -> "[object Object]"/NaN).
+        Ok(value.clone())
+    }
+
+    /// Like [`Self::call_function_internal`] but binds `this` to `receiver`, used
+    /// when invoking a user `valueOf`/`toString` hook so the hook body can read
+    /// `this`.
+    fn call_method_internal(
+        &mut self,
+        callee: &Value,
+        receiver: Value,
+        args: Vec<Value>,
+    ) -> Result<Value> {
+        self.last_receiver_source = None;
+        self.call_closure_internal(callee, args, Some(receiver))
     }
 
     /// Call a function value with the given arguments and run it to completion.
     /// Returns the function's return value.
     fn call_function_internal(&mut self, callee: &Value, args: Vec<Value>) -> Result<Value> {
+        self.call_closure_internal(callee, args, None)
+    }
+
+    /// Shared body for the internal-call helpers: push a frame (optionally with a
+    /// bound `this`) and run it to completion, returning the result.
+    fn call_closure_internal(
+        &mut self,
+        callee: &Value,
+        args: Vec<Value>,
+        this_value: Option<Value>,
+    ) -> Result<Value> {
         let closure = match callee {
             Value::Function(c) => c.clone(),
             other => {
-                return Err(ZapcodeError::TypeError(format!(
-                    "{} is not a function",
-                    other.to_js_string()
-                )));
+                let msg = other.to_js_string(&self.heap);
+                return Err(ZapcodeError::TypeError(format!("{} is not a function", msg)));
             }
         };
 
         let target_frame_depth = self.frames.len();
-        self.push_call_frame(&closure, &args, None)?;
+        self.push_call_frame(&closure, &args, this_value)?;
 
         // Run until the new frame returns
         loop {
@@ -1101,8 +1702,17 @@ impl Vm {
                     }
                 }
                 Err(err) => {
-                    // Try to catch the error within the callback
-                    if let Some(try_info) = self.try_stack.pop() {
+                    // Try to catch the error within the callback. Only a try block
+                    // that lives *inside* this internal call (i.e. above the frame
+                    // this call started at) may catch here; an outer try belongs to
+                    // the caller and must be left for it to handle.
+                    if let Some(try_info) = self
+                        .try_stack
+                        .last()
+                        .filter(|t| t.frame_depth > target_frame_depth)
+                        .cloned()
+                    {
+                        self.try_stack.pop();
                         while self.frames.len() > try_info.frame_depth {
                             self.frames.pop();
                             self.tracker.pop_frame();
@@ -1112,6 +1722,15 @@ impl Vm {
                         self.push(error_val)?;
                         self.current_frame_mut().ip = try_info.catch_ip;
                     } else {
+                        // Unwind the frame(s) this call pushed so the frame stack is
+                        // restored to the caller's depth before propagating. Without
+                        // this, a nested internal call (e.g. a cyclic ToPrimitive
+                        // hook) that errors would leave orphaned frames and later
+                        // desync the interpreter loop (`frames.last().unwrap()`).
+                        while self.frames.len() > target_frame_depth {
+                            self.frames.pop();
+                            self.tracker.pop_frame();
+                        }
                         return Err(err);
                     }
                 }
@@ -1148,7 +1767,8 @@ impl Vm {
         arr: Vec<Value>,
     ) -> Result<Option<Value>> {
         if arr.is_empty() {
-            return Ok(Some(Value::Array(Vec::new())));
+            let h = self.heap.alloc_array(Vec::new());
+            return Ok(Some(Value::Array(h)));
         }
 
         // Validate callback type BEFORE pushing continuation
@@ -1221,11 +1841,15 @@ impl Vm {
     /// `Ok(None)` if a continuation was started (async callback).
     fn execute_array_callback_method(
         &mut self,
-        arr: Vec<Value>,
+        handle: Handle,
         method: &str,
         all_args: Vec<Value>,
     ) -> Result<Option<Value>> {
         let callback = all_args.first().cloned().unwrap_or(Value::Undefined);
+        // Snapshot the elements; callbacks may run guest code, so we iterate over
+        // the snapshot (clone-out) rather than holding a heap borrow. `sort`
+        // re-reads/writes the live slot via `handle` for in-place semantics.
+        let arr = self.heap.array_vec(handle);
 
         match method {
             "map" => {
@@ -1237,7 +1861,8 @@ impl Vm {
                 for (i, item) in arr.iter().enumerate() {
                     result.push(self.call_element_callback(&callback, item, i)?);
                 }
-                Ok(Some(Value::Array(result)))
+                let h = self.heap.alloc_array(result);
+                Ok(Some(Value::Array(h)))
             }
             "filter" | "find" | "findIndex" | "findLast" | "findLastIndex" | "every" | "some"
             | "reduce" | "reduceRight" | "sort" | "flatMap" => {
@@ -1256,7 +1881,8 @@ impl Vm {
                                 result.push(item.clone());
                             }
                         }
-                        Ok(Some(Value::Array(result)))
+                        let h = self.heap.alloc_array(result);
+                        Ok(Some(Value::Array(h)))
                     }
                     "find" => {
                         for (i, item) in arr.iter().enumerate() {
@@ -1372,19 +1998,23 @@ impl Vm {
                                 }
                             }
                         } else {
-                            result.sort_by_key(|a| a.to_js_string());
+                            let heap = &self.heap;
+                            result.sort_by_key(|a| a.to_js_string(heap));
                         }
-                        Ok(Some(Value::Array(result)))
+                        // sort() mutates in place and returns the same array.
+                        self.heap.set_array(handle, result);
+                        Ok(Some(Value::Array(handle)))
                     }
                     "flatMap" => {
                         let mut result = Vec::new();
                         for (i, item) in arr.iter().enumerate() {
                             match self.call_element_callback(&callback, item, i)? {
-                                Value::Array(inner) => result.extend(inner),
+                                Value::Array(inner) => result.extend(self.heap.array_vec(inner)),
                                 other => result.push(other),
                             }
                         }
-                        Ok(Some(Value::Array(result)))
+                        let h = self.heap.alloc_array(result);
+                        Ok(Some(Value::Array(h)))
                     }
                     _ => unreachable!(),
                 }
@@ -1407,23 +2037,71 @@ impl Vm {
     }
 
     /// Execute .then(), .catch(), or .finally() on a resolved/rejected promise.
-    /// Synchronously invokes the callback and returns a new promise wrapping the result.
+    ///
+    /// The callback is run via the continuation machinery (a
+    /// [`Continuation::PromiseCallback`]) rather than synchronously, so a tool
+    /// (external) call inside the callback can suspend the VM and resume — this
+    /// is what makes `primary().catch(() => fallbackTool())` work. The main
+    /// `execute()` loop drives the callback; when it returns, the continuation
+    /// shapes the result into the chain's next promise.
+    ///
+    /// Returns:
+    /// - `PromiseMethodOutcome::Value(v)` — completed synchronously (no callback
+    ///   to run); push `v`.
+    /// - `PromiseMethodOutcome::ContinuationStarted` — a callback frame and
+    ///   continuation were pushed; the caller must return `Ok(None)` so the
+    ///   main loop drives it.
+    /// - `PromiseMethodOutcome::NotAPromise` — the receiver was not a promise /
+    ///   the method is unknown; fall through to the normal error path.
     fn execute_promise_method(
         &mut self,
         promise: Value,
         method: &str,
         args: Vec<Value>,
-    ) -> Result<Option<Value>> {
-        let (status, value, reason) = if let Value::Object(ref map) = promise {
+    ) -> Result<PromiseMethodOutcome> {
+        let (status, value, reason) = if let Value::Object(h) = &promise {
+            let map = self.heap.object_map(*h);
             let status = match map.get("status") {
                 Some(Value::String(s)) => s.to_string(),
                 _ => "pending".to_string(),
             };
+            // A deferred single-call promise (N5): `.then`/`.catch`/`.finally`
+            // forces its host call to settle. Suspend on the call now, recording
+            // a `ResumeAction::PromiseMethod` so that on resume the settled value
+            // is wrapped in a resolved promise and the method (with its callbacks)
+            // re-runs through the normal promise-method path — which itself
+            // supports a tool call inside the callback (N4). A *rejection* is
+            // delivered via `resume_with_error`, which raises at the call site and
+            // is shaped into a rejected promise there.
+            if status == "pending_call" {
+                let id = match map.get("__call_id__") {
+                    Some(Value::Int(n)) => *n as u64,
+                    _ => {
+                        return Err(ZapcodeError::RuntimeError(
+                            "internal error: pending_call promise missing __call_id__".to_string(),
+                        ))
+                    }
+                };
+                // Already settled (the promise was awaited before): run the method
+                // synchronously against the cached resolved value — no re-invoke.
+                if let Some(cached) = self.resolved.get(&id).cloned() {
+                    let resolved = builtins::make_resolved_promise(cached, &mut self.heap);
+                    return self.execute_promise_method(resolved, method, args);
+                }
+                self.resume_action = Some(ResumeAction::PromiseMethod {
+                    method: method.to_string(),
+                    args,
+                });
+                return match self.suspend_on_pending_call(id)? {
+                    Some(state) => Ok(PromiseMethodOutcome::Suspend(state)),
+                    None => unreachable!("suspend_on_pending_call always suspends"),
+                };
+            }
             let value = map.get("value").cloned().unwrap_or(Value::Undefined);
             let reason = map.get("reason").cloned().unwrap_or(Value::Undefined);
             (status, value, reason)
         } else {
-            return Ok(None);
+            return Ok(PromiseMethodOutcome::NotAPromise);
         };
 
         let on_fulfilled = args.first().cloned().unwrap_or(Value::Undefined);
@@ -1433,49 +2111,102 @@ impl Vm {
             "then" => {
                 if status == "resolved" {
                     if matches!(on_fulfilled, Value::Function(_)) {
-                        let result = self.call_function_internal(&on_fulfilled, vec![value])?;
-                        Ok(Some(builtins::make_resolved_promise(result)))
+                        self.start_promise_callback(
+                            on_fulfilled,
+                            vec![value],
+                            PromiseCallbackMode::WrapResult,
+                            promise,
+                        )
                     } else {
                         // No callback — pass through the promise
-                        Ok(Some(promise))
+                        Ok(PromiseMethodOutcome::Value(promise))
                     }
                 } else if status == "rejected" {
                     if matches!(on_rejected, Value::Function(_)) {
-                        let result = self.call_function_internal(&on_rejected, vec![reason])?;
-                        Ok(Some(builtins::make_resolved_promise(result)))
+                        self.start_promise_callback(
+                            on_rejected,
+                            vec![reason],
+                            PromiseCallbackMode::WrapResult,
+                            promise,
+                        )
                     } else {
                         // No onRejected — pass through the rejection
-                        Ok(Some(promise))
+                        Ok(PromiseMethodOutcome::Value(promise))
                     }
                 } else {
-                    Ok(Some(promise))
+                    Ok(PromiseMethodOutcome::Value(promise))
                 }
             }
             "catch" => {
                 if status == "rejected" {
                     let handler = args.first().cloned().unwrap_or(Value::Undefined);
                     if matches!(handler, Value::Function(_)) {
-                        let result = self.call_function_internal(&handler, vec![reason])?;
-                        Ok(Some(builtins::make_resolved_promise(result)))
+                        self.start_promise_callback(
+                            handler,
+                            vec![reason],
+                            PromiseCallbackMode::WrapResult,
+                            promise,
+                        )
                     } else {
-                        Ok(Some(promise))
+                        Ok(PromiseMethodOutcome::Value(promise))
                     }
                 } else {
                     // Resolved — pass through
-                    Ok(Some(promise))
+                    Ok(PromiseMethodOutcome::Value(promise))
                 }
             }
             "finally" => {
                 let handler = args.first().cloned().unwrap_or(Value::Undefined);
                 if matches!(handler, Value::Function(_)) {
-                    // finally callback receives no arguments
-                    self.call_function_internal(&handler, vec![])?;
+                    // finally callback receives no arguments and its return value
+                    // is discarded — the original promise passes through.
+                    self.start_promise_callback(
+                        handler,
+                        vec![],
+                        PromiseCallbackMode::PassThrough,
+                        promise,
+                    )
+                } else {
+                    // No handler — pass through the original promise
+                    Ok(PromiseMethodOutcome::Value(promise))
                 }
-                // finally always passes through the original promise
-                Ok(Some(promise))
             }
-            _ => Ok(None),
+            _ => Ok(PromiseMethodOutcome::NotAPromise),
         }
+    }
+
+    /// Push a promise-callback frame plus a [`Continuation::PromiseCallback`] so
+    /// the main `execute()` loop drives the callback. This lets a tool call
+    /// inside the callback suspend the VM (the continuation is part of the
+    /// serialized state and resumes cleanly).
+    fn start_promise_callback(
+        &mut self,
+        callback: Value,
+        args: Vec<Value>,
+        mode: PromiseCallbackMode,
+        original_promise: Value,
+    ) -> Result<PromiseMethodOutcome> {
+        let closure = match &callback {
+            Value::Function(c) => c.clone(),
+            _ => {
+                return Err(ZapcodeError::TypeError(
+                    "promise callback is not a function".to_string(),
+                ))
+            }
+        };
+
+        let caller_frame_depth = self.frames.len();
+        self.push_call_frame(&closure, &args, None)?;
+        let callback_frame_index = self.frames.len() - 1;
+
+        self.continuations.push(Continuation::PromiseCallback {
+            mode,
+            original_promise,
+            caller_frame_depth,
+            callback_frame_index,
+        });
+
+        Ok(PromiseMethodOutcome::ContinuationStarted)
     }
 
     fn alloc_generator_id(&mut self) -> u64 {
@@ -1519,7 +2250,7 @@ impl Vm {
                                 .iter()
                                 .find(|(n, _)| n == name)
                                 .map(|(_, v)| v.clone())
-                                .unwrap_or(Value::Array(Vec::new()));
+                                .unwrap_or_else(|| Value::Array(self.heap.alloc_array(Vec::new())));
                             locals.push(val);
                         }
                         _ => {
@@ -1680,11 +2411,11 @@ impl Vm {
         }
     }
 
-    fn make_iterator_result(&self, value: Value, done: bool) -> Value {
+    fn make_iterator_result(&mut self, value: Value, done: bool) -> Value {
         let mut obj = IndexMap::new();
         obj.insert(Arc::from("value"), value);
         obj.insert(Arc::from("done"), Value::Bool(done));
-        Value::Object(obj)
+        Value::Object(self.heap.alloc_object(obj))
     }
 
     fn dispatch(&mut self, instr: Instruction) -> Result<Option<VmState>> {
@@ -1710,6 +2441,13 @@ impl Vm {
                 self.push(val)?;
             }
             Instruction::LoadLocal(idx) => {
+                // Loading a local clears any pending builtin-global name: the
+                // `last_global_name` shortcut (used so `Math.floor` resolves to a
+                // builtin method) must only apply to a property read *immediately*
+                // after the matching `LoadGlobal`. Otherwise a stale name leaks into
+                // an unrelated member access — e.g. `String(o.zzz)` would wrongly
+                // resolve missing `o.zzz` to a `String` builtin method.
+                self.last_global_name = None;
                 let frame_index = self.frames.len() - 1;
                 let val = self.read_local(frame_index, idx);
                 // If the slot is boxed, write-back must target the cell so the
@@ -1795,6 +2533,10 @@ impl Vm {
             Instruction::Add => {
                 let right = self.pop()?;
                 let left = self.pop()?;
+                // ToPrimitive(default) both operands so user valueOf/toString
+                // hooks participate before the string-vs-number decision.
+                let left = self.to_primitive(&left, ToPrimitiveHint::Default)?;
+                let right = self.to_primitive(&right, ToPrimitiveHint::Default)?;
                 let result = match (&left, &right) {
                     (Value::Int(a), Value::Int(b)) => match a.checked_add(*b) {
                         Some(r) => Value::Int(r),
@@ -1804,7 +2546,7 @@ impl Vm {
                     (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 + b),
                     (Value::Float(a), Value::Int(b)) => Value::Float(a + *b as f64),
                     (Value::String(a), _) => {
-                        let rhs = right.to_js_string();
+                        let rhs = right.to_js_string(&self.heap);
                         let new_len = a.len().saturating_add(rhs.len());
                         if new_len > 10_000_000 {
                             return Err(ZapcodeError::AllocationLimitExceeded);
@@ -1814,7 +2556,7 @@ impl Vm {
                         Value::String(Arc::from(s.as_str()))
                     }
                     (_, Value::String(b)) => {
-                        let lhs = left.to_js_string();
+                        let lhs = left.to_js_string(&self.heap);
                         let new_len = lhs.len().saturating_add(b.len());
                         if new_len > 10_000_000 {
                             return Err(ZapcodeError::AllocationLimitExceeded);
@@ -1827,8 +2569,8 @@ impl Vm {
                     // plain objects), the whole expression is string concatenation
                     // (e.g. `[1,2]+[3]` -> "1,23", `[]+{}` -> "[object Object]").
                     _ if coerces_to_string_in_add(&left) || coerces_to_string_in_add(&right) => {
-                        let lhs = left.to_js_string();
-                        let rhs = right.to_js_string();
+                        let lhs = left.to_js_string(&self.heap);
+                        let rhs = right.to_js_string(&self.heap);
                         let new_len = lhs.len().saturating_add(rhs.len());
                         if new_len > 10_000_000 {
                             return Err(ZapcodeError::AllocationLimitExceeded);
@@ -1837,106 +2579,133 @@ impl Vm {
                         s.push_str(&rhs);
                         Value::String(Arc::from(s.as_str()))
                     }
-                    _ => Value::Float(left.to_number() + right.to_number()),
+                    _ => Value::Float(
+                        left.to_number_heap(&self.heap) + right.to_number_heap(&self.heap),
+                    ),
                 };
                 self.push(result)?;
             }
             Instruction::Sub => {
                 let right = self.pop()?;
                 let left = self.pop()?;
+                let left = self.to_primitive(&left, ToPrimitiveHint::Number)?;
+                let right = self.to_primitive(&right, ToPrimitiveHint::Number)?;
                 let result = match (&left, &right) {
                     (Value::Int(a), Value::Int(b)) => match a.checked_sub(*b) {
                         Some(r) => Value::Int(r),
                         None => Value::Float(*a as f64 - *b as f64),
                     },
-                    _ => Value::Float(left.to_number() - right.to_number()),
+                    _ => Value::Float(
+                        left.to_number_heap(&self.heap) - right.to_number_heap(&self.heap),
+                    ),
                 };
                 self.push(result)?;
             }
             Instruction::Mul => {
                 let right = self.pop()?;
                 let left = self.pop()?;
+                let left = self.to_primitive(&left, ToPrimitiveHint::Number)?;
+                let right = self.to_primitive(&right, ToPrimitiveHint::Number)?;
                 let result = match (&left, &right) {
                     (Value::Int(a), Value::Int(b)) => match a.checked_mul(*b) {
                         Some(r) => Value::Int(r),
                         None => Value::Float(*a as f64 * *b as f64),
                     },
-                    _ => Value::Float(left.to_number() * right.to_number()),
+                    _ => Value::Float(
+                        left.to_number_heap(&self.heap) * right.to_number_heap(&self.heap),
+                    ),
                 };
                 self.push(result)?;
             }
             Instruction::Div => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                let result = Value::Float(left.to_number() / right.to_number());
+                let left = self.to_primitive(&left, ToPrimitiveHint::Number)?;
+                let right = self.to_primitive(&right, ToPrimitiveHint::Number)?;
+                let result = Value::Float(
+                    left.to_number_heap(&self.heap) / right.to_number_heap(&self.heap),
+                );
                 self.push(result)?;
             }
             Instruction::Rem => {
                 let right = self.pop()?;
                 let left = self.pop()?;
+                let left = self.to_primitive(&left, ToPrimitiveHint::Number)?;
+                let right = self.to_primitive(&right, ToPrimitiveHint::Number)?;
                 let result = match (&left, &right) {
                     (Value::Int(a), Value::Int(b)) if *b != 0 => Value::Int(a % b),
-                    _ => Value::Float(left.to_number() % right.to_number()),
+                    _ => Value::Float(
+                        left.to_number_heap(&self.heap) % right.to_number_heap(&self.heap),
+                    ),
                 };
                 self.push(result)?;
             }
             Instruction::Pow => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                let result = Value::Float(left.to_number().powf(right.to_number()));
+                let left = self.to_primitive(&left, ToPrimitiveHint::Number)?;
+                let right = self.to_primitive(&right, ToPrimitiveHint::Number)?;
+                let result = Value::Float(
+                    left.to_number_heap(&self.heap)
+                        .powf(right.to_number_heap(&self.heap)),
+                );
                 self.push(result)?;
             }
             Instruction::Neg => {
                 let val = self.pop()?;
+                let val = self.to_primitive(&val, ToPrimitiveHint::Number)?;
                 let result = match val {
                     Value::Int(n) => Value::Int(-n),
-                    _ => Value::Float(-val.to_number()),
+                    _ => Value::Float(-val.to_number_heap(&self.heap)),
                 };
                 self.push(result)?;
             }
             Instruction::BitNot => {
                 let val = self.pop()?;
-                let n = js_to_int32(val.to_number());
+                let n = js_to_int32(val.to_number_heap(&self.heap));
                 self.push(Value::Int(!n as i64))?;
             }
             Instruction::BitAnd => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                let result = js_to_int32(left.to_number()) & js_to_int32(right.to_number());
+                let result = js_to_int32(left.to_number_heap(&self.heap))
+                    & js_to_int32(right.to_number_heap(&self.heap));
                 self.push(Value::Int(result as i64))?;
             }
             Instruction::BitOr => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                let result = js_to_int32(left.to_number()) | js_to_int32(right.to_number());
+                let result = js_to_int32(left.to_number_heap(&self.heap))
+                    | js_to_int32(right.to_number_heap(&self.heap));
                 self.push(Value::Int(result as i64))?;
             }
             Instruction::BitXor => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                let result = js_to_int32(left.to_number()) ^ js_to_int32(right.to_number());
+                let result = js_to_int32(left.to_number_heap(&self.heap))
+                    ^ js_to_int32(right.to_number_heap(&self.heap));
                 self.push(Value::Int(result as i64))?;
             }
             Instruction::Shl => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                let shift = js_to_uint32(right.to_number()) & 0x1f;
-                let result = js_to_int32(left.to_number()).wrapping_shl(shift);
+                let shift = js_to_uint32(right.to_number_heap(&self.heap)) & 0x1f;
+                let result = js_to_int32(left.to_number_heap(&self.heap)).wrapping_shl(shift);
                 self.push(Value::Int(result as i64))?;
             }
             Instruction::Shr => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                let shift = js_to_uint32(right.to_number()) & 0x1f;
-                let result = js_to_int32(left.to_number()).wrapping_shr(shift);
+                let shift = js_to_uint32(right.to_number_heap(&self.heap)) & 0x1f;
+                let result = js_to_int32(left.to_number_heap(&self.heap)).wrapping_shr(shift);
                 self.push(Value::Int(result as i64))?;
             }
             Instruction::Ushr => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                let shift = js_to_uint32(right.to_number()) & 0x1f;
+                let shift = js_to_uint32(right.to_number_heap(&self.heap)) & 0x1f;
                 // ToUint32 semantics: negative operands wrap (e.g. -1 >>> 0 === 4294967295).
-                let result = js_to_uint32(left.to_number()).wrapping_shr(shift);
+                let result = js_to_uint32(left.to_number_heap(&self.heap)).wrapping_shr(shift);
                 self.push(Value::Int(result as i64))?;
             }
 
@@ -1964,23 +2733,31 @@ impl Vm {
             Instruction::Lt => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                self.push(Value::Bool(js_less_than(&left, &right)))?;
+                let left = self.to_primitive(&left, ToPrimitiveHint::Number)?;
+                let right = self.to_primitive(&right, ToPrimitiveHint::Number)?;
+                self.push(Value::Bool(js_less_than(&left, &right, &self.heap)))?;
             }
             Instruction::Lte => {
                 let right = self.pop()?;
                 let left = self.pop()?;
+                let left = self.to_primitive(&left, ToPrimitiveHint::Number)?;
+                let right = self.to_primitive(&right, ToPrimitiveHint::Number)?;
                 // a <= b  <=>  !(b < a), but NaN must make it false either way.
-                self.push(Value::Bool(js_less_than_or_equal(&left, &right)))?;
+                self.push(Value::Bool(js_less_than_or_equal(&left, &right, &self.heap)))?;
             }
             Instruction::Gt => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                self.push(Value::Bool(js_less_than(&right, &left)))?;
+                let left = self.to_primitive(&left, ToPrimitiveHint::Number)?;
+                let right = self.to_primitive(&right, ToPrimitiveHint::Number)?;
+                self.push(Value::Bool(js_less_than(&right, &left, &self.heap)))?;
             }
             Instruction::Gte => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                self.push(Value::Bool(js_less_than_or_equal(&right, &left)))?;
+                let left = self.to_primitive(&left, ToPrimitiveHint::Number)?;
+                let right = self.to_primitive(&right, ToPrimitiveHint::Number)?;
+                self.push(Value::Bool(js_less_than_or_equal(&right, &left, &self.heap)))?;
             }
 
             // Logical
@@ -1998,7 +2775,8 @@ impl Vm {
                     arr.push(self.pop()?);
                 }
                 arr.reverse();
-                self.push(Value::Array(arr))?;
+                let h = self.heap.alloc_array(arr);
+                self.push(Value::Array(h))?;
             }
             Instruction::CreateObject(count) => {
                 self.tracker.track_allocation(&self.limits)?;
@@ -2017,17 +2795,20 @@ impl Vm {
                             obj.insert(k, val);
                         }
                         _ => {
-                            let k: Arc<str> = Arc::from(key.to_js_string().as_str());
+                            let k: Arc<str> = Arc::from(key.to_js_string(&self.heap).as_str());
                             obj.insert(k, val);
                         }
                     }
                 }
-                self.push(Value::Object(obj))?;
+                let h = self.heap.alloc_object(obj);
+                self.push(Value::Object(h))?;
             }
             Instruction::ObjectRest(excluded) => {
                 let source = self.pop()?;
-                let rest = match source {
-                    Value::Object(map) => map
+                let rest: IndexMap<Arc<str>, Value> = match source {
+                    Value::Object(h) => self
+                        .heap
+                        .object_map(h)
                         .into_iter()
                         .filter(|(key, _)| {
                             !excluded.iter().any(|excluded| excluded == key.as_ref())
@@ -2035,13 +2816,18 @@ impl Vm {
                         .collect(),
                     _ => IndexMap::new(),
                 };
-                self.push(Value::Object(rest))?;
+                let h = self.heap.alloc_object(rest);
+                self.push(Value::Object(h))?;
             }
             Instruction::GetProperty(name) => {
                 let obj = self.pop()?;
                 // Place of the object we're reading the property from.
                 let obj_place = self.last_place.take();
                 let result = self.get_property(&obj, &name)?;
+                // Consume the builtin-global shortcut: it applies only to this
+                // single read immediately after a `LoadGlobal`, never to a later
+                // chained access on the produced value.
+                self.last_global_name = None;
                 match result {
                     Value::BuiltinMethod {
                         object_name,
@@ -2082,10 +2868,14 @@ impl Vm {
                 let obj_val = self.pop()?;
                 let value = self.pop()?;
                 match obj_val {
-                    Value::Object(mut obj) => {
-                        obj.insert(Arc::from(name.as_str()), value);
-                        // Push modified object back so compile_store can store it
-                        self.push(Value::Object(obj))?;
+                    Value::Object(h) => {
+                        // Mutate the heap slot in place; the handle is shared so the
+                        // write is visible through every alias (reference semantics).
+                        if let Some(obj) = self.heap.object_mut(h) {
+                            obj.insert(Arc::from(name.as_str()), value);
+                        }
+                        // Push the (same) object handle back so compile_store can store it.
+                        self.push(Value::Object(h))?;
                     }
                     _ => {
                         return Err(ZapcodeError::TypeError(format!(
@@ -2109,22 +2899,35 @@ impl Vm {
                         Some(PlaceSeg::Index(*f as usize))
                     }
                     (Value::Object(_), Value::String(key)) => Some(PlaceSeg::Prop(key.to_string())),
-                    (Value::Object(_), _) => Some(PlaceSeg::Prop(index.to_js_string())),
+                    (Value::Object(_), _) => {
+                        Some(PlaceSeg::Prop(index.to_js_string(&self.heap)))
+                    }
                     _ => None,
                 };
                 let result = match (&obj, &index) {
-                    (Value::Array(arr), Value::Int(i)) => {
-                        arr.get(*i as usize).cloned().unwrap_or(Value::Undefined)
-                    }
-                    (Value::Array(arr), Value::Float(f)) => {
-                        arr.get(*f as usize).cloned().unwrap_or(Value::Undefined)
-                    }
-                    (Value::Object(map), Value::String(key)) => {
-                        map.get(key.as_ref()).cloned().unwrap_or(Value::Undefined)
-                    }
-                    (Value::Object(map), _) => {
-                        let key: Arc<str> = Arc::from(index.to_js_string().as_str());
-                        map.get(key.as_ref()).cloned().unwrap_or(Value::Undefined)
+                    (Value::Array(h), Value::Int(i)) => self
+                        .heap
+                        .array(*h)
+                        .get(*i as usize)
+                        .cloned()
+                        .unwrap_or(Value::Undefined),
+                    (Value::Array(h), Value::Float(f)) => self
+                        .heap
+                        .array(*h)
+                        .get(*f as usize)
+                        .cloned()
+                        .unwrap_or(Value::Undefined),
+                    (Value::Object(h), Value::String(key)) => self
+                        .heap
+                        .object(*h)
+                        .and_then(|m| m.get(key.as_ref()).cloned())
+                        .unwrap_or(Value::Undefined),
+                    (Value::Object(h), _) => {
+                        let key: Arc<str> = Arc::from(index.to_js_string(&self.heap).as_str());
+                        self.heap
+                            .object(*h)
+                            .and_then(|m| m.get(key.as_ref()).cloned())
+                            .unwrap_or(Value::Undefined)
                     }
                     (Value::String(s), Value::Int(i)) => s
                         .chars()
@@ -2167,10 +2970,11 @@ impl Vm {
             }
             Instruction::SetIndex => {
                 let index = self.pop()?;
-                let mut obj = self.pop()?;
+                let obj = self.pop()?;
                 let value = self.pop()?;
-                match &mut obj {
-                    Value::Array(arr) => {
+                match &obj {
+                    Value::Array(h) => {
+                        let cur_len = self.heap.array(*h).len();
                         let idx = match &index {
                             Value::Int(i) if *i >= 0 => *i as usize,
                             Value::Float(f) if *f >= 0.0 && *f == (*f as usize as f64) => {
@@ -2183,25 +2987,29 @@ impl Vm {
                             }
                         };
                         // Cap maximum sparse array growth to prevent memory exhaustion
-                        if idx > arr.len() + 1024 {
+                        if idx > cur_len + 1024 {
                             return Err(ZapcodeError::RuntimeError(format!(
                                 "array index {} too far beyond length {}",
-                                idx,
-                                arr.len()
+                                idx, cur_len
                             )));
                         }
-                        while arr.len() <= idx {
-                            arr.push(Value::Undefined);
+                        // Mutate the heap slot in place (reference semantics).
+                        if let Some(arr) = self.heap.array_mut(*h) {
+                            while arr.len() <= idx {
+                                arr.push(Value::Undefined);
+                            }
+                            arr[idx] = value;
                         }
-                        arr[idx] = value;
                     }
-                    Value::Object(map) => {
-                        let key: Arc<str> = Arc::from(index.to_js_string().as_str());
-                        map.insert(key, value);
+                    Value::Object(h) => {
+                        let key: Arc<str> = Arc::from(index.to_js_string(&self.heap).as_str());
+                        if let Some(map) = self.heap.object_mut(*h) {
+                            map.insert(key, value);
+                        }
                     }
                     _ => {}
                 }
-                // Push modified object back so compile_store can store it to the variable
+                // Push the (same) handle back so compile_store can store it to the variable.
                 self.push(obj)?;
             }
             Instruction::FreshenBinding(slot) => {
@@ -2219,26 +3027,34 @@ impl Vm {
                 }
             }
             Instruction::DeleteProperty(name) => {
-                let mut obj = self.pop()?;
-                if let Value::Object(map) = &mut obj {
-                    map.shift_remove(name.as_str());
+                let obj = self.pop()?;
+                if let Value::Object(h) = &obj {
+                    if let Some(map) = self.heap.object_mut(*h) {
+                        map.shift_remove(name.as_str());
+                    }
                 }
                 self.push(obj)?;
             }
             Instruction::DeleteIndex => {
                 let key = self.pop()?;
-                let mut obj = self.pop()?;
-                match &mut obj {
-                    Value::Object(map) => {
-                        let k = key.to_js_string();
-                        map.shift_remove(k.as_str());
+                let obj = self.pop()?;
+                match &obj {
+                    Value::Object(h) => {
+                        let k = key.to_js_string(&self.heap);
+                        if let Some(map) = self.heap.object_mut(*h) {
+                            map.shift_remove(k.as_str());
+                        }
                     }
-                    Value::Array(arr) => {
+                    Value::Array(h) => {
                         // `delete arr[i]` leaves a hole (undefined) without
                         // changing length, matching JS.
                         if let Value::Int(i) = &key {
-                            if *i >= 0 && (*i as usize) < arr.len() {
-                                arr[*i as usize] = Value::Undefined;
+                            if *i >= 0 {
+                                if let Some(arr) = self.heap.array_mut(*h) {
+                                    if (*i as usize) < arr.len() {
+                                        arr[*i as usize] = Value::Undefined;
+                                    }
+                                }
                             }
                         }
                     }
@@ -2253,7 +3069,7 @@ impl Vm {
             Instruction::ArrayAppend => {
                 self.tracker.track_allocation(&self.limits)?;
                 let value = self.pop()?;
-                let mut acc = match self.pop()? {
+                let acc = match self.pop()? {
                     Value::Array(a) => a,
                     other => {
                         return Err(ZapcodeError::TypeError(format!(
@@ -2262,13 +3078,15 @@ impl Vm {
                         )))
                     }
                 };
-                acc.push(value);
+                if let Some(v) = self.heap.array_mut(acc) {
+                    v.push(value);
+                }
                 self.push(Value::Array(acc))?;
             }
             Instruction::ArraySpreadAppend => {
                 self.tracker.track_allocation(&self.limits)?;
                 let iterable = self.pop()?;
-                let mut acc = match self.pop()? {
+                let acc = match self.pop()? {
                     Value::Array(a) => a,
                     other => {
                         return Err(ZapcodeError::TypeError(format!(
@@ -2277,15 +3095,17 @@ impl Vm {
                         )))
                     }
                 };
-                match iterable {
-                    Value::Array(items) => acc.extend(items),
-                    Value::String(s) => acc.extend(
-                        s.chars()
-                            .map(|c| Value::String(Arc::from(c.to_string().as_str()))),
-                    ),
-                    Value::Object(ref m) if is_set_object(&iterable) => acc.extend(set_items(m)),
-                    Value::Object(ref m) if is_map_object(&iterable) => {
-                        acc.extend(map_entry_pairs(m))
+                let extra: Vec<Value> = match &iterable {
+                    Value::Array(items) => self.heap.array_vec(*items),
+                    Value::String(s) => s
+                        .chars()
+                        .map(|c| Value::String(Arc::from(c.to_string().as_str())))
+                        .collect(),
+                    Value::Object(_) if is_set_object(&iterable, &self.heap) => {
+                        set_items(&iterable, &self.heap)
+                    }
+                    Value::Object(_) if is_map_object(&iterable, &self.heap) => {
+                        map_entry_pairs(&iterable, &mut self.heap)
                     }
                     other => {
                         return Err(ZapcodeError::TypeError(format!(
@@ -2293,24 +3113,28 @@ impl Vm {
                             other.type_name()
                         )))
                     }
+                };
+                if let Some(v) = self.heap.array_mut(acc) {
+                    v.extend(extra);
                 }
                 self.push(Value::Array(acc))?;
             }
             Instruction::ArrayRestFrom(from) => {
                 self.tracker.track_allocation(&self.limits)?;
                 let value = self.pop()?;
-                let rest = match value {
+                let rest: Vec<Value> = match value {
                     Value::Array(items) => {
-                        Value::Array(items.into_iter().skip(from).collect())
+                        self.heap.array_vec(items).into_iter().skip(from).collect()
                     }
-                    _ => Value::Array(Vec::new()),
+                    _ => Vec::new(),
                 };
-                self.push(rest)?;
+                let h = self.heap.alloc_array(rest);
+                self.push(Value::Array(h))?;
             }
             Instruction::ObjectInsert => {
                 let value = self.pop()?;
                 let key = self.pop()?;
-                let mut acc = match self.pop()? {
+                let acc = match self.pop()? {
                     Value::Object(o) => o,
                     other => {
                         return Err(ZapcodeError::TypeError(format!(
@@ -2321,14 +3145,16 @@ impl Vm {
                 };
                 let key: Arc<str> = match key {
                     Value::String(k) => k,
-                    other => Arc::from(other.to_js_string().as_str()),
+                    other => Arc::from(other.to_js_string(&self.heap).as_str()),
                 };
-                acc.insert(key, value);
+                if let Some(map) = self.heap.object_mut(acc) {
+                    map.insert(key, value);
+                }
                 self.push(Value::Object(acc))?;
             }
             Instruction::ObjectSpreadAssign => {
                 let source = self.pop()?;
-                let mut acc = match self.pop()? {
+                let acc = match self.pop()? {
                     Value::Object(o) => o,
                     other => {
                         return Err(ZapcodeError::TypeError(format!(
@@ -2338,9 +3164,12 @@ impl Vm {
                     }
                 };
                 match source {
-                    Value::Object(map) => {
-                        for (k, v) in map {
-                            acc.insert(k, v);
+                    Value::Object(h) => {
+                        let entries = self.heap.object_map(h);
+                        if let Some(map) = self.heap.object_mut(acc) {
+                            for (k, v) in entries {
+                                map.insert(k, v);
+                            }
                         }
                     }
                     // Spreading null/undefined is a no-op in JS; ignore others.
@@ -2353,15 +3182,29 @@ impl Vm {
                 let right = self.pop()?;
                 let left = self.pop()?;
                 let result = match &right {
-                    Value::Object(map) => {
-                        let key = left.to_js_string();
-                        map.contains_key(key.as_str())
+                    Value::Object(h) => {
+                        let key = left.to_js_string(&self.heap);
+                        self.heap.object(*h).is_some_and(|m| m.contains_key(key.as_str()))
                     }
-                    Value::Array(arr) => {
-                        if let Value::Int(i) = left {
-                            (i as usize) < arr.len()
-                        } else {
-                            false
+                    Value::Array(h) => {
+                        let len = self.heap.array(*h).len();
+                        match &left {
+                            // Numeric index membership: `0 in [1,2]`.
+                            Value::Int(i) => *i >= 0 && (*i as usize) < len,
+                            // String keys: `"length"` is an own property of every
+                            // array; numeric string keys like `"0"` are indices.
+                            // (Inherited prototype methods such as "push"/"map"
+                            // stay absent — own-key membership only.)
+                            _ => {
+                                let key = left.to_js_string(&self.heap);
+                                if key == "length" {
+                                    true
+                                } else if let Ok(idx) = key.parse::<usize>() {
+                                    idx < len
+                                } else {
+                                    false
+                                }
+                            }
                         }
                     }
                     _ => false,
@@ -2371,8 +3214,13 @@ impl Vm {
             Instruction::InstanceOf => {
                 let right = self.pop()?;
                 let left = self.pop()?;
+                // Helper: does object handle `h` have key `k`?
+                let has_key = |h: Handle, k: &str, heap: &Heap| -> bool {
+                    heap.object(h).is_some_and(|m| m.contains_key(k))
+                };
                 // Check if left's __class__ matches right's __class_name__
-                let result = if let Value::Object(class_obj) = &right {
+                let result = if let Value::Object(class_h) = &right {
+                    let class_obj = self.heap.object_map(*class_h);
                     if let Some(Value::String(ctor)) = class_obj.get("__builtin_constructor__") {
                         // Builtin constructors. Object matches any object/array/function;
                         // Array matches arrays; Error matches any error object; a specific
@@ -2384,21 +3232,38 @@ impl Vm {
                             ),
                             "Array" => matches!(left, Value::Array(_)),
                             "Error" => {
-                                matches!(&left, Value::Object(i) if i.contains_key("__error__"))
+                                matches!(&left, Value::Object(i) if has_key(*i, "__error__", &self.heap))
                             }
-                            "TypeError" | "RangeError" | "SyntaxError" | "ReferenceError" => {
-                                matches!(&left, Value::Object(i)
-                                    if i.get("name")
-                                        == Some(&Value::String(Arc::from(ctor.as_ref()))))
+                            "TypeError" | "RangeError" | "SyntaxError" | "ReferenceError"
+                            | "AggregateError" => match &left {
+                                Value::Object(i) => {
+                                    self.heap.object(*i).and_then(|m| m.get("name"))
+                                        == Some(&Value::String(Arc::from(ctor.as_ref())))
+                                }
+                                _ => false,
+                            },
+                            "Map" => {
+                                matches!(&left, Value::Object(i) if has_key(*i, "__map__", &self.heap))
                             }
-                            "Map" => matches!(&left, Value::Object(i) if i.contains_key("__map__")),
-                            "Set" => matches!(&left, Value::Object(i) if i.contains_key("__set__")),
+                            "Set" => {
+                                matches!(&left, Value::Object(i) if has_key(*i, "__set__", &self.heap))
+                            }
+                            "Date" => {
+                                matches!(&left, Value::Object(i) if has_key(*i, "__date_ms__", &self.heap))
+                            }
                             _ => false,
                         }
                     } else if let (Value::Object(instance), Some(class_name)) =
                         (&left, class_obj.get("__class_name__"))
                     {
-                        instance.get("__class__") == Some(class_name)
+                        let inst = self.heap.object_map(*instance);
+                        // Match the instance's class or any of its ancestors.
+                        match inst.get("__class_chain__") {
+                            Some(Value::Array(chain)) => {
+                                self.heap.array(*chain).contains(class_name)
+                            }
+                            _ => inst.get("__class__") == Some(class_name),
+                        }
                     } else {
                         false
                     }
@@ -2443,7 +3308,8 @@ impl Vm {
                                     }
                                     ParamPattern::Rest(name) => {
                                         let rest: Vec<Value> = args[i..].to_vec();
-                                        captured.push((name.clone(), Value::Array(rest)));
+                                        let h = self.heap.alloc_array(rest);
+                                        captured.push((name.clone(), Value::Array(h)));
                                     }
                                     _ => {}
                                 }
@@ -2480,16 +3346,20 @@ impl Vm {
                         let receiver = recv.map(|b| *b).or_else(|| self.last_receiver.take());
                         let result = match object_name.as_ref() {
                             "__array__" => {
+                                // Arrays are heap handles: mutating methods edit
+                                // the slot in place, so the change is already
+                                // visible through every alias. No write-back via
+                                // `place` is needed (reference semantics).
+                                let _ = &place;
                                 if let Some(Value::Array(arr)) = &receiver {
-                                    let receiver_update =
-                                        mutated_array_receiver(&method_name, arr, &args);
+                                    let arr = *arr;
                                     // Check if this is a callback method first
-                                    let result = match method_name.as_ref() {
+                                    match method_name.as_ref() {
                                         "map" | "filter" | "forEach" | "find" | "findIndex"
                                         | "findLast" | "findLastIndex" | "every" | "some"
                                         | "reduce" | "reduceRight" | "sort" | "flatMap" => {
                                             match self.execute_array_callback_method(
-                                                arr.clone(),
+                                                arr,
                                                 &method_name,
                                                 args,
                                             )? {
@@ -2503,37 +3373,14 @@ impl Vm {
                                             }
                                         }
                                         _ => builtins::call_builtin(
-                                            &Value::Array(arr.clone()),
+                                            &Value::Array(arr),
                                             &method_name,
                                             &args,
                                             &self.limits,
                                             &mut self.stdout,
+                                            &mut self.heap,
                                         )?,
-                                    };
-                                    if let (Some(p), Some(updated)) = (&place, receiver_update) {
-                                        self.write_place(p, Value::Array(updated));
                                     }
-                                    // sort() mutates the array in place (the
-                                    // comparator path produces the sorted array
-                                    // but isn't covered by mutated_array_receiver).
-                                    // Only write back when the place still holds
-                                    // the exact array we sorted — guards against a
-                                    // stale place leaking through a call-result
-                                    // receiver (e.g. `Object.keys(obj).sort()`,
-                                    // where the place wrongly points at `obj`).
-                                    if method_name.as_ref() == "sort" {
-                                        if let (Some(p), Some(Value::Array(sorted))) =
-                                            (&place, &result)
-                                        {
-                                            if matches!(
-                                                self.read_place(p),
-                                                Some(Value::Array(ref cur)) if arrays_same_values(cur, arr)
-                                            ) {
-                                                self.write_place(p, Value::Array(sorted.clone()));
-                                            }
-                                        }
-                                    }
-                                    result
                                 } else {
                                     None
                                 }
@@ -2546,31 +3393,51 @@ impl Vm {
                                         &args,
                                         &self.limits,
                                         &mut self.stdout,
+                                        &mut self.heap,
                                     )?
                                 } else {
                                     None
                                 }
                             }
                             "__number__" => {
-                                let n =
-                                    receiver.as_ref().map(|v| v.to_number()).unwrap_or(f64::NAN);
+                                let n = receiver
+                                    .as_ref()
+                                    .map(|v| v.to_number_heap(&self.heap))
+                                    .unwrap_or(f64::NAN);
                                 builtins::call_number_method(n, &method_name, &args)?
                             }
                             "__object__" => match (&receiver, method_name.as_ref()) {
                                 (Some(Value::Object(map)), "hasOwnProperty") => {
-                                    let key =
-                                        args.first().map(|v| v.to_js_string()).unwrap_or_default();
-                                    Some(Value::Bool(map.contains_key(key.as_str())))
+                                    let key = args
+                                        .first()
+                                        .map(|v| v.to_js_string(&self.heap))
+                                        .unwrap_or_default();
+                                    let has = self
+                                        .heap
+                                        .object(*map)
+                                        .is_some_and(|m| m.contains_key(key.as_str()));
+                                    Some(Value::Bool(has))
                                 }
                                 _ => None,
                             },
                             "__regexp__" => {
-                                match receiver.as_ref().and_then(builtins::regexp_parts) {
+                                // The receiver handle is needed so /g exec/test can
+                                // read and advance the `lastIndex` slot in place.
+                                let regex_handle = match receiver.as_ref() {
+                                    Some(Value::Object(h)) => Some(*h),
+                                    _ => None,
+                                };
+                                match receiver
+                                    .as_ref()
+                                    .and_then(|v| builtins::regexp_parts(v, &self.heap))
+                                {
                                     Some((pat, flags)) => builtins::call_regexp_method(
                                         &pat,
                                         &flags,
                                         &method_name,
                                         &args,
+                                        regex_handle,
+                                        &mut self.heap,
                                     )?,
                                     None => None,
                                 }
@@ -2620,73 +3487,98 @@ impl Vm {
                             }
                             "__promise__" => {
                                 if let Some(promise) = receiver {
-                                    self.execute_promise_method(promise, &method_name, args)?
+                                    match self
+                                        .execute_promise_method(promise, &method_name, args)?
+                                    {
+                                        PromiseMethodOutcome::Value(v) => Some(v),
+                                        // A continuation was started — the main
+                                        // execute() loop drives the callback (and
+                                        // suspends if it makes a tool call). Don't
+                                        // push a result here.
+                                        PromiseMethodOutcome::ContinuationStarted => {
+                                            return Ok(None);
+                                        }
+                                        // A deferred single-call promise forced its
+                                        // host call — propagate the suspension; the
+                                        // recorded resume_action finishes the method.
+                                        PromiseMethodOutcome::Suspend(state) => {
+                                            return Ok(Some(state));
+                                        }
+                                        PromiseMethodOutcome::NotAPromise => None,
+                                    }
                                 } else {
                                     None
                                 }
                             }
                             "__map__" => {
+                                // Map is a heap handle; mutating methods edit the
+                                // backing slot in place (reference semantics), so
+                                // no `place` write-back is needed.
+                                let _ = &place;
                                 if let Some(Value::Object(map)) = receiver {
                                     if method_name.as_ref() == "forEach" {
                                         // cb(value, key, map) — needs guest closure.
                                         let cb = args.first().cloned().unwrap_or(Value::Undefined);
-                                        let entries = match map.get("__entries__") {
-                                            Some(Value::Array(e)) => e.clone(),
-                                            _ => Vec::new(),
-                                        };
-                                        for entry in &entries {
-                                            if let Value::Object(e) = entry {
-                                                let v = e
-                                                    .get("value")
+                                        let pairs = map_entry_pairs(
+                                            &Value::Object(map),
+                                            &mut self.heap,
+                                        );
+                                        for pair in pairs {
+                                            if let Value::Array(ph) = pair {
+                                                let kv = self.heap.array_vec(ph);
+                                                let k = kv
+                                                    .first()
                                                     .cloned()
                                                     .unwrap_or(Value::Undefined);
-                                                let k = e
-                                                    .get("key")
+                                                let v = kv
+                                                    .get(1)
                                                     .cloned()
                                                     .unwrap_or(Value::Undefined);
                                                 self.call_function_internal(
                                                     &cb,
-                                                    vec![v, k, Value::Object(map.clone())],
+                                                    vec![v, k, Value::Object(map)],
                                                 )?;
                                             }
                                         }
                                         Some(Value::Undefined)
                                     } else {
-                                        let (result, updated) =
-                                            execute_map_method(map, &method_name, &args);
-                                        if let (Some(p), Some(updated)) = (&place, updated) {
-                                            self.write_place(p, Value::Object(updated));
-                                        }
-                                        result
+                                        execute_map_method(
+                                            map,
+                                            &method_name,
+                                            &args,
+                                            &mut self.heap,
+                                        )
                                     }
                                 } else {
                                     None
                                 }
                             }
                             "__set__" => {
+                                let _ = &place;
                                 if let Some(Value::Object(map)) = receiver {
                                     if method_name.as_ref() == "forEach" {
                                         // cb(value, value, set) — needs guest closure.
                                         let cb = args.first().cloned().unwrap_or(Value::Undefined);
-                                        let items = set_items(&map);
+                                        let items =
+                                            set_items(&Value::Object(map), &self.heap);
                                         for item in items {
                                             self.call_function_internal(
                                                 &cb,
                                                 vec![
                                                     item.clone(),
                                                     item.clone(),
-                                                    Value::Object(map.clone()),
+                                                    Value::Object(map),
                                                 ],
                                             )?;
                                         }
                                         Some(Value::Undefined)
                                     } else {
-                                        let (result, updated) =
-                                            execute_set_method(map, &method_name, &args);
-                                        if let (Some(p), Some(updated)) = (&place, updated) {
-                                            self.write_place(p, Value::Object(updated));
-                                        }
-                                        result
+                                        execute_set_method(
+                                            map,
+                                            &method_name,
+                                            &args,
+                                            &mut self.heap,
+                                        )
                                     }
                                 } else {
                                     None
@@ -2694,7 +3586,8 @@ impl Vm {
                             }
                             "__date__" => {
                                 if let Some(Value::Object(date)) = receiver {
-                                    execute_date_method(&date, &method_name)
+                                    let map = self.heap.object_map(date);
+                                    execute_date_method(&map, &method_name)
                                 } else {
                                     None
                                 }
@@ -2713,19 +3606,22 @@ impl Vm {
                             {
                                 let src = builtins::array_from_source(
                                     args.first().unwrap_or(&Value::Undefined),
+                                    &mut self.heap,
                                 );
                                 let map_fn = args[1].clone();
                                 let mut out = Vec::with_capacity(src.len());
                                 for (i, item) in src.iter().enumerate() {
                                     out.push(self.call_element_callback(&map_fn, item, i)?);
                                 }
-                                Some(Value::Array(out))
+                                let h = self.heap.alloc_array(out);
+                                Some(Value::Array(h))
                             }
                             global_name => builtins::call_global_method(
                                 global_name,
                                 &method_name,
                                 &args,
                                 &mut self.stdout,
+                                &mut self.heap,
                             )?,
                         };
                         match result {
@@ -2740,19 +3636,39 @@ impl Vm {
                     }
                     // Bare type-conversion functions: String(x)/Number(x)/Boolean(x),
                     // represented as objects carrying a "__global_fn__" marker.
-                    Value::Object(ref map) if map.contains_key("__global_fn__") => {
-                        let kind = match map.get("__global_fn__") {
+                    Value::Object(h)
+                        if self
+                            .heap
+                            .object(h)
+                            .is_some_and(|m| m.contains_key("__global_fn__")) =>
+                    {
+                        let kind = match self.heap.object(h).and_then(|m| m.get("__global_fn__")) {
                             Some(Value::String(s)) => s.clone(),
                             _ => Arc::from(""),
                         };
-                        let value = builtins::call_global_fn(kind.as_ref(), &args)?;
+                        // String(x)/Number(x) run ToPrimitive on their argument so
+                        // a user valueOf/toString hook is honored (String -> string
+                        // hint, Number -> number hint).
+                        let mut args = args;
+                        match kind.as_ref() {
+                            "String" => {
+                                if let Some(first) = args.first().cloned() {
+                                    args[0] = self.to_primitive(&first, ToPrimitiveHint::String)?;
+                                }
+                            }
+                            "Number" => {
+                                if let Some(first) = args.first().cloned() {
+                                    args[0] = self.to_primitive(&first, ToPrimitiveHint::Number)?;
+                                }
+                            }
+                            _ => {}
+                        }
+                        let value = builtins::call_global_fn(kind.as_ref(), &args, &mut self.heap)?;
                         self.push(value)?;
                     }
                     _ => {
-                        return Err(ZapcodeError::TypeError(format!(
-                            "{} is not a function",
-                            callee.to_js_string()
-                        )));
+                        let msg = callee.to_js_string(&self.heap);
+                        return Err(ZapcodeError::TypeError(format!("{} is not a function", msg)));
                     }
                 }
             }
@@ -2817,7 +3733,7 @@ impl Vm {
             // increment the re-dispatched instruction performs.
             Instruction::CallSpread => {
                 let items = match self.pop()? {
-                    Value::Array(a) => a,
+                    Value::Array(a) => self.heap.array_vec(a),
                     _ => Vec::new(),
                 };
                 let n = items.len();
@@ -2829,7 +3745,7 @@ impl Vm {
             }
             Instruction::CallExternalSpread(name) => {
                 let items = match self.pop()? {
-                    Value::Array(a) => a,
+                    Value::Array(a) => self.heap.array_vec(a),
                     _ => Vec::new(),
                 };
                 let n = items.len();
@@ -2854,18 +3770,43 @@ impl Vm {
                     .push(PendingExternalCall { id, name, args });
                 self.push(Value::Pending(id))?;
             }
-            Instruction::MakeBatchPromise(n) => {
+            Instruction::MakeBatchPromise(kind, n) => {
                 let mut items = Vec::with_capacity(n);
                 for _ in 0..n {
                     items.push(self.pop()?);
                 }
                 items.reverse();
-                // Mark as a pending-all batch promise; the await resolves it.
+                // Mark as a pending-batch promise tagged with the combinator;
+                // the await resolves it per `kind`.
+                let items_arr = Value::Array(self.heap.alloc_array(items));
                 let mut obj = IndexMap::new();
                 obj.insert(Arc::from("__promise__"), Value::Bool(true));
                 obj.insert(Arc::from("status"), Value::String(Arc::from("pending_all")));
-                obj.insert(Arc::from("items"), Value::Array(items));
-                self.push(Value::Object(obj))?;
+                obj.insert(Arc::from("__batch_kind__"), Value::String(Arc::from(kind.as_str())));
+                obj.insert(Arc::from("items"), items_arr);
+                let h = self.heap.alloc_object(obj);
+                self.push(Value::Object(h))?;
+            }
+            Instruction::MakeCallPromise => {
+                // Wrap the just-registered deferred call (a `Value::Pending(id)`
+                // on the stack) in a single-call Promise object. The host call is
+                // deferred until the promise is awaited or driven by
+                // `.then`/`.catch`/`.finally` (N5).
+                let id = match self.pop()? {
+                    Value::Pending(id) => id,
+                    other => {
+                        return Err(ZapcodeError::RuntimeError(format!(
+                            "internal error: MakeCallPromise expected a pending call, got {}",
+                            other.type_name()
+                        )))
+                    }
+                };
+                let mut obj = IndexMap::new();
+                obj.insert(Arc::from("__promise__"), Value::Bool(true));
+                obj.insert(Arc::from("status"), Value::String(Arc::from("pending_call")));
+                obj.insert(Arc::from("__call_id__"), Value::Int(id as i64));
+                let h = self.heap.alloc_object(obj);
+                self.push(Value::Object(h))?;
             }
 
             // Control flow
@@ -2900,10 +3841,17 @@ impl Vm {
             // Iterators
             Instruction::GetIterator => {
                 let val = self.pop()?;
+                // Build an iterator object `[items_array, index]` from the items.
+                let iter_from_items = |items: Vec<Value>, heap: &mut Heap| -> Value {
+                    let inner = Value::Array(heap.alloc_array(items));
+                    Value::Array(heap.alloc_array(vec![inner, Value::Int(0)]))
+                };
                 match val {
                     Value::Array(arr) => {
-                        // Push an iterator object: [array, index]
-                        let iter_obj = Value::Array(vec![Value::Array(arr), Value::Int(0)]);
+                        // Push an iterator object: [array, index]. Reuse the array
+                        // handle so iteration sees live elements.
+                        let iter_obj =
+                            Value::Array(self.heap.alloc_array(vec![Value::Array(arr), Value::Int(0)]));
                         self.push(iter_obj)?;
                     }
                     Value::String(s) => {
@@ -2911,38 +3859,26 @@ impl Vm {
                             .chars()
                             .map(|c| Value::String(Arc::from(c.to_string().as_str())))
                             .collect();
-                        let iter_obj = Value::Array(vec![Value::Array(chars), Value::Int(0)]);
+                        let iter_obj = iter_from_items(chars, &mut self.heap);
                         self.push(iter_obj)?;
                     }
                     Value::Generator(gen_obj) => {
-                        let iter_obj = Value::Array(vec![
+                        let iter_obj = Value::Array(self.heap.alloc_array(vec![
                             Value::String(Arc::from("__gen__")),
                             Value::Int(gen_obj.id as i64),
                             Value::Bool(false),
-                        ]);
+                        ]));
                         self.push(iter_obj)?;
                     }
                     // Map iterates as [key, value] pairs; Set as its items.
-                    Value::Object(ref m) if is_set_object(&val) => {
-                        let iter_obj =
-                            Value::Array(vec![Value::Array(set_items(m)), Value::Int(0)]);
+                    Value::Object(_) if is_set_object(&val, &self.heap) => {
+                        let items = set_items(&val, &self.heap);
+                        let iter_obj = iter_from_items(items, &mut self.heap);
                         self.push(iter_obj)?;
                     }
-                    Value::Object(ref m) if is_map_object(&val) => {
-                        let pairs: Vec<Value> = match m.get("__entries__") {
-                            Some(Value::Array(entries)) => entries
-                                .iter()
-                                .filter_map(|e| match e {
-                                    Value::Object(e) => Some(Value::Array(vec![
-                                        e.get("key").cloned().unwrap_or(Value::Undefined),
-                                        e.get("value").cloned().unwrap_or(Value::Undefined),
-                                    ])),
-                                    _ => None,
-                                })
-                                .collect(),
-                            _ => Vec::new(),
-                        };
-                        let iter_obj = Value::Array(vec![Value::Array(pairs), Value::Int(0)]);
+                    Value::Object(_) if is_map_object(&val, &self.heap) => {
+                        let pairs = map_entry_pairs(&val, &mut self.heap);
+                        let iter_obj = iter_from_items(pairs, &mut self.heap);
                         self.push(iter_obj)?;
                     }
                     _ => {
@@ -2955,134 +3891,124 @@ impl Vm {
             }
             Instruction::IteratorNext => {
                 let iter = self.pop()?;
+                let items = match &iter {
+                    Value::Array(h) => self.heap.array_vec(*h),
+                    _ => return Err(ZapcodeError::RuntimeError("invalid iterator state".into())),
+                };
                 // Check for generator iterator (3-element sentinel)
-                if let Value::Array(ref items) = iter {
-                    if items.len() == 3 {
-                        if let Value::String(ref s) = items[0] {
-                            if s.as_ref() == "__gen__" {
-                                let gen_id = match &items[1] {
-                                    Value::Int(id) => *id as u64,
-                                    _ => {
-                                        return Err(ZapcodeError::RuntimeError(
-                                            "bad gen iter".into(),
-                                        ))
-                                    }
-                                };
-                                let gen_key = format!("__gen_{}", gen_id);
-                                let gen_obj = if let Some(Value::Generator(g)) =
-                                    self.globals.remove(&gen_key)
-                                {
-                                    g
-                                } else {
-                                    self.push(Value::Array(vec![
-                                        Value::String(Arc::from("__gen__")),
-                                        Value::Int(gen_id as i64),
-                                        Value::Bool(true),
-                                    ]))?;
-                                    self.push(Value::Undefined)?;
-                                    return Ok(None);
-                                };
-                                let result = self.generator_next(gen_obj, Value::Undefined)?;
-                                if let Value::Object(ref obj) = result {
-                                    let done = obj
-                                        .get("done")
-                                        .is_some_and(|v| matches!(v, Value::Bool(true)));
-                                    let value =
-                                        obj.get("value").cloned().unwrap_or(Value::Undefined);
-                                    self.push(Value::Array(vec![
-                                        Value::String(Arc::from("__gen__")),
-                                        Value::Int(gen_id as i64),
-                                        Value::Bool(done),
-                                    ]))?;
-                                    self.push(value)?;
-                                } else {
-                                    self.push(iter)?;
-                                    self.push(Value::Undefined)?;
-                                }
+                if items.len() == 3 {
+                    if let Value::String(s) = &items[0] {
+                        if s.as_ref() == "__gen__" {
+                            let gen_id = match &items[1] {
+                                Value::Int(id) => *id as u64,
+                                _ => return Err(ZapcodeError::RuntimeError("bad gen iter".into())),
+                            };
+                            let gen_key = format!("__gen_{}", gen_id);
+                            let gen_obj = if let Some(Value::Generator(g)) =
+                                self.globals.remove(&gen_key)
+                            {
+                                g
+                            } else {
+                                let done_iter = self.heap.alloc_array(vec![
+                                    Value::String(Arc::from("__gen__")),
+                                    Value::Int(gen_id as i64),
+                                    Value::Bool(true),
+                                ]);
+                                self.push(Value::Array(done_iter))?;
+                                self.push(Value::Undefined)?;
                                 return Ok(None);
+                            };
+                            let result = self.generator_next(gen_obj, Value::Undefined)?;
+                            if let Value::Object(obj_h) = &result {
+                                let obj = self.heap.object_map(*obj_h);
+                                let done = obj
+                                    .get("done")
+                                    .is_some_and(|v| matches!(v, Value::Bool(true)));
+                                let value = obj.get("value").cloned().unwrap_or(Value::Undefined);
+                                let new_iter = self.heap.alloc_array(vec![
+                                    Value::String(Arc::from("__gen__")),
+                                    Value::Int(gen_id as i64),
+                                    Value::Bool(done),
+                                ]);
+                                self.push(Value::Array(new_iter))?;
+                                self.push(value)?;
+                            } else {
+                                self.push(iter)?;
+                                self.push(Value::Undefined)?;
                             }
+                            return Ok(None);
                         }
                     }
                 }
-                match iter {
-                    Value::Array(ref items) if items.len() == 2 => {
-                        let arr = match &items[0] {
-                            Value::Array(a) => a,
-                            _ => return Err(ZapcodeError::RuntimeError("invalid iterator".into())),
-                        };
-                        let idx = match &items[1] {
-                            Value::Int(i) => *i as usize,
-                            _ => return Err(ZapcodeError::RuntimeError("invalid iterator".into())),
-                        };
-                        if idx < arr.len() {
-                            let value = arr[idx].clone();
-                            // Update iterator
-                            let new_iter =
-                                Value::Array(vec![items[0].clone(), Value::Int((idx + 1) as i64)]);
-                            // Push updated iterator back, then the value
-                            self.push(new_iter)?;
-                            self.push(value)?;
-                        } else {
-                            // Done — increment index past the end so IteratorDone sees idx > len
-                            let new_iter =
-                                Value::Array(vec![items[0].clone(), Value::Int((idx + 1) as i64)]);
-                            self.push(new_iter)?;
-                            self.push(Value::Undefined)?;
-                        }
-                    }
-                    _ => {
-                        return Err(ZapcodeError::RuntimeError("invalid iterator state".into()));
-                    }
+                if items.len() == 2 {
+                    let inner = match &items[0] {
+                        Value::Array(a) => *a,
+                        _ => return Err(ZapcodeError::RuntimeError("invalid iterator".into())),
+                    };
+                    let idx = match &items[1] {
+                        Value::Int(i) => *i as usize,
+                        _ => return Err(ZapcodeError::RuntimeError("invalid iterator".into())),
+                    };
+                    let value = self.heap.array(inner).get(idx).cloned();
+                    // Update iterator: same inner array handle, advanced index.
+                    let new_iter = self
+                        .heap
+                        .alloc_array(vec![Value::Array(inner), Value::Int((idx + 1) as i64)]);
+                    self.push(Value::Array(new_iter))?;
+                    self.push(value.unwrap_or(Value::Undefined))?;
+                } else {
+                    return Err(ZapcodeError::RuntimeError("invalid iterator state".into()));
                 }
             }
             Instruction::IteratorDone => {
                 let value = self.pop()?;
-                let iter = self.peek()?;
-                // Check for generator iterator first
-                if let Value::Array(items) = iter {
-                    if items.len() == 3 {
-                        if let Value::String(ref s) = items[0] {
-                            if s.as_ref() == "__gen__" {
-                                let done = matches!(&items[2], Value::Bool(true));
-                                if !done {
-                                    self.push(value)?;
-                                }
-                                self.push(Value::Bool(done))?;
-                                return Ok(None);
-                            }
-                        }
-                    }
-                }
-                let iter = self.peek()?;
-                match iter {
-                    Value::Array(items) if items.len() == 2 => {
-                        let arr = match &items[0] {
-                            Value::Array(a) => a,
-                            _ => {
-                                self.push(value)?;
-                                self.push(Value::Bool(true))?;
-                                return Ok(None);
-                            }
-                        };
-                        let idx = match &items[1] {
-                            Value::Int(i) => *i as usize,
-                            _ => {
-                                self.push(value)?;
-                                self.push(Value::Bool(true))?;
-                                return Ok(None);
-                            }
-                        };
-                        let done = idx > arr.len();
-                        if !done {
-                            // Push value back for the binding
-                            self.push(value)?;
-                        }
-                        self.push(Value::Bool(done))?;
-                    }
+                let items = match self.peek()? {
+                    Value::Array(h) => self.heap.array_vec(*h),
                     _ => {
                         self.push(value)?;
                         self.push(Value::Bool(true))?;
+                        return Ok(None);
                     }
+                };
+                // Check for generator iterator first
+                if items.len() == 3 {
+                    if let Value::String(s) = &items[0] {
+                        if s.as_ref() == "__gen__" {
+                            let done = matches!(&items[2], Value::Bool(true));
+                            if !done {
+                                self.push(value)?;
+                            }
+                            self.push(Value::Bool(done))?;
+                            return Ok(None);
+                        }
+                    }
+                }
+                if items.len() == 2 {
+                    let inner = match &items[0] {
+                        Value::Array(a) => *a,
+                        _ => {
+                            self.push(value)?;
+                            self.push(Value::Bool(true))?;
+                            return Ok(None);
+                        }
+                    };
+                    let idx = match &items[1] {
+                        Value::Int(i) => *i as usize,
+                        _ => {
+                            self.push(value)?;
+                            self.push(Value::Bool(true))?;
+                            return Ok(None);
+                        }
+                    };
+                    let done = idx > self.heap.array(inner).len();
+                    if !done {
+                        // Push value back for the binding
+                        self.push(value)?;
+                    }
+                    self.push(Value::Bool(done))?;
+                } else {
+                    self.push(value)?;
+                    self.push(Value::Bool(true))?;
                 }
             }
 
@@ -3096,7 +4022,7 @@ impl Vm {
             }
             Instruction::Throw => {
                 let val = self.pop()?;
-                let msg = val.to_js_string();
+                let msg = val.to_js_string(&self.heap);
                 // Preserve the thrown value so a `catch` binding sees it verbatim
                 // (string/object/…), while uncaught throws still report `msg`.
                 self.pending_throw = Some(val);
@@ -3110,9 +4036,33 @@ impl Vm {
             Instruction::TypeOf => {
                 let val = self.pop()?;
                 // `typeof null === "object"` (a long-standing JS quirk).
-                // Everything else matches type_name().
-                let type_str = match val {
+                // Callable builtin markers (bare global fns like `String`/`parseInt`,
+                // builtin constructors like `Object`/`Map`, and `Symbol`) are objects
+                // internally but must report as "function" (O8 needs
+                // `typeof Symbol === "function"`). Pure namespaces (`Math`, `JSON`,
+                // `console`) carry no callable marker and stay "object".
+                let type_str = match &val {
                     Value::Null => "object",
+                    // A produced Symbol value reports `typeof === "symbol"`.
+                    Value::Object(h)
+                        if self.heap.object(*h).is_some_and(|m| m.contains_key("__symbol__")) =>
+                    {
+                        "symbol"
+                    }
+                    // Callable builtin markers (bare global fns like `String`/`parseInt`,
+                    // builtin constructors like `Object`/`Map`, and the `Symbol`
+                    // factory) are objects internally but must report as "function"
+                    // (O8 needs `typeof Symbol === "function"`). Pure namespaces
+                    // (`Math`, `JSON`, `console`) carry no callable marker and stay
+                    // "object".
+                    Value::Object(h)
+                        if self.heap.object(*h).is_some_and(|m| {
+                            m.contains_key("__global_fn__")
+                                || m.contains_key("__builtin_constructor__")
+                        }) =>
+                    {
+                        "function"
+                    }
                     other => other.type_name(),
                 };
                 self.push(Value::String(Arc::from(type_str)))?;
@@ -3129,7 +4079,7 @@ impl Vm {
                 let val = self.pop()?;
                 let result = match val {
                     Value::Int(n) => Value::Int(n + 1),
-                    _ => Value::Float(val.to_number() + 1.0),
+                    _ => Value::Float(val.to_number_heap(&self.heap) + 1.0),
                 };
                 self.push(result)?;
             }
@@ -3137,7 +4087,7 @@ impl Vm {
                 let val = self.pop()?;
                 let result = match val {
                     Value::Int(n) => Value::Int(n - 1),
-                    _ => Value::Float(val.to_number() - 1.0),
+                    _ => Value::Float(val.to_number_heap(&self.heap) - 1.0),
                 };
                 self.push(result)?;
             }
@@ -3149,7 +4099,13 @@ impl Vm {
                     parts.push(self.pop()?);
                 }
                 parts.reverse();
-                let result: String = parts.iter().map(|v| v.to_js_string()).collect();
+                // ToPrimitive(string) each interpolated value so a user toString
+                // hook is honored before string coercion.
+                let mut result = String::new();
+                for v in parts {
+                    let prim = self.to_primitive(&v, ToPrimitiveHint::String)?;
+                    result.push_str(&prim.to_js_string(&self.heap));
+                }
                 self.push(Value::String(Arc::from(result.as_str())))?;
             }
 
@@ -3164,7 +4120,8 @@ impl Vm {
             Instruction::DestructureArray(count) => {
                 let arr = self.pop()?;
                 match arr {
-                    Value::Array(items) => {
+                    Value::Array(h) => {
+                        let items = self.heap.array_vec(h);
                         for i in 0..count {
                             self.push(items.get(i).cloned().unwrap_or(Value::Undefined))?;
                         }
@@ -3203,8 +4160,9 @@ impl Vm {
                         "internal error: awaited a deferred call outside Promise.all".to_string(),
                     ));
                 }
-                if builtins::is_promise(&val) {
-                    if let Value::Object(map) = &val {
+                if builtins::is_promise(&val, &self.heap) {
+                    if let Value::Object(h) = &val {
+                        let map = self.heap.object_map(*h);
                         let status = map.get("status").cloned().unwrap_or(Value::Undefined);
                         match status {
                             Value::String(s) if s.as_ref() == "resolved" => {
@@ -3213,19 +4171,53 @@ impl Vm {
                             }
                             Value::String(s) if s.as_ref() == "rejected" => {
                                 let reason = map.get("reason").cloned().unwrap_or(Value::Undefined);
+                                let reason = reason.to_js_string(&self.heap);
                                 return Err(ZapcodeError::RuntimeError(format!(
                                     "Unhandled promise rejection: {}",
-                                    reason.to_js_string()
+                                    reason
                                 )));
                             }
                             Value::String(s) if s.as_ref() == "pending_all" => {
                                 let items = match map.get("items") {
-                                    Some(Value::Array(a)) => a.clone(),
+                                    Some(Value::Array(a)) => self.heap.array_vec(*a),
                                     _ => Vec::new(),
+                                };
+                                let kind = match map.get("__batch_kind__") {
+                                    Some(Value::String(k)) => match k.as_ref() {
+                                        "race" => BatchKind::Race,
+                                        "any" => BatchKind::Any,
+                                        "allSettled" => BatchKind::AllSettled,
+                                        _ => BatchKind::All,
+                                    },
+                                    _ => BatchKind::All,
                                 };
                                 // Suspend on the whole batch (or resolve inline if
                                 // every element is already available).
-                                return self.await_batch(items);
+                                return self.await_batch(kind, items);
+                            }
+                            Value::String(s) if s.as_ref() == "pending_call" => {
+                                // A deferred single-call promise (N5): trigger its
+                                // host call now. Suspend with the call's name/args;
+                                // resume pushes the settled value, which is exactly
+                                // what `await` should produce. The value is also
+                                // cached under the call id (`CacheValue`) so a
+                                // second await/then on the same promise reuses it.
+                                let id = match map.get("__call_id__") {
+                                    Some(Value::Int(n)) => *n as u64,
+                                    _ => {
+                                        return Err(ZapcodeError::RuntimeError(
+                                            "internal error: pending_call promise missing __call_id__"
+                                                .to_string(),
+                                        ))
+                                    }
+                                };
+                                // Already settled (awaited before): reuse the value.
+                                if let Some(cached) = self.resolved.get(&id).cloned() {
+                                    self.push(cached)?;
+                                } else {
+                                    self.resume_action = Some(ResumeAction::CacheValue { id });
+                                    return self.suspend_on_pending_call(id);
+                                }
                             }
                             _ => {
                                 // Unknown status — pass through
@@ -3280,10 +4272,12 @@ impl Vm {
                 let super_class = if has_super { Some(self.pop()?) } else { None };
 
                 // If super class, copy its prototype methods to ours (inheritance)
-                if let Some(Value::Object(ref sc)) = super_class {
-                    if let Some(Value::Object(super_proto)) = sc.get("__prototype__").cloned() {
+                if let Some(Value::Object(sc)) = &super_class {
+                    if let Some(Value::Object(super_proto_h)) =
+                        self.heap.object(*sc).and_then(|m| m.get("__prototype__").cloned())
+                    {
                         // Super prototype methods go first, then our own (which override)
-                        let mut merged = super_proto;
+                        let mut merged = self.heap.object_map(super_proto_h);
                         for (k, v) in prototype {
                             merged.insert(k, v);
                         }
@@ -3291,14 +4285,33 @@ impl Vm {
                     }
                 }
 
+                // The inheritance chain of class names (self first), so
+                // `instanceof` matches ancestor classes too.
+                let mut chain = vec![Value::String(Arc::from(name.as_str()))];
+                if let Some(Value::Object(sc)) = &super_class {
+                    let scm = self.heap.object_map(*sc);
+                    match scm.get("__class_chain__") {
+                        Some(Value::Array(c)) => chain.extend(self.heap.array_vec(*c)),
+                        _ => {
+                            if let Some(n) = scm.get("__class_name__") {
+                                chain.push(n.clone());
+                            }
+                        }
+                    }
+                }
+
+                let chain_arr = Value::Array(self.heap.alloc_array(chain));
+                let proto_obj = Value::Object(self.heap.alloc_object(prototype));
+
                 // Build the class object
                 let mut class_obj = IndexMap::new();
                 class_obj.insert(
                     Arc::from("__class_name__"),
                     Value::String(Arc::from(name.as_str())),
                 );
+                class_obj.insert(Arc::from("__class_chain__"), chain_arr);
                 class_obj.insert(Arc::from("__constructor__"), constructor);
-                class_obj.insert(Arc::from("__prototype__"), Value::Object(prototype));
+                class_obj.insert(Arc::from("__prototype__"), proto_obj);
 
                 // Store super class reference for super() calls
                 if let Some(sc) = super_class {
@@ -3310,7 +4323,8 @@ impl Vm {
                     class_obj.insert(k, v);
                 }
 
-                self.push(Value::Object(class_obj))?;
+                let h = self.heap.alloc_object(class_obj);
+                self.push(Value::Object(h))?;
             }
 
             Instruction::Construct(arg_count) => {
@@ -3322,35 +4336,65 @@ impl Vm {
 
                 let callee = self.pop()?;
 
-                if let Value::Object(obj) = &callee {
-                    if let Some(Value::String(name)) = obj.get("__builtin_constructor__") {
+                if let Value::Object(obj_h) = &callee {
+                    let builtin_ctor = self
+                        .heap
+                        .object(*obj_h)
+                        .and_then(|m| m.get("__builtin_constructor__"))
+                        .and_then(|v| match v {
+                            Value::String(s) => Some(s.clone()),
+                            _ => None,
+                        });
+                    if let Some(name) = builtin_ctor {
                         match name.as_ref() {
                             "Map" => {
                                 // Accepts an array of [k, v] pairs OR another Map.
-                                let entries = build_map_entries(
-                                    args.first().unwrap_or(&Value::Undefined),
-                                );
-                                self.push(make_map_object(entries))?;
+                                let arg = args.first().cloned().unwrap_or(Value::Undefined);
+                                let entries = build_map_entries(&arg, &mut self.heap);
+                                let m = make_map_object(entries, &mut self.heap);
+                                self.push(m)?;
                                 return Ok(None);
                             }
                             "Set" => {
                                 // Accepts an array, string, Set, or Map.
-                                let items =
-                                    iterable_items(args.first().unwrap_or(&Value::Undefined));
-                                self.push(make_set_object(items))?;
+                                let arg = args.first().cloned().unwrap_or(Value::Undefined);
+                                let items = iterable_items(&arg, &mut self.heap);
+                                let s = make_set_object(items, &mut self.heap);
+                                self.push(s)?;
                                 return Ok(None);
                             }
                             "Date" => {
-                                let millis =
-                                    args.first().map_or(0, |value| value.to_number() as i64);
-                                self.push(make_date_object(millis))?;
+                                let d = construct_date(&args, &mut self.heap);
+                                self.push(d)?;
                                 return Ok(None);
                             }
                             "Error" | "TypeError" | "RangeError" | "SyntaxError"
                             | "ReferenceError" => {
-                                let msg =
-                                    args.first().map(|v| v.to_js_string()).unwrap_or_default();
-                                self.push(make_error_object(name.as_ref(), &msg))?;
+                                let msg = args
+                                    .first()
+                                    .map(|v| v.to_js_string(&self.heap))
+                                    .unwrap_or_default();
+                                let e = make_error_object(name.as_ref(), &msg, &mut self.heap);
+                                self.push(e)?;
+                                return Ok(None);
+                            }
+                            "AggregateError" => {
+                                // new AggregateError(errors, message)
+                                let errors = match args.first().cloned() {
+                                    Some(v) => v,
+                                    None => Value::Array(self.heap.alloc_array(Vec::new())),
+                                };
+                                let msg = args
+                                    .get(1)
+                                    .map(|v| v.to_js_string(&self.heap))
+                                    .unwrap_or_default();
+                                let e = make_error_object("AggregateError", &msg, &mut self.heap);
+                                if let Value::Object(m) = &e {
+                                    if let Some(map) = self.heap.object_mut(*m) {
+                                        map.insert(Arc::from("errors"), errors);
+                                    }
+                                }
+                                self.push(e)?;
                                 return Ok(None);
                             }
                             "Array" => {
@@ -3371,7 +4415,8 @@ impl Vm {
                                     },
                                     other => other.to_vec(),
                                 };
-                                self.push(Value::Array(arr))?;
+                                let h = self.heap.alloc_array(arr);
+                                self.push(Value::Array(h))?;
                                 return Ok(None);
                             }
                             "Object" => {
@@ -3379,7 +4424,10 @@ impl Vm {
                                     Some(v @ (Value::Object(_) | Value::Array(_))) => {
                                         self.push(v.clone())?
                                     }
-                                    _ => self.push(Value::Object(IndexMap::new()))?,
+                                    _ => {
+                                        let h = self.heap.alloc_object(IndexMap::new());
+                                        self.push(Value::Object(h))?
+                                    }
                                 }
                                 return Ok(None);
                             }
@@ -3388,57 +4436,67 @@ impl Vm {
                     }
                 }
 
+                let is_user_class = matches!(&callee, Value::Object(h)
+                    if self.heap.object(*h).is_some_and(|m| m.contains_key("__class_name__")));
                 match &callee {
-                    Value::Object(class_obj) if class_obj.contains_key("__class_name__") => {
+                    Value::Object(class_h) if is_user_class => {
+                        let class_obj = self.heap.object_map(*class_h);
                         // Create a new instance object
                         let mut instance = IndexMap::new();
 
                         // Copy prototype methods onto the instance
-                        if let Some(Value::Object(proto)) = class_obj.get("__prototype__") {
-                            for (k, v) in proto {
+                        if let Some(Value::Object(proto_h)) = class_obj.get("__prototype__") {
+                            for (k, v) in self.heap.object_map(*proto_h) {
                                 instance.insert(k.clone(), v.clone());
                             }
                         }
 
-                        // Store class reference for instanceof
+                        // Store class reference(s) for instanceof.
                         if let Some(class_name) = class_obj.get("__class_name__") {
                             instance.insert(Arc::from("__class__"), class_name.clone());
                         }
+                        if let Some(chain) = class_obj.get("__class_chain__") {
+                            instance.insert(Arc::from("__class_chain__"), chain.clone());
+                        }
 
-                        let instance_val = Value::Object(instance);
+                        let instance_val = Value::Object(self.heap.alloc_object(instance));
 
-                        // Call the constructor with `this` bound to the instance
-                        if let Some(ctor) = class_obj.get("__constructor__") {
-                            if let Value::Function(closure) = ctor {
+                        // Call the constructor with `this` bound to the instance.
+                        // A subclass with no own constructor forwards to the nearest
+                        // ancestor constructor (implicit `constructor(...a){ super(...a) }`).
+                        match find_class_constructor(&class_obj, &self.heap) {
+                            Some(Value::Function(closure)) => {
                                 // Clear receiver source — constructors should not
                                 // write back to a receiver variable.
                                 self.last_receiver_source = None;
-                                self.push_call_frame(closure, &args, Some(instance_val))?;
+                                self.push_call_frame(&closure, &args, Some(instance_val))?;
                                 self.last_receiver = None;
-                            } else {
-                                // No valid constructor, just return the instance
+                            }
+                            _ => {
                                 self.push(instance_val)?;
                             }
-                        } else {
-                            // No constructor, just return the instance
-                            self.push(instance_val)?;
                         }
                     }
                     Value::Function(closure) => {
                         // `new` on a plain function — just call it
-                        self.push_call_frame(closure, &args, None)?;
+                        let closure = closure.clone();
+                        self.push_call_frame(&closure, &args, None)?;
                         self.last_receiver = None;
                     }
                     _ => {
+                        let msg = callee.to_js_string(&self.heap);
                         return Err(ZapcodeError::TypeError(format!(
                             "{} is not a constructor",
-                            callee.to_js_string()
+                            msg
                         )));
                     }
                 }
             }
 
             Instruction::LoadThis => {
+                // See LoadLocal: clear any stale builtin-global name so a property
+                // read on `this` can't pick up the wrong builtin method.
+                self.last_global_name = None;
                 // Walk frames from top to find the nearest `this` value
                 let this_val = self
                     .frames
@@ -3464,7 +4522,7 @@ impl Vm {
                     }
                 }
             }
-            Instruction::CallSuper(arg_count) => {
+            Instruction::CallSuper { arg_count, class } => {
                 let mut args = Vec::with_capacity(arg_count);
                 for _ in 0..arg_count {
                     args.push(self.pop()?);
@@ -3479,21 +4537,21 @@ impl Vm {
                     .find_map(|f| f.this_value.clone())
                     .unwrap_or(Value::Undefined);
 
-                // Find the super class constructor from the class that's being constructed.
-                // We need to look it up from the globals — the class with __super__ key.
-                // The super class info is stored on the class object.
-                // We'll look through globals for the class that has __super__.
-                let mut super_ctor = None;
-                for val in self.globals.values() {
-                    if let Value::Object(obj) = val {
-                        if let Some(Value::Object(super_class)) = obj.get("__super__") {
-                            if let Some(ctor) = super_class.get("__constructor__") {
-                                super_ctor = Some(ctor.clone());
-                                break;
-                            }
-                        }
-                    }
-                }
+                // Resolve the super-class constructor. Prefer the lexically-defining
+                // class (`class.__super__`), which is correct even when several
+                // classes share a single ancestor; fall back to the legacy global
+                // scan for any bytecode compiled before the class name was threaded.
+                let super_class_handle = class
+                    .as_deref()
+                    .and_then(|name| self.super_class_handle_of(name))
+                    .or_else(|| self.any_super_class_handle());
+
+                let super_ctor = super_class_handle.and_then(|sh| {
+                    // Walk to the nearest ancestor that actually defines a
+                    // constructor, so chained empty subclasses still forward args.
+                    let parent = self.heap.object(sh)?.clone();
+                    find_class_constructor(&parent, &self.heap)
+                });
 
                 if let Some(Value::Function(closure)) = super_ctor {
                     self.last_receiver_source = None;
@@ -3504,9 +4562,103 @@ impl Vm {
                     self.push(Value::Undefined)?;
                 }
             }
+            Instruction::LoadSuperMethod { class, method } => {
+                // `super.method(...)`: bind the current `this` and push the parent
+                // method so the following `Call` invokes it with this receiver.
+                let this_val = self
+                    .frames
+                    .iter()
+                    .rev()
+                    .find_map(|f| f.this_value.clone())
+                    .unwrap_or(Value::Undefined);
+
+                let m = self.super_prototype_member(&class, &method);
+                match m {
+                    Some(func @ Value::Function(_)) => {
+                        self.last_receiver = Some(this_val);
+                        self.last_receiver_source = None;
+                        self.push(func)?;
+                    }
+                    _ => {
+                        return Err(ZapcodeError::TypeError(format!(
+                            "(intermediate value).{} is not a function",
+                            method
+                        )));
+                    }
+                }
+            }
+            Instruction::LoadSuperProp { class, prop } => {
+                // `super.prop` read — fetch from the super prototype; absent data
+                // properties yield undefined (instance fields live on `this`).
+                let v = self
+                    .super_prototype_member(&class, &prop)
+                    .unwrap_or(Value::Undefined);
+                self.push(v)?;
+            }
         }
 
         Ok(None)
+    }
+
+    /// Resolve the class object stored in globals under `name`, returning its
+    /// heap handle if it's an actual class (has `__class_name__`). Classes are
+    /// bound to globals by their declared name, which is how `super` finds its
+    /// lexically-defining class at runtime.
+    fn class_handle_by_name(&self, name: &str) -> Option<Handle> {
+        match self.globals.get(name) {
+            Some(Value::Object(h))
+                if self
+                    .heap
+                    .object(*h)
+                    .is_some_and(|m| m.contains_key("__class_name__")) =>
+            {
+                Some(*h)
+            }
+            _ => None,
+        }
+    }
+
+    /// The `__super__` class handle of the class named `name`, if any.
+    fn super_class_handle_of(&self, name: &str) -> Option<Handle> {
+        let class_h = self.class_handle_by_name(name)?;
+        match self.heap.object(class_h).and_then(|m| m.get("__super__")) {
+            Some(Value::Object(sh)) => Some(*sh),
+            _ => None,
+        }
+    }
+
+    /// Legacy fallback: the first class in globals that declares a `__super__`.
+    /// Only used for bytecode compiled before the defining-class name was carried
+    /// on `CallSuper`; ambiguous with multiple subclasses but preserves old behavior.
+    fn any_super_class_handle(&self) -> Option<Handle> {
+        let handles: Vec<Handle> = self
+            .globals
+            .values()
+            .filter_map(|v| match v {
+                Value::Object(h) => Some(*h),
+                _ => None,
+            })
+            .collect();
+        handles.into_iter().find_map(|h| {
+            match self.heap.object(h).and_then(|m| m.get("__super__")) {
+                Some(Value::Object(sh)) => Some(*sh),
+                _ => None,
+            }
+        })
+    }
+
+    /// Look up `member` on the super prototype of the class named `class`.
+    /// The super class's `__prototype__` is itself already flattened with its own
+    /// ancestors' methods, so this resolves inherited members through the chain.
+    fn super_prototype_member(&self, class: &str, member: &str) -> Option<Value> {
+        let super_h = self.super_class_handle_of(class)?;
+        let proto_h = match self.heap.object(super_h).and_then(|m| m.get("__prototype__")) {
+            Some(Value::Object(ph)) => *ph,
+            _ => return None,
+        };
+        self.heap
+            .object(proto_h)
+            .and_then(|m| m.get(member).cloned())
     }
 
     fn get_property(&self, obj: &Value, name: &str) -> Result<Value> {
@@ -3514,12 +4666,13 @@ impl Vm {
         if matches!(obj, Value::Null | Value::Undefined) {
             return Err(ZapcodeError::TypeError(format!(
                 "Cannot read properties of {} (reading '{}')",
-                obj.to_js_string(),
+                obj.to_js_string(&self.heap),
                 name
             )));
         }
         match obj {
-            Value::Object(map) => {
+            Value::Object(h) => {
+                let map = self.heap.object_map(*h);
                 // Check if property exists as a real value on the object
                 if let Some(val) = map.get(name) {
                     if !matches!(val, Value::Undefined) {
@@ -3527,16 +4680,13 @@ impl Vm {
                     }
                 }
                 // Check if this is a promise instance — expose .then/.catch/.finally
-                if builtins::is_promise(obj) && is_promise_method(name) {
+                if builtins::is_promise(obj, &self.heap) && is_promise_method(name) {
                     return Ok(builtin_method("__promise__", name));
                 }
-                if is_map_object(obj) {
+                if is_map_object(obj, &self.heap) {
                     if name == "size" {
-                        let n = match obj {
-                            Value::Object(m) => match m.get("__entries__") {
-                                Some(Value::Array(e)) => e.len(),
-                                _ => 0,
-                            },
+                        let n = match map.get("__entries__") {
+                            Some(Value::Array(e)) => self.heap.array(*e).len(),
                             _ => 0,
                         };
                         return Ok(Value::Int(n as i64));
@@ -3545,22 +4695,21 @@ impl Vm {
                         return Ok(builtin_method("__map__", name));
                     }
                 }
-                if is_set_object(obj) {
+                if is_set_object(obj, &self.heap) {
                     if name == "size" {
-                        let n = match obj {
-                            Value::Object(m) => set_items(m).len(),
-                            _ => 0,
-                        };
+                        let n = set_items(obj, &self.heap).len();
                         return Ok(Value::Int(n as i64));
                     }
                     if is_set_method(name) {
                         return Ok(builtin_method("__set__", name));
                     }
                 }
-                if is_date_object(obj) && is_date_method(name) {
+                if is_date_object(obj, &self.heap) && is_date_method(name) {
                     return Ok(builtin_method("__date__", name));
                 }
-                if builtins::regexp_parts(obj).is_some() && matches!(name, "test" | "exec") {
+                if builtins::regexp_parts(obj, &self.heap).is_some()
+                    && matches!(name, "test" | "exec")
+                {
                     return Ok(builtin_method("__regexp__", name));
                 }
                 // Check if this is a known global object — return builtin method handle
@@ -3575,12 +4724,12 @@ impl Vm {
                 }
                 Ok(Value::Undefined)
             }
-            Value::Array(arr) => match name {
-                "length" => Ok(Value::Int(arr.len() as i64)),
+            Value::Array(h) => match name {
+                "length" => Ok(Value::Int(self.heap.array(*h).len() as i64)),
                 _ if is_array_method(name) => Ok(builtin_method("__array__", name)),
                 _ => {
                     if let Ok(idx) = name.parse::<usize>() {
-                        Ok(arr.get(idx).cloned().unwrap_or(Value::Undefined))
+                        Ok(self.heap.array(*h).get(idx).cloned().unwrap_or(Value::Undefined))
                     } else {
                         Ok(Value::Undefined)
                     }
@@ -3618,218 +4767,72 @@ fn builtin_method(object_name: &str, method_name: &str) -> Value {
 use crate::parser::ir::{DestructureField, ParamPattern};
 
 /// Read a named field from `value` (Undefined if missing / not an object).
-fn field_of(value: &Value, key: &str) -> Value {
+fn field_of(value: &Value, key: &str, heap: &Heap) -> Value {
     match value {
-        Value::Object(map) => map.get(key).cloned().unwrap_or(Value::Undefined),
+        Value::Object(h) => heap
+            .object(*h)
+            .and_then(|m| m.get(key).cloned())
+            .unwrap_or(Value::Undefined),
         _ => Value::Undefined,
     }
 }
 
 /// Extract the locals bound by a (possibly nested) destructuring pattern from
 /// `value`, pushing them in declaration order to mirror `declare_destructure_locals`.
-fn extract_pattern(pattern: &ParamPattern, value: &Value, out: &mut Vec<Value>) {
+fn extract_pattern(pattern: &ParamPattern, value: &Value, out: &mut Vec<Value>, heap: &mut Heap) {
     match pattern {
         ParamPattern::Ident(_) | ParamPattern::Rest(_) => out.push(value.clone()),
-        ParamPattern::DefaultValue { pattern, .. } => extract_pattern(pattern, value, out),
-        ParamPattern::ObjectDestructure(fields) => extract_object_fields(fields, value, out),
+        ParamPattern::DefaultValue { pattern, .. } => extract_pattern(pattern, value, out, heap),
+        ParamPattern::ObjectDestructure(fields) => extract_object_fields(fields, value, out, heap),
         ParamPattern::ArrayDestructure(elems) => {
             for (i, elem) in elems.iter().enumerate() {
                 if let Some(p) = elem {
                     if matches!(p, ParamPattern::Rest(_)) {
                         // `...rest`: collect the remaining elements as an array.
-                        let rest = match value {
-                            Value::Array(a) => {
-                                Value::Array(a.iter().skip(i).cloned().collect())
-                            }
-                            _ => Value::Array(Vec::new()),
+                        let rest_items: Vec<Value> = match value {
+                            Value::Array(a) => heap.array(*a).iter().skip(i).cloned().collect(),
+                            _ => Vec::new(),
                         };
-                        out.push(rest);
+                        out.push(Value::Array(heap.alloc_array(rest_items)));
                         continue;
                     }
                     let item = match value {
-                        Value::Array(a) => a.get(i).cloned().unwrap_or(Value::Undefined),
+                        Value::Array(a) => heap.array(*a).get(i).cloned().unwrap_or(Value::Undefined),
                         _ => Value::Undefined,
                     };
-                    extract_pattern(p, &item, out);
+                    extract_pattern(p, &item, out, heap);
                 }
             }
         }
     }
 }
 
-fn extract_object_fields(fields: &[DestructureField], value: &Value, out: &mut Vec<Value>) {
+fn extract_object_fields(
+    fields: &[DestructureField],
+    value: &Value,
+    out: &mut Vec<Value>,
+    heap: &mut Heap,
+) {
     let mut consumed: Vec<String> = Vec::new();
     for field in fields {
         if field.rest {
-            let rest = match value {
-                Value::Object(map) => Value::Object(
-                    map.iter()
-                        .filter(|(k, _)| !consumed.iter().any(|c| c == k.as_ref()))
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
-                ),
-                _ => Value::Object(IndexMap::new()),
+            let rest_map: IndexMap<Arc<str>, Value> = match value {
+                Value::Object(h) => heap
+                    .object_map(*h)
+                    .into_iter()
+                    .filter(|(k, _)| !consumed.iter().any(|c| c == k.as_ref()))
+                    .collect(),
+                _ => IndexMap::new(),
             };
-            out.push(rest);
+            out.push(Value::Object(heap.alloc_object(rest_map)));
         } else if let Some(nested) = &field.nested {
             consumed.push(field.key.clone());
-            let child = field_of(value, &field.key);
-            extract_object_fields(nested, &child, out);
+            let child = field_of(value, &field.key, heap);
+            extract_object_fields(nested, &child, out, heap);
         } else {
             consumed.push(field.key.clone());
-            out.push(field_of(value, &field.key));
+            out.push(field_of(value, &field.key, heap));
         }
-    }
-}
-
-/// Navigate `path` within `target` and store `value` at the leaf. Returns whether
-/// the write succeeded (false if the path doesn't resolve).
-fn set_in_place(target: &mut Value, path: &[PlaceSeg], value: Value) -> bool {
-    let Some((last, prefix)) = path.split_last() else {
-        return false;
-    };
-    let mut cur = target;
-    for seg in prefix {
-        cur = match nav_mut(cur, seg) {
-            Some(c) => c,
-            None => return false,
-        };
-    }
-    set_seg(cur, last, value)
-}
-
-fn nav_mut<'a>(v: &'a mut Value, seg: &PlaceSeg) -> Option<&'a mut Value> {
-    match (v, seg) {
-        (Value::Object(map), PlaceSeg::Prop(k)) => map.get_mut(k.as_str()),
-        (Value::Array(arr), PlaceSeg::Index(i)) => arr.get_mut(*i),
-        _ => None,
-    }
-}
-
-fn set_seg(v: &mut Value, seg: &PlaceSeg, value: Value) -> bool {
-    match (v, seg) {
-        (Value::Object(map), PlaceSeg::Prop(k)) => {
-            map.insert(Arc::from(k.as_str()), value);
-            true
-        }
-        (Value::Array(arr), PlaceSeg::Index(i)) => {
-            if *i < arr.len() {
-                arr[*i] = value;
-                true
-            } else if *i == arr.len() {
-                arr.push(value);
-                true
-            } else {
-                false
-            }
-        }
-        _ => false,
-    }
-}
-
-fn mutated_array_receiver(method: &str, arr: &[Value], args: &[Value]) -> Option<Vec<Value>> {
-    match method {
-        "push" => {
-            let mut updated = arr.to_vec();
-            updated.extend(args.iter().cloned());
-            Some(updated)
-        }
-        "pop" => {
-            let mut updated = arr.to_vec();
-            updated.pop();
-            Some(updated)
-        }
-        "shift" => {
-            let mut updated = arr.to_vec();
-            if !updated.is_empty() {
-                updated.remove(0);
-            }
-            Some(updated)
-        }
-        "unshift" => {
-            let mut updated = args.to_vec();
-            updated.extend_from_slice(arr);
-            Some(updated)
-        }
-        "reverse" => {
-            let mut updated = arr.to_vec();
-            updated.reverse();
-            Some(updated)
-        }
-        "fill" => {
-            let fill_val = args.first().cloned().unwrap_or(Value::Undefined);
-            let len = arr.len() as i64;
-            let start = if args.len() > 1 {
-                normalize_array_index(args[1].to_number() as i64, len)
-            } else {
-                0
-            };
-            let end = if args.len() > 2 {
-                normalize_array_index(args[2].to_number() as i64, len)
-            } else {
-                arr.len()
-            };
-            let mut updated = arr.to_vec();
-            for item in updated.iter_mut().take(end.min(arr.len())).skip(start) {
-                *item = fill_val.clone();
-            }
-            Some(updated)
-        }
-        "splice" => {
-            let len = arr.len() as i64;
-            let raw_start = args.first().map_or(0, |value| value.to_number() as i64);
-            let start = if raw_start < 0 {
-                (len + raw_start).max(0) as usize
-            } else {
-                (raw_start as usize).min(arr.len())
-            };
-            let delete_count = if args.len() > 1 {
-                ((args[1].to_number() as i64).max(0) as usize).min(arr.len() - start)
-            } else {
-                arr.len() - start
-            };
-            let mut updated = arr.to_vec();
-            updated.splice(start..start + delete_count, args.iter().skip(2).cloned());
-            Some(updated)
-        }
-        "copyWithin" => {
-            let len = arr.len() as i64;
-            let target =
-                normalize_array_index(args.first().map_or(0, |v| v.to_number() as i64), len);
-            let start = if args.len() > 1 {
-                normalize_array_index(args[1].to_number() as i64, len)
-            } else {
-                0
-            };
-            let end = if args.len() > 2 {
-                normalize_array_index(args[2].to_number() as i64, len)
-            } else {
-                arr.len()
-            };
-            let mut updated = arr.to_vec();
-            let slice: Vec<Value> = updated
-                .get(start..end.min(updated.len()))
-                .map(|s| s.to_vec())
-                .unwrap_or_default();
-            for (offset, val) in slice.into_iter().enumerate() {
-                let dst = target + offset;
-                if dst < updated.len() {
-                    updated[dst] = val;
-                } else {
-                    break;
-                }
-            }
-            Some(updated)
-        }
-        _ => None,
-    }
-}
-
-fn normalize_array_index(idx: i64, len: i64) -> usize {
-    if idx < 0 {
-        (len + idx).max(0) as usize
-    } else {
-        (idx as usize).min(len as usize)
     }
 }
 
@@ -3859,25 +4862,19 @@ fn js_to_uint32(n: f64) -> u32 {
 /// JS abstract relational comparison `left < right`. When both operands are
 /// strings the comparison is lexicographic; otherwise it is numeric (NaN
 /// operands make the result false, as `f64` ordering already does).
-fn js_less_than(left: &Value, right: &Value) -> bool {
+fn js_less_than(left: &Value, right: &Value, heap: &Heap) -> bool {
     if let (Value::String(a), Value::String(b)) = (left, right) {
         return a.as_ref() < b.as_ref();
     }
-    left.to_number() < right.to_number()
+    left.to_number_heap(heap) < right.to_number_heap(heap)
 }
 
 /// JS `left <= right` (lexicographic for two strings, numeric otherwise).
-fn js_less_than_or_equal(left: &Value, right: &Value) -> bool {
+fn js_less_than_or_equal(left: &Value, right: &Value, heap: &Heap) -> bool {
     if let (Value::String(a), Value::String(b)) = (left, right) {
         return a.as_ref() <= b.as_ref();
     }
-    left.to_number() <= right.to_number()
-}
-
-/// Whether two arrays have the same elements in the same order (a cheap
-/// structural compare used to confirm a sort receiver matches its lvalue).
-fn arrays_same_values(a: &[Value], b: &[Value]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_js_string() == y.to_js_string())
+    left.to_number_heap(heap) <= right.to_number_heap(heap)
 }
 
 /// True for reference values that coerce to a string in JS `+` (their
@@ -3907,76 +4904,96 @@ fn same_value_zero(a: &Value, b: &Value) -> bool {
 /// Coerce a constructor argument into a list of items for `new Set(...)`:
 /// arrays yield their elements, strings their characters, Sets their items, and
 /// Maps their `[key, value]` pairs.
-fn iterable_items(v: &Value) -> Vec<Value> {
+fn iterable_items(v: &Value, heap: &mut Heap) -> Vec<Value> {
     match v {
-        Value::Array(a) => a.clone(),
+        Value::Array(a) => heap.array_vec(*a),
         Value::String(s) => s
             .chars()
             .map(|c| Value::String(Arc::from(c.to_string().as_str())))
             .collect(),
-        Value::Object(m) if is_set_object(v) => set_items(m),
-        Value::Object(m) if is_map_object(v) => map_entry_pairs(m),
+        Value::Object(_) if is_set_object(v, heap) => set_items(v, heap),
+        Value::Object(_) if is_map_object(v, heap) => map_entry_pairs(v, heap),
         _ => Vec::new(),
     }
 }
 
 /// The `[key, value]` array pairs of a Map object's internal entries.
-fn map_entry_pairs(m: &IndexMap<Arc<str>, Value>) -> Vec<Value> {
-    match m.get("__entries__") {
-        Some(Value::Array(entries)) => entries
-            .iter()
-            .filter_map(|e| match e {
-                Value::Object(em) => Some(Value::Array(vec![
-                    em.get("key").cloned().unwrap_or(Value::Undefined),
-                    em.get("value").cloned().unwrap_or(Value::Undefined),
-                ])),
-                _ => None,
-            })
-            .collect(),
+fn map_entry_pairs(v: &Value, heap: &mut Heap) -> Vec<Value> {
+    let Value::Object(h) = v else {
+        return Vec::new();
+    };
+    let map = heap.object_map(*h);
+    match map.get("__entries__") {
+        Some(Value::Array(eh)) => {
+            let entries = heap.array_vec(*eh);
+            let mut out = Vec::with_capacity(entries.len());
+            for e in entries {
+                if let Value::Object(em_h) = e {
+                    let em = heap.object_map(em_h);
+                    let pair = heap.alloc_array(vec![
+                        em.get("key").cloned().unwrap_or(Value::Undefined),
+                        em.get("value").cloned().unwrap_or(Value::Undefined),
+                    ]);
+                    out.push(Value::Array(pair));
+                }
+            }
+            out
+        }
         _ => Vec::new(),
     }
 }
 
 /// Build Map entry objects from a constructor argument (an array of `[k, v]`
 /// pairs, or another Map). Later duplicate keys overwrite earlier ones.
-fn build_map_entries(arg: &Value) -> Vec<Value> {
-    let pairs = iterable_items(arg);
-    let mut entries: Vec<Value> = Vec::new();
+fn build_map_entries(arg: &Value, heap: &mut Heap) -> Vec<Value> {
+    let pairs = iterable_items(arg, heap);
+    // Track entries as plain (key, value) tuples first, then alloc objects, so
+    // we never hold a heap borrow across the dedup loop.
+    let mut entries: Vec<(Value, Value)> = Vec::new();
     for p in pairs {
         let (k, v) = match p {
-            Value::Array(kv) => (
-                kv.first().cloned().unwrap_or(Value::Undefined),
-                kv.get(1).cloned().unwrap_or(Value::Undefined),
-            ),
+            Value::Array(kv) => {
+                let kv = heap.array_vec(kv);
+                (
+                    kv.first().cloned().unwrap_or(Value::Undefined),
+                    kv.get(1).cloned().unwrap_or(Value::Undefined),
+                )
+            }
             _ => (Value::Undefined, Value::Undefined),
         };
-        let existing = entries.iter_mut().find_map(|e| match e {
-            Value::Object(em) if em.get("key").is_some_and(|ek| same_value_zero(ek, &k)) => {
-                Some(em)
-            }
-            _ => None,
-        });
-        if let Some(em) = existing {
-            em.insert(Arc::from("value"), v);
+        if let Some(slot) = entries.iter_mut().find(|(ek, _)| same_value_zero(ek, &k)) {
+            slot.1 = v;
         } else {
-            let mut em = IndexMap::new();
-            em.insert(Arc::from("key"), k);
-            em.insert(Arc::from("value"), v);
-            entries.push(Value::Object(em));
+            entries.push((k, v));
         }
     }
     entries
+        .into_iter()
+        .map(|(k, v)| {
+            let mut em = IndexMap::new();
+            em.insert(Arc::from("key"), k);
+            em.insert(Arc::from("value"), v);
+            Value::Object(heap.alloc_object(em))
+        })
+        .collect()
 }
 
-fn make_map_object(entries: Vec<Value>) -> Value {
+fn make_map_object(entries: Vec<Value>, heap: &mut Heap) -> Value {
+    let entries_arr = Value::Array(heap.alloc_array(entries));
     let mut obj = IndexMap::new();
     obj.insert(Arc::from("__map__"), Value::Bool(true));
-    obj.insert(Arc::from("__entries__"), Value::Array(entries));
-    Value::Object(obj)
+    obj.insert(Arc::from("__entries__"), entries_arr);
+    Value::Object(heap.alloc_object(obj))
 }
 
-fn is_map_object(value: &Value) -> bool {
-    matches!(value, Value::Object(map) if matches!(map.get("__map__"), Some(Value::Bool(true))))
+fn is_map_object(value: &Value, heap: &Heap) -> bool {
+    match value {
+        Value::Object(h) => matches!(
+            heap.object(*h).and_then(|m| m.get("__map__")),
+            Some(Value::Bool(true))
+        ),
+        _ => false,
+    }
 }
 
 fn is_map_method(name: &str) -> bool {
@@ -3986,8 +5003,14 @@ fn is_map_method(name: &str) -> bool {
     )
 }
 
-fn is_set_object(value: &Value) -> bool {
-    matches!(value, Value::Object(map) if matches!(map.get("__set__"), Some(Value::Bool(true))))
+fn is_set_object(value: &Value, heap: &Heap) -> bool {
+    match value {
+        Value::Object(h) => matches!(
+            heap.object(*h).and_then(|m| m.get("__set__")),
+            Some(Value::Bool(true))
+        ),
+        _ => false,
+    }
 }
 
 fn is_set_method(name: &str) -> bool {
@@ -3998,66 +5021,89 @@ fn is_set_method(name: &str) -> bool {
 }
 
 /// Build a Set object from items, de-duplicating by strict equality.
-fn make_set_object(items: Vec<Value>) -> Value {
+fn make_set_object(items: Vec<Value>, heap: &mut Heap) -> Value {
     let mut unique: Vec<Value> = Vec::new();
     for item in items {
         if !unique.iter().any(|u| same_value_zero(u, &item)) {
             unique.push(item);
         }
     }
+    let items_arr = Value::Array(heap.alloc_array(unique));
     let mut obj = IndexMap::new();
     obj.insert(Arc::from("__set__"), Value::Bool(true));
-    obj.insert(Arc::from("__items__"), Value::Array(unique));
-    Value::Object(obj)
+    obj.insert(Arc::from("__items__"), items_arr);
+    Value::Object(heap.alloc_object(obj))
 }
 
-fn set_items(map: &IndexMap<Arc<str>, Value>) -> Vec<Value> {
-    match map.get("__items__") {
-        Some(Value::Array(items)) => items.clone(),
+fn set_items(value: &Value, heap: &Heap) -> Vec<Value> {
+    let Value::Object(h) = value else {
+        return Vec::new();
+    };
+    match heap.object(*h).and_then(|m| m.get("__items__")) {
+        Some(Value::Array(ih)) => heap.array_vec(*ih),
         _ => Vec::new(),
     }
 }
 
-/// Execute a Set method, returning (result, updated-set-for-write-back).
+/// Execute a Set method. The set object is a heap handle; mutations edit its
+/// internal `__items__` array in place, so changes are visible through aliases.
 fn execute_set_method(
-    map: IndexMap<Arc<str>, Value>,
+    set_handle: Handle,
     method: &str,
     args: &[Value],
-) -> (Option<Value>, Option<IndexMap<Arc<str>, Value>>) {
-    let mut items = set_items(&map);
+    heap: &mut Heap,
+) -> Option<Value> {
+    // The handle of the inner `__items__` array.
+    let items_handle = match heap.object(set_handle).and_then(|m| m.get("__items__")) {
+        Some(Value::Array(ih)) => *ih,
+        _ => return None,
+    };
+    let items = heap.array_vec(items_handle);
     let arg = args.first().cloned().unwrap_or(Value::Undefined);
     match method {
-        "has" => (
-            Some(Value::Bool(items.iter().any(|i| same_value_zero(i, &arg)))),
-            None,
-        ),
+        "has" => Some(Value::Bool(items.iter().any(|i| same_value_zero(i, &arg)))),
         "add" => {
             if !items.iter().any(|i| same_value_zero(i, &arg)) {
-                items.push(arg);
+                if let Some(v) = heap.array_mut(items_handle) {
+                    v.push(arg);
+                }
             }
-            let mut m = map;
-            m.insert(Arc::from("__items__"), Value::Array(items));
-            (Some(Value::Object(m.clone())), Some(m))
+            Some(Value::Object(set_handle))
         }
         "delete" => {
-            let before = items.len();
-            items.retain(|i| !same_value_zero(i, &arg));
-            let removed = items.len() != before;
-            let mut m = map;
-            m.insert(Arc::from("__items__"), Value::Array(items));
-            (Some(Value::Bool(removed)), Some(m))
+            let mut removed = false;
+            if let Some(v) = heap.array_mut(items_handle) {
+                let before = v.len();
+                v.retain(|i| !same_value_zero(i, &arg));
+                removed = v.len() != before;
+            }
+            Some(Value::Bool(removed))
         }
         "clear" => {
-            let mut m = map;
-            m.insert(Arc::from("__items__"), Value::Array(Vec::new()));
-            (Some(Value::Undefined), Some(m))
+            heap.set_array(items_handle, Vec::new());
+            Some(Value::Undefined)
         }
-        "values" | "keys" => (Some(Value::Array(items)), None),
-        _ => (None, None),
+        "values" | "keys" => Some(Value::Array(heap.alloc_array(items))),
+        _ => None,
     }
 }
 
-fn make_error_object(name: &str, message: &str) -> Value {
+/// The constructor a class should run: its own, or (for a subclass with no own
+/// constructor) the nearest ancestor's, so args forward to `super`.
+fn find_class_constructor(class_obj: &IndexMap<Arc<str>, Value>, heap: &Heap) -> Option<Value> {
+    match class_obj.get("__constructor__") {
+        Some(Value::Function(c)) => Some(Value::Function(c.clone())),
+        _ => match class_obj.get("__super__") {
+            Some(Value::Object(sc)) => {
+                let parent = heap.object(*sc)?.clone();
+                find_class_constructor(&parent, heap)
+            }
+            _ => None,
+        },
+    }
+}
+
+fn make_error_object(name: &str, message: &str, heap: &mut Heap) -> Value {
     let mut obj = IndexMap::new();
     obj.insert(Arc::from("__error__"), Value::Bool(true));
     obj.insert(Arc::from("name"), Value::String(Arc::from(name)));
@@ -4066,124 +5112,278 @@ fn make_error_object(name: &str, message: &str) -> Value {
         Arc::from("stack"),
         Value::String(Arc::from(format!("{}: {}", name, message).as_str())),
     );
-    Value::Object(obj)
+    Value::Object(heap.alloc_object(obj))
 }
 
+/// Execute a Map method. The map object is a heap handle; mutations edit its
+/// internal `__entries__` array (and entry objects) in place via the heap, so
+/// changes are visible through every alias (reference semantics).
 fn execute_map_method(
-    mut map: IndexMap<Arc<str>, Value>,
+    map_handle: Handle,
     method: &str,
     args: &[Value],
-) -> (Option<Value>, Option<IndexMap<Arc<str>, Value>>) {
-    let entries = match map.get("__entries__") {
-        Some(Value::Array(entries)) => entries.clone(),
-        _ => Vec::new(),
+    heap: &mut Heap,
+) -> Option<Value> {
+    let entries_handle = match heap.object(map_handle).and_then(|m| m.get("__entries__")) {
+        Some(Value::Array(eh)) => *eh,
+        _ => return None,
     };
+    let entries = heap.array_vec(entries_handle);
     let key = args.first().cloned().unwrap_or(Value::Undefined);
+
+    // Locate the entry-object handle whose "key" matches `key` (SameValueZero).
+    let find_entry = |entries: &[Value], heap: &Heap| -> Option<Handle> {
+        entries.iter().find_map(|entry| match entry {
+            Value::Object(eh)
+                if heap
+                    .object(*eh)
+                    .and_then(|e| e.get("key"))
+                    .is_some_and(|item| same_value_zero(item, &key)) =>
+            {
+                Some(*eh)
+            }
+            _ => None,
+        })
+    };
 
     match method {
         "get" => {
-            let value = entries
-                .iter()
-                .find_map(|entry| match entry {
-                    Value::Object(entry)
-                        if entry.get("key").is_some_and(|item| same_value_zero(item, &key)) =>
-                    {
-                        entry.get("value").cloned()
-                    }
-                    _ => None,
-                })
+            let value = find_entry(&entries, heap)
+                .and_then(|eh| heap.object(eh).and_then(|e| e.get("value").cloned()))
                 .unwrap_or(Value::Undefined);
-            (Some(value), None)
+            Some(value)
         }
-        "has" => {
-            let has_key = entries.iter().any(|entry| match entry {
-                Value::Object(entry) => entry.get("key").is_some_and(|item| same_value_zero(item, &key)),
-                _ => false,
-            });
-            (Some(Value::Bool(has_key)), None)
-        }
+        "has" => Some(Value::Bool(find_entry(&entries, heap).is_some())),
         "set" => {
             let value = args.get(1).cloned().unwrap_or(Value::Undefined);
-            let mut updated_entries = entries;
-            let mut replaced = false;
-            for entry in &mut updated_entries {
-                if let Value::Object(entry) = entry {
-                    if entry.get("key").is_some_and(|item| same_value_zero(item, &key)) {
-                        entry.insert(Arc::from("value"), value.clone());
-                        replaced = true;
-                        break;
-                    }
+            if let Some(eh) = find_entry(&entries, heap) {
+                if let Some(e) = heap.object_mut(eh) {
+                    e.insert(Arc::from("value"), value);
                 }
-            }
-            if !replaced {
+            } else {
                 let mut entry = IndexMap::new();
                 entry.insert(Arc::from("key"), key);
                 entry.insert(Arc::from("value"), value);
-                updated_entries.push(Value::Object(entry));
+                let eh = heap.alloc_object(entry);
+                if let Some(v) = heap.array_mut(entries_handle) {
+                    v.push(Value::Object(eh));
+                }
             }
-            map.insert(Arc::from("__entries__"), Value::Array(updated_entries));
-            (Some(Value::Object(map.clone())), Some(map))
+            Some(Value::Object(map_handle))
         }
         "delete" => {
-            let mut updated_entries = entries;
-            let before = updated_entries.len();
-            updated_entries.retain(|entry| match entry {
-                Value::Object(entry) => !entry.get("key").is_some_and(|item| same_value_zero(item, &key)),
-                _ => true,
-            });
-            let deleted = updated_entries.len() != before;
-            map.insert(Arc::from("__entries__"), Value::Array(updated_entries));
-            (Some(Value::Bool(deleted)), Some(map))
+            let target = find_entry(&entries, heap);
+            let mut deleted = false;
+            if let Some(eh) = target {
+                if let Some(v) = heap.array_mut(entries_handle) {
+                    let before = v.len();
+                    v.retain(|e| !matches!(e, Value::Object(h) if *h == eh));
+                    deleted = v.len() != before;
+                }
+            }
+            Some(Value::Bool(deleted))
         }
         "clear" => {
-            map.insert(Arc::from("__entries__"), Value::Array(Vec::new()));
-            (Some(Value::Undefined), Some(map))
+            heap.set_array(entries_handle, Vec::new());
+            Some(Value::Undefined)
         }
         "keys" => {
-            let keys = entries
+            let keys: Vec<Value> = entries
                 .iter()
                 .filter_map(|e| match e {
-                    Value::Object(e) => e.get("key").cloned(),
+                    Value::Object(eh) => heap.object(*eh).and_then(|m| m.get("key").cloned()),
                     _ => None,
                 })
                 .collect();
-            (Some(Value::Array(keys)), None)
+            Some(Value::Array(heap.alloc_array(keys)))
         }
         "values" => {
-            let vals = entries
+            let vals: Vec<Value> = entries
                 .iter()
                 .filter_map(|e| match e {
-                    Value::Object(e) => e.get("value").cloned(),
+                    Value::Object(eh) => heap.object(*eh).and_then(|m| m.get("value").cloned()),
                     _ => None,
                 })
                 .collect();
-            (Some(Value::Array(vals)), None)
+            Some(Value::Array(heap.alloc_array(vals)))
         }
         "entries" => {
-            let pairs = entries
+            let pairs: Vec<(Value, Value)> = entries
                 .iter()
                 .filter_map(|e| match e {
-                    Value::Object(e) => Some(Value::Array(vec![
-                        e.get("key").cloned().unwrap_or(Value::Undefined),
-                        e.get("value").cloned().unwrap_or(Value::Undefined),
-                    ])),
+                    Value::Object(eh) => heap.object(*eh).map(|m| {
+                        (
+                            m.get("key").cloned().unwrap_or(Value::Undefined),
+                            m.get("value").cloned().unwrap_or(Value::Undefined),
+                        )
+                    }),
                     _ => None,
                 })
                 .collect();
-            (Some(Value::Array(pairs)), None)
+            let out: Vec<Value> = pairs
+                .into_iter()
+                .map(|(k, v)| Value::Array(heap.alloc_array(vec![k, v])))
+                .collect();
+            Some(Value::Array(heap.alloc_array(out)))
         }
-        _ => (None, None),
+        _ => None,
     }
 }
 
-fn make_date_object(millis: i64) -> Value {
+fn make_date_object(millis: i64, heap: &mut Heap) -> Value {
     let mut obj = IndexMap::new();
     obj.insert(Arc::from("__date_ms__"), Value::Int(millis));
-    Value::Object(obj)
+    Value::Object(heap.alloc_object(obj))
 }
 
-fn is_date_object(value: &Value) -> bool {
-    matches!(value, Value::Object(map) if map.contains_key("__date_ms__"))
+/// An Invalid Date (its time value is NaN).
+fn make_invalid_date(heap: &mut Heap) -> Value {
+    let mut obj = IndexMap::new();
+    obj.insert(Arc::from("__date_ms__"), Value::Float(f64::NAN));
+    Value::Object(heap.alloc_object(obj))
+}
+
+/// Build a Date from constructor arguments:
+/// - none: epoch 0 (the sandbox has no wall clock, for deterministic replay);
+/// - one string: parse it (ISO / `YYYY-MM-DD`); invalid -> Invalid Date;
+/// - one number: epoch millis;
+/// - 2+ numbers: `(year, monthIndex, day, hours, minutes, seconds, ms)` in UTC.
+fn construct_date(args: &[Value], heap: &mut Heap) -> Value {
+    match args {
+        [] => make_date_object(0, heap),
+        [single] => match single {
+            Value::String(s) => match parse_date_string(s) {
+                Some(ms) => make_date_object(ms, heap),
+                None => make_invalid_date(heap),
+            },
+            other => {
+                let n = other.to_number();
+                if n.is_finite() {
+                    make_date_object(n as i64, heap)
+                } else {
+                    make_invalid_date(heap)
+                }
+            }
+        },
+        _ => {
+            let part = |i: usize, default: i64| -> i64 {
+                args.get(i).map(|v| v.to_number() as i64).unwrap_or(default)
+            };
+            let year = part(0, 1970);
+            let month = part(1, 0); // 0-indexed
+            let day = part(2, 1);
+            let hours = part(3, 0);
+            let minutes = part(4, 0);
+            let seconds = part(5, 0);
+            let ms = part(6, 0);
+            let days = days_from_civil(year, month + 1, day);
+            let millis = days * 86_400_000
+                + hours * 3_600_000
+                + minutes * 60_000
+                + seconds * 1_000
+                + ms;
+            make_date_object(millis, heap)
+        }
+    }
+}
+
+/// `Date.UTC(year, monthIndex, day, ...)` -> epoch millis (UTC).
+pub(crate) fn date_utc_millis(args: &[Value]) -> f64 {
+    let part = |i: usize, default: i64| -> i64 {
+        args.get(i).map(|v| v.to_number() as i64).unwrap_or(default)
+    };
+    let year = part(0, 1970);
+    let month = part(1, 0);
+    let day = part(2, 1);
+    let hours = part(3, 0);
+    let minutes = part(4, 0);
+    let seconds = part(5, 0);
+    let ms = part(6, 0);
+    (days_from_civil(year, month + 1, day) * 86_400_000
+        + hours * 3_600_000
+        + minutes * 60_000
+        + seconds * 1_000
+        + ms) as f64
+}
+
+/// Days since the Unix epoch for a civil (year, month 1-12, day) date (UTC).
+/// Inverse of [`civil_from_days`] (Howard Hinnant's algorithm).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Parse a JS date string to epoch millis (UTC). Supports `YYYY-MM-DD`,
+/// `YYYY-MM-DDTHH:MM[:SS[.fff]]` with an optional `Z` or `±HH:MM` offset, and a
+/// space separator. Returns None for anything it can't parse.
+pub(crate) fn parse_date_string(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (date_part, time_part) = match s.split_once(['T', ' ']) {
+        Some((d, t)) => (d, Some(t)),
+        None => (s, None),
+    };
+    let mut dp = date_part.split('-');
+    let year: i64 = dp.next()?.trim().parse().ok()?;
+    let month: i64 = match dp.next() {
+        Some(m) => m.parse().ok()?,
+        None => 1,
+    };
+    let day: i64 = match dp.next() {
+        Some(d) => d.parse().ok()?,
+        None => 1,
+    };
+    if dp.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let mut millis = days_from_civil(year, month, day) * 86_400_000;
+
+    if let Some(time) = time_part {
+        let time = time.trim();
+        // Split off a trailing timezone designator.
+        let (clock, tz_offset_min): (&str, i64) = if let Some(rest) = time.strip_suffix('Z') {
+            (rest, 0)
+        } else if let Some(idx) = time.rfind(['+', '-']).filter(|&i| i >= 5) {
+            // i >= 5 avoids matching a '-' inside the time (HH:MM:SS has none).
+            let (clock, tz) = time.split_at(idx);
+            let sign = if tz.starts_with('-') { -1 } else { 1 };
+            let tz = &tz[1..];
+            let mut tzp = tz.split(':');
+            let oh: i64 = tzp.next()?.parse().ok()?;
+            let om: i64 = tzp.next().map_or(Ok(0), |x| x.parse()).ok()?;
+            (clock, sign * (oh * 60 + om))
+        } else {
+            (time, 0)
+        };
+        let mut cp = clock.split(':');
+        let hours: i64 = cp.next()?.parse().ok()?;
+        let minutes: i64 = cp.next().map_or(Ok(0), |x| x.parse()).ok()?;
+        let (seconds, frac_ms): (i64, i64) = match cp.next() {
+            Some(sec) => match sec.split_once('.') {
+                Some((whole, frac)) => {
+                    let ms_str: String = frac.chars().take(3).collect();
+                    let ms_str = format!("{:0<3}", ms_str);
+                    (whole.parse().ok()?, ms_str.parse().ok()?)
+                }
+                None => (sec.parse().ok()?, 0),
+            },
+            None => (0, 0),
+        };
+        millis += hours * 3_600_000 + minutes * 60_000 + seconds * 1_000 + frac_ms;
+        millis -= tz_offset_min * 60_000;
+    }
+    Some(millis)
+}
+
+fn is_date_object(value: &Value, heap: &Heap) -> bool {
+    match value {
+        Value::Object(h) => heap.object(*h).is_some_and(|m| m.contains_key("__date_ms__")),
+        _ => false,
+    }
 }
 
 fn is_date_method(name: &str) -> bool {
@@ -4208,15 +5408,39 @@ fn is_date_method(name: &str) -> bool {
             | "getSeconds"
             | "getUTCMilliseconds"
             | "getMilliseconds"
+            | "toJSON"
+            | "toString"
+            | "toDateString"
+            | "getTimezoneOffset"
     )
 }
 
 fn execute_date_method(map: &IndexMap<Arc<str>, Value>, method: &str) -> Option<Value> {
-    let millis = match map.get("__date_ms__") {
-        Some(Value::Int(millis)) => *millis,
-        Some(Value::Float(millis)) => *millis as i64,
-        _ => 0,
+    let millis_f = match map.get("__date_ms__") {
+        Some(Value::Int(millis)) => *millis as f64,
+        Some(Value::Float(millis)) => *millis,
+        _ => 0.0,
     };
+    // An Invalid Date: time-based getters are NaN, formatters say "Invalid Date".
+    if millis_f.is_nan() {
+        return Some(match method {
+            "getTime" | "valueOf" | "getUTCFullYear" | "getFullYear" | "getUTCMonth"
+            | "getMonth" | "getUTCDate" | "getDate" | "getUTCDay" | "getDay" | "getUTCHours"
+            | "getHours" | "getUTCMinutes" | "getMinutes" | "getUTCSeconds" | "getSeconds"
+            | "getUTCMilliseconds" | "getMilliseconds" | "getTimezoneOffset" => {
+                Value::Float(f64::NAN)
+            }
+            _ => Value::String(Arc::from("Invalid Date")),
+        });
+    }
+    let millis = millis_f as i64;
+    // getTimezoneOffset is 0 (the sandbox runs in UTC).
+    if method == "getTimezoneOffset" {
+        return Some(Value::Int(0));
+    }
+    if matches!(method, "toJSON" | "toString" | "toDateString") {
+        return Some(Value::String(Arc::from(unix_millis_to_iso(millis).as_str())));
+    }
     let seconds = millis.div_euclid(1000);
     let ms = millis.rem_euclid(1000);
     let days = seconds.div_euclid(86_400);
@@ -4372,6 +5596,19 @@ impl ZapcodeRun {
     }
 
     pub fn run(&self, input_values: Vec<(String, Value)>) -> Result<RunResult> {
+        self.run_with_input_heap(input_values, Heap::new())
+    }
+
+    /// Like [`run`], but seeds the VM with `input_heap` — the heap that backs any
+    /// array/object `Value`s in `input_values`. Builtin globals are appended on
+    /// top of this heap (see [`Vm::with_programs_and_heap`]) so the handles in the
+    /// supplied inputs remain valid. Host bindings allocate compound inputs into a
+    /// fresh heap and pass it here so the handles line up.
+    pub fn run_with_input_heap(
+        &self,
+        input_values: Vec<(String, Value)>,
+        input_heap: Heap,
+    ) -> Result<RunResult> {
         let mut root_span = SpanBuilder::new("zapcode.run");
 
         // Parse
@@ -4409,7 +5646,13 @@ impl ZapcodeRun {
 
         // Execute
         let execute_span = SpanBuilder::new("execute");
-        let mut vm = Vm::new(compiled, self.limits.clone(), ext_set);
+        // An empty input heap is the common case (primitive or no inputs); take
+        // the plain constructor so the seeded-heap path stays opt-in.
+        let mut vm = if input_heap.is_empty() {
+            Vm::new(compiled, self.limits.clone(), ext_set)
+        } else {
+            Vm::with_programs_and_heap(vec![compiled], self.limits.clone(), ext_set, input_heap)
+        };
 
         for (name, value) in input_values {
             vm.globals.insert(name, value);
@@ -4434,6 +5677,7 @@ impl ZapcodeRun {
                         return Ok(RunResult {
                             state: s,
                             stdout: vm.stdout,
+                            heap: vm.heap,
                             trace,
                         });
                     }
@@ -4448,6 +5692,7 @@ impl ZapcodeRun {
                         return Ok(RunResult {
                             state: s,
                             stdout: vm.stdout,
+                            heap: vm.heap,
                             trace,
                         });
                     }
@@ -4471,6 +5716,7 @@ impl ZapcodeRun {
         Ok(RunResult {
             state,
             stdout: vm.stdout,
+            heap: vm.heap,
             trace,
         })
     }
@@ -4499,11 +5745,35 @@ impl ZapcodeRun {
 }
 
 /// Result of running a Zapcode program.
+#[derive(Debug)]
 pub struct RunResult {
     pub state: VmState,
     pub stdout: String,
+    /// The object heap at the end of the run. Needed to resolve the `Handle`s in
+    /// `Value::Array`/`Value::Object` returned in `state` — e.g. to read array
+    /// elements or coerce a returned array/object to a string. For a suspended
+    /// run it is the heap as of the suspension point.
+    pub heap: Heap,
     /// Execution trace covering parse → compile → execute.
     pub trace: ExecutionTrace,
+}
+
+impl RunResult {
+    /// Build a `RunResult` after a snapshot resume, taking the heap and stdout
+    /// from the resumed VM. The trace covers only the resume span (parse/compile
+    /// already happened in the original run).
+    pub(crate) fn from_resume(state: VmState, vm: Vm) -> Self {
+        let mut root = SpanBuilder::new("zapcode.resume");
+        root.add_child(SpanBuilder::new("resume").finish_ok());
+        RunResult {
+            state,
+            stdout: vm.stdout,
+            heap: vm.heap,
+            trace: ExecutionTrace {
+                root: root.finish_ok(),
+            },
+        }
+    }
 }
 
 /// Quick helper to evaluate a TypeScript expression.

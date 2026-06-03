@@ -34,10 +34,12 @@ fn promise_all_can_snapshot_external_calls() {
 
     let state = lookup_snapshot(state)
         .resume(Value::String("A".into()))
-        .unwrap();
+        .unwrap()
+        .state;
     let state = lookup_snapshot(state)
         .resume(Value::String("B".into()))
-        .unwrap();
+        .unwrap()
+        .state;
 
     match state {
         VmState::Complete(output) => assert_eq!(output, Value::String("A,B".into())),
@@ -61,10 +63,12 @@ fn for_of_can_snapshot_awaited_external_calls() {
 
     let state = lookup_snapshot(state)
         .resume(Value::String("A".into()))
-        .unwrap();
+        .unwrap()
+        .state;
     let state = lookup_snapshot(state)
         .resume(Value::String("B".into()))
-        .unwrap();
+        .unwrap()
+        .state;
 
     match state {
         VmState::Complete(output) => assert_eq!(output, Value::String("A,B".into())),
@@ -164,10 +168,12 @@ fn indexed_for_loop_can_sequence_external_calls() {
 
     let state = lookup_snapshot(state)
         .resume(Value::String("A".into()))
-        .unwrap();
+        .unwrap()
+        .state;
     let state = lookup_snapshot(state)
         .resume(Value::String("B".into()))
-        .unwrap();
+        .unwrap()
+        .state;
 
     match state {
         VmState::Complete(output) => assert_eq!(output, Value::String("A,B".into())),
@@ -188,10 +194,12 @@ fn direct_sequential_external_calls_can_snapshot_today() {
 
     let state = lookup_snapshot(state)
         .resume(Value::String("A".into()))
-        .unwrap();
+        .unwrap()
+        .state;
     let state = lookup_snapshot(state)
         .resume(Value::String("B".into()))
-        .unwrap();
+        .unwrap()
+        .state;
 
     match state {
         VmState::Complete(output) => assert_eq!(output, Value::String("A,B".into())),

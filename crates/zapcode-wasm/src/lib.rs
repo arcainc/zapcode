@@ -4,17 +4,19 @@ use js_sys::{Array, Object, Reflect};
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 
+use zapcode_core::heap::Heap;
 use zapcode_core::{
-    ExecutionTrace, ResourceLimits, TraceSpan as CoreTraceSpan, TraceStatus, Value, VmState,
-    ZapcodeError, ZapcodeSnapshot as CoreSnapshot,
+    ExecutionTrace, ResourceLimits, RunResult, TraceSpan as CoreTraceSpan, TraceStatus, Value,
+    VmState, ZapcodeError, ZapcodeSnapshot as CoreSnapshot,
 };
 
 // ---------------------------------------------------------------------------
 // Value conversion: zapcode_core::Value <-> JsValue
 // ---------------------------------------------------------------------------
 
-/// Convert a `JsValue` to a `zapcode_core::Value`.
-fn js_to_value(js: &JsValue) -> Result<Value, JsError> {
+/// Convert a `JsValue` to a `zapcode_core::Value`, allocating any array/object
+/// into `heap` (array/object `Value`s carry a `Handle`, not inline contents).
+fn js_to_value(js: &JsValue, heap: &mut Heap) -> Result<Value, JsError> {
     if js.is_undefined() {
         Ok(Value::Undefined)
     } else if js.is_null() {
@@ -34,9 +36,9 @@ fn js_to_value(js: &JsValue) -> Result<Value, JsError> {
         let arr = Array::from(js);
         let mut items = Vec::with_capacity(arr.length() as usize);
         for i in 0..arr.length() {
-            items.push(js_to_value(&arr.get(i))?);
+            items.push(js_to_value(&arr.get(i), heap)?);
         }
-        Ok(Value::Array(items))
+        Ok(Value::Array(heap.alloc_array(items)))
     } else if js.is_object() {
         let obj = Object::from(js.clone());
         let entries = Object::entries(&obj);
@@ -47,10 +49,10 @@ fn js_to_value(js: &JsValue) -> Result<Value, JsError> {
                 .get(0)
                 .as_string()
                 .ok_or_else(|| JsError::new("object keys must be strings"))?;
-            let val = js_to_value(&pair.get(1))?;
+            let val = js_to_value(&pair.get(1), heap)?;
             map.insert(Arc::from(key.as_str()), val);
         }
-        Ok(Value::Object(map))
+        Ok(Value::Object(heap.alloc_object(map)))
     } else {
         Err(JsError::new(&format!(
             "cannot convert JS value to Zapcode value: {:?}",
@@ -59,8 +61,9 @@ fn js_to_value(js: &JsValue) -> Result<Value, JsError> {
     }
 }
 
-/// Convert a `zapcode_core::Value` to a `JsValue`.
-fn value_to_js(val: &Value) -> Result<JsValue, JsError> {
+/// Convert a `zapcode_core::Value` to a `JsValue`, dereferencing array/object
+/// handles through `heap`.
+fn value_to_js(val: &Value, heap: &Heap) -> Result<JsValue, JsError> {
     match val {
         Value::Undefined => Ok(JsValue::undefined()),
         Value::Null => Ok(JsValue::null()),
@@ -68,18 +71,21 @@ fn value_to_js(val: &Value) -> Result<JsValue, JsError> {
         Value::Int(n) => Ok(JsValue::from(*n as f64)),
         Value::Float(n) => Ok(JsValue::from(*n)),
         Value::String(s) => Ok(JsValue::from_str(s.as_ref())),
-        Value::Array(arr) => {
-            let js_arr = Array::new_with_length(arr.len() as u32);
-            for (i, item) in arr.iter().enumerate() {
-                js_arr.set(i as u32, value_to_js(item)?);
+        Value::Array(h) => {
+            let items = heap.array(*h);
+            let js_arr = Array::new_with_length(items.len() as u32);
+            for (i, item) in items.iter().enumerate() {
+                js_arr.set(i as u32, value_to_js(item, heap)?);
             }
             Ok(js_arr.into())
         }
-        Value::Object(map) => {
+        Value::Object(h) => {
             let obj = Object::new();
-            for (k, v) in map {
-                Reflect::set(&obj, &JsValue::from_str(k.as_ref()), &value_to_js(v)?)
-                    .map_err(|_| JsError::new("failed to set object property"))?;
+            if let Some(map) = heap.object(*h) {
+                for (k, v) in map {
+                    Reflect::set(&obj, &JsValue::from_str(k.as_ref()), &value_to_js(v, heap)?)
+                        .map_err(|_| JsError::new("failed to set object property"))?;
+                }
             }
             Ok(obj.into())
         }
@@ -174,9 +180,12 @@ impl Zapcode {
     /// @returns An object with `output` and `stdout` keys on completion,
     ///          or `suspended`, `functionName`, `args`, and `snapshot` keys on suspension.
     pub fn run(&self, inputs: JsValue) -> Result<JsValue, JsError> {
-        let input_values = extract_inputs(&inputs)?;
-        let result = self.inner.run(input_values).map_err(zapcode_err)?;
-        vm_state_to_js(result.state, &result.stdout, Some(&result.trace))
+        let (input_values, input_heap) = extract_inputs(&inputs)?;
+        let result = self
+            .inner
+            .run_with_input_heap(input_values, input_heap)
+            .map_err(zapcode_err)?;
+        run_result_to_js(result, true)
     }
 
     /// Start execution, returning raw state (for suspension / snapshot handling).
@@ -184,16 +193,23 @@ impl Zapcode {
     /// @param inputs - Optional object mapping input names to values.
     /// @returns Same shape as `run()`.
     pub fn start(&self, inputs: JsValue) -> Result<JsValue, JsError> {
-        let input_values = extract_inputs(&inputs)?;
-        let result = self.inner.run(input_values).map_err(zapcode_err)?;
-        vm_state_to_js(result.state, &result.stdout, Some(&result.trace))
+        let (input_values, input_heap) = extract_inputs(&inputs)?;
+        let result = self
+            .inner
+            .run_with_input_heap(input_values, input_heap)
+            .map_err(zapcode_err)?;
+        run_result_to_js(result, true)
     }
 }
 
-/// Extract input key-value pairs from a JsValue (expected to be an object or undefined/null).
-fn extract_inputs(inputs: &JsValue) -> Result<Vec<(String, Value)>, JsError> {
+/// Extract input key-value pairs from a JsValue (expected to be an object or
+/// undefined/null), allocating any array/object inputs into a fresh `Heap`. The
+/// heap is returned alongside so the caller can pass it to the heap-seeding core
+/// entry point (`run_with_input_heap`); the input handles are valid there.
+fn extract_inputs(inputs: &JsValue) -> Result<(Vec<(String, Value)>, Heap), JsError> {
+    let mut heap = Heap::new();
     if inputs.is_undefined() || inputs.is_null() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), heap));
     }
     let obj = Object::from(inputs.clone());
     let entries = Object::entries(&obj);
@@ -204,10 +220,10 @@ fn extract_inputs(inputs: &JsValue) -> Result<Vec<(String, Value)>, JsError> {
             .get(0)
             .as_string()
             .ok_or_else(|| JsError::new("input keys must be strings"))?;
-        let val = js_to_value(&pair.get(1))?;
+        let val = js_to_value(&pair.get(1), &mut heap)?;
         out.push((key, val));
     }
-    Ok(out)
+    Ok((out, heap))
 }
 
 /// Convert a `TraceSpan` to a JS object.
@@ -261,16 +277,32 @@ fn trace_span_to_js(span: &CoreTraceSpan) -> Result<JsValue, JsError> {
     Ok(obj.into())
 }
 
-/// Convert a `VmState` (+ optional stdout + trace) to a JS object.
+/// Marshal a whole [`RunResult`] (state + heap + stdout + optional trace) into a
+/// JS object.
+fn run_result_to_js(result: RunResult, include_trace: bool) -> Result<JsValue, JsError> {
+    let RunResult {
+        state,
+        heap,
+        stdout,
+        trace,
+    } = result;
+    let trace_ref = if include_trace { Some(&trace) } else { None };
+    vm_state_to_js(state, &heap, &stdout, trace_ref)
+}
+
+/// Convert a `VmState` (+ heap + optional stdout + trace) to a JS object. `heap`
+/// resolves the array/object handles in the completed output or a suspension's
+/// args/calls.
 fn vm_state_to_js(
     state: VmState,
+    heap: &Heap,
     stdout: &str,
     trace: Option<&ExecutionTrace>,
 ) -> Result<JsValue, JsError> {
     let obj = Object::new();
     match state {
         VmState::Complete(value) => {
-            Reflect::set(&obj, &JsValue::from_str("output"), &value_to_js(&value)?)
+            Reflect::set(&obj, &JsValue::from_str("output"), &value_to_js(&value, heap)?)
                 .map_err(|_| JsError::new("failed to set output"))?;
             Reflect::set(
                 &obj,
@@ -294,7 +326,7 @@ fn vm_state_to_js(
             .map_err(|_| JsError::new("failed to set functionName"))?;
             let js_args = Array::new_with_length(args.len() as u32);
             for (i, arg) in args.iter().enumerate() {
-                js_args.set(i as u32, value_to_js(arg)?);
+                js_args.set(i as u32, value_to_js(arg, heap)?);
             }
             Reflect::set(&obj, &JsValue::from_str("args"), &js_args.into())
                 .map_err(|_| JsError::new("failed to set args"))?;
@@ -308,7 +340,11 @@ fn vm_state_to_js(
             )
             .map_err(|_| JsError::new("failed to set stdout"))?;
         }
-        VmState::SuspendedMany { calls, snapshot } => {
+        VmState::SuspendedMany {
+            calls,
+            combinator,
+            snapshot,
+        } => {
             Reflect::set(&obj, &JsValue::from_str("suspended"), &JsValue::from(true))
                 .map_err(|_| JsError::new("failed to set suspended"))?;
             Reflect::set(
@@ -317,6 +353,12 @@ fn vm_state_to_js(
                 &JsValue::from(true),
             )
             .map_err(|_| JsError::new("failed to set suspendedMany"))?;
+            Reflect::set(
+                &obj,
+                &JsValue::from_str("combinator"),
+                &JsValue::from_str(combinator.as_str()),
+            )
+            .map_err(|_| JsError::new("failed to set combinator"))?;
             let js_calls = Array::new_with_length(calls.len() as u32);
             for (i, call) in calls.iter().enumerate() {
                 let call_obj = Object::new();
@@ -328,7 +370,7 @@ fn vm_state_to_js(
                 .map_err(|_| JsError::new("failed to set call name"))?;
                 let js_args = Array::new_with_length(call.args.len() as u32);
                 for (j, arg) in call.args.iter().enumerate() {
-                    js_args.set(j as u32, value_to_js(arg)?);
+                    js_args.set(j as u32, value_to_js(arg, heap)?);
                 }
                 Reflect::set(&call_obj, &JsValue::from_str("args"), &js_args.into())
                     .map_err(|_| JsError::new("failed to set call args"))?;
@@ -389,8 +431,11 @@ impl ZapcodeSnapshot {
     /// @param return_value - The value to return to the suspended external call.
     /// @returns Same shape as `Zapcode.run()`.
     pub fn resume(&self, return_value: JsValue) -> Result<JsValue, JsError> {
-        let val = js_to_value(&return_value)?;
-        let state = self.inner.clone().resume(val).map_err(zapcode_err)?;
-        vm_state_to_js(state, "", None)
+        // Allocate any array/object in the return value into the snapshot's own
+        // heap so its handles are valid when the snapshot is restored on resume.
+        let mut snapshot = self.inner.clone();
+        let val = js_to_value(&return_value, snapshot.heap_mut())?;
+        let result = snapshot.resume(val).map_err(zapcode_err)?;
+        run_result_to_js(result, false)
     }
 }

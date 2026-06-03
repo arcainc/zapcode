@@ -96,6 +96,8 @@ pub enum Statement {
         binding: ForBinding,
         iterable: Expr,
         body: Vec<Statement>,
+        /// `for await (const x of it)` — await each iterated value before binding.
+        await_each: bool,
         span: Span,
     },
     For {
@@ -136,6 +138,9 @@ pub enum Statement {
     },
     FunctionDecl {
         func_index: usize,
+        /// The declared name, carried here so the compiler can bind it without a
+        /// lookup into a (per-function-scope) compiled-function table.
+        name: Option<String>,
         span: Span,
     },
     Switch {

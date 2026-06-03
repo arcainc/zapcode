@@ -1,13 +1,28 @@
-use zapcode_core::Value;
+use zapcode_core::heap::Heap;
+use zapcode_core::vm::VmState;
+use zapcode_core::{ResourceLimits, Value, ZapcodeRun};
 
-/// Helper to run TS code and get stdout + value
-fn eval_with_output(code: &str) -> (Value, String) {
-    zapcode_core::vm::eval_ts_with_output(code).unwrap()
+/// Helper to run TS code and get the completion value, the heap that resolves
+/// its array/object handles, and stdout.
+fn eval_with_output(code: &str) -> (Value, Heap, String) {
+    let result = ZapcodeRun::new(
+        code.to_string(),
+        Vec::new(),
+        Vec::new(),
+        ResourceLimits::default(),
+    )
+    .unwrap()
+    .run(Vec::new())
+    .unwrap();
+    match result.state {
+        VmState::Complete(v) => (v, result.heap, result.stdout),
+        other => panic!("expected completion, got {other:?}"),
+    }
 }
 
 #[test]
 fn test_basic_generator_yield() {
-    let (val, _) = eval_with_output(
+    let (val, heap, _) = eval_with_output(
         r#"
         function* simple() {
             yield 1;
@@ -23,7 +38,8 @@ fn test_basic_generator_yield() {
         "#,
     );
     match val {
-        Value::Array(items) => {
+        Value::Array(h) => {
+            let items = heap.array_vec(h);
             assert_eq!(items[0], Value::Int(1));
             assert_eq!(items[1], Value::Bool(false));
             assert_eq!(items[2], Value::Int(2));
@@ -39,7 +55,7 @@ fn test_basic_generator_yield() {
 
 #[test]
 fn test_generator_with_return() {
-    let (val, _) = eval_with_output(
+    let (val, heap, _) = eval_with_output(
         r#"
         function* withReturn() {
             yield 1;
@@ -53,7 +69,8 @@ fn test_generator_with_return() {
         "#,
     );
     match val {
-        Value::Array(items) => {
+        Value::Array(h) => {
+            let items = heap.array_vec(h);
             assert_eq!(items[0], Value::Int(1));
             assert_eq!(items[1], Value::Bool(false));
             assert_eq!(items[2], Value::Int(42));
@@ -67,7 +84,7 @@ fn test_generator_with_return() {
 
 #[test]
 fn test_generator_with_args() {
-    let (val, _) = eval_with_output(
+    let (val, heap, _) = eval_with_output(
         r#"
         function* range(start, end) {
             for (let i = start; i < end; i++) {
@@ -83,7 +100,8 @@ fn test_generator_with_args() {
         "#,
     );
     match val {
-        Value::Array(items) => {
+        Value::Array(h) => {
+            let items = heap.array_vec(h);
             assert_eq!(items[0], Value::Int(0));
             assert_eq!(items[1], Value::Bool(false));
             assert_eq!(items[2], Value::Int(1));
@@ -99,7 +117,7 @@ fn test_generator_with_args() {
 
 #[test]
 fn test_generator_receive_values() {
-    let (val, _) = eval_with_output(
+    let (val, heap, _) = eval_with_output(
         r#"
         function* adder() {
             let sum = 0;
@@ -116,7 +134,8 @@ fn test_generator_receive_values() {
         "#,
     );
     match val {
-        Value::Array(items) => {
+        Value::Array(h) => {
+            let items = heap.array_vec(h);
             assert_eq!(items[0], Value::Int(0));
             assert_eq!(items[1], Value::Int(10));
             assert_eq!(items[2], Value::Int(30));
@@ -127,7 +146,7 @@ fn test_generator_receive_values() {
 
 #[test]
 fn test_generator_done_state() {
-    let (val, _) = eval_with_output(
+    let (val, heap, _) = eval_with_output(
         r#"
         function* once() {
             yield 42;
@@ -141,7 +160,8 @@ fn test_generator_done_state() {
         "#,
     );
     match val {
-        Value::Array(items) => {
+        Value::Array(h) => {
+            let items = heap.array_vec(h);
             assert_eq!(items[0], Value::Undefined);
             assert_eq!(items[1], Value::Bool(true));
             assert_eq!(items[2], Value::Undefined);
@@ -153,7 +173,7 @@ fn test_generator_done_state() {
 
 #[test]
 fn test_generator_for_of() {
-    let (_, stdout) = eval_with_output(
+    let (_, _heap, stdout) = eval_with_output(
         r#"
         function* range(start, end) {
             for (let i = start; i < end; i++) {
@@ -170,7 +190,7 @@ fn test_generator_for_of() {
 
 #[test]
 fn test_generator_with_for_loop() {
-    let (val, _) = eval_with_output(
+    let (val, heap, _) = eval_with_output(
         r#"
         function* countdown(n) {
             for (let i = n; i > 0; i--) {
@@ -186,7 +206,8 @@ fn test_generator_with_for_loop() {
         "#,
     );
     match val {
-        Value::Array(items) => {
+        Value::Array(h) => {
+            let items = heap.array_vec(h);
             assert_eq!(items[0], Value::Int(3));
             assert_eq!(items[1], Value::Int(2));
             assert_eq!(items[2], Value::Int(1));
@@ -198,7 +219,7 @@ fn test_generator_with_for_loop() {
 
 #[test]
 fn test_generator_yield_undefined() {
-    let (val, _) = eval_with_output(
+    let (val, heap, _) = eval_with_output(
         r#"
         function* gen() {
             yield;
@@ -211,7 +232,8 @@ fn test_generator_yield_undefined() {
         "#,
     );
     match val {
-        Value::Array(items) => {
+        Value::Array(h) => {
+            let items = heap.array_vec(h);
             assert_eq!(items[0], Value::Undefined);
             assert_eq!(items[1], Value::Bool(false));
             assert_eq!(items[2], Value::Undefined);
@@ -223,7 +245,7 @@ fn test_generator_yield_undefined() {
 
 #[test]
 fn test_generator_with_while_loop() {
-    let (val, _) = eval_with_output(
+    let (val, heap, _) = eval_with_output(
         r#"
         function* fibonacci() {
             let a = 0;
@@ -247,7 +269,8 @@ fn test_generator_with_while_loop() {
         "#,
     );
     match val {
-        Value::Array(items) => {
+        Value::Array(h) => {
+            let items = heap.array_vec(h);
             assert_eq!(items.len(), 7);
             assert_eq!(items[0], Value::Int(0));
             assert_eq!(items[1], Value::Int(1));
@@ -263,7 +286,7 @@ fn test_generator_with_while_loop() {
 
 #[test]
 fn test_multiple_generator_instances() {
-    let (val, _) = eval_with_output(
+    let (val, heap, _) = eval_with_output(
         r#"
         function* counter() {
             let n = 0;
@@ -282,7 +305,8 @@ fn test_multiple_generator_instances() {
         "#,
     );
     match val {
-        Value::Array(items) => {
+        Value::Array(h) => {
+            let items = heap.array_vec(h);
             assert_eq!(items[0], Value::Int(0));
             assert_eq!(items[1], Value::Int(1));
             assert_eq!(items[2], Value::Int(0));
@@ -294,7 +318,7 @@ fn test_multiple_generator_instances() {
 
 #[test]
 fn test_generator_for_of_with_console_log() {
-    let (_, stdout) = eval_with_output(
+    let (_, _heap, stdout) = eval_with_output(
         r#"
         function* nums() {
             yield 10;
@@ -311,7 +335,7 @@ fn test_generator_for_of_with_console_log() {
 
 #[test]
 fn test_generator_expression_result() {
-    let (val, _) = eval_with_output(
+    let (val, _heap, _) = eval_with_output(
         r#"
         function* gen() {
             const x = yield 1;

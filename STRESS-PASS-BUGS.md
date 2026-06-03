@@ -2,6 +2,257 @@
 
 ## Fix status (in progress)
 
+**Round 6 (branch `arca/heap-handles-rewrite`) — deferred-five final disposition + O4 security-regression fix:**
+
+This round finishes the "deferred five" (G4 / O4 / G9 / N9 / N5) and, critically,
+*repairs a GREEN-suite regression* that Round 5 had left in (and mis-labelled as
+"pre-existing"). Final per-item status:
+
+- **G4 — FIXED (with documented architectural residual).** `match()` (non-global)
+  and each `matchAll()` element expose `.index`, `.input`, `.groups`, `m[0..n]`,
+  and `.length`; named captures populate `.groups`. The non-global result is an
+  *array-like heap object* rather than a true `Array` (heap arrays are `Vec`-backed
+  and cannot carry the extra named props the spec attaches to a match result), so
+  `Array.isArray(nonGlobalMatch) === false` and array methods aren't available on
+  it (use indexed access or spread `matchAll`). The global `match(/…/g)` still
+  returns a plain array of matched strings, exactly like JS. *Residual is purely
+  the value's brand (object vs Array); every property the feature targeted works.*
+  Making it a real Array-with-props would require changing the heap's `Array`
+  variant to carry a side map of named properties — a core-value-model change that
+  ripples through serialization/cloning/equality/all array builtins, i.e. exactly
+  the kind of destabilizing rewrite the GREEN guarantee says to avoid. Tests:
+  `stress_match_groups.rs`.
+
+- **O4 — FIXED (valueOf/toString fully landed + now cyclic-safe); `Symbol.toPrimitive` documented residual.**
+  User `valueOf`/`toString` hooks are honored at every coercion point (`+`, the
+  arithmetic/relational operators, string concat / template literals, and
+  `String()`/`Number()`), with the correct per-hint method order. **Round 6 fixed a
+  real regression this introduced:** a self-referential hook
+  (`toString(){ return "" + this }`) recursed *past* the previous 200-deep
+  `to_primitive` guard and **overflowed the native Rust stack, aborting the whole
+  `security` test binary (SIGABRT)** — i.e. the suite was NOT actually green at the
+  Round-5 HEAD, contrary to the note Round 4 left below. Fix:
+    1. Lowered the ToPrimitive recursion guard from 200 → 8 (each level nests a full
+       guest-call interpreter loop on the native stack; 8 is far above any
+       legitimate valueOf→toString fallback yet well below native-stack
+       exhaustion), so a cyclic hook now surfaces a clean, catchable
+       `RuntimeError("ToPrimitive recursion limit exceeded …")` instead of crashing
+       the host.
+    2. Fixed `call_closure_internal`'s error path to (a) only catch a `try` block
+       that lives *inside* the internal call (`frame_depth > target_frame_depth`)
+       and (b) unwind the frames it pushed before propagating — previously a nested
+       internal call that errored left orphaned frames and later panicked at
+       `frames.last().unwrap()`.
+    3. Replaced the obsolete `test_tostring_not_invoked_during_coercion` security
+       test (it asserted the *pre-O4* "never invoke toString, always
+       `[object Object]`" stance, which O4 deliberately superseded) with three tests
+       matching the real contract: a non-cyclic hook IS honored, a cyclic hook is
+       *bounded, not fatal*, and the resulting error is *catchable from inside the
+       guest*. Invoking the hook is not a sandbox escape (it runs under the same
+       limits); the only real security concern — unbounded recursion DoS — is now
+       handled cleanly. (`crates/zapcode-core/tests/security.rs`.)
+  *Residual (deferred):* `[Symbol.toPrimitive]` is still not dispatched. It depends
+  on real well-known-symbol keying (O8): the crate's `Symbol` is a stub whose
+  values are `__symbol__`-tagged heap objects, and the four computed-property-key
+  sites all coerce keys via `to_js_string`, so a `[Symbol.toPrimitive]` key can't be
+  matched without a shared property-key mapping change across the get/set/define
+  paths — moderate blast radius for a niche hook, deliberately left out to protect
+  the GREEN suite. The common `valueOf`/`toString` path covers the realistic cases.
+
+- **G9 — DOCUMENTED RESIDUAL (intentionally not landed).** Strings remain indexed by
+  Unicode *code point* (Rust `chars()`), not UTF-16 code units, so `"😀".length` is
+  `1` (JS: `2`) and `"😀".charCodeAt(0)` is `128512` (JS: `55357`, the high
+  surrogate). This is *self-consistent* across `length`, indexing `s[i]`, `charAt`,
+  `charCodeAt`, `codePointAt`, `at`, `slice`, `substring`, `substr`,
+  `indexOf`/`lastIndexOf`, and the regex/match `.index` (all code-point based).
+  Converting to UTF-16 is a broad, mutually-coupled change across ~15 call sites in
+  `vm/mod.rs` and `vm/builtins.rs` plus the byte↔char-count match machinery; there
+  is **no safe partial** — converting only some of those methods would make
+  `s.length` disagree with `s[i]`/`slice`, introducing a *new* divergence worse than
+  the current consistent model. Only BMP characters are exercised by the suite (and
+  the one e2e `charCodeAt` test uses A/B/Z), so no test currently depends on either
+  semantics. Per the GREEN guarantee, the full UTF-16 rewrite is left as the
+  documented residual rather than shipped half-done. *Practical impact:* correct for
+  all BMP text (the overwhelming majority of agent input); diverges only on astral
+  (non-BMP) characters — emoji, some CJK-extension and math-script code points.
+
+- **N9 — FIXED (with pre-existing generator residual).** `for await (const x of …)`
+  awaits each iterated value (arrays of promises/values, mixed, destructuring,
+  break/continue, nesting, rejection-in-loop, and suspend/resume across an external
+  call in the body), and async-generator *consumption* via for-await drives the
+  iterator and awaits each yielded value. *Residual (unchanged, pre-existing):* an
+  `async function*` that suspends on an *external host call mid-iteration* errors
+  `cannot suspend inside a generator` — a generator-engine limitation (generators
+  run synchronously via `generator_next`, which can't capture/resume a host-call
+  suspension across `yield`), not specific to for-await. Pinned by
+  `async_generator_external_suspension_is_the_documented_gap` in `stress_for_await.rs`.
+
+- **N5 — FIXED (fully, including stringification).** A bare (un-awaited) tool call is
+  a real deferred Promise object (`typeof === "object"`, host call held until
+  awaited / `.then`/`.catch`/`.finally`-ed / returned-and-awaited), with `.then`
+  chaining, callback-internal tool calls, thenable adoption, and snapshot
+  round-trip. **Round 6 closed the last residual:** a `__promise__`-tagged heap
+  object now string-coerces to the spec's `[object Promise]` (via a `to_js_string`
+  special-case mirroring `__date_ms__`/`__error__`), instead of leaking
+  `[object Object]`. So `"" + tool()` → `"[object Promise]"`. (`stress_call_promise.rs`.)
+
+**Net for the deferred five:** G4, O4, N9, N5 are fully landed (each with a small,
+honestly-documented residual that is architectural / pre-existing, not a gap in the
+targeted behavior); N5's previously-documented stringification residual is now also
+closed. **G9 is the one item deliberately left as a documented residual** because no
+correctness-preserving partial exists and the full UTF-16 conversion would
+destabilize the suite. The suite is now **fully green** (it was *not* at the Round-5
+HEAD — the `security` binary was aborting on the cyclic-toString case; that is fixed
+here). 634 core tests pass (0 failed), `cargo build --workspace` is clean (0
+warnings), and the JS `test:scenarios3` (77 checks) + `test:e2e` (all suites incl.
+`stress`/`parallel`/`marshalling`) are green with the native binding rebuilt.
+
+**Round 5 (branch `arca/heap-handles-rewrite`) — N5 bare tool-call as a deferred Promise:**
+- **N5 — FIXED (general case).** A bare (un-awaited) tool-call expression now
+  evaluates to a real *deferred* Promise object instead of an eagerly-resolved
+  value. `const p = tool(); typeof p === "object"` and the host call is **not**
+  made until `p` is awaited, `.then`/`.catch`/`.finally`-ed, or returned-and-awaited.
+  - Compilation: a non-spread bare external call lowers to
+    `CallExternalDeferred(name,argc)` + `MakeCallPromise`, producing a promise
+    object `{__promise__:true, status:"pending_call", __call_id__:id}` whose call
+    is held in `pending_calls`. The *directly-awaited* form `await tool()` keeps
+    the pre-N5 eager-suspend `CallExternal` path (special-cased in the compiler's
+    `Expr::Await`), so that hot path is byte-for-byte unchanged.
+  - `Await` on a `pending_call` promise suspends once on its host call (an
+    ordinary `VmState::Suspended { name, args }` the existing host bridge already
+    handles) and resumes with the result.
+  - `.then`/`.catch`/`.finally` on a `pending_call` promise force the call via the
+    same suspension, recording a `ResumeAction::PromiseMethod`; on resume the
+    settled value is wrapped (resolved) or, via `resume_with_error`, rejected, and
+    the method runs through the existing N4 promise-callback machinery (so a tool
+    call *inside* the callback still suspends/resumes). `.then` chaining works
+    (`tool().then(a).then(b)`), and a promise callback that itself *returns* a
+    deferred promise (thenable adoption) is forced via `ResumeAction::ChainResult`.
+  - State (`resume_action`) is serialized in the snapshot (`#[serde(default)]`), so
+    a deferred-promise suspension survives dump/load/resume.
+  - `Promise.all`/`race`/`any`/`allSettled` batching is unchanged: direct
+    external-call array elements still lower to `CallExternalDeferred` +
+    `MakeBatchPromise` and never reach the single-call path. (Verified by
+    `stress_promise_combinators.rs`, `parallel_calls.rs`, JS `parallel`/`stress`.)
+  - Tests: `stress_call_promise.rs` (13) — typeof/deferral, await of a stored
+    promise, `.then` single + chain, `.then` callback making a tool call, `.catch`
+    rejection + pass-through, `.finally` pass-through, snapshot round-trip,
+    return-then-await, and the unchanged `await tool()` form.
+  - **Residual / behavior change (documented):** a bare tool-call promise
+    string-coerces to `[object Object]` rather than the spec `[object Promise]`
+    (shared with all heap-Object promises here — a stringification detail, not
+    N5-specific). Two N4 tests in `stress_then_tools.rs` were updated to the
+    now-correct JS semantics: a callback's *returned* deferred promise is adopted
+    (so `.finally(() => tool())` drives the call), and a tool error is only
+    catchable by an inner `try` when the call is `await`-ed inside it (a bare
+    `return tool()` defers past the `try`, matching JS). Pre-N5 snapshot/session/
+    wire-format tests that used bare un-awaited calls purely to trigger a
+    suspension were switched to `await tool()` (same suspension, correct N5
+    semantics).
+
+**Round 4 (branch `arca/heap-handles-rewrite`) — Promise combinators + `super.method` + MED/LOW edges:**
+- **C3 `super.method()` / `super.prop` — FIXED.** Class methods now track their
+  defining class on the frame, so `super.g()` dispatches to the parent method with
+  the subclass instance as `this` (reads `this`-fields set after `super()`), chains
+  through three+ levels, and `super.g` (no call) yields the parent function value.
+  Coexists with `instanceof` and normal inherited dispatch. (`stress_classes.rs`.)
+- **N1 `Promise.race` / N2 `Promise.any` / N3 `Promise.allSettled` — FIXED.** When an
+  array element is a direct external call, the combinator lowers to a
+  `MakeBatchPromise(kind,n)` deferred batch; awaiting it suspends once with
+  `VmState::SuspendedMany { combinator, .. }`. The host bridge runs the *real* JS
+  combinator (true settle timing for race/any) and resumes per kind: race →
+  first-settled value (or first rejection); any → first fulfilled (else
+  AggregateError); allSettled → per-element `{status,value|reason}`, never rejects.
+  Inline (no-external-call) combinators settle without a host round-trip. `Promise.all`
+  baseline preserved. (`stress_promise_combinators.rs` + e2e `parallel`/`stress`.)
+- **N8 `Promise.resolve` adoption — FIXED.** `Promise.resolve(value)` /
+  `Promise.resolve(promise)` adopt rather than double-wrap; awaiting a resolved
+  promise unwraps to its value.
+- **N4 tool calls inside `.then`/`.catch`/`.finally` callbacks — FIXED** (prior commit;
+  enables the `primary().catch(() => fallback())` retry pattern). (`stress_then_tools.rs`.)
+- **N9 `for await (const x of …)` — FIXED.** The for-of lowering now reads oxc's
+  `ForOfStatement::await` flag (previously the loop parsed but the flag was silently
+  ignored, so each `x` was the raw Promise object). `Statement::ForOf` carries an
+  `await_each: bool`; when set, the compiler emits an `Await` instruction on each
+  iterated value just after the loop's done-check and before the binding. This reuses
+  the existing `Await` path: a resolved promise unwraps, a rejected promise throws
+  (`Unhandled promise rejection: …`), a non-promise passes through, and a pending
+  external call suspends/resumes back into the same loop iteration. Verified for arrays
+  of promises (`for await ([Promise.resolve(1),Promise.resolve(2)])` sums to 3), plain
+  values, mixed, destructuring bindings, break/continue, nesting (no iterator leak),
+  rejection-in-loop, and suspend/resume across an external call in the loop body.
+  Async-generator *consumption* also works: `for await (… of asyncGen())` drives the
+  generator's iterator and awaits each yielded value (yielding promises and internal
+  promise-awaits both resolve correctly). (`stress_for_await.rs`.)
+  - **Residual gap (deferred):** an `async function*` that suspends on an *external*
+    (host) call mid-iteration is unsupported — it errors `cannot suspend inside a
+    generator`. This is a pre-existing generator limitation (generators run
+    synchronously via `generator_next`, which can't capture/resume a host-call
+    suspension across the yield boundary), not specific to for-await; internal
+    promise-awaits and yielding promises inside an async generator both work. Pinned by
+    `async_generator_external_suspension_is_the_documented_gap` in `stress_for_await.rs`.
+- **Edges:** **O5** (`"key" in obj` no longer a parse error when the line starts with a
+  string literal; array `length`/numeric-index `in` membership, own-keys only),
+  **H6** (`Map.set`/`Set.add` return the collection so chaining works; returns the same
+  shared handle under reference semantics), **G3** (a `/g` regex maintains `lastIndex`
+  so `while((m=re.exec(s))!==null)` terminates, and `/g .test()` advances then resets),
+  **O8** (minimal `Symbol`: `typeof Symbol === "function"`, `Symbol()` is a unique
+  `typeof === "symbol"` value with `.description`, usable as a computed key) — all FIXED.
+  Bonus: a stale `last_global_name` no longer leaks a builtin method into an unrelated
+  member access (`String(o.missing)` → `"undefined"`, not `"function"`). (`stress_edges_round1.rs`.)
+- **Binding parity:** `zapcode-wasm` and `zapcode-py` now destructure and surface the new
+  `combinator` field on `SuspendedMany`, so `cargo build --workspace` is clean.
+- **Intentionally deferred (still divergent):** **N5** is now FIXED in Round 5 — a
+  bare tool-call expression is a real deferred Promise object with `.then`/`.catch`/
+  `.finally`, deferred until awaited/then-ed (see Round 5 above);
+  (**N9** `for await…of` is now FIXED — see Round 4; only async-generator
+  *external-call* suspension mid-iteration remains a documented gap); **G4**
+  `match()`/`matchAll` `.index`/`.input`/named `.groups`; **O4** `valueOf`/`toString`/
+  `Symbol.toPrimitive` coercion hooks; **G9** UTF-16 string indexing (strings are indexed
+  by code point). **N7** `AggregateError` global landed in Round 2; `Promise.any`'s
+  all-reject surfaces an AggregateError-shaped rejection via the host bridge.
+- **Verified:** 579 core tests (0 failed) + `cargo build --workspace` clean (0 warnings) +
+  full JS `test:scenarios3` (10 scenarios) and `test:e2e` (all suites incl. `parallel`/
+  `stress`/`marshalling`) green.
+- **`security` test issue — RESOLVED in Round 6 (it was an O4 regression, not "pre-existing").**
+  As of the Round-5 HEAD, the `security` binary aborted (SIGABRT) on
+  `test_tostring_not_invoked_during_coercion`: the O4 hook invoked a self-referential
+  `toString(){ return "" + this }`, which recursed past the (then 200-deep)
+  ToPrimitive guard and overflowed the native stack — taking the whole binary down
+  (so `test_weakref_escape`, run earlier in the same process, also appeared to
+  "fail"). This was a genuine O4-introduced regression, *not* a pre-existing /
+  platform issue. Round 6 fixes it (recursion guard 200→8 so it errors cleanly,
+  `call_closure_internal` frame-unwind on the error path, and the obsolete test
+  replaced by three tests asserting the real bounded/catchable/honored contract).
+  The full suite — including `security`, `stress_for_await.rs`, `async_await`,
+  `generators`, and all `stress_*` — is now green.
+
+**Round 3 (branch `arca/heap-handles-rewrite`) — the heap-with-handles rewrite:**
+- **A (reference semantics) — FIXED.** `Value::Array`/`Object` now carry a `Handle`
+  into a VM-owned `Heap`; cloning a value shares the slot, so aliasing,
+  mutate-through-parameter, Map-of-arrays bucket pushes, identity `===`, and
+  identity Map object-keys all behave like JS. `structuredClone` deep-copies.
+  The old place/write-back machinery is retired in favour of in-place heap
+  mutation. The heap serializes with the snapshot (handles preserve sharing; a
+  cycle-safe visited-set was added to the serializability walk). Verified: 537
+  core tests + 8 new `stress_references.rs` tests + full JS scenario3/e2e suites,
+  all green. (54 files, +2762/-1614.)
+
+
+
+**Round 2 (branch `arca/heap-handles-rewrite`) — Tier A complete + most of Tier B:**
+- **J4** nested `for…of`; **D1/D2** function hoisting; **C4** caught runtime
+  errors are real `Error` objects; **B1** trailing-block completion values;
+  **E1/E2** optional-chaining short-circuit (calls + trailing members).
+- **M (Dates)** string/multi-arg construction, `Date.parse`/`Date.UTC`,
+  arithmetic & coercion, Invalid Date, `instanceof Date`, `toJSON`/`toString`.
+- **C1/C2** `instanceof` ancestor classes + implicit constructor → `super`.
+- **N7** `AggregateError` global.
+- Deferred as deep follow-ups (architectural, do dedicated): **A** reference
+  semantics (the heap-with-handles rewrite — chosen, not yet done); **N1–N5/N8/N9**
+  Promise combinator semantics (eager-resolution suspend model + determinism);
+  **C3** `super.method()` (needs current-class tracking in frames).
+
 Fixed and verified (cargo tests + full JS scenario suite, native binding rebuilt):
 
 - **Cluster L (Tier 0 crashes):** L1/L2/L3 (BigInt/Infinity/NaN/undefined tool
@@ -188,8 +439,10 @@ short-circuiting the whole chain.
 **G3 [HIGH] Global-regex `lastIndex` not maintained → `while((m=re.exec(s)))` loops forever** (`allocation limit exceeded`).
 `const r=/a/g; r.test("aaa"); r.lastIndex` → exp `1`, act `null`.
 
-**G4 [HIGH] `match()`/`matchAll` results lack `.index` / `.input` / named `.groups`.**
-`"xxabc".match(/abc/).index` → exp `2`, act `null`; `"12-34".match(/(?<a>\d+)-(?<b>\d+)/).groups` → exp `{a,b}`, act `undefined`.
+**G4 [RESOLVED] `match()`/`matchAll` results lack `.index` / `.input` / named `.groups`.**
+~~`"xxabc".match(/abc/).index` → exp `2`, act `null`; `"12-34".match(/(?<a>\d+)-(?<b>\d+)/).groups` → exp `{a,b}`, act `undefined`.~~
+Non-global `match(re)` and each `matchAll(re)` element now return an **array-like heap object**: keys `"0".."n"` for the capture groups, plus `length`, `index` (match start in *chars*), `input` (the subject), and `groups` (an object of named captures, or `undefined` if the pattern declares none). So `m[0]`, `m[1]`, `m.index`, `m.input`, `m.groups.name`, and `m.length` all work, and `matchAll` is iterable/spreadable. The **global** `match(re)/g` still returns a plain array of matched strings (JS does too), so `.join()` etc. work on it.
+**Trade-off (acceptable):** because heap arrays are `Vec`-backed and cannot carry extra named properties, the non-global result is an *object* rather than an *array* — `Array.isArray("a1".match(/(.)/))` is `false` (and array methods like `.join()`/`.map()` are not available on the non-global result; use indexed access or spread `matchAll`). Tests: `crates/zapcode-core/tests/stress_match_groups.rs`.
 
 **G5 [MED] `split` ignores the `limit` arg and drops regex capture groups.**
 `"a,b,c".split(",",2)` → exp `["a","b"]`, act `["a","b","c"]`; `"a1b2c".split(/(\d)/)` → exp `["a","1","b","2","c"]`, act `["a","b","c"]`.
@@ -354,7 +607,7 @@ Even `throw new Error("x")` arrives with `typeof e === "string"`, `e.message ===
 
 **N4 [HIGH] Tool calls inside `.then`/`.catch`/`.finally` callbacks throw** `runtime error: cannot call an external function inside an array-callback method` (misleading message — it's a promise callback). **Blocks the idiomatic `primary().catch(() => fallback())` retry pattern.**
 
-**N5 [MED] A tool-call expression is an eagerly-resolved value, not a Promise** — `const p = delay(…); typeof p` → exp `"object"`, act `"string"` (resolved value); `p.then` is `undefined`; the op runs to completion at the assignment. **Root cause of N1–N3, N6.** (`Promise.resolve(5)` *is* a real promise — specific to tool calls.) **N7 [MED]** `AggregateError` is undefined and `Promise.any`'s rejection carries no `.errors`/`.name`. **N8 [MED]** `Promise.resolve(thenable)` doesn't adopt the thenable. **N9 [LOW]** `for await…of` / async-generator *consumption* fails to parse (plain `function*` + `.next()` work).
+**N5 [MED] A tool-call expression is an eagerly-resolved value, not a Promise** — `const p = delay(…); typeof p` → exp `"object"`, act `"string"` (resolved value); `p.then` is `undefined`; the op runs to completion at the assignment. **Root cause of N1–N3, N6.** (`Promise.resolve(5)` *is* a real promise — specific to tool calls.) **N7 [MED]** `AggregateError` is undefined and `Promise.any`'s rejection carries no `.errors`/`.name`. **N8 [MED]** `Promise.resolve(thenable)` doesn't adopt the thenable. **N9 [FIXED — Round 4]** `for await…of` now awaits each iterated value (arrays of promises/values, mixed, destructuring, break/continue, nesting, rejection, suspend/resume across an external call in the body). Async-generator *consumption* via for-await also works (yielding promises + internal awaits resolve). Residual gap: an async generator that suspends on an *external* host call mid-iteration errors `cannot suspend inside a generator` (a pre-existing generator limitation). See `stress_for_await.rs`.
 *Good:* `Promise.all` parallelizes and preserves index order; `.then`/`.catch`/`.finally` chaining + value/promise unwrap; `await` non-promise; `allSettled` element shape `{status,value/reason}`.
 
 ## Cluster O — Coercion / operators  *(silent corruption of common code)*
@@ -365,7 +618,8 @@ Even `throw new Error("x")` arrives with `typeof e === "string"`, `e.message ===
 
 **O3 [HIGH] `+` with any object/array operand returns `null`** (no object→primitive). `[1,2]+[3]` → exp `"1,23"`, act `null`; `1+[2]`, `[]+{}`, `+[5]`, `+{}` all `null`.
 
-**O4 [HIGH] `valueOf`/`toString`/`Symbol.toPrimitive` hooks ignored in coercion.** `({valueOf(){return 42}})+1` → exp `43`, act `null`; `({toString(){return "hi"}})+""` → exp `"hi"`, act `"[object Object]"`; `Symbol.toPrimitive` ⇒ error (Symbol global missing, O8).
+**O4 [FIXED — valueOf/toString; Symbol.toPrimitive deferred] User ToPrimitive hooks now honored in coercion.** A VM-level `Vm::to_primitive(value, hint)` (crates/zapcode-core/src/vm/mod.rs) invokes a heap object's callable `valueOf`/`toString` field via the guest-call path (`call_method_internal`, binding `this`) and uses a primitive result. Applied at: `Add` (default hint), `Sub`/`Mul`/`Div`/`Rem`/`Pow`/`Neg` (number hint), relational `Lt`/`Lte`/`Gt`/`Gte` (number hint), `ConcatStrings` / template literals (string hint), and the `String()`/`Number()` globals. Method order per spec (number/default → valueOf-then-toString; string → toString-then-valueOf); a hook returning an object is skipped; re-entrancy is bounded (`to_primitive_depth`, cap 200) so a cyclic/suspending hook can't loop. Now: `({valueOf(){return 42}})+1` → `43`, `({toString(){return "hi"}})+""` → `"hi"`, `Number({valueOf(){return 3}})` → `3`, `({valueOf(){return 100}})<200` → `true`. Regression tests: crates/zapcode-core/tests/stress_toprimitive.rs.
+  - **Residual gap (deferred):** `[Symbol.toPrimitive]` is NOT dispatched. The crate's `Symbol` is a stub (no well-known symbols; object property keys are plain `Arc<str>`, and a computed `[Symbol.toPrimitive]` key stringifies to `"[object Object]"`), so the well-known-symbol key can't be matched reliably. Wiring it requires real well-known-symbol keying first (depends on O8). A hook that itself makes a tool call (would need suspension mid-instruction) is also out of scope — it surfaces as a RuntimeError from the internal call path rather than suspending.
 
 **O5 [HIGH] `in` operator: string-literal left operand is a PARSE ERROR; inherited/`length` keys not seen.** `"a" in {a:1}` → exp `true`, act parse error `Unexpected token`; `"length" in [1,2]` → `false`.
 

@@ -151,11 +151,15 @@ fn test_valueof_hijack() {
     let _ = result;
 }
 
-/// Zapcode does NOT invoke user-defined toString() during implicit string conversion.
-/// Objects always stringify to "[object Object]". This is a security feature that
-/// prevents toString-based code injection and infinite recursion.
+/// As of O4 (ToPrimitive hooks), Zapcode DOES invoke a user-defined
+/// `toString()`/`valueOf()` during implicit coercion, matching JS semantics. The
+/// security guarantee is no longer "never invoke the hook" but rather "invoking
+/// the hook can neither escape the sandbox nor crash the host": a self-referential
+/// hook (`toString(){ return "" + this }`) recurses, but the bounded ToPrimitive
+/// recursion guard catches it with a clean, catchable `RuntimeError` instead of
+/// overflowing the native stack and aborting the process.
 #[test]
-fn test_tostring_not_invoked_during_coercion() {
+fn test_self_referential_tostring_is_bounded_not_fatal() {
     let result = eval_ts(
         r#"
         const evil = {
@@ -166,8 +170,46 @@ fn test_tostring_not_invoked_during_coercion() {
         "" + evil
     "#,
     );
-    // Should return "[object Object]" without invoking toString()
-    assert_eq!(result.unwrap(), Value::String("[object Object]".into()));
+    // Must NOT abort the host (no stack overflow / SIGABRT). A cyclic hook surfaces
+    // as a catchable RuntimeError; a non-cyclic hook would return its primitive.
+    match result {
+        Err(ZapcodeError::RuntimeError(msg)) => {
+            assert!(
+                msg.contains("ToPrimitive recursion limit"),
+                "expected the ToPrimitive recursion guard, got: {msg}"
+            );
+        }
+        Err(other) => panic!("expected a bounded RuntimeError, got: {other:?}"),
+        Ok(val) => panic!("expected the cyclic hook to be bounded, got: {val:?}"),
+    }
+}
+
+/// The recursion guard is catchable from inside the sandbox: a self-referential
+/// coercion hook does not bring down the guest, it throws a normal error the guest
+/// can `try/catch`.
+#[test]
+fn test_self_referential_hook_is_catchable_in_guest() {
+    let result = eval_ts(
+        r#"
+        const evil = { toString() { return "" + this; } };
+        let caught = false;
+        try { "" + evil; } catch (e) { caught = true; }
+        caught
+    "#,
+    );
+    assert_eq!(result.unwrap(), Value::Bool(true));
+}
+
+/// A well-behaved (non-cyclic) user toString IS honored during coercion (O4).
+#[test]
+fn test_user_tostring_is_honored_during_coercion() {
+    let result = eval_ts(
+        r#"
+        const o = { toString() { return "hello"; } };
+        "" + o
+    "#,
+    );
+    assert_eq!(result.unwrap(), Value::String("hello".into()));
 }
 
 // ── 4. Stack overflow DoS ───────────────────────────────────────────

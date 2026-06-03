@@ -55,6 +55,13 @@ struct Compiler {
     top_level_bindings: HashMap<String, TopLevelBindingKind>,
     /// Label attached to the next loop (from a `label:` statement), if any.
     pending_label: Option<String>,
+    /// Function-declaration indices already bound by the scope's hoist pass, so
+    /// the in-source-order `FunctionDecl` statement is a no-op for them.
+    hoisted_funcs: std::collections::HashSet<usize>,
+    /// The lexically-enclosing class name while compiling a class
+    /// method/constructor body. Lets `super`/`super.m()` resolve against the
+    /// defining class's `__super__` regardless of the runtime receiver's class.
+    current_class: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +88,8 @@ impl Compiler {
             mode: CompilerMode::Standard,
             top_level_bindings: HashMap::new(),
             pending_label: None,
+            hoisted_funcs: std::collections::HashSet::new(),
+            current_class: None,
         }
     }
 
@@ -98,6 +107,8 @@ impl Compiler {
             mode: CompilerMode::SessionChunk,
             top_level_bindings,
             pending_label: None,
+            hoisted_funcs: std::collections::HashSet::new(),
+            current_class: None,
         }
     }
 
@@ -175,18 +186,18 @@ impl Compiler {
             self.functions.push(compiled);
         }
 
-        // Second pass: compile body
+        // Second pass: compile body. Hoist top-level function declarations first
+        // so forward references and mutual recursion resolve.
+        self.hoist_function_decls(&program.body)?;
         // For the last statement, if it's an expression, keep the value on the stack
         let len = program.body.len();
         for (i, stmt) in program.body.iter().enumerate() {
             let is_last = i == len - 1;
             if is_last {
-                if let Statement::Expression { expr, .. } = stmt {
-                    self.compile_expr(expr)?;
-                    // Don't pop — leave value on stack as program result
-                } else {
-                    self.compile_statement(stmt)?;
-                }
+                // Leave the trailing statement's completion value on the stack as
+                // the program result (so a script ending in try/catch, if, or a
+                // block yields that block's value, not null).
+                self.compile_completion_statement(stmt)?;
             } else {
                 self.compile_statement(stmt)?;
             }
@@ -197,6 +208,11 @@ impl Compiler {
 
     fn compile_function_def(&mut self, func: &FunctionDef) -> Result<CompiledFunction> {
         let mut func_compiler = Compiler::new(self.external_functions.clone());
+        // Inherit the enclosing class context so `super` inside a method/constructor
+        // body (which compiles into this fresh sub-compiler) resolves to the right
+        // defining class. Nested non-method closures inside a method keep the same
+        // class context, matching JS lexical `super` scoping.
+        func_compiler.current_class = self.current_class.clone();
 
         // Set up parameters as locals
         for param in &func.params {
@@ -249,6 +265,8 @@ impl Compiler {
             }
         }
 
+        // Hoist this function body's own nested function declarations.
+        func_compiler.hoist_function_decls(&func.body)?;
         for stmt in &func.body {
             func_compiler.compile_statement(stmt)?;
         }
@@ -448,6 +466,7 @@ impl Compiler {
                 binding,
                 iterable,
                 body,
+                await_each,
                 ..
             } => {
                 self.compile_expr(iterable)?;
@@ -460,10 +479,25 @@ impl Compiler {
                     label: self.pending_label.take(),
                 });
 
-                self.emit(Instruction::Dup);
+                // IteratorNext consumes the iterator and pushes the *advanced*
+                // iterator plus the next value, so the single iterator is
+                // threaded through each iteration. (A `Dup` here would leak one
+                // iterator per iteration onto the stack; harmless for a single
+                // loop, but a nested loop would then leave exhausted inner
+                // iterators sitting on top of the outer one — making the outer
+                // loop read the wrong iterator and exit after one pass.)
                 self.emit(Instruction::IteratorNext);
                 self.emit(Instruction::IteratorDone);
                 let exit_jump = self.emit(Instruction::JumpIfTrue(0));
+
+                // `for await`: the iterated value (now on top of the stack, with
+                // the threaded iterator beneath it) must be awaited before being
+                // bound. Await unwraps a resolved promise, throws a rejected one,
+                // suspends on a pending external call, and passes non-promises
+                // through — exactly the per-element semantics we want.
+                if *await_each {
+                    self.emit(Instruction::Await);
+                }
 
                 // Bind the value
                 match binding {
@@ -579,27 +613,14 @@ impl Compiler {
                 self.compile_statement(body)?;
                 self.pending_label = None;
             }
-            Statement::FunctionDecl { func_index, .. } => {
-                self.emit(Instruction::CreateClosure(*func_index));
-                let name = if *func_index < self.functions.len() {
-                    self.functions[*func_index].name.clone()
-                } else {
-                    None
-                };
-                if let Some(name) = name {
-                    if self.is_session_chunk() {
-                        self.record_top_level_binding(&name, TopLevelBindingKind::Function)?;
-                        self.emit(Instruction::StoreGlobal(name));
-                    } else {
-                        // Store as both local and global so recursion works
-                        self.emit(Instruction::Dup);
-                        let idx = self.declare_local(&name);
-                        self.emit(Instruction::StoreLocal(idx));
-                        self.emit(Instruction::StoreGlobal(name));
-                    }
-                } else {
-                    self.emit(Instruction::Pop);
+            Statement::FunctionDecl {
+                func_index, name, ..
+            } => {
+                // Already bound by the enclosing scope's hoist pass — no-op.
+                if self.hoisted_funcs.contains(func_index) {
+                    return Ok(());
                 }
+                self.emit_function_decl_binding(*func_index, name)?;
             }
             Statement::ClassDecl {
                 name,
@@ -694,6 +715,225 @@ impl Compiler {
                     self.patch_jump(jump_end, body_starts[default_idx]);
                 } else {
                     self.patch_jump(jump_end, end);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile a statement in "completion-value position": its value is left on
+    /// the stack as the result (used for the program's trailing statement and,
+    /// recursively, the trailing statement of a block/if/try it contains).
+    /// Expression/Block/If/TryCatch produce a value; anything else keeps its
+    /// normal (value-less) compilation.
+    fn compile_completion_statement(&mut self, stmt: &Statement) -> Result<()> {
+        match stmt {
+            Statement::Expression { expr, .. } => {
+                self.compile_expr(expr)?; // leave value, no Pop
+            }
+            Statement::Block { body, .. } => {
+                self.compile_completion_block(body)?;
+            }
+            Statement::If {
+                test,
+                consequent,
+                alternate,
+                ..
+            } => {
+                self.compile_expr(test)?;
+                let jump_else = self.emit(Instruction::JumpIfFalse(0));
+                self.compile_completion_block(consequent)?;
+                let jump_end = self.emit(Instruction::Jump(0));
+                let else_target = self.current_offset();
+                self.patch_jump(jump_else, else_target);
+                match alternate {
+                    Some(alt) => self.compile_completion_block(alt)?,
+                    None => {
+                        self.emit(Instruction::Push(Constant::Undefined));
+                    }
+                }
+                let end_target = self.current_offset();
+                self.patch_jump(jump_end, end_target);
+            }
+            Statement::TryCatch {
+                try_body,
+                catch_param,
+                catch_body,
+                finally_body,
+                ..
+            } => {
+                let setup = self.emit(Instruction::SetupTry(0, None));
+                self.compile_completion_block(try_body)?;
+                self.emit(Instruction::EndTry);
+                let jump_past_catch = self.emit(Instruction::Jump(0));
+                let catch_start = self.current_offset();
+                self.patch_jump(setup, catch_start);
+                if let Some(param) = catch_param {
+                    let idx = self.declare_local(param);
+                    self.emit(Instruction::StoreLocal(idx));
+                } else {
+                    self.emit(Instruction::Pop);
+                }
+                self.compile_completion_block(catch_body)?;
+                let after_catch = self.current_offset();
+                self.patch_jump(jump_past_catch, after_catch);
+                // A finally block runs for effects; its value is discarded (an
+                // abrupt completion inside finally — return/throw — is B2, separate).
+                if let Some(finally) = finally_body {
+                    for s in finally {
+                        self.compile_statement(s)?;
+                    }
+                }
+            }
+            other => {
+                self.compile_statement(other)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile a statement list so exactly one value (its completion value) is
+    /// left on the stack.
+    fn compile_completion_block(&mut self, stmts: &[Statement]) -> Result<()> {
+        let Some((last, init)) = stmts.split_last() else {
+            self.emit(Instruction::Push(Constant::Undefined));
+            return Ok(());
+        };
+        for s in init {
+            self.compile_statement(s)?;
+        }
+        match last {
+            Statement::Expression { .. }
+            | Statement::Block { .. }
+            | Statement::If { .. }
+            | Statement::TryCatch { .. } => self.compile_completion_statement(last)?,
+            other => {
+                // A non-value statement contributes no completion value; compile
+                // it normally and default the block's value to undefined.
+                self.compile_statement(other)?;
+                self.emit(Instruction::Push(Constant::Undefined));
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile a complete optional chain (`a?.b.c`, `x?.f()`, `arr?.[i]`, …).
+    /// Every link is evaluated left-to-right; an optional link that sees a
+    /// nullish receiver jumps to a single landing that yields `undefined`,
+    /// skipping all remaining links (later non-optional accesses and calls).
+    fn compile_optional_chain(&mut self, top: &Expr) -> Result<()> {
+        let mut short_circuits: Vec<usize> = Vec::new();
+        self.compile_chain_link(top, &mut short_circuits)?;
+        let done = self.emit(Instruction::Jump(0));
+        // Short-circuit landing: the guard left [.., obj, obj] on the stack
+        // (Dup + peeked-nullish), so drop both and yield undefined.
+        let sc_target = self.current_offset();
+        for j in &short_circuits {
+            self.patch_jump(*j, sc_target);
+        }
+        self.emit(Instruction::Pop);
+        self.emit(Instruction::Pop);
+        self.emit(Instruction::Push(Constant::Undefined));
+        let end = self.current_offset();
+        self.patch_jump(done, end);
+        Ok(())
+    }
+
+    /// Compile one link of an optional chain, recursing into its object/callee
+    /// first. A non-chain head is compiled normally. Each link keeps exactly one
+    /// value on the stack; an optional link guards its receiver and records a
+    /// short-circuit jump (taken with `[.., obj, obj]` on the stack).
+    fn compile_chain_link(&mut self, expr: &Expr, sc: &mut Vec<usize>) -> Result<()> {
+        match expr {
+            Expr::Member {
+                object,
+                property,
+                optional,
+            } => {
+                self.compile_chain_link(object, sc)?;
+                if *optional {
+                    self.emit(Instruction::Dup);
+                    sc.push(self.emit(Instruction::JumpIfNullish(0)));
+                    self.emit(Instruction::Pop);
+                }
+                self.emit(Instruction::GetProperty(property.clone()));
+            }
+            Expr::ComputedMember {
+                object,
+                property,
+                optional,
+            } => {
+                self.compile_chain_link(object, sc)?;
+                if *optional {
+                    self.emit(Instruction::Dup);
+                    sc.push(self.emit(Instruction::JumpIfNullish(0)));
+                    self.emit(Instruction::Pop);
+                }
+                self.compile_expr(property)?;
+                self.emit(Instruction::GetIndex);
+            }
+            Expr::Call {
+                callee,
+                args,
+                optional,
+            } => {
+                self.compile_chain_link(callee, sc)?;
+                if *optional {
+                    self.emit(Instruction::Dup);
+                    sc.push(self.emit(Instruction::JumpIfNullish(0)));
+                    self.emit(Instruction::Pop);
+                }
+                if args.iter().any(|a| matches!(a, Expr::Spread(_))) {
+                    self.compile_spread_args(args)?;
+                    self.emit(Instruction::CallSpread);
+                } else {
+                    for arg in args {
+                        self.compile_expr(arg)?;
+                    }
+                    self.emit(Instruction::Call(args.len()));
+                }
+            }
+            // The head of the chain (e.g. an identifier) — compile normally.
+            other => self.compile_expr(other)?,
+        }
+        Ok(())
+    }
+
+    /// Emit the closure creation + name binding for a function declaration.
+    fn emit_function_decl_binding(
+        &mut self,
+        func_index: usize,
+        name: &Option<String>,
+    ) -> Result<()> {
+        self.emit(Instruction::CreateClosure(func_index));
+        if let Some(name) = name {
+            if self.is_session_chunk() {
+                self.record_top_level_binding(name, TopLevelBindingKind::Function)?;
+                self.emit(Instruction::StoreGlobal(name.clone()));
+            } else {
+                // Store as both local and global so recursion + globals resolve.
+                self.emit(Instruction::Dup);
+                let idx = self.declare_local(name);
+                self.emit(Instruction::StoreLocal(idx));
+                self.emit(Instruction::StoreGlobal(name.clone()));
+            }
+        } else {
+            self.emit(Instruction::Pop);
+        }
+        Ok(())
+    }
+
+    /// Hoist top-level function declarations of a body: bind each before the
+    /// body's other statements run, so forward references and mutual recursion
+    /// resolve (JS function-declaration hoisting).
+    fn hoist_function_decls(&mut self, stmts: &[Statement]) -> Result<()> {
+        for stmt in stmts {
+            if let Statement::FunctionDecl {
+                func_index, name, ..
+            } = stmt
+            {
+                if self.hoisted_funcs.insert(*func_index) {
+                    self.emit_function_decl_binding(*func_index, name)?;
                 }
             }
         }
@@ -981,7 +1221,12 @@ impl Compiler {
                 self.emit(Instruction::Push(Constant::String(pattern.clone())));
                 self.emit(Instruction::Push(Constant::String("flags".to_string())));
                 self.emit(Instruction::Push(Constant::String(flags.clone())));
-                self.emit(Instruction::CreateObject(3));
+                // `lastIndex` is the mutable cursor maintained by `exec`/`test` on
+                // /g (and /y) regexes so that repeated calls advance through the
+                // subject string and eventually terminate (G3).
+                self.emit(Instruction::Push(Constant::String("lastIndex".to_string())));
+                self.emit(Instruction::Push(Constant::Int(0)));
+                self.emit(Instruction::CreateObject(4));
             }
             Expr::Ident(name) => {
                 if name == "this" {
@@ -1313,6 +1558,28 @@ impl Compiler {
                 property,
                 optional,
             } => {
+                // An optional chain short-circuits the *whole* chain (incl. later
+                // non-optional accesses/calls) to undefined when a `?.` link is
+                // nullish, so it's compiled as a unit.
+                if expr_is_optional_chain(expr) {
+                    return self.compile_optional_chain(expr);
+                }
+                // `super.prop` (not a call): read from the defining class's super
+                // prototype. Note a *bare* super-method reference (without an
+                // immediate call) loses its `this` binding here; that mirrors plain
+                // method references and is acceptable for C3.
+                if matches!(object.as_ref(), Expr::Ident(n) if n == "super") {
+                    let class = self.current_class.clone().ok_or_else(|| {
+                        ZapcodeError::CompileError(
+                            "'super' keyword unexpected here (outside a class method)".to_string(),
+                        )
+                    })?;
+                    self.emit(Instruction::LoadSuperProp {
+                        class,
+                        prop: property.clone(),
+                    });
+                    return Ok(());
+                }
                 self.compile_expr(object)?;
                 if *optional {
                     self.emit(Instruction::Dup);
@@ -1336,6 +1603,9 @@ impl Compiler {
                 property,
                 optional,
             } => {
+                if expr_is_optional_chain(expr) {
+                    return self.compile_optional_chain(expr);
+                }
                 self.compile_expr(object)?;
                 if *optional {
                     self.emit(Instruction::Dup);
@@ -1357,10 +1627,14 @@ impl Compiler {
                 }
             }
             Expr::Call { callee, args, .. } => {
-                // Check for `Promise.all([ ...direct external calls... ])` — when
-                // any element is a direct external call, compile the elements as
-                // deferred calls so the host can run them in parallel.
-                if self.try_compile_promise_all_batch(callee, args)? {
+                if expr_is_optional_chain(expr) {
+                    return self.compile_optional_chain(expr);
+                }
+                // Check for `Promise.{all,race,any,allSettled}([ ...direct
+                // external calls... ])` — when any element is a direct external
+                // call, compile the elements as deferred calls so the host can
+                // run them in parallel and settle them per the combinator.
+                if self.try_compile_promise_batch(callee, args)? {
                     return Ok(());
                 }
                 // Check if this is a super() call
@@ -1369,12 +1643,46 @@ impl Compiler {
                         for arg in args {
                             self.compile_expr(arg)?;
                         }
-                        self.emit(Instruction::CallSuper(args.len()));
+                        self.emit(Instruction::CallSuper {
+                            arg_count: args.len(),
+                            class: self.current_class.clone(),
+                        });
+                        return Ok(());
+                    }
+                }
+                // Check if this is a `super.method(...)` call: resolve the parent
+                // method against the defining class's super prototype and call it
+                // with the current `this` bound as receiver.
+                if let Expr::Member {
+                    object, property, ..
+                } = callee.as_ref()
+                {
+                    if matches!(object.as_ref(), Expr::Ident(n) if n == "super") {
+                        let class = self.current_class.clone().ok_or_else(|| {
+                            ZapcodeError::CompileError(
+                                "'super' keyword unexpected here (outside a class method)"
+                                    .to_string(),
+                            )
+                        })?;
+                        self.emit(Instruction::LoadSuperMethod {
+                            class,
+                            method: property.clone(),
+                        });
+                        for arg in args {
+                            self.compile_expr(arg)?;
+                        }
+                        self.emit(Instruction::Call(args.len()));
                         return Ok(());
                     }
                 }
                 let has_spread = args.iter().any(|a| matches!(a, Expr::Spread(_)));
-                // Check if this is a direct call to an external function
+                // Check if this is a direct call to an external function. A bare
+                // (un-awaited) tool call evaluates to a deferred single-call
+                // Promise object (N5): the host call is registered but not made
+                // until the promise is awaited or driven by .then/.catch/.finally.
+                // A *directly awaited* tool call (`await tool()`) is special-cased
+                // in `Expr::Await` to use the eager-suspend `CallExternal` path,
+                // so it never reaches here — keeping that hot path unchanged.
                 if let Expr::Ident(name) = callee.as_ref() {
                     if self.external_functions.contains(name) {
                         if has_spread {
@@ -1384,7 +1692,8 @@ impl Compiler {
                             for arg in args {
                                 self.compile_expr(arg)?;
                             }
-                            self.emit(Instruction::CallExternal(name.clone(), args.len()));
+                            self.emit(Instruction::CallExternalDeferred(name.clone(), args.len()));
+                            self.emit(Instruction::MakeCallPromise);
                         }
                         return Ok(());
                     }
@@ -1412,10 +1721,36 @@ impl Compiler {
                 self.emit(Instruction::CreateClosure(*func_index));
             }
             Expr::Await(expr) => {
-                self.compile_expr(expr)?;
-                // Emit Await instruction to unwrap Promise objects.
-                // External call suspension is already handled by CallExternal
-                // before this point — Await only handles internal promise values.
+                // Fast path: `await tool(args)` where `tool` is a direct external
+                // call (no spread). Compile to the eager-suspend `CallExternal`,
+                // exactly as before N5 — the call suspends here and resumes with
+                // the result, and the following `Await` passes the (non-promise)
+                // result through. This keeps the overwhelmingly common
+                // await-a-tool-call path byte-for-byte unchanged and off the new
+                // deferred single-call-promise machinery.
+                let mut handled = false;
+                if let Expr::Call { callee, args, .. } = expr.as_ref() {
+                    if !expr_is_optional_chain(expr)
+                        && !args.iter().any(|a| matches!(a, Expr::Spread(_)))
+                    {
+                        if let Expr::Ident(name) = callee.as_ref() {
+                            if self.external_functions.contains(name) {
+                                for arg in args {
+                                    self.compile_expr(arg)?;
+                                }
+                                self.emit(Instruction::CallExternal(name.clone(), args.len()));
+                                handled = true;
+                            }
+                        }
+                    }
+                }
+                if !handled {
+                    self.compile_expr(expr)?;
+                }
+                // Emit Await instruction to unwrap Promise objects (including a
+                // deferred single-call promise, which suspends here on its host
+                // call). External call suspension for the direct `await tool()`
+                // form is handled by CallExternal above.
                 self.emit(Instruction::Await);
             }
             Expr::Yield { value, delegate: _ } => {
@@ -1482,26 +1817,35 @@ impl Compiler {
         Ok(())
     }
 
-    /// If `callee(args)` is `Promise.all([...])` and at least one array element
-    /// is a direct call to an external function, compile it as a parallel batch:
-    /// each direct external-call element becomes a deferred call (no suspend),
-    /// other elements compile normally, then `MakeBatchPromise` wraps them.
+    /// If `callee(args)` is `Promise.{all,race,any,allSettled}([...])` and at
+    /// least one array element is a direct call to an external function, compile
+    /// it as a parallel batch tagged with the combinator kind: each direct
+    /// external-call element becomes a deferred call (no suspend), other
+    /// elements compile normally, then `MakeBatchPromise(kind, n)` wraps them.
     /// Returns `true` if it handled the call.
-    fn try_compile_promise_all_batch(&mut self, callee: &Expr, args: &[Expr]) -> Result<bool> {
-        // callee must be `Promise.all`
-        let is_promise_all = matches!(
-            callee,
-            Expr::Member { object, property, .. }
-                if property == "all" && matches!(object.as_ref(), Expr::Ident(n) if n == "Promise")
-        );
-        if !is_promise_all || args.len() != 1 {
+    fn try_compile_promise_batch(&mut self, callee: &Expr, args: &[Expr]) -> Result<bool> {
+        // callee must be `Promise.<combinator>`
+        let Expr::Member { object, property, .. } = callee else {
+            return Ok(false);
+        };
+        if !matches!(object.as_ref(), Expr::Ident(n) if n == "Promise") {
+            return Ok(false);
+        }
+        let kind = match property.as_str() {
+            "all" => BatchKind::All,
+            "race" => BatchKind::Race,
+            "any" => BatchKind::Any,
+            "allSettled" => BatchKind::AllSettled,
+            _ => return Ok(false),
+        };
+        if args.len() != 1 {
             return Ok(false);
         }
         let Expr::Array(elements) = &args[0] else {
             return Ok(false);
         };
         // Only take the batch path if there's at least one direct external call;
-        // otherwise fall through to the normal Promise.all builtin so existing
+        // otherwise fall through to the normal Promise.* builtin so existing
         // behavior (resolved promises, plain values, rejection) is unchanged.
         let has_external_call = elements
             .iter()
@@ -1532,7 +1876,7 @@ impl Compiler {
                 }
             }
         }
-        self.emit(Instruction::MakeBatchPromise(elements.len()));
+        self.emit(Instruction::MakeBatchPromise(kind, elements.len()));
         Ok(true)
     }
 
@@ -1559,7 +1903,8 @@ impl Compiler {
     ) -> Result<()> {
         let class_name = name.unwrap_or("AnonymousClass").to_string();
 
-        // Push super class if present
+        // Push super class if present. Resolve the super reference under the OUTER
+        // class context (it names a sibling/ancestor binding, not this class).
         if let Some(sc) = super_class {
             if let Some(idx) = self.resolve_local(sc) {
                 self.emit(Instruction::LoadLocal(idx));
@@ -1567,6 +1912,12 @@ impl Compiler {
                 self.emit(Instruction::LoadGlobal(sc.to_string()));
             }
         }
+
+        // Method/constructor bodies are compiled with this class as the lexical
+        // `super` context; restore the previous context afterwards so nested or
+        // sibling classes don't leak it.
+        let prev_class = self.current_class.take();
+        self.current_class = Some(class_name.clone());
 
         // Push static methods: name, closure pairs
         for sm in static_methods {
@@ -1595,6 +1946,8 @@ impl Compiler {
         } else {
             self.emit(Instruction::Push(Constant::Undefined));
         }
+
+        self.current_class = prev_class;
 
         self.emit(Instruction::CreateClass {
             name: class_name,
@@ -1652,6 +2005,23 @@ fn is_place_expr(expr: &Expr) -> bool {
         expr,
         Expr::Ident(_) | Expr::Member { .. } | Expr::ComputedMember { .. }
     )
+}
+
+/// Whether an expression's access/call spine contains an optional (`?.`) link,
+/// i.e. it is the top of an optional chain and must short-circuit as a whole.
+fn expr_is_optional_chain(expr: &Expr) -> bool {
+    match expr {
+        Expr::Member {
+            object, optional, ..
+        }
+        | Expr::ComputedMember {
+            object, optional, ..
+        } => *optional || expr_is_optional_chain(object),
+        Expr::Call {
+            callee, optional, ..
+        } => *optional || expr_is_optional_chain(callee),
+        _ => false,
+    }
 }
 
 pub fn compile(program: &Program) -> Result<CompiledProgram> {

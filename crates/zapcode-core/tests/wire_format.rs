@@ -5,7 +5,7 @@ use zapcode_core::{ResourceLimits, Value, ZapcodeRun, ZapcodeSessionSnapshot, Za
 
 fn suspended_snapshot() -> ZapcodeSnapshot {
     let runner = ZapcodeRun::new(
-        r#"const r = fetch("https://example.com");"#.to_string(),
+        r#"const r = await fetch("https://example.com");"#.to_string(),
         Vec::new(),
         vec!["fetch".to_string()],
         ResourceLimits::default(),
@@ -31,7 +31,7 @@ fn load_roundtrips_a_real_snapshot() {
     let bytes = suspended_snapshot().dump().unwrap();
     let loaded = ZapcodeSnapshot::load(&bytes).unwrap();
     // Resuming the reloaded snapshot completes the program.
-    match loaded.resume(Value::Int(7)).unwrap() {
+    match loaded.resume(Value::Int(7)).unwrap().state {
         VmState::Complete(_) => {}
         VmState::Suspended { .. } => panic!("expected completion after resume"),
         VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),

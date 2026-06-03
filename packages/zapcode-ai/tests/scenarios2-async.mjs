@@ -543,77 +543,51 @@ await check("BUG-TOOL-ERR: tool Error in catch is plain string (e.message undefi
 });
 
 // ---------------------------------------------------------------------------
-// 15. Promise.allSettled — probe existence and behavior
-//     CONFIRMED BUG: typeof returns "function" but calling throws
-//     "Promise.allSettled is not a function" — phantom/broken stub
+// 15. Promise.allSettled — now implemented (inline, all-settled inputs).
+//     FIXED (N3): returns one {status,value|reason} object per element.
 // ---------------------------------------------------------------------------
-await check("MISSING: Promise.allSettled is phantom stub (typeof=function but uncallable)", async () => {
+await check("Promise.allSettled returns per-element settled objects", async () => {
   const result = await execute(
     `
-    const typeStr = typeof Promise.allSettled;
-    let callResult = "not-called";
-    try {
-      await Promise.allSettled([Promise.resolve("a")]);
-      callResult = "called-ok";
-    } catch(e) {
-      callResult = "threw:" + String(e);
-    }
-    typeStr + "|" + callResult
+    const r = await Promise.allSettled([Promise.resolve("a"), Promise.reject("e")]);
+    typeof Promise.allSettled + "|" +
+      r[0].status + ":" + r[0].value + "|" + r[1].status + ":" + r[1].reason
     `,
-    {},
-    { autoFix: true }
+    {}
   );
-  // typeof shows "function" but calling throws — broken stub
-  assert.equal(result.output, "function|threw:type error: Promise.allSettled is not a function",
-    `MISSING: Promise.allSettled reports typeof="function" but throws when called. Got: "${result.output}"`);
+  assert.equal(result.output, "function|fulfilled:a|rejected:e",
+    `Promise.allSettled should report per-element statuses. Got: "${result.output}"`);
 });
 
 // ---------------------------------------------------------------------------
-// 16. Promise.race — probe existence and basic behavior
-//     CONFIRMED BUG: same phantom-stub pattern
+// 16. Promise.race — now implemented. FIXED (N1): the first element wins.
 // ---------------------------------------------------------------------------
-await check("MISSING: Promise.race is phantom stub (typeof=function but uncallable)", async () => {
+await check("Promise.race resolves with the first settled value", async () => {
   const result = await execute(
     `
-    const typeStr = typeof Promise.race;
-    let callResult = "not-called";
-    try {
-      await Promise.race([Promise.resolve("a")]);
-      callResult = "called-ok";
-    } catch(e) {
-      callResult = "threw:" + String(e);
-    }
-    typeStr + "|" + callResult
+    const r = await Promise.race([Promise.resolve("first"), Promise.resolve("second")]);
+    typeof Promise.race + "|" + r
     `,
-    {},
-    { autoFix: true }
+    {}
   );
-  assert.equal(result.output, "function|threw:type error: Promise.race is not a function",
-    `MISSING: Promise.race reports typeof="function" but throws when called. Got: "${result.output}"`);
+  assert.equal(result.output, "function|first",
+    `Promise.race should resolve with the first settled value. Got: "${result.output}"`);
 });
 
 // ---------------------------------------------------------------------------
-// 17. Promise.any — probe existence and behavior
-//     CONFIRMED BUG: same phantom-stub pattern
+// 17. Promise.any — now implemented. FIXED (N2): first fulfilled wins, skips
+//     rejections.
 // ---------------------------------------------------------------------------
-await check("MISSING: Promise.any is phantom stub (typeof=function but uncallable)", async () => {
+await check("Promise.any skips rejection and returns first fulfilled", async () => {
   const result = await execute(
     `
-    const typeStr = typeof Promise.any;
-    let callResult = "not-called";
-    try {
-      await Promise.any([Promise.resolve("a")]);
-      callResult = "called-ok";
-    } catch(e) {
-      callResult = "threw:" + String(e);
-    }
-    typeStr + "|" + callResult
+    const r = await Promise.any([Promise.reject("bad"), Promise.resolve("good")]);
+    typeof Promise.any + "|" + r
     `,
-    {},
-    { autoFix: true }
+    {}
   );
-  assert.equal(result.output, "function|threw:type error: Promise.any is not a function",
-    `MISSING: Promise.any reports typeof="function" but throws when called. Got: "${result.output}"`);
+  assert.equal(result.output, "function|good",
+    `Promise.any should skip the rejection and return "good". Got: "${result.output}"`);
 });
 
 // ---------------------------------------------------------------------------

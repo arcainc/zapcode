@@ -36,7 +36,9 @@ const MAGIC: &[u8; 4] = b"ZPC1";
 
 /// Bump on any breaking change to the serialized layout of `Value`,
 /// `CompiledProgram`, the VM frame/continuation types, or the snapshot structs.
-pub(crate) const FORMAT_VERSION: u16 = 1;
+/// v2: `Value::Array`/`Value::Object` now carry a `Handle` into the heap, and
+/// the snapshot carries the heap itself — incompatible with v1 byte layouts.
+pub(crate) const FORMAT_VERSION: u16 = 2;
 
 const HEADER_LEN: usize = 4 + 2 + 1 + 1 + 32;
 
