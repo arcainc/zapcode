@@ -257,8 +257,10 @@ short-circuiting the whole chain.
 **G3 [HIGH] Global-regex `lastIndex` not maintained → `while((m=re.exec(s)))` loops forever** (`allocation limit exceeded`).
 `const r=/a/g; r.test("aaa"); r.lastIndex` → exp `1`, act `null`.
 
-**G4 [HIGH] `match()`/`matchAll` results lack `.index` / `.input` / named `.groups`.**
-`"xxabc".match(/abc/).index` → exp `2`, act `null`; `"12-34".match(/(?<a>\d+)-(?<b>\d+)/).groups` → exp `{a,b}`, act `undefined`.
+**G4 [RESOLVED] `match()`/`matchAll` results lack `.index` / `.input` / named `.groups`.**
+~~`"xxabc".match(/abc/).index` → exp `2`, act `null`; `"12-34".match(/(?<a>\d+)-(?<b>\d+)/).groups` → exp `{a,b}`, act `undefined`.~~
+Non-global `match(re)` and each `matchAll(re)` element now return an **array-like heap object**: keys `"0".."n"` for the capture groups, plus `length`, `index` (match start in *chars*), `input` (the subject), and `groups` (an object of named captures, or `undefined` if the pattern declares none). So `m[0]`, `m[1]`, `m.index`, `m.input`, `m.groups.name`, and `m.length` all work, and `matchAll` is iterable/spreadable. The **global** `match(re)/g` still returns a plain array of matched strings (JS does too), so `.join()` etc. work on it.
+**Trade-off (acceptable):** because heap arrays are `Vec`-backed and cannot carry extra named properties, the non-global result is an *object* rather than an *array* — `Array.isArray("a1".match(/(.)/))` is `false` (and array methods like `.join()`/`.map()` are not available on the non-global result; use indexed access or spread `matchAll`). Tests: `crates/zapcode-core/tests/stress_match_groups.rs`.
 
 **G5 [MED] `split` ignores the `limit` arg and drops regex capture groups.**
 `"a,b,c".split(",",2)` → exp `["a","b"]`, act `["a","b","c"]`; `"a1b2c".split(/(\d)/)` → exp `["a","1","b","2","c"]`, act `["a","b","c"]`.

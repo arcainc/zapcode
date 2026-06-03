@@ -1286,6 +1286,60 @@ fn translate_replacement(repl: &str) -> String {
     out
 }
 
+/// Build a JS-style match result as an array-like heap object for a single
+/// `regex::Captures`. Vec-backed arrays can't carry the extra `.index`,
+/// `.input`, and `.groups` properties a JS match result has, so we model the
+/// result as an object with integer-string keys `"0".."n"` for the capture
+/// groups plus `length`, `index` (match start in *chars*), `input` (subject),
+/// and `groups` (object of named captures, or `undefined` if the pattern has
+/// none). `m[0]`, `m[1]`, `m.index`, `m.input`, `m.groups.name`, and `m.length`
+/// all resolve through normal object key access. `Array.isArray` is therefore
+/// `false` for this value — an accepted trade-off (see STRESS-PASS-BUGS.md).
+fn alloc_match_result(
+    re: &regex::Regex,
+    caps: &regex::Captures,
+    subject: &Arc<str>,
+    heap: &mut Heap,
+) -> Value {
+    let mut map: IndexMap<Arc<str>, Value> = IndexMap::new();
+    // Numbered capture groups, including group 0 (the whole match).
+    let len = caps.len();
+    for i in 0..len {
+        let v = caps
+            .get(i)
+            .map(|mm| Value::String(Arc::from(mm.as_str())))
+            .unwrap_or(Value::Undefined);
+        map.insert(Arc::from(i.to_string().as_str()), v);
+    }
+    map.insert(Arc::from("length"), Value::Int(len as i64));
+    // `index`: start of the whole match, in chars (JS uses code-unit/char index,
+    // not bytes). Convert the regex crate's byte offset.
+    let index_chars = caps
+        .get(0)
+        .map(|m| subject[..m.start()].chars().count())
+        .unwrap_or(0);
+    map.insert(Arc::from("index"), Value::Int(index_chars as i64));
+    map.insert(Arc::from("input"), Value::String(subject.clone()));
+    // Named capture groups -> `groups` object, or `undefined` if the pattern
+    // declares no named groups (matching JS semantics).
+    let named: Vec<&str> = re.capture_names().flatten().collect();
+    let groups_val = if named.is_empty() {
+        Value::Undefined
+    } else {
+        let mut g: IndexMap<Arc<str>, Value> = IndexMap::new();
+        for name in named {
+            let v = caps
+                .name(name)
+                .map(|mm| Value::String(Arc::from(mm.as_str())))
+                .unwrap_or(Value::Undefined);
+            g.insert(Arc::from(name), v);
+        }
+        Value::Object(heap.alloc_object(g))
+    };
+    map.insert(Arc::from("groups"), groups_val);
+    Value::Object(heap.alloc_object(map))
+}
+
 fn call_string_method(
     s: &Arc<str>,
     method: &str,
@@ -1548,16 +1602,9 @@ fn call_string_method(
                     }));
                 }
                 return Ok(Some(match re.captures(s) {
-                    Some(caps) => {
-                        let items: Vec<Value> = caps
-                            .iter()
-                            .map(|c| {
-                                c.map(|m| Value::String(Arc::from(m.as_str())))
-                                    .unwrap_or(Value::Undefined)
-                            })
-                            .collect();
-                        Value::Array(heap.alloc_array(items))
-                    }
+                    // Non-global match: return an array-like object carrying
+                    // `.index`, `.input`, and named `.groups` (G4).
+                    Some(caps) => alloc_match_result(&re, &caps, s, heap),
                     None => Value::Null,
                 }));
             }
@@ -1574,23 +1621,13 @@ fn call_string_method(
         "matchAll" => {
             if let Some((pat, flags)) = args.first().and_then(|v| regexp_parts(v, heap)) {
                 let re = compile_regex(&pat, &flags)?;
-                // Collect raw match groups first, then allocate to avoid borrowing
-                // the heap mutably twice (nested alloc inside a map closure).
-                let raw: Vec<Vec<Value>> = re
-                    .captures_iter(s)
-                    .map(|caps| {
-                        caps.iter()
-                            .map(|c| {
-                                c.map(|m| Value::String(Arc::from(m.as_str())))
-                                    .unwrap_or(Value::Undefined)
-                            })
-                            .collect()
-                    })
-                    .collect();
-                let all: Vec<Value> = raw
-                    .into_iter()
-                    .map(|items| Value::Array(heap.alloc_array(items)))
-                    .collect();
+                // Each yielded result is an array-like object carrying `.index`,
+                // `.input`, and named `.groups` (G4). `captures_iter` borrows only
+                // `re`/`s`, so we can allocate into the heap as we iterate.
+                let mut all: Vec<Value> = Vec::new();
+                for caps in re.captures_iter(s) {
+                    all.push(alloc_match_result(&re, &caps, s, heap));
+                }
                 return Ok(Some(Value::Array(heap.alloc_array(all))));
             }
             Value::Array(heap.alloc_array(Vec::new()))
