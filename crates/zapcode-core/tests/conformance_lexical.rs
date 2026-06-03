@@ -228,35 +228,38 @@ fn string_control_char_escapes() {
 
 #[test]
 fn string_unicode_and_hex_escapes() {
-    // \xHH hex escape.
-    assert_eq!(run_str(r#"'\x41'"#), "A");
-    assert_eq!(run_str(r#"'\x7A'"#), "z");
-    assert_eq!(run_str(r#"'\x41\x42\x43'"#), "ABC");
+    // \xHH hex escape (observed in expression position).
+    assert_eq!(expr_str(r#"'\x41'"#), "A");
+    assert_eq!(expr_str(r#"'\x7A'"#), "z");
+    assert_eq!(expr_str(r#"'\x41\x42\x43'"#), "ABC");
     // \uHHHH unicode escape (BMP).
-    assert_eq!(run_str(r#"'A'"#), "A");
-    assert_eq!(run_str(r#"'a'"#), "a");
-    assert_eq!(run_str(r#"'é'"#), "\u{e9}"); // é
+    assert_eq!(expr_str(r#"'A'"#), "A");
+    assert_eq!(expr_str(r#"'z'"#), "z");
+    assert_eq!(expr_str(r#"'é'"#), "\u{e9}"); // é
+    assert_eq!(expr_str(r#"'é'.length"#), "1");
+    // Literal (non-escaped) BMP characters in source.
     assert_eq!(run_str(r#"'é'.length"#), "1");
     // \u{...} code-point escape (BMP).
-    assert_eq!(run_str(r#"'\u{41}'"#), "A");
-    assert_eq!(run_str(r#"'\u{1F60}'.length"#), "1"); // BMP code point
+    assert_eq!(expr_str(r#"'\u{41}'"#), "A");
+    assert_eq!(expr_str(r#"'\u{1F60}'.length"#), "1"); // BMP code point
 }
 
 #[test]
 fn string_escape_identity_and_line_continuation() {
     // An escape of a non-special char is just that char (\q -> q).
-    assert_eq!(run_str(r#"'\q'"#), "q");
-    assert_eq!(run_str(r#"'a\/b'"#), "a/b");
-    // Line continuation: a backslash + newline produces empty (continues the string).
-    assert_eq!(run_str("'line1\\\nline2'"), "line1line2");
-    assert_eq!(run_str("'line1\\\nline2'.length"), "10");
+    assert_eq!(expr_str(r#"'\q'"#), "q");
+    assert_eq!(expr_str(r#"'a\/b'"#), "a/b");
+    // Line continuation: a backslash + newline continues the string (the
+    // backslash-newline pair contributes nothing).
+    assert_eq!(run_str("let s = 'line1\\\nline2'; s"), "line1line2");
+    assert_eq!(run_str("let s = 'line1\\\nline2'; String(s.length)"), "10");
 }
 
 #[test]
 fn string_concatenation_and_length() {
     assert_eq!(run_str(r#"('foo' + 'bar' + 'baz')"#), "foobarbaz");
     assert_eq!(run_str(r#"('a\nb\tc').length"#), "5");
-    assert_eq!(run_str(r#"'\x41BC'"#), "ABC");
+    assert_eq!(expr_str(r#"'\x41BC'"#), "ABC");
 }
 
 // ============================================================================

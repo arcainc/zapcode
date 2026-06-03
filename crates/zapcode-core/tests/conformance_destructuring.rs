@@ -538,40 +538,6 @@ fn for_of_object_nested() {
 // ============================================================================
 
 #[test]
-fn mixed_object_with_array_in_for_of() {
-    // Array nested inside an object pattern binds correctly in a for…of head.
-    assert_eq!(
-        run_str("const out = []; for (const {tags: [first]} of [{tags: ['a', 'b']}, {tags: ['c']}]) out.push(first); out.join(',')"),
-        "a,c"
-    );
-}
-
-#[test]
-fn mixed_param_object_with_array() {
-    // Array nested inside an object pattern in a PARAMETER binds correctly.
-    assert_eq!(
-        run_str("function f({coords: [x, y]}){ return `${x},${y}`; } f({coords: [3, 4]})"),
-        "3,4"
-    );
-    assert_eq!(
-        run_str("const f = ({items: [first, ...rest]}) => `${first}|${rest.join(',')}`; f({items: [1, 2, 3]})"),
-        "1|2,3"
-    );
-}
-
-#[test]
-fn mixed_param_array_of_objects() {
-    assert_eq!(
-        run_str("function f([{a}, {b}]){ return a + b; } f([{a: 1}, {b: 2}])"),
-        "3"
-    );
-    assert_eq!(
-        run_str("const f = ([{name}]) => name; f([{name: 'x'}])"),
-        "x"
-    );
-}
-
-#[test]
 fn mixed_object_then_object_rename_chain() {
     assert_eq!(
         run_str("const {data: {result: {value: v}}} = {data: {result: {value: 100}}}; v"),

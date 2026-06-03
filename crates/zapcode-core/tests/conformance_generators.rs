@@ -24,6 +24,7 @@
 //!   * `yield*` delegating to another GENERATOR does not flatten (yields the
 //!     generator object → `[object Generator]`). JS: it flattens.
 //!   * `yield*` over an EMPTY ARRAY yields one stray `undefined`. JS: nothing.
+//!   * `yield*` over a STRING yields the whole string as one value (JS: chars).
 //!   * `yield*` over a Set / Map does not iterate the collection's elements.
 //!   * a generator's `.throw(...)` method does not exist.
 //!   * `it[Symbol.iterator]()` (generator self-iterability via the well-known
