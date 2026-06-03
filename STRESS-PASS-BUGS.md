@@ -2,6 +2,19 @@
 
 ## Fix status (in progress)
 
+**Round 3 (branch `arca/heap-handles-rewrite`) — the heap-with-handles rewrite:**
+- **A (reference semantics) — FIXED.** `Value::Array`/`Object` now carry a `Handle`
+  into a VM-owned `Heap`; cloning a value shares the slot, so aliasing,
+  mutate-through-parameter, Map-of-arrays bucket pushes, identity `===`, and
+  identity Map object-keys all behave like JS. `structuredClone` deep-copies.
+  The old place/write-back machinery is retired in favour of in-place heap
+  mutation. The heap serializes with the snapshot (handles preserve sharing; a
+  cycle-safe visited-set was added to the serializability walk). Verified: 537
+  core tests + 8 new `stress_references.rs` tests + full JS scenario3/e2e suites,
+  all green. (54 files, +2762/-1614.)
+
+
+
 **Round 2 (branch `arca/heap-handles-rewrite`) — Tier A complete + most of Tier B:**
 - **J4** nested `for…of`; **D1/D2** function hoisting; **C4** caught runtime
   errors are real `Error` objects; **B1** trailing-block completion values;
