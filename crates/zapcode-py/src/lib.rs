@@ -255,9 +255,14 @@ fn run_result_to_py(
             dict.set_item("snapshot", ZapcodeSnapshot { inner: snapshot })?;
             dict.set_item("stdout", stdout)?;
         }
-        VmState::SuspendedMany { calls, snapshot } => {
+        VmState::SuspendedMany {
+            calls,
+            combinator,
+            snapshot,
+        } => {
             dict.set_item("suspended", true)?;
             dict.set_item("suspended_many", true)?;
+            dict.set_item("combinator", combinator.as_str())?;
             let py_calls = PyList::empty(py);
             for call in &calls {
                 let call_dict = PyDict::new(py);

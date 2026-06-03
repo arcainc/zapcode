@@ -340,7 +340,11 @@ fn vm_state_to_js(
             )
             .map_err(|_| JsError::new("failed to set stdout"))?;
         }
-        VmState::SuspendedMany { calls, snapshot } => {
+        VmState::SuspendedMany {
+            calls,
+            combinator,
+            snapshot,
+        } => {
             Reflect::set(&obj, &JsValue::from_str("suspended"), &JsValue::from(true))
                 .map_err(|_| JsError::new("failed to set suspended"))?;
             Reflect::set(
@@ -349,6 +353,12 @@ fn vm_state_to_js(
                 &JsValue::from(true),
             )
             .map_err(|_| JsError::new("failed to set suspendedMany"))?;
+            Reflect::set(
+                &obj,
+                &JsValue::from_str("combinator"),
+                &JsValue::from_str(combinator.as_str()),
+            )
+            .map_err(|_| JsError::new("failed to set combinator"))?;
             let js_calls = Array::new_with_length(calls.len() as u32);
             for (i, call) in calls.iter().enumerate() {
                 let call_obj = Object::new();

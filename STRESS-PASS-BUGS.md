@@ -2,6 +2,49 @@
 
 ## Fix status (in progress)
 
+**Round 4 (branch `arca/heap-handles-rewrite`) — Promise combinators + `super.method` + MED/LOW edges:**
+- **C3 `super.method()` / `super.prop` — FIXED.** Class methods now track their
+  defining class on the frame, so `super.g()` dispatches to the parent method with
+  the subclass instance as `this` (reads `this`-fields set after `super()`), chains
+  through three+ levels, and `super.g` (no call) yields the parent function value.
+  Coexists with `instanceof` and normal inherited dispatch. (`stress_classes.rs`.)
+- **N1 `Promise.race` / N2 `Promise.any` / N3 `Promise.allSettled` — FIXED.** When an
+  array element is a direct external call, the combinator lowers to a
+  `MakeBatchPromise(kind,n)` deferred batch; awaiting it suspends once with
+  `VmState::SuspendedMany { combinator, .. }`. The host bridge runs the *real* JS
+  combinator (true settle timing for race/any) and resumes per kind: race →
+  first-settled value (or first rejection); any → first fulfilled (else
+  AggregateError); allSettled → per-element `{status,value|reason}`, never rejects.
+  Inline (no-external-call) combinators settle without a host round-trip. `Promise.all`
+  baseline preserved. (`stress_promise_combinators.rs` + e2e `parallel`/`stress`.)
+- **N8 `Promise.resolve` adoption — FIXED.** `Promise.resolve(value)` /
+  `Promise.resolve(promise)` adopt rather than double-wrap; awaiting a resolved
+  promise unwraps to its value.
+- **N4 tool calls inside `.then`/`.catch`/`.finally` callbacks — FIXED** (prior commit;
+  enables the `primary().catch(() => fallback())` retry pattern). (`stress_then_tools.rs`.)
+- **Edges:** **O5** (`"key" in obj` no longer a parse error when the line starts with a
+  string literal; array `length`/numeric-index `in` membership, own-keys only),
+  **H6** (`Map.set`/`Set.add` return the collection so chaining works; returns the same
+  shared handle under reference semantics), **G3** (a `/g` regex maintains `lastIndex`
+  so `while((m=re.exec(s))!==null)` terminates, and `/g .test()` advances then resets),
+  **O8** (minimal `Symbol`: `typeof Symbol === "function"`, `Symbol()` is a unique
+  `typeof === "symbol"` value with `.description`, usable as a computed key) — all FIXED.
+  Bonus: a stale `last_global_name` no longer leaks a builtin method into an unrelated
+  member access (`String(o.missing)` → `"undefined"`, not `"function"`). (`stress_edges_round1.rs`.)
+- **Binding parity:** `zapcode-wasm` and `zapcode-py` now destructure and surface the new
+  `combinator` field on `SuspendedMany`, so `cargo build --workspace` is clean.
+- **Intentionally deferred (still divergent):** **N5** full tool-call-as-deferred-Promise
+  (a bare tool-call expression is still an eagerly-resolved value, not a real Promise
+  object with `.then`; combinators only defer when an array element is a *direct* external
+  call); **N9** `for await…of` / async-generator consumption (parse-level gap); **G4**
+  `match()`/`matchAll` `.index`/`.input`/named `.groups`; **O4** `valueOf`/`toString`/
+  `Symbol.toPrimitive` coercion hooks; **G9** UTF-16 string indexing (strings are indexed
+  by code point). **N7** `AggregateError` global landed in Round 2; `Promise.any`'s
+  all-reject surfaces an AggregateError-shaped rejection via the host bridge.
+- **Verified:** 579 core tests (0 failed) + `cargo build --workspace` clean (0 warnings) +
+  full JS `test:scenarios3` (10 scenarios) and `test:e2e` (all suites incl. `parallel`/
+  `stress`/`marshalling`) green.
+
 **Round 3 (branch `arca/heap-handles-rewrite`) — the heap-with-handles rewrite:**
 - **A (reference semantics) — FIXED.** `Value::Array`/`Object` now carry a `Handle`
   into a VM-owned `Heap`; cloning a value shares the slot, so aliasing,
