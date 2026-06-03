@@ -430,12 +430,12 @@ await test("durable helper functions (rest params, named callbacks) survive dump
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 10. ANOMALY: a factory-local closure's captured mutable state is NOT preserved
-//     across a dump/load boundary (works within a single chunk). Top-level state
-//     IS preserved (covered by the STRESS test above). Encoded as the actual,
-//     deterministic behavior so the file stays green; reported separately.
+// 10. A factory-local closure's captured mutable state IS preserved across a
+//     dump/load boundary, just like top-level state (covered by the STRESS test
+//     above). The shared upvalue cell backing the capture travels in the
+//     idle-session snapshot and is re-linked on load. Matches real Node.
 // ─────────────────────────────────────────────────────────────────────────────
-await test("ANOMALY: factory-local closure state works in-chunk but resets across dump/load", async () => {
+await test("factory-local closure state survives dump/load (matches Node)", async () => {
   const events = [];
   const tools = createWorkflowTools(events);
 
@@ -450,8 +450,7 @@ await test("ANOMALY: factory-local closure state works in-chunk but resets acros
   );
   assert.equal(inChunk.output, "1,2,3");
 
-  // Across a dump/load boundary, the captured frame is not serialized: the
-  // returned closure reads as if reset (observed actual value: null).
+  // Across a dump/load boundary, the captured cell survives: tick() continues.
   let session = createSession({ tools });
   const first = await session.runChunk(`
     function makeCounter() { let n = 0; return () => { n = n + 1; return n; }; }
@@ -462,8 +461,8 @@ await test("ANOMALY: factory-local closure state works in-chunk but resets acros
 
   session = reload(session, tools);
   const afterReload = await session.runChunk(`tick()`);
-  // Standard JS would give 2 here; this sandbox loses the factory-local frame.
-  assert.equal(afterReload.output, null);
+  // Standard JS gives 2 here; the factory-local frame's cell is preserved.
+  assert.equal(afterReload.output, 2);
 });
 
 console.log(`\n${passed} scenarios3 state-machine checks passed.`);

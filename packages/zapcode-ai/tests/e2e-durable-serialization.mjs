@@ -12,10 +12,11 @@
  *     calls AND `Promise.all` batches), including error injection at the boundary;
  *   - byte-stability: re-dumping an idle state and reloading is value-preserving.
  *
- * It also pins the one documented serialization boundary: a closure returned from
- * a nested function call does NOT retain its captured function-local environment
- * across dump/load (top-level/module-level state does) — see
- * `nested_closure_capture_resets_across_serialization`.
+ * It also covers the nested-closure capture case: a closure returned from a
+ * nested function call DOES retain its captured function-local environment
+ * across dump/load — the shared upvalue cell backing the capture travels in the
+ * idle-session snapshot — just like top-level/module-level state. See
+ * `nested_closure_capture_survives_serialization`.
  */
 import assert from "node:assert/strict";
 import { createSession, loadSession } from "../dist/index.js";
@@ -217,25 +218,24 @@ await test("idle re-dump is value-preserving (dump → load → dump → load)",
 // Documented serialization boundary
 // ---------------------------------------------------------------------------
 
-await test("nested_closure_capture_resets_across_serialization", async () => {
-  // DIVERGENCE (documented): a closure RETURNED from a nested function call does
-  // not retain its captured function-local environment across dump/load. Within a
-  // single session it works; after a reload the captured locals are gone (an arrow
-  // closure reads `undefined` → arithmetic yields NaN; an object-method call
-  // returns the receiver rather than its computed result). Top-level / module-level
-  // closures (see the earlier test) DO survive. Asserting actual behavior.
+await test("nested_closure_capture_survives_serialization", async () => {
+  // A closure RETURNED from a nested function call retains its captured
+  // function-local environment across dump/load — the shared upvalue cell that
+  // backs the capture is carried in the idle-session snapshot and re-linked on
+  // load, the same way top-level / module-level closures survive (see the
+  // earlier test). Matches real Node.
 
   // Sanity: it works WITHOUT a reload.
   let s = createSession({ tools: {} });
   const same = await s.runChunk(`function mk(){ let n = 10; return () => ++n; } const inc = mk(); inc() + ',' + inc()`);
   assert.equal(same.output, "11,12");
 
-  // After a reload, the captured `n` is lost.
+  // After a reload, the captured `n` survives: the next ++n continues from 11.
   s = createSession({ tools: {} });
-  await s.runChunk(`function mk(){ let n = 10; return () => ++n; } const inc = mk(); inc();`);
+  await s.runChunk(`function mk(){ let n = 10; return () => ++n; } const inc = mk(); inc();`); // n = 11
   s = reload(s);
   const afterReload = await s.runChunk(`String(inc())`);
-  assert.equal(afterReload.output, "NaN"); // JS: "12"
+  assert.equal(afterReload.output, "12");
 });
 
 console.log(`\n${passed} durable-serialization checks passed.`);
