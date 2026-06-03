@@ -586,11 +586,41 @@ fn nested_array_var_decl_documented_divergence() {
 
 #[test]
 fn array_inside_object_var_decl_documented_divergence() {
-    // DIVERGENCE: an array pattern nested inside an OBJECT var-decl pattern does not
-    // bind (the inner names come out `undefined`). (Object-in-object nesting works;
-    // see object_nested_deep. And array-in-object works in for…of / params.)
+    // DIVERGENCE: an array pattern nested inside an OBJECT pattern does not bind —
+    // the inner names come out `undefined`. (Object-in-object nesting works; see
+    // object_nested_deep.) Only a DIRECT array-in-array for…of head binds nested
+    // arrays (see for_of_array_nested).
     assert_eq!(run_str("const {arr: [x, y]} = {arr: [1, 2]}; String(x) + ',' + String(y)"), "undefined,undefined"); // JS: 1,2
     assert_eq!(run_str("const {p: {q: [r]}} = {p: {q: [42]}}; String(r)"), "undefined"); // JS: 42
+}
+
+#[test]
+fn array_inside_object_for_of_documented_divergence() {
+    // DIVERGENCE: an array pattern nested inside an OBJECT pattern does not bind even
+    // in a for…of head (the array-in-ARRAY for…of head DOES bind; see
+    // for_of_array_nested — this is the array-in-OBJECT form).
+    assert_eq!(
+        run_str("const out = []; for (const {tags: [first]} of [{tags: ['a', 'b']}, {tags: ['c']}]) out.push(String(first)); out.join(',')"),
+        "undefined,undefined" // JS: a,c
+    );
+}
+
+#[test]
+fn array_inside_object_param_documented_divergence() {
+    // DIVERGENCE: an array pattern nested inside an OBJECT parameter pattern does not
+    // bind (inner names come out `undefined`).
+    assert_eq!(
+        run_str("function f({coords: [x, y]}){ return String(x) + ',' + String(y); } f({coords: [3, 4]})"),
+        "undefined,undefined" // JS: 3,4
+    );
+}
+
+#[test]
+fn object_inside_array_param_documented_divergence() {
+    // DIVERGENCE: an object pattern nested inside an ARRAY parameter pattern does not
+    // bind (inner names come out `undefined`).
+    assert_eq!(run_str("function f([{a}, {b}]){ return a + b; } f([{a: 1}, {b: 2}])"), "NaN"); // JS: 3
+    assert_eq!(run_str("const f = ([{name}]) => String(name); f([{name: 'x'}])"), "undefined"); // JS: x
 }
 
 #[test]
@@ -617,11 +647,12 @@ fn param_pattern_defaults_documented_divergence() {
 #[test]
 fn destructuring_assignment_to_existing_targets_unsupported() {
     // DIVERGENCE: destructuring ASSIGNMENT (to already-declared names or member
-    // expressions, i.e. without a `const`/`let`/`var`) is a CompileError. Only the
-    // declaration form is supported. JS accepts all of these. Pinned by compile
-    // failure rather than a brittle message.
-    assert!(is_compile_error("let a = 1, b = 2; [a, b] = [b, a]; a + ',' + b")); // JS swap: 2,1
-    assert!(is_compile_error("let a, b; ({a, b} = {a: 1, b: 2}); a + b")); // JS: 3
-    assert!(is_compile_error("const o = {}; ({x: o.p} = {x: 7}); o.p")); // JS: 7
-    assert!(is_compile_error("let arr = []; [arr[0], arr[1]] = [1, 2]; JSON.stringify(arr)")); // JS: [1,2]
+    // expressions, i.e. without a `const`/`let`/`var`) errors with an
+    // "unsupported assignment target" CompileError (raised lazily at run time).
+    // Only the declaration form is supported. JS accepts all of these. Pinned by
+    // error rather than a brittle message.
+    assert!(errors_out("let a = 1, b = 2; [a, b] = [b, a]; a + ',' + b")); // JS swap: 2,1
+    assert!(errors_out("let a, b; ({a, b} = {a: 1, b: 2}); a + b")); // JS: 3
+    assert!(errors_out("const o = {}; ({x: o.p} = {x: 7}); o.p")); // JS: 7
+    assert!(errors_out("let arr = []; [arr[0], arr[1]] = [1, 2]; JSON.stringify(arr)")); // JS: [1,2]
 }
