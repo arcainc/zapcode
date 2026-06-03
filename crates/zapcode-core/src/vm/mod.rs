@@ -3608,6 +3608,10 @@ impl Vm {
                                     args.first().unwrap_or(&Value::Undefined),
                                     &mut self.heap,
                                 );
+                                // Charge the produced array against the memory limit
+                                // before invoking the mapFn per element, so a giant
+                                // `{length:n}` source can't allocate untracked.
+                                self.track_array_capacity(src.len())?;
                                 let map_fn = args[1].clone();
                                 let mut out = Vec::with_capacity(src.len());
                                 for (i, item) in src.iter().enumerate() {
@@ -3615,6 +3619,32 @@ impl Vm {
                                 }
                                 let h = self.heap.alloc_array(out);
                                 Some(Value::Array(h))
+                            }
+                            // Array.from(arrayLike) / Array.of(...) allocate an
+                            // array sized from guest-controlled input. Charge the
+                            // length against the memory limit *before* the builtin
+                            // materializes the Vec, so a huge `{length:n}` can't
+                            // bypass the limit (untracked multi-GB allocation).
+                            "Array"
+                                if method_name.as_ref() == "from"
+                                    || method_name.as_ref() == "of" =>
+                            {
+                                let len = if method_name.as_ref() == "of" {
+                                    args.len()
+                                } else {
+                                    builtins::array_from_source_len(
+                                        args.first().unwrap_or(&Value::Undefined),
+                                        &self.heap,
+                                    )
+                                };
+                                self.track_array_capacity(len)?;
+                                builtins::call_global_method(
+                                    "Array",
+                                    &method_name,
+                                    &args,
+                                    &mut self.stdout,
+                                    &mut self.heap,
+                                )?
                             }
                             global_name => builtins::call_global_method(
                                 global_name,

@@ -27,7 +27,7 @@
 //!    confusing postcard decode error deep in the wrong type.
 
 use miniz_oxide::deflate::compress_to_vec;
-use miniz_oxide::inflate::decompress_to_vec;
+use miniz_oxide::inflate::decompress_to_vec_with_limit;
 use sha2::{Digest, Sha256};
 
 use crate::error::{Result, ZapcodeError};
@@ -41,6 +41,14 @@ const MAGIC: &[u8; 4] = b"ZPC1";
 pub(crate) const FORMAT_VERSION: u16 = 2;
 
 const HEADER_LEN: usize = 4 + 2 + 1 + 1 + 32;
+
+/// Hard ceiling on the *inflated* payload size accepted by [`decode_frame`] at
+/// load time. The per-snapshot `max_snapshot_bytes` limit lives *inside* the
+/// payload we haven't decoded yet (and is attacker-controlled in a forged blob),
+/// so the load path enforces this fixed, deployment-independent cap instead.
+/// Matches the default `max_snapshot_bytes` (256MB) so honest snapshots produced
+/// under default limits always load, while a decompression bomb is rejected.
+pub(crate) const MAX_LOAD_DECOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
 
 const COMPRESSION_NONE: u8 = 0;
 const COMPRESSION_DEFLATE: u8 = 1;
@@ -111,7 +119,17 @@ pub(crate) fn encode_frame(kind: FrameKind, payload: &[u8]) -> Vec<u8> {
 /// Rejects (with actionable errors) a bad magic, a format-version mismatch, a
 /// wrong payload kind, a payload whose SHA-256 doesn't match the header, or an
 /// undecompressable payload. The hash is checked before decompression.
-pub(crate) fn decode_frame(expected: FrameKind, bytes: &[u8]) -> Result<Vec<u8>> {
+///
+/// `max_decompressed` caps the *inflated* size: a DEFLATE payload can decompress
+/// to far more than its stored bytes (a decompression bomb), so we bound the
+/// inflation itself rather than checking the size after allocating. A frame
+/// whose payload inflates past the cap is rejected before the giant buffer is
+/// fully materialized, closing the snapshot-load memory-exhaustion vector.
+pub(crate) fn decode_frame(
+    expected: FrameKind,
+    bytes: &[u8],
+    max_decompressed: usize,
+) -> Result<Vec<u8>> {
     if bytes.len() < HEADER_LEN {
         return Err(ZapcodeError::SnapshotError(format!(
             "{} blob is too short to contain a header ({} bytes)",
@@ -160,10 +178,34 @@ pub(crate) fn decode_frame(expected: FrameKind, bytes: &[u8]) -> Result<Vec<u8>>
     }
 
     match compression_byte[0] {
-        COMPRESSION_NONE => Ok(stored.to_vec()),
-        COMPRESSION_DEFLATE => decompress_to_vec(stored).map_err(|e| {
-            ZapcodeError::SnapshotError(format!("snapshot decompression failed: {}", e))
-        }),
+        COMPRESSION_NONE => {
+            // An uncompressed payload can also exceed the budget; reject it the
+            // same way rather than handing a huge buffer to postcard.
+            if stored.len() > max_decompressed {
+                return Err(ZapcodeError::SnapshotError(format!(
+                    "snapshot payload is {} bytes, exceeding the {}-byte load limit",
+                    stored.len(),
+                    max_decompressed
+                )));
+            }
+            Ok(stored.to_vec())
+        }
+        COMPRESSION_DEFLATE => {
+            // Bound the inflated output: miniz_oxide stops (with an error) once
+            // it would exceed the cap, so a high-ratio decompression bomb can't
+            // force a multi-GB allocation on load.
+            decompress_to_vec_with_limit(stored, max_decompressed).map_err(|e| {
+                if matches!(e.status, miniz_oxide::inflate::TINFLStatus::HasMoreOutput) {
+                    ZapcodeError::SnapshotError(format!(
+                        "snapshot decompresses to more than the {}-byte load limit \
+                         (possible decompression bomb)",
+                        max_decompressed
+                    ))
+                } else {
+                    ZapcodeError::SnapshotError(format!("snapshot decompression failed: {:?}", e.status))
+                }
+            })
+        }
         other => Err(ZapcodeError::SnapshotError(format!(
             "unknown snapshot compression byte {}",
             other

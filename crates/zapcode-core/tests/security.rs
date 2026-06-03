@@ -1057,3 +1057,351 @@ fn test_finalization_registry_escape() {
     // not supported is good
     let _ = result;
 }
+
+// ── 10. Reference-cycle / deep-recursion host-abort hardening ────────
+//
+// Reference semantics let guest code build cycles (`const a=[]; a.push(a)`) and
+// arbitrarily deep structures. The recursive value walkers (JSON.stringify,
+// String()/template/join coercion, structuredClone, and the host marshalling
+// layer) must NEVER overflow the native stack and abort the host process — they
+// must surface a catchable error or render a bounded placeholder. These cover
+// the pure-Rust paths; the napi-boundary equivalents live in the JS test suite.
+
+use zapcode_core::{ResourceLimits, ZapcodeRun};
+
+/// Run a snippet to completion under explicit resource limits.
+fn eval_with_limits(source: &str, limits: ResourceLimits) -> Result<Value, ZapcodeError> {
+    ZapcodeRun::new(source.to_string(), Vec::new(), Vec::new(), limits)?.run_simple()
+}
+
+#[test]
+fn cyclic_array_json_stringify_throws_catchable_typeerror() {
+    // Real JS throws "Converting circular structure to JSON"; we must do the
+    // same (a catchable error) rather than overflow the native stack.
+    let result = eval_ts("const a = []; a.push(a); JSON.stringify(a)");
+    match result {
+        Err(ZapcodeError::TypeError(msg)) => {
+            assert!(
+                msg.contains("circular structure"),
+                "expected the circular-structure TypeError, got: {msg}"
+            );
+        }
+        other => panic!("expected a catchable TypeError, got: {other:?}"),
+    }
+}
+
+#[test]
+fn cyclic_object_json_stringify_throws_catchable_typeerror() {
+    let result = eval_ts("const o = {}; o.self = o; JSON.stringify(o)");
+    assert!(
+        matches!(result, Err(ZapcodeError::TypeError(ref m)) if m.contains("circular structure")),
+        "expected circular-structure TypeError, got: {result:?}"
+    );
+}
+
+#[test]
+fn indirect_cycle_json_stringify_throws_catchable_typeerror() {
+    let result = eval_ts("const a = []; const b = [a]; a.push(b); JSON.stringify(a)");
+    assert!(
+        matches!(result, Err(ZapcodeError::TypeError(ref m)) if m.contains("circular structure")),
+        "expected circular-structure TypeError, got: {result:?}"
+    );
+}
+
+#[test]
+fn cyclic_stringify_is_catchable_inside_guest() {
+    // The guest can recover from the cyclic-stringify error with try/catch.
+    let result = eval_ts(
+        r#"
+        const a = []; a.push(a);
+        let caught = false;
+        try { JSON.stringify(a); } catch (e) { caught = true; }
+        caught
+    "#,
+    );
+    assert_eq!(result.unwrap(), Value::Bool(true));
+}
+
+#[test]
+fn cyclic_array_string_coercion_is_bounded_not_fatal() {
+    // String() / template / join of a cycle must not abort; it returns a bounded
+    // (possibly placeholder-containing) string.
+    let result = eval_ts("const a = []; a.push(a); String(a)");
+    assert!(result.is_ok(), "String(cycle) must not abort: {result:?}");
+    let result = eval_ts("const a = []; a.push(a); `${a}`");
+    assert!(result.is_ok(), "template of cycle must not abort: {result:?}");
+    let result = eval_ts("const a = []; a.push(a); a.join(',')");
+    assert!(result.is_ok(), "join of cycle must not abort: {result:?}");
+}
+
+#[test]
+fn cyclic_console_log_is_bounded_not_fatal() {
+    let (_, out) = zapcode_core::vm::eval_ts_with_output(
+        "const a = []; a.push(a); console.log(a); 1",
+    )
+    .expect("console.log of a cycle must not abort");
+    // It produced *some* bounded output line.
+    assert!(!out.is_empty());
+}
+
+#[test]
+fn cyclic_structured_clone_roundtrips_without_abort() {
+    // structuredClone of a cycle must terminate (JS preserves the cycle); the
+    // clone is independent of the original and its self-reference is intact.
+    let result = eval_ts(
+        r#"
+        const a = []; a.push(a);
+        const c = structuredClone(a);
+        // The clone is a distinct object whose first element is itself.
+        (c !== a) && (c[0] === c) && (c.length === 1)
+    "#,
+    );
+    assert_eq!(result.unwrap(), Value::Bool(true));
+}
+
+#[test]
+fn cyclic_object_structured_clone_roundtrips() {
+    let result = eval_ts(
+        r#"
+        const o = {}; o.self = o;
+        const c = structuredClone(o);
+        (c !== o) && (c.self === c)
+    "#,
+    );
+    assert_eq!(result.unwrap(), Value::Bool(true));
+}
+
+#[test]
+fn shared_structure_preserved_by_structured_clone() {
+    // Two refs to the same inner array must remain a single shared clone.
+    let result = eval_ts(
+        r#"
+        const inner = [1];
+        const outer = [inner, inner];
+        const c = structuredClone(outer);
+        c[0] === c[1]
+    "#,
+    );
+    assert_eq!(result.unwrap(), Value::Bool(true));
+}
+
+#[test]
+fn deeply_nested_json_stringify_is_catchable_not_fatal() {
+    // Runtime-built deep (acyclic) nesting that previously overflowed the native
+    // stack must now surface a catchable error instead of aborting.
+    let result = eval_ts(
+        r#"
+        let a = { v: 1 };
+        for (let i = 0; i < 9000; i++) { a = { n: a }; }
+        JSON.stringify(a).length
+    "#,
+    );
+    match result {
+        Ok(_) => {} // bounded but accepted (shouldn't happen past the cap, but fine)
+        Err(ZapcodeError::RuntimeError(msg)) => {
+            assert!(
+                msg.contains("nesting depth"),
+                "expected a nesting-depth error, got: {msg}"
+            );
+        }
+        Err(other) => panic!("expected RuntimeError(nesting depth), got: {other:?}"),
+    }
+}
+
+#[test]
+fn deeply_nested_structured_clone_is_catchable_not_fatal() {
+    let result = eval_ts(
+        r#"
+        let a = { v: 1 };
+        for (let i = 0; i < 9000; i++) { a = { n: a }; }
+        structuredClone(a); 1
+    "#,
+    );
+    match result {
+        Ok(_) => {}
+        Err(ZapcodeError::RuntimeError(msg)) => {
+            assert!(
+                msg.contains("nesting depth"),
+                "expected a nesting-depth error, got: {msg}"
+            );
+        }
+        Err(other) => panic!("expected RuntimeError(nesting depth), got: {other:?}"),
+    }
+}
+
+#[test]
+fn deeply_nested_string_coercion_is_bounded_not_fatal() {
+    // String() of a deep (acyclic) array must not abort the host.
+    let result = eval_ts(
+        r#"
+        let a: any = [1];
+        for (let i = 0; i < 9000; i++) { a = [a]; }
+        String(a).length >= 0
+    "#,
+    );
+    assert!(result.is_ok(), "String(deep) must not abort: {result:?}");
+}
+
+// ── 11. Parser nesting-depth guard (parse-time stack overflow) ───────
+
+#[test]
+fn deeply_nested_array_literal_is_parse_error_not_abort() {
+    // ~10k nested array literals previously overflowed oxc's recursive descent
+    // at parse time, aborting the host before any VM limit was consulted.
+    let n = 10_000;
+    let code = format!("const x = {}{}; 1", "[".repeat(n), "]".repeat(n));
+    match eval_ts(&code) {
+        Err(ZapcodeError::ParseError(msg)) => {
+            assert!(
+                msg.contains("nesting depth"),
+                "expected a nesting-depth parse error, got: {msg}"
+            );
+        }
+        other => panic!("expected a ParseError, got: {other:?}"),
+    }
+}
+
+#[test]
+fn deeply_nested_object_literal_is_parse_error_not_abort() {
+    let n = 10_000;
+    let code = format!("const x = {}1{}; 1", "{a:".repeat(n), "}".repeat(n));
+    assert!(
+        matches!(eval_ts(&code), Err(ZapcodeError::ParseError(ref m)) if m.contains("nesting depth")),
+        "expected a nesting-depth ParseError"
+    );
+}
+
+#[test]
+fn modestly_nested_literal_still_parses() {
+    // The cap is well above any realistic structure: a 32-deep array parses fine.
+    let n = 32;
+    let code = format!("const x = {}{}; x.length", "[".repeat(n), "]".repeat(n));
+    let result = eval_ts(&code);
+    assert!(result.is_ok(), "32-deep literal should parse: {result:?}");
+}
+
+#[test]
+fn brackets_inside_strings_do_not_trip_the_depth_guard() {
+    // A string full of `[` must not be counted as nesting.
+    let code = format!("const s = \"{}\"; s.length", "[".repeat(5000));
+    let result = eval_ts(&code);
+    assert!(
+        result.is_ok(),
+        "brackets inside a string literal must not trip the guard: {result:?}"
+    );
+}
+
+// ── 12. Resource-limit bypass via unbounded builtin allocations ──────
+
+fn tight_mem_limits() -> ResourceLimits {
+    ResourceLimits {
+        memory_limit_bytes: 8 * 1024 * 1024, // 8MB
+        time_limit_ms: 20_000,
+        ..ResourceLimits::default()
+    }
+}
+
+#[test]
+fn array_from_length_arraylike_respects_memory_limit() {
+    // Array.from({length: huge}) previously allocated an untracked multi-GB Vec.
+    let result = eval_with_limits(
+        "const a = Array.from({length: 50000000}); a.length",
+        tight_mem_limits(),
+    );
+    assert!(
+        matches!(
+            result,
+            Err(ZapcodeError::MemoryLimitExceeded(_)) | Err(ZapcodeError::AllocationLimitExceeded)
+        ),
+        "Array.from({{length:50M}}) must hit a resource limit, got: {result:?}"
+    );
+}
+
+#[test]
+fn array_from_small_arraylike_still_works() {
+    let result = eval_with_limits(
+        "const a = Array.from({length: 3}); a.length",
+        tight_mem_limits(),
+    );
+    assert_eq!(result.unwrap(), Value::Int(3));
+}
+
+#[test]
+fn pad_start_respects_memory_limit() {
+    let result = eval_with_limits(
+        "const s = 'x'.padStart(200000000, 'ab'); s.length",
+        tight_mem_limits(),
+    );
+    assert!(
+        matches!(result, Err(ZapcodeError::MemoryLimitExceeded(_))),
+        "padStart past the cap must throw MemoryLimitExceeded, got: {result:?}"
+    );
+}
+
+#[test]
+fn pad_end_respects_memory_limit() {
+    let result = eval_with_limits(
+        "const s = 'x'.padEnd(200000000, 'ab'); s.length",
+        tight_mem_limits(),
+    );
+    assert!(
+        matches!(result, Err(ZapcodeError::MemoryLimitExceeded(_))),
+        "padEnd past the cap must throw MemoryLimitExceeded, got: {result:?}"
+    );
+}
+
+#[test]
+fn array_join_respects_memory_limit() {
+    // Build many references to one large string (cheap — Arc shares it), then
+    // join into one giant contiguous buffer (previously untracked).
+    let result = eval_with_limits(
+        r#"
+        const s = "x".repeat(1000000);
+        const a = [];
+        let i = 0;
+        while (i < 300) { a.push(s); i = i + 1; }
+        a.join("").length
+    "#,
+        tight_mem_limits(),
+    );
+    assert!(
+        matches!(result, Err(ZapcodeError::MemoryLimitExceeded(_))),
+        "Array.join past the cap must throw MemoryLimitExceeded, got: {result:?}"
+    );
+}
+
+#[test]
+fn string_concat_respects_memory_limit() {
+    let result = eval_with_limits(
+        r#"
+        const s = "x".repeat(5000000);
+        s.concat(s, s, s, s, s).length
+    "#,
+        tight_mem_limits(),
+    );
+    assert!(
+        matches!(result, Err(ZapcodeError::MemoryLimitExceeded(_))),
+        "String.concat past the cap must throw MemoryLimitExceeded, got: {result:?}"
+    );
+}
+
+#[test]
+fn small_string_builders_still_work_under_tight_limit() {
+    // The guards must not break legitimate small uses.
+    assert_eq!(
+        eval_with_limits("'5'.padStart(3, '0')", tight_mem_limits()).unwrap(),
+        Value::String("005".into())
+    );
+    assert_eq!(
+        eval_with_limits("['a','b','c'].join('-')", tight_mem_limits()).unwrap(),
+        Value::String("a-b-c".into())
+    );
+    assert_eq!(
+        eval_with_limits("'ab'.concat('cd', 'ef')", tight_mem_limits()).unwrap(),
+        Value::String("abcdef".into())
+    );
+    assert_eq!(
+        eval_with_limits("Array.of(1, 2, 3).length", tight_mem_limits()).unwrap(),
+        Value::Int(3)
+    );
+}

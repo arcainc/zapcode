@@ -3,6 +3,17 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
 
+/// Maximum nesting depth for the recursive value walkers (`to_js_string`,
+/// JSON serialization, deep-clone, host marshalling). Reference values can form
+/// cycles or be nested arbitrarily deep; an unbounded native recursion would
+/// exhaust the OS stack and abort the entire host process (an uncatchable
+/// `SIGSEGV`/`SIGABRT` across the napi boundary). Capping the recursion well
+/// below the native-stack budget turns "deep or cyclic value" into a bounded,
+/// catchable condition. Far above the 64-deep JSON parse cap and any realistic
+/// data shape, yet well under native-stack exhaustion (each frame here is small,
+/// unlike the interpreter-loop frames the VM's `max_stack_depth` governs).
+pub const MAX_RENDER_DEPTH: usize = 256;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Value {
     Undefined,
@@ -211,6 +222,17 @@ impl Value {
     }
 
     pub fn to_js_string(&self, heap: &Heap) -> String {
+        self.to_js_string_depth(heap, 0)
+    }
+
+    /// Depth-bounded string coercion. Reference values (arrays/objects) can form
+    /// cycles (`const a = []; a.push(a)`) or be nested arbitrarily deep, so the
+    /// naive recursion would exhaust the native stack and abort the whole host
+    /// process. We cap the recursion at [`MAX_RENDER_DEPTH`] and render anything
+    /// past it as the placeholder `[...]`/`[Object]` rather than recursing — this
+    /// keeps `String(cyclic)` / template literals / `console.log` / `join` bounded
+    /// and abort-safe instead of crashing the embedder.
+    fn to_js_string_depth(&self, heap: &Heap, depth: usize) -> String {
         match self {
             Value::Undefined => "undefined".to_string(),
             Value::Null => "null".to_string(),
@@ -232,6 +254,13 @@ impl Value {
             }
             Value::String(s) => s.to_string(),
             Value::Array(h) => {
+                if depth >= MAX_RENDER_DEPTH {
+                    // Bottomed out (deep or cyclic): stop recursing. This cannot
+                    // be reached by any legitimate finite structure short of
+                    // MAX_RENDER_DEPTH nesting, so a placeholder is acceptable and
+                    // keeps the walk abort-safe.
+                    return "[...]".to_string();
+                }
                 // JS Array.prototype.toString renders null/undefined (and holes)
                 // as the empty string, not the literal "null"/"undefined".
                 let items: Vec<String> = heap
@@ -239,12 +268,15 @@ impl Value {
                     .iter()
                     .map(|v| match v {
                         Value::Null | Value::Undefined => String::new(),
-                        _ => v.to_js_string(heap),
+                        _ => v.to_js_string_depth(heap, depth + 1),
                     })
                     .collect();
                 items.join(",")
             }
             Value::Object(h) => {
+                if depth >= MAX_RENDER_DEPTH {
+                    return "[object Object]".to_string();
+                }
                 let Some(map) = heap.object(*h) else {
                     return "[object Object]".to_string();
                 };
@@ -270,11 +302,11 @@ impl Value {
                 if matches!(map.get("__error__"), Some(Value::Bool(true))) {
                     let name = map
                         .get("name")
-                        .map(|v| v.to_js_string(heap))
+                        .map(|v| v.to_js_string_depth(heap, depth + 1))
                         .unwrap_or_else(|| "Error".to_string());
                     let message = map
                         .get("message")
-                        .map(|v| v.to_js_string(heap))
+                        .map(|v| v.to_js_string_depth(heap, depth + 1))
                         .unwrap_or_default();
                     if message.is_empty() {
                         name

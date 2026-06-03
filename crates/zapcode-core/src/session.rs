@@ -178,9 +178,22 @@ impl ZapcodeSessionSnapshot {
     }
 
     pub fn load(bytes: &[u8]) -> Result<Self> {
-        let payload = crate::wire::decode_frame(FrameKind::Session, bytes)?;
-        postcard::from_bytes(&payload)
-            .map_err(|e| ZapcodeError::SnapshotError(format!("load failed: {}", e)))
+        let payload = crate::wire::decode_frame(
+            FrameKind::Session,
+            bytes,
+            crate::wire::MAX_LOAD_DECOMPRESSED_BYTES,
+        )?;
+        let mut snapshot: Self = postcard::from_bytes(&payload)
+            .map_err(|e| ZapcodeError::SnapshotError(format!("load failed: {}", e)))?;
+        // Clamp untrusted, blob-embedded resource limits down to safe defaults so
+        // a forged/tampered session can't raise its own limits to bypass sandbox
+        // enforcement when the next chunk runs (the wire SHA is keyless — it
+        // detects corruption, not forgery).
+        match &mut snapshot.data {
+            SessionSnapshotData::Idle(idle) => idle.limits.clamp_to_default(),
+            SessionSnapshotData::Suspended(s) => s.vm.limits.clamp_to_default(),
+        }
+        Ok(snapshot)
     }
 
     pub fn run_chunk(
