@@ -63,7 +63,28 @@ fn js_to_value(js: &JsValue, heap: &mut Heap) -> Result<Value, JsError> {
 
 /// Convert a `zapcode_core::Value` to a `JsValue`, dereferencing array/object
 /// handles through `heap`.
+/// Max nesting depth when marshalling a guest value out to JS. Guest reference
+/// values can form cycles or be nested arbitrarily deep; unbounded native
+/// recursion here would overflow the OS stack and abort the host. Capped (and
+/// cycle-checked) so a cyclic/deep value surfaces a catchable error.
+const MAX_MARSHAL_DEPTH: usize = 256;
+
 fn value_to_js(val: &Value, heap: &Heap) -> Result<JsValue, JsError> {
+    let mut seen: Vec<zapcode_core::heap::Handle> = Vec::new();
+    value_to_js_inner(val, heap, &mut seen, 0)
+}
+
+fn value_to_js_inner(
+    val: &Value,
+    heap: &Heap,
+    seen: &mut Vec<zapcode_core::heap::Handle>,
+    depth: usize,
+) -> Result<JsValue, JsError> {
+    if depth > MAX_MARSHAL_DEPTH {
+        return Err(JsError::new(
+            "value nesting depth exceeded while marshalling result (max 256)",
+        ));
+    }
     match val {
         Value::Undefined => Ok(JsValue::undefined()),
         Value::Null => Ok(JsValue::null()),
@@ -72,20 +93,34 @@ fn value_to_js(val: &Value, heap: &Heap) -> Result<JsValue, JsError> {
         Value::Float(n) => Ok(JsValue::from(*n)),
         Value::String(s) => Ok(JsValue::from_str(s.as_ref())),
         Value::Array(h) => {
+            if seen.contains(h) {
+                return Err(JsError::new("Converting circular structure to JSON"));
+            }
+            seen.push(*h);
             let items = heap.array(*h);
             let js_arr = Array::new_with_length(items.len() as u32);
             for (i, item) in items.iter().enumerate() {
-                js_arr.set(i as u32, value_to_js(item, heap)?);
+                js_arr.set(i as u32, value_to_js_inner(item, heap, seen, depth + 1)?);
             }
+            seen.pop();
             Ok(js_arr.into())
         }
         Value::Object(h) => {
             let obj = Object::new();
             if let Some(map) = heap.object(*h) {
-                for (k, v) in map {
-                    Reflect::set(&obj, &JsValue::from_str(k.as_ref()), &value_to_js(v, heap)?)
-                        .map_err(|_| JsError::new("failed to set object property"))?;
+                if seen.contains(h) {
+                    return Err(JsError::new("Converting circular structure to JSON"));
                 }
+                seen.push(*h);
+                for (k, v) in map {
+                    Reflect::set(
+                        &obj,
+                        &JsValue::from_str(k.as_ref()),
+                        &value_to_js_inner(v, heap, seen, depth + 1)?,
+                    )
+                    .map_err(|_| JsError::new("failed to set object property"))?;
+                }
+                seen.pop();
             }
             Ok(obj.into())
         }

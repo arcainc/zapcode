@@ -112,3 +112,81 @@ fn large_compressible_state_is_compressed_on_the_wire() {
     // And it still round-trips.
     ZapcodeSessionSnapshot::load(&bytes).unwrap();
 }
+
+// ── Decompression-bomb / forged-limit hardening ─────────────────────
+
+use miniz_oxide::deflate::compress_to_vec;
+use sha2::{Digest, Sha256};
+
+/// Hand-build a wire frame over arbitrary stored bytes (mirrors `encode_frame`),
+/// recomputing the SHA-256 — exactly what an attacker who controls the durable
+/// blob can do, since the integrity hash is keyless.
+fn forge_frame(kind: u8, compression: u8, stored: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"ZPC1");
+    out.extend_from_slice(&2u16.to_le_bytes()); // FORMAT_VERSION
+    out.push(kind); // 1 = snapshot, 2 = session
+    out.push(compression); // 0 = none, 1 = deflate
+    out.extend_from_slice(&Sha256::digest(stored));
+    out.extend_from_slice(stored);
+    out
+}
+
+#[test]
+fn load_rejects_decompression_bomb() {
+    // A tiny stored payload that inflates to far past the load cap must be
+    // rejected during inflation, not allocated in full.
+    let huge = vec![0u8; 400 * 1024 * 1024]; // 400MB of zeros -> tiny when DEFLATEd
+    let stored = compress_to_vec(&huge, 9);
+    assert!(
+        stored.len() < 1024 * 1024,
+        "the bomb payload should be small (high ratio): {} bytes",
+        stored.len()
+    );
+    let frame = forge_frame(2 /* session */, 1 /* deflate */, &stored);
+    let err = ZapcodeSessionSnapshot::load(&frame).unwrap_err().to_string();
+    assert!(
+        err.contains("decompression bomb") || err.contains("load limit"),
+        "expected a decompression-bomb rejection, got: {err}"
+    );
+}
+
+#[test]
+fn load_rejects_oversized_uncompressed_payload() {
+    // An uncompressed payload bigger than the load cap is rejected too.
+    let stored = vec![0u8; 300 * 1024 * 1024];
+    let frame = forge_frame(1 /* snapshot */, 0 /* none */, &stored);
+    let err = ZapcodeSnapshot::load(&frame).unwrap_err().to_string();
+    assert!(
+        err.contains("load limit"),
+        "expected an oversized-payload rejection, got: {err}"
+    );
+}
+
+#[test]
+fn loaded_session_limits_are_clamped_to_default() {
+    // A session persisted with looser-than-default limits must NOT keep them on
+    // reload (a forged blob could otherwise raise its own limits). After reload,
+    // the default allocation budget (100k) must be enforced — a 1.5M-iteration
+    // allocating loop that the inflated limit would permit must now be rejected.
+    let loose = ResourceLimits {
+        memory_limit_bytes: 2 * 1024 * 1024 * 1024, // 2GB
+        max_allocations: 5_000_000_000,
+        max_stack_depth: 1_000_000,
+        ..ResourceLimits::default()
+    };
+    let session = ZapcodeSessionSnapshot::new(Vec::new(), loose).unwrap();
+    let bytes = session.dump().unwrap();
+
+    let reloaded = ZapcodeSessionSnapshot::load(&bytes).unwrap();
+    let loop_code =
+        "let n = 0; for (let i = 0; i < 1500000; i++) { const x = [i]; n = n + x[0]; } n";
+    match reloaded.run_chunk(loop_code.to_string(), Vec::new()) {
+        Err(zapcode_core::ZapcodeError::AllocationLimitExceeded) => {} // clamped — good
+        Err(zapcode_core::ZapcodeError::MemoryLimitExceeded(_)) => {}  // also acceptable
+        other => panic!(
+            "expected the loaded session's limits to be clamped to default and fire \
+             a resource limit, got: {other:?}"
+        ),
+    }
+}

@@ -10,7 +10,24 @@ use crate::error::{Result, ZapcodeError};
 
 type DestructureFieldParts = (Option<String>, Option<Box<ParamPattern>>, Option<Expr>);
 
+/// Maximum bracket/brace/paren nesting depth the source may contain.
+///
+/// oxc's recursive-descent parser AND our `AstLowerer` descend one native stack
+/// frame per nesting level, and each level is *very* stack-hungry — on a 2MB
+/// thread stack (Rust's default worker/test stack) a debug build overflows below
+/// 80 levels of `[[[…]]]`, aborting the whole host process (an uncatchable
+/// `SIGSEGV`/`SIGABRT`) *before any VM resource limit is consulted*, since this
+/// is parse time. We reject deeper input up front with a clean, catchable
+/// `ParseError`. 64 matches the existing `JSON_MAX_DEPTH` parse cap, is safe on
+/// the smallest stack we run on, and is far beyond any realistic AI-generated
+/// expression (which nests literals a handful of levels at most).
+const MAX_NESTING_DEPTH: usize = 64;
+
 pub fn parse(source: &str) -> Result<Program> {
+    // Reject pathologically deep bracket nesting before it reaches oxc's
+    // recursive descent (which would overflow the native stack and abort).
+    check_nesting_depth(source)?;
+
     // Auto-wrap trailing object literals: `{ key: value }` → `({ key: value })`
     // This avoids the JS ambiguity where `{` at statement start is a block.
     let source = wrap_trailing_object(source);
@@ -31,6 +48,84 @@ pub fn parse(source: &str) -> Result<Program> {
         body: lowerer.body,
         functions: lowerer.functions,
     })
+}
+
+/// Scan the source and reject it (with a catchable `ParseError`) if the
+/// bracket/brace/paren nesting ever exceeds [`MAX_NESTING_DEPTH`]. This runs
+/// before oxc so a deeply-nested literal can never drive oxc's recursive descent
+/// to native-stack exhaustion (which aborts the host process).
+///
+/// The scanner is bracket-counting and skips the contents of string, template,
+/// and regex-ish literals and of `//` / `/* */` comments, so brackets *inside*
+/// strings/comments don't inflate the count. It does not need to be a full lexer
+/// — a conservative over-count inside an exotic construct only makes the guard
+/// fire slightly earlier, never later, which is the safe direction.
+fn check_nesting_depth(source: &str) -> Result<()> {
+    let bytes = source.as_bytes();
+    let n = bytes.len();
+    let mut i = 0usize;
+    let mut depth: usize = 0;
+    let mut max_depth: usize = 0;
+
+    while i < n {
+        let c = bytes[i];
+        match c {
+            // Line comment: skip to end of line.
+            b'/' if i + 1 < n && bytes[i + 1] == b'/' => {
+                i += 2;
+                while i < n && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            // Block comment: skip to closing */.
+            b'/' if i + 1 < n && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < n && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+            }
+            // String / template literal: skip to the matching unescaped quote.
+            // (Template `${}` interpolations may contain brackets, but counting
+            // the whole template as opaque only under-counts depth there, which
+            // is safe — a deeply-nested interpolation would still have to repeat
+            // outside any single template to reach the cap.)
+            b'"' | b'\'' | b'`' => {
+                let quote = c;
+                i += 1;
+                while i < n {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == quote {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                if depth > max_depth {
+                    max_depth = depth;
+                    if max_depth > MAX_NESTING_DEPTH {
+                        return Err(ZapcodeError::ParseError(format!(
+                            "expression nesting depth exceeds the maximum of {}",
+                            MAX_NESTING_DEPTH
+                        )));
+                    }
+                }
+                i += 1;
+            }
+            b')' | b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    Ok(())
 }
 
 /// If the source ends with a `{ ... }` block that looks like an object literal

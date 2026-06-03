@@ -30,6 +30,23 @@ impl Default for ResourceLimits {
     }
 }
 
+impl ResourceLimits {
+    /// Clamp each field so it is no looser than the build defaults. Used when
+    /// limits are restored from an *untrusted* snapshot/session blob: the SHA in
+    /// the wire frame is a keyless integrity check (it detects corruption, not
+    /// forgery), so an attacker who controls the stored bytes can otherwise set
+    /// arbitrarily large limits and bypass sandbox enforcement on resume. A blob
+    /// legitimately produced under *tighter* limits keeps them (we only lower).
+    pub fn clamp_to_default(&mut self) {
+        let def = ResourceLimits::default();
+        self.memory_limit_bytes = self.memory_limit_bytes.min(def.memory_limit_bytes);
+        self.time_limit_ms = self.time_limit_ms.min(def.time_limit_ms);
+        self.max_stack_depth = self.max_stack_depth.min(def.max_stack_depth);
+        self.max_allocations = self.max_allocations.min(def.max_allocations);
+        self.max_snapshot_bytes = self.max_snapshot_bytes.min(def.max_snapshot_bytes);
+    }
+}
+
 /// Tracks resource usage during execution.
 #[derive(Debug, Default)]
 pub struct ResourceTracker {

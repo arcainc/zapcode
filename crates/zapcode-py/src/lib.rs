@@ -55,7 +55,29 @@ fn py_to_value(obj: &Bound<'_, PyAny>, heap: &mut Heap) -> PyResult<Value> {
 
 /// Convert a `zapcode_core::Value` to a Python object, dereferencing
 /// array/object handles through `heap`.
+/// Max nesting depth when marshalling a guest value out to Python. Guest
+/// reference values can form cycles or be nested arbitrarily deep; unbounded
+/// native recursion here would overflow the OS stack and abort the host. Capped
+/// (and cycle-checked) so a cyclic/deep value surfaces a catchable error.
+const MAX_MARSHAL_DEPTH: usize = 256;
+
 fn value_to_py(py: Python<'_>, val: &Value, heap: &Heap) -> PyResult<PyObject> {
+    let mut seen: Vec<zapcode_core::heap::Handle> = Vec::new();
+    value_to_py_inner(py, val, heap, &mut seen, 0)
+}
+
+fn value_to_py_inner(
+    py: Python<'_>,
+    val: &Value,
+    heap: &Heap,
+    seen: &mut Vec<zapcode_core::heap::Handle>,
+    depth: usize,
+) -> PyResult<PyObject> {
+    if depth > MAX_MARSHAL_DEPTH {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "value nesting depth exceeded while marshalling result (max 256)",
+        ));
+    }
     match val {
         Value::Undefined | Value::Null => Ok(py.None()),
         Value::Bool(b) => Ok(b.into_pyobject(py)?.to_owned().into_any().unbind()),
@@ -63,18 +85,32 @@ fn value_to_py(py: Python<'_>, val: &Value, heap: &Heap) -> PyResult<PyObject> {
         Value::Float(n) => Ok(n.into_pyobject(py)?.into_any().unbind()),
         Value::String(s) => Ok(s.as_ref().into_pyobject(py)?.into_any().unbind()),
         Value::Array(h) => {
+            if seen.contains(h) {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "Converting circular structure to JSON",
+                ));
+            }
+            seen.push(*h);
             let list = PyList::empty(py);
             for item in heap.array(*h) {
-                list.append(value_to_py(py, item, heap)?)?;
+                list.append(value_to_py_inner(py, item, heap, seen, depth + 1)?)?;
             }
+            seen.pop();
             Ok(list.into_pyobject(py)?.into_any().unbind())
         }
         Value::Object(h) => {
             let dict = PyDict::new(py);
             if let Some(map) = heap.object(*h) {
-                for (k, v) in map {
-                    dict.set_item(k.as_ref(), value_to_py(py, v, heap)?)?;
+                if seen.contains(h) {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "Converting circular structure to JSON",
+                    ));
                 }
+                seen.push(*h);
+                for (k, v) in map {
+                    dict.set_item(k.as_ref(), value_to_py_inner(py, v, heap, seen, depth + 1)?)?;
+                }
+                seen.pop();
             }
             Ok(dict.into_pyobject(py)?.into_any().unbind())
         }

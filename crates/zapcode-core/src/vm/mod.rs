@@ -13,6 +13,7 @@ use crate::snapshot::ZapcodeSnapshot;
 use crate::trace::{ExecutionTrace, SpanBuilder, TraceStatus};
 use crate::value::{
     Closure, FunctionRef, GeneratorObject, Place, PlaceRoot, PlaceSeg, SuspendedFrame, Value,
+    MAX_RENDER_DEPTH,
 };
 
 mod builtins;
@@ -2245,12 +2246,14 @@ impl Vm {
         } else {
             value
         };
+        let mut seen: Vec<Handle> = Vec::new();
         match self.serialize_json_dynamic(
             &transformed,
             replacer_fn.as_ref(),
             whitelist.as_deref(),
             indent.as_deref(),
             0,
+            &mut seen,
         )? {
             Some(s) => Ok(Value::String(Arc::from(s.as_str()))),
             None => Ok(Value::Undefined),
@@ -2267,7 +2270,19 @@ impl Vm {
         whitelist: Option<&[String]>,
         indent: Option<&str>,
         depth: usize,
+        seen: &mut Vec<Handle>,
     ) -> Result<Option<String>> {
+        // Defense-in-depth: bound nesting so a pathologically deep (but acyclic)
+        // structure can't overflow the native stack. True reference cycles are
+        // caught by the `seen` set in the array/object arms below; this guards the
+        // deep-but-finite case. Mirrors the pure `builtins::serialize_json` guard so
+        // the toJSON/replacer-aware VM path is just as crash-safe.
+        if depth > MAX_RENDER_DEPTH {
+            return Err(ZapcodeError::RuntimeError(format!(
+                "JSON nesting depth exceeded (max {})",
+                MAX_RENDER_DEPTH
+            )));
+        }
         // Honor a `toJSON()` method on objects (plain objects and Date alike). The
         // hook's return value is serialized in place of the object.
         let val = if let Value::Object(h) = val {
@@ -2302,6 +2317,12 @@ impl Vm {
             }),
             Value::String(s) => Some(builtins::json_escape_string(s)),
             Value::Array(h) => {
+                if seen.contains(h) {
+                    return Err(ZapcodeError::TypeError(
+                        "Converting circular structure to JSON".to_string(),
+                    ));
+                }
+                seen.push(*h);
                 let items_src = self.heap.array_vec(*h);
                 let mut items: Vec<String> = Vec::with_capacity(items_src.len());
                 for (i, item) in items_src.iter().enumerate() {
@@ -2315,10 +2336,11 @@ impl Vm {
                         item.clone()
                     };
                     let s = self
-                        .serialize_json_dynamic(&item, replacer, whitelist, indent, depth + 1)?
+                        .serialize_json_dynamic(&item, replacer, whitelist, indent, depth + 1, seen)?
                         .unwrap_or_else(|| "null".to_string());
                     items.push(s);
                 }
+                seen.pop();
                 Some(builtins::join_json_array(&items, indent, depth))
             }
             Value::Object(h) => {
@@ -2341,6 +2363,12 @@ impl Vm {
                 {
                     return Ok(Some("{}".to_string()));
                 }
+                if seen.contains(h) {
+                    return Err(ZapcodeError::TypeError(
+                        "Converting circular structure to JSON".to_string(),
+                    ));
+                }
+                seen.push(*h);
                 let mut pairs: Vec<(String, String)> = Vec::new();
                 for (k, v) in map.iter() {
                     if k.starts_with("__") {
@@ -2360,11 +2388,12 @@ impl Vm {
                         v.clone()
                     };
                     if let Some(s) =
-                        self.serialize_json_dynamic(&v, replacer, whitelist, indent, depth + 1)?
+                        self.serialize_json_dynamic(&v, replacer, whitelist, indent, depth + 1, seen)?
                     {
                         pairs.push((k.to_string(), s));
                     }
                 }
+                seen.pop();
                 Some(builtins::join_json_object(&pairs, indent, depth))
             }
         })
@@ -4501,6 +4530,10 @@ impl Vm {
                                     args.first().unwrap_or(&Value::Undefined),
                                     &mut self.heap,
                                 );
+                                // Charge the produced array against the memory limit
+                                // before invoking the mapFn per element, so a giant
+                                // `{length:n}` source can't allocate untracked.
+                                self.track_array_capacity(src.len())?;
                                 let map_fn = args[1].clone();
                                 let mut out = Vec::with_capacity(src.len());
                                 for (i, item) in src.iter().enumerate() {
@@ -4521,6 +4554,32 @@ impl Vm {
                                     && matches!(args.get(1), Some(Value::Function(_))) =>
                             {
                                 Some(self.json_parse_with_reviver(&args)?)
+                            }
+                            // Array.from(arrayLike) / Array.of(...) allocate an
+                            // array sized from guest-controlled input. Charge the
+                            // length against the memory limit *before* the builtin
+                            // materializes the Vec, so a huge `{length:n}` can't
+                            // bypass the limit (untracked multi-GB allocation).
+                            "Array"
+                                if method_name.as_ref() == "from"
+                                    || method_name.as_ref() == "of" =>
+                            {
+                                let len = if method_name.as_ref() == "of" {
+                                    args.len()
+                                } else {
+                                    builtins::array_from_source_len(
+                                        args.first().unwrap_or(&Value::Undefined),
+                                        &self.heap,
+                                    )
+                                };
+                                self.track_array_capacity(len)?;
+                                builtins::call_global_method(
+                                    "Array",
+                                    &method_name,
+                                    &args,
+                                    &mut self.stdout,
+                                    &mut self.heap,
+                                )?
                             }
                             global_name => builtins::call_global_method(
                                 global_name,
