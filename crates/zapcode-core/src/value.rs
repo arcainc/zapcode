@@ -260,6 +260,12 @@ impl Value {
                     }
                     return crate::vm::unix_millis_to_iso(ms as i64);
                 }
+                // A promise object (the deferred-call / settled promise repr,
+                // tagged with `__promise__: true`) stringifies to "[object Promise]"
+                // like a real JS Promise, rather than leaking "[object Object]".
+                if matches!(map.get("__promise__"), Some(Value::Bool(true))) {
+                    return "[object Promise]".to_string();
+                }
                 // Error objects stringify as "Name: message" (like JS).
                 if matches!(map.get("__error__"), Some(Value::Bool(true))) {
                     let name = map

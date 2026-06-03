@@ -104,10 +104,9 @@ fn bare_tool_call_is_an_object_and_defers() {
     assert_eq!(expect_complete_str(state), "object");
 }
 
-/// The deferred promise is a truthy object. (Like every promise object in this
-/// engine it string-coerces to `[object Object]`, not the spec's
-/// `[object Promise]` — a heap-Object stringification detail shared with batch /
-/// resolved promises, not specific to N5.)
+/// The deferred promise is a truthy object that string-coerces to the spec's
+/// `[object Promise]` (the `__promise__`-tagged heap object is recognized by
+/// stringification — shared with batch / resolved promises).
 #[test]
 fn bare_tool_call_is_truthy_object() {
     let state = start(
@@ -116,7 +115,7 @@ fn bare_tool_call_is_truthy_object() {
         (p ? "truthy:" : "falsy:") + ("" + p)
     "#,
     );
-    assert_eq!(expect_complete_str(state), "truthy:[object Object]");
+    assert_eq!(expect_complete_str(state), "truthy:[object Promise]");
 }
 
 /// Building a bare tool-call promise but never consuming it makes no host call.
