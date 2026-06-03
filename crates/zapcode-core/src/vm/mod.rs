@@ -1404,6 +1404,29 @@ impl Vm {
             .expect("internal error: invalid function reference")
     }
 
+    /// JS `Function.prototype.length`: the count of leading parameters that have
+    /// neither a default value nor are a rest element (counting stops at the
+    /// first such parameter).
+    fn function_arity(&self, func_ref: FunctionRef) -> i64 {
+        let f = match self
+            .program(func_ref.program_id)
+            .functions
+            .get(func_ref.function_id)
+        {
+            Some(f) => f,
+            None => return 0,
+        };
+        let mut n = 0i64;
+        for p in &f.params {
+            match p {
+                crate::parser::ir::ParamPattern::DefaultValue { .. }
+                | crate::parser::ir::ParamPattern::Rest(_) => break,
+                _ => n += 1,
+            }
+        }
+        n
+    }
+
     #[allow(dead_code)]
     fn instructions(&self) -> &[Instruction] {
         match self.current_frame().func_index {
@@ -4975,6 +4998,9 @@ impl Vm {
                         if self.heap.object(*h).is_some_and(|m| {
                             m.contains_key("__global_fn__")
                                 || m.contains_key("__builtin_constructor__")
+                                // A user class value is callable (constructor), so
+                                // `typeof Class === "function"` like JS.
+                                || m.contains_key("__class_name__")
                         }) =>
                     {
                         "function"
@@ -5555,6 +5581,30 @@ impl Vm {
         }
     }
 
+    /// Resolve a static member `name` inherited from a class's `__super__` chain.
+    /// Statics are stored directly on the class object (alongside the internal
+    /// `__…__` keys), so we walk parent class objects skipping those internals.
+    /// Returns the first match, mirroring JS static inheritance through the
+    /// constructor's prototype chain.
+    fn inherited_static_member(&self, class_map: &IndexMap<Arc<str>, Value>, name: &str) -> Option<Value> {
+        let mut current = match class_map.get("__super__") {
+            Some(Value::Object(h)) => *h,
+            _ => return None,
+        };
+        loop {
+            let parent = self.heap.object(current)?;
+            if let Some(v) = parent.get(name) {
+                if !matches!(v, Value::Undefined) {
+                    return Some(v.clone());
+                }
+            }
+            current = match parent.get("__super__") {
+                Some(Value::Object(h)) => *h,
+                _ => return None,
+            };
+        }
+    }
+
     /// The built-in Error base name a class (named `name`) transitively extends,
     /// if any — used so `super(message)` in an Error subclass runs the Error
     /// constructor (sets `.message`/`.stack`).
@@ -5853,6 +5903,29 @@ impl Vm {
                         return Ok(val.clone());
                     }
                 }
+                // Reflection on a class value: `Class.name` is the declared name,
+                // and static members not found above are inherited from `__super__`
+                // (statics walk the constructor's prototype chain in JS).
+                if map.contains_key("__class_name__") {
+                    if name == "name" {
+                        if let Some(n @ Value::String(_)) = map.get("__class_name__") {
+                            return Ok(n.clone());
+                        }
+                    }
+                    if let Some(v) = self.inherited_static_member(&map, name) {
+                        return Ok(v);
+                    }
+                }
+                // `instance.constructor` resolves to the instance's class value.
+                // Instances carry `__class__` (the class name); the class object is
+                // bound to that name in globals.
+                if name == "constructor" && map.contains_key("__class__") {
+                    if let Some(Value::String(cname)) = map.get("__class__") {
+                        if let Some(ch) = self.class_handle_by_name(cname) {
+                            return Ok(Value::Object(ch));
+                        }
+                    }
+                }
                 // Check if this is a promise instance — expose .then/.catch/.finally
                 if builtins::is_promise(obj, &self.heap) && is_promise_method(name) {
                     return Ok(builtin_method("__promise__", name));
@@ -5912,6 +5985,20 @@ impl Vm {
             Value::String(s) => match name {
                 "length" => Ok(Value::Int(s.chars().count() as i64)),
                 _ if is_string_method(name) => Ok(builtin_method("__string__", name)),
+                _ => Ok(Value::Undefined),
+            },
+            Value::Function(closure) => match name {
+                // Function reflection: `.length` is the arity (params before the
+                // first default/rest), `.name` is the declared/inferred name.
+                "length" => Ok(Value::Int(self.function_arity(closure.func_ref))),
+                "name" => {
+                    let n = self
+                        .current_function(closure.func_ref)
+                        .name
+                        .clone()
+                        .unwrap_or_default();
+                    Ok(Value::String(Arc::from(n.as_str())))
+                }
                 _ => Ok(Value::Undefined),
             },
             Value::Generator(_) => match name {

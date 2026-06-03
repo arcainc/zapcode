@@ -782,22 +782,22 @@ fn to_string_hook_in_template_literal() {
 // ============================================================================
 
 #[test]
-fn typeof_class_is_object_documented_divergence() {
-    // DIVERGENCE (documented): a class value's typeof is "object" here.
-    assert_eq!(run_str("class C {} typeof C"), "object"); // JS: "function"
+fn typeof_class_is_function() {
+    // A class value is callable (its constructor), so `typeof Class === "function"`.
+    assert_eq!(run_str("class C {} typeof C"), "function");
 }
 
 #[test]
-fn class_name_property_absent_documented_divergence() {
-    // DIVERGENCE (documented): `Class.name` is not installed.
-    assert_eq!(run_str("class Foo {} String(Foo.name)"), "undefined"); // JS: "Foo"
+fn class_name_property() {
+    // `Class.name` reflects the declared class name.
+    assert_eq!(run_str("class Foo {} String(Foo.name)"), "Foo");
 }
 
 #[test]
-fn instance_constructor_property_absent_documented_divergence() {
-    // DIVERGENCE (documented): instances do not carry a `.constructor` back-link.
-    assert_eq!(run_str("class Foo {} String(new Foo().constructor === Foo)"), "false"); // JS: true
-    assert_eq!(run_str("class Foo {} typeof new Foo().constructor"), "undefined"); // JS: "function"
+fn instance_constructor_property() {
+    // Instances carry a `.constructor` back-link to their class value.
+    assert_eq!(run_str("class Foo {} String(new Foo().constructor === Foo)"), "true");
+    assert_eq!(run_str("class Foo {} typeof new Foo().constructor"), "function");
 }
 
 #[test]
@@ -808,13 +808,16 @@ fn methods_are_per_instance_not_shared_documented_divergence() {
 }
 
 #[test]
-fn static_methods_not_inherited_documented_divergence() {
-    // DIVERGENCE (documented): static methods are not inherited by subclasses;
-    // reach the parent static by naming the parent class instead.
+fn static_methods_are_inherited_by_subclasses() {
+    // Statics inherit through the constructor's prototype chain, so a subclass
+    // resolves a parent static method (and field) it does not override.
     assert_eq!(
-        run_err("class A { static f(){ return 9; } } class B extends A {} B.f()"),
-        // JS: returns 9 (statics inherit through the constructor's prototype chain)
-        r#"TypeError("undefined is not a function")"#
+        run_str("class A { static f(){ return 9; } } class B extends A {} String(B.f())"),
+        "9"
+    );
+    assert_eq!(
+        run_str("class A { static who(){ return 'A'; } } class B extends A {} class C extends B {} String(C.who())"),
+        "A"
     );
 }
 

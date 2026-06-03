@@ -539,13 +539,17 @@ fn array_destructuring_defaults() {
 // ----------------------------------------------------------------------------
 
 #[test]
-fn function_length_and_name_are_unreflected_documented_divergence() {
-    // DIVERGENCE (documented): functions do not reflect `.length` (arity) or
-    // `.name`; both read as `undefined`. JS exposes the param count and the name.
-    assert_eq!(run_str("function f(a, b, c){} typeof f.length"), "undefined"); // JS: number 3
-    assert_eq!(run_str("const g = (a, b) => 0; typeof g.length"), "undefined"); // JS: number 2
-    assert_eq!(run_str("function named(){} typeof named.name"), "undefined"); // JS: "named"
-    assert_eq!(run_str("const bar = function(){}; typeof bar.name"), "undefined"); // JS: "bar"
+fn function_length_and_name_are_reflected() {
+    // Functions reflect `.length` (arity = leading params before any default/rest)
+    // and `.name` (declared, or inferred from the binding for an anonymous expr).
+    assert_eq!(run_str("function f(a, b, c){} f.length"), "3");
+    assert_eq!(run_str("const g = (a, b) => 0; g.length"), "2");
+    // `.length` counts only params before the first default or rest.
+    assert_eq!(run_str("function h(a, b = 1, c){} h.length"), "1");
+    assert_eq!(run_str("function r(a, ...rest){} r.length"), "1");
+    assert_eq!(run_str("function named(){} named.name"), "named");
+    assert_eq!(run_str("const bar = function(){}; bar.name"), "bar");
+    assert_eq!(run_str("const arrow = () => 0; arrow.name"), "arrow");
 }
 
 #[test]

@@ -359,6 +359,21 @@ impl<'a> AstLowerer<'a> {
                 Some(expr) => Some(self.lower_expr(expr)?),
                 None => None,
             };
+            // JS name inference: `const f = function(){}` / `const f = () => {}`
+            // gives the (otherwise anonymous) function the binding's name.
+            if let (AssignTarget::Ident(bind_name), Some(init_expr)) = (&pattern, &init) {
+                if let Some(func_index) = match init_expr {
+                    Expr::FunctionExpr { func_index } => Some(*func_index),
+                    Expr::ArrowFunction { func_index } => Some(*func_index),
+                    _ => None,
+                } {
+                    if let Some(f) = self.functions.get_mut(func_index) {
+                        if f.name.is_none() {
+                            f.name = Some(bind_name.clone());
+                        }
+                    }
+                }
+            }
             declarations.push(VarDeclarator { pattern, init });
         }
         Ok(Statement::VariableDecl {
