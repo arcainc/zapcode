@@ -1,11 +1,10 @@
 //! Conformance breadth: statements & control flow.
 //!
 //! Loops, labeled break/continue, switch (fallthrough/default), conditionals,
-//! block scoping, and try/catch/finally. Asserts real-Node answers where zapcode
-//! agrees; the deferred "cluster B" try/finally-with-abrupt-completion gaps are
-//! pinned to zapcode's *actual* documented behavior (clearly commented), so this
-//! suite documents the boundary rather than asserting an answer the engine doesn't
-//! produce.
+//! block scoping, and try/catch/finally. Asserts real-Node answers throughout,
+//! including the try/finally-with-abrupt-completion semantics (an abrupt
+//! completion in `finally` overrides the body; `finally` runs on return / break /
+//! continue / throw), which now match Node.
 
 use zapcode_core::vm::VmState;
 use zapcode_core::{ResourceLimits, ZapcodeRun};
@@ -240,28 +239,26 @@ fn nested_try_catch() {
 }
 
 #[test]
-fn try_finally_abrupt_completion_documented_divergence() {
-    // DIVERGENCE (documented, cluster B — try/finally completion semantics):
-    // zapcode's `finally` does not currently (a) override an in-flight `return`,
-    // (b) re-propagate a pending exception when there is no `catch`, or
-    // (c) run when control leaves the `try` via `continue`/`break`. These pin
-    // zapcode's ACTUAL behavior so the boundary is documented, not the JS answer.
+fn try_finally_abrupt_completion_matches_node() {
+    // try/finally completion semantics (cluster B), now matching real Node:
+    // (a) a `return`/`break`/`continue`/`throw` inside `finally` overrides the
+    // try/catch outcome, (b) a `finally` with no `catch` re-propagates a pending
+    // exception, and (c) `finally` runs when control leaves the `try` via
+    // `continue`/`break`.
 
-    // (a) finally `return` does NOT override the try `return` (JS: returns 2).
-    assert_eq!(run_str("function tf(){ try { return 1; } finally { return 2; } } tf()"), "1");
+    // (a) finally `return` overrides the try `return`.
+    assert_eq!(run_str("function tf(){ try { return 1; } finally { return 2; } } tf()"), "2");
 
-    // (b) finally without catch swallows the throw rather than re-propagating to
-    // the outer catch (JS: ['f','c']).
+    // (b) finally without catch re-propagates the throw to the outer catch.
     assert_eq!(
         run_str("let log=[]; try { try{ throw new Error('e'); } finally { log.push('f'); } } catch(e){ log.push('c'); } log.join(',')"),
-        "f"
+        "f,c"
     );
 
-    // (c) `continue` out of the try does not run the finally for that iteration
-    // (JS: ['f0','body','f1']).
+    // (c) `continue` out of the try runs the finally for that iteration.
     assert_eq!(
         run_str("let log=[]; for(let i=0;i<2;i++){ try{ if(i===0) continue; log.push('body'); } finally { log.push('f'+i); } } log.join(',')"),
-        "body,f1"
+        "f0,body,f1"
     );
 }
 

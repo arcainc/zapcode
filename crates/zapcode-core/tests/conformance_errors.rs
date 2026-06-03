@@ -24,14 +24,11 @@
 //!     (the built-in subtypes do). `super(message)` is not auto-propagated to
 //!     `this.message`; set it explicitly.
 //!   * `new Error(undefined).message` is the string `"undefined"` (real JS: `""`).
-//!   * `try { … } finally { … }` with NO `catch` *swallows* an in-flight throw
-//!     after running the finally body (real JS re-propagates). We only assert
-//!     finally semantics in shapes the interpreter handles like Node, and pin
-//!     the swallow case to actual behavior with a comment.
-//!   * When a `catch` block throws and the same statement's `finally` also
-//!     throws, the catch's exception propagates (real JS: the finally's wins).
-//!     `try { return … } finally { throw … }` keeps the return path (the finally
-//!     throw does not replace it).
+//!
+//! try/catch/finally completion semantics now match Node: a `finally` runs on
+//! every way of leaving its `try`/`catch` (normal, return, break, continue,
+//! throw), a `finally` with no `catch` re-propagates a pending exception, and an
+//! abrupt completion *inside* the finally (return/throw) supersedes the body's.
 
 use zapcode_core::vm::VmState;
 use zapcode_core::{ResourceLimits, ZapcodeRun};
@@ -520,33 +517,36 @@ fn catch_and_finally_both_run() {
 
 #[test]
 fn finally_runs_when_inner_try_throws_and_outer_catches() {
-    // try/finally (no catch) inside an outer try/catch: the finally body runs.
+    // try/finally (no catch) inside an outer try/catch: the finally body runs and
+    // then the pending throw re-propagates to the outer catch.
     assert_eq!(
         run_str(
             "let s=[]; try { try { s.push('t'); throw 1; } finally { s.push('f'); } } \
              catch(e){ s.push('c'); } s.join(',')"
         ),
-        "t,f"
+        "t,f,c"
     );
 }
 
 #[test]
 fn finally_with_loop_break() {
+    // The finally runs for the breaking iteration before control leaves the loop.
     assert_eq!(
         run_str(
             "let s=[]; for(let i=0;i<3;i++){ try { if(i===1) break; s.push('t'+i); } finally { s.push('f'+i); } } s.join(',')"
         ),
-        "t0,f0"
+        "t0,f0,f1"
     );
 }
 
 #[test]
 fn finally_with_loop_continue() {
+    // The finally runs on each iteration, including the one that `continue`s.
     assert_eq!(
         run_str(
             "let s=[]; for(let i=0;i<3;i++){ try { if(i===1) continue; s.push('t'+i); } finally { s.push('f'+i); } } s.join(',')"
         ),
-        "t0,f0,t2,f2"
+        "t0,f0,f1,t2,f2"
     );
 }
 
@@ -562,35 +562,32 @@ fn nested_finally_ordering_inner_caught() {
 }
 
 // ============================================================================
-// try / catch / finally — DOCUMENTED DIVERGENCES (pinned to actual behavior)
+// try / catch / finally — abrupt-completion semantics (matching Node)
 // ============================================================================
 
 #[test]
-fn divergence_try_finally_no_catch_swallows_throw() {
-    // DIVERGENCE: a `try { throw } finally { }` with NO local catch runs the
-    // finally body but then SWALLOWS the in-flight exception instead of
-    // re-propagating it to an enclosing catch (real JS re-propagates, so the
-    // outer catch would set `v` and run its body). zapcode leaves the outer
-    // catch un-entered. Pinned to actual behavior.
+fn try_finally_no_catch_repropagates_throw() {
+    // A `try { throw } finally { }` with NO local catch runs the finally body and
+    // then re-propagates the in-flight exception to the enclosing catch, which
+    // binds `v` and runs its body.
     assert_eq!(
         run_str("let v='none'; let s=[]; try { try { throw 'XX'; } finally { s.push('f'); } } catch(e){ v = e; } v + '|' + s.join(',')"),
-        // finally ran ('f'), but the outer catch did NOT bind `v`.
-        "none|f"
+        // finally ran ('f') and the outer catch then bound `v` to the throw.
+        "XX|f"
     );
 }
 
 #[test]
-fn divergence_catch_throw_wins_over_finally_throw() {
-    // DIVERGENCE: when the catch block throws and the same statement's finally
-    // ALSO throws, real JS propagates the finally's exception; zapcode propagates
-    // the catch's. Pinned to actual behavior.
+fn finally_throw_wins_over_catch_throw() {
+    // When the catch block throws and the same statement's finally ALSO throws,
+    // the finally's exception wins (the catch's is discarded).
     assert_eq!(
         run_str(
             "let m='X'; \
              try { try { throw new Error('orig'); } catch(e){ throw new Error('fromCatch'); } finally { throw new Error('fromFinally'); } } \
              catch(e){ m = e.message; } m"
         ),
-        "fromCatch"
+        "fromFinally"
     );
 }
 
@@ -620,29 +617,27 @@ fn try_ok_then_finally_throw_propagates_finally() {
 }
 
 #[test]
-fn divergence_try_return_finally_throw_keeps_return() {
-    // DIVERGENCE: `try { return 'R' } finally { throw … }` — real JS replaces the
-    // return with the finally throw (the outer catch fires). zapcode keeps the
-    // return path; the finally throw does not propagate. Pinned to actual.
+fn try_return_finally_throw_replaces_return() {
+    // `try { return 'R' } finally { throw … }` — the finally throw replaces the
+    // pending return, so the outer catch fires with the finally's message.
     assert_eq!(
         run_str(
             "let m='X'; function f(){ try { return 'R'; } finally { throw new Error('fromFinally'); } } \
              try { f(); } catch(e){ m = e.message; } m"
         ),
-        "X"
+        "fromFinally"
     );
 }
 
 #[test]
-fn divergence_finally_side_effects_skipped_on_return_path() {
-    // DIVERGENCE: a finally body's side effects do NOT run when the try returns
-    // (real JS runs the finally on the return path). The function still returns
-    // its value. Pinned to actual.
+fn finally_side_effects_run_on_return_path() {
+    // A finally body's side effects run when the try returns; the function still
+    // returns its value once the finally completes normally.
     assert_eq!(
         run_str(
             "let s=[]; function f(){ try { return 'R'; } finally { s.push('F'); } } let v=f(); JSON.stringify([s, v])"
         ),
-        "[[],\"R\"]"
+        "[[\"F\"],\"R\"]"
     );
 }
 

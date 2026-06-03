@@ -298,6 +298,62 @@ pub(crate) struct TryInfo {
     pub(crate) catch_ip: usize,
     pub(crate) frame_depth: usize,
     pub(crate) stack_depth: usize,
+    /// Start ip of the `finally` body, if this try statement has one. Abrupt
+    /// completions (`return`/`break`/`continue`) and uncaught throws that leave
+    /// the protected region run this finally before continuing.
+    #[serde(default)]
+    pub(crate) finally_ip: Option<usize>,
+    /// Whether this try statement has a `catch` handler. When it does not, a
+    /// throw routes straight to the finally (carrying the exception) instead of
+    /// being treated as caught.
+    #[serde(default)]
+    pub(crate) has_catch: bool,
+    /// The completion to resume once the finally body finishes (`EndFinally`).
+    /// `None` while executing the protected body; set when control enters the
+    /// finally. A `Normal` completion simply falls through.
+    #[serde(default)]
+    pub(crate) pending: Option<Completion>,
+    /// Set once control has entered this try's finally body, so a further abrupt
+    /// completion raised *inside* the finally does not re-run the same finally
+    /// (it supersedes the pending completion and propagates outward).
+    #[serde(default)]
+    pub(crate) in_finally: bool,
+    /// ip just past the whole try/catch/finally statement. A `break`/`continue`
+    /// whose target lies inside `[setup_ip, region_end)` stays within this try
+    /// (its finally is skipped); a target outside escapes (the finally runs).
+    #[serde(default)]
+    pub(crate) region_start: usize,
+    #[serde(default)]
+    pub(crate) region_end: usize,
+}
+
+/// An abrupt or normal completion threaded through `finally` blocks. JS requires
+/// a `finally` to run on every way of leaving its `try`/`catch`, and an abrupt
+/// completion *inside* the finally to supersede whatever the body was doing.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) enum Completion {
+    /// Fall through to the code after the try statement.
+    Normal,
+    /// Resume a pending `return value;`.
+    Return(Value),
+    /// Re-raise a pending exception once the finally finishes.
+    Throw(Value),
+    /// Resume a pending `break`/`continue`, transferring control to `target`.
+    Break(usize),
+    Continue(usize),
+}
+
+/// Whether `completion` escapes the try statement described by `info` (i.e.
+/// transferring control out of it must run its `finally`). A `return` always
+/// escapes the enclosing trys in its frame; a `break`/`continue` escapes a try
+/// only when its target lands outside that try statement's ip range.
+fn completion_escapes(completion: &Completion, info: &TryInfo) -> bool {
+    match completion {
+        Completion::Return(_) | Completion::Throw(_) | Completion::Normal => true,
+        Completion::Break(target) | Completion::Continue(target) => {
+            !(info.region_start..info.region_end).contains(target)
+        }
+    }
 }
 
 impl Vm {
@@ -593,22 +649,203 @@ impl Vm {
                 };
             }
         }
-        match self.try_stack.pop() {
-            Some(try_info) => {
-                // Unwind frames and stack to the nearest enclosing try block,
-                // exactly as the execute loop does for a runtime error.
-                while self.frames.len() > try_info.frame_depth {
-                    self.frames.pop();
-                    self.tracker.pop_frame();
-                }
-                self.stack.truncate(try_info.stack_depth);
-                self.push(error)?;
-                self.current_frame_mut().ip = try_info.catch_ip;
-                self.execute()
-            }
+        // Route the rejection to the nearest catch or finally (running finallys
+        // on the way), exactly as the execute loop does for a runtime error.
+        if self.route_thrown(error.clone(), 0)? {
+            self.execute()
+        } else {
             // No handler — the failure is the program's failure.
-            None => Err(ZapcodeError::ExternalError(error.to_js_string(&self.heap))),
+            Err(ZapcodeError::ExternalError(error.to_js_string(&self.heap)))
         }
+    }
+
+    /// Route a thrown value to the nearest enclosing handler (a `catch` or a
+    /// `finally`). Returns `true` if a handler was engaged (control was
+    /// transferred and execution should continue), or `false` if the throw is
+    /// uncaught (no remaining handler) and must propagate to the host.
+    ///
+    /// `min_frame_depth` limits how far unwinding may go: only try frames at
+    /// depth `> min_frame_depth` are considered, so an internal call (which sets
+    /// it to the caller's depth) does not steal the caller's handlers.
+    fn route_thrown(&mut self, error_val: Value, min_frame_depth: usize) -> Result<bool> {
+        loop {
+            let Some(try_info) = self
+                .try_stack
+                .last()
+                .filter(|t| t.frame_depth > min_frame_depth)
+                .cloned()
+            else {
+                // No handler at this level. Preserve the thrown value so a
+                // caller that re-raises (e.g. a generator surfacing the error at
+                // its driving `.next()`) reconstructs the original error object /
+                // value rather than a stringified one.
+                self.pending_throw = Some(error_val);
+                return Ok(false);
+            };
+            self.try_stack.pop();
+
+            // Unwind to the protected region's frame/stack depth.
+            while self.frames.len() > try_info.frame_depth {
+                self.frames.pop();
+                self.tracker.pop_frame();
+            }
+            self.stack.truncate(try_info.stack_depth);
+
+            if try_info.in_finally {
+                // The exception was raised *inside* this try's finally body. It
+                // supersedes whatever the finally was resuming; drop this frame
+                // and keep unwinding to an outer handler.
+                continue;
+            }
+
+            if try_info.has_catch {
+                // Enter the catch block. The catch protection is consumed: a
+                // throw inside the catch body must route to this try's finally
+                // (if any) or propagate, never back to the same catch.
+                self.push(error_val)?;
+                if try_info.finally_ip.is_some() {
+                    let mut info = try_info;
+                    info.has_catch = false;
+                    let catch_ip = info.catch_ip;
+                    self.try_stack.push(info);
+                    self.current_frame_mut().ip = catch_ip;
+                } else {
+                    self.current_frame_mut().ip = try_info.catch_ip;
+                }
+                return Ok(true);
+            }
+
+            if let Some(finally_ip) = try_info.finally_ip {
+                // No catch (or catch already consumed): run the finally with the
+                // exception pending, then re-raise it via EndFinally.
+                let mut info = try_info;
+                info.pending = Some(Completion::Throw(error_val));
+                info.in_finally = true;
+                info.has_catch = false;
+                self.try_stack.push(info);
+                self.current_frame_mut().ip = finally_ip;
+                return Ok(true);
+            }
+
+            // This try frame neither catches nor has a finally for this throw;
+            // keep unwinding to an outer handler.
+        }
+    }
+
+    /// Run any `finally` blocks in the current frame that an abrupt completion
+    /// (`return`/`break`/`continue`) is escaping, then perform the completion.
+    /// Returns `Ok(true)` if a finally was entered (execution continues at the
+    /// finally body); the caller should resume the main loop. Returns `Ok(false)`
+    /// if no intervening finally needs to run and the caller should carry out the
+    /// completion itself.
+    ///
+    /// `escapes` decides, per candidate try frame in the current call frame,
+    /// whether the completion leaves it (always true for return; for break/
+    /// continue, true unless the jump target stays within the try statement).
+    fn route_abrupt(&mut self, completion: Completion) -> Result<bool> {
+        let frame_depth = self.frames.len();
+        // Find the innermost try frame in the *current* call frame that still has
+        // an un-run finally and that this completion escapes.
+        let idx = self.try_stack.iter().rposition(|t| {
+            t.frame_depth == frame_depth
+                && t.finally_ip.is_some()
+                && !t.in_finally
+                && completion_escapes(&completion, t)
+        });
+        let Some(idx) = idx else {
+            return Ok(false);
+        };
+
+        // Any inner try frames (above idx) in this call frame are being escaped
+        // too; drop them (their finallys, if any, were handled by recursion when
+        // their own bodies completed — here they are inner-to-idx and already
+        // resolved, so simply discard).
+        self.try_stack.truncate(idx + 1);
+
+        let try_info = &mut self.try_stack[idx];
+        let finally_ip = try_info.finally_ip.unwrap();
+        let stack_depth = try_info.stack_depth;
+        try_info.pending = Some(completion);
+        try_info.in_finally = true;
+        try_info.has_catch = false;
+        self.stack.truncate(stack_depth);
+        self.current_frame_mut().ip = finally_ip;
+        Ok(true)
+    }
+
+    /// Resume a completion saved by a `finally` (via `EndFinally`). A `Normal`
+    /// completion falls through; the abrupt ones re-perform their transfer,
+    /// routing through any *further* enclosing finallys first. Returns a
+    /// `VmState` only when the resumed completion ends the program/suspends.
+    fn resume_completion(&mut self, completion: Completion) -> Result<Option<VmState>> {
+        match completion {
+            Completion::Normal => Ok(None),
+            Completion::Return(v) => {
+                if self.route_abrupt(Completion::Return(v.clone()))? {
+                    return Ok(None);
+                }
+                self.perform_return(v)
+            }
+            Completion::Throw(v) => {
+                // Re-raise the pending exception. Routing to the next handler is
+                // done uniformly by the execute loop's error path, which reads
+                // `pending_throw` so the original value/identity is preserved.
+                let msg = v.to_js_string(&self.heap);
+                self.pending_throw = Some(v);
+                Err(ZapcodeError::RuntimeError(msg))
+            }
+            Completion::Break(target) => {
+                if self.route_abrupt(Completion::Break(target))? {
+                    return Ok(None);
+                }
+                self.current_frame_mut().ip = target;
+                Ok(None)
+            }
+            Completion::Continue(target) => {
+                if self.route_abrupt(Completion::Continue(target))? {
+                    return Ok(None);
+                }
+                self.current_frame_mut().ip = target;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Pop the current call frame and deliver `return_val` to the caller (the
+    /// body of the old `Return` instruction). Returns `VmState::Complete` at the
+    /// top level. The caller must already have run any escaped `finally` blocks.
+    fn perform_return(&mut self, return_val: Value) -> Result<Option<VmState>> {
+        if self.frames.len() <= 1 {
+            return Ok(Some(VmState::Complete(return_val)));
+        }
+
+        let frame = self.frames.pop().unwrap();
+        self.tracker.pop_frame();
+
+        // If this was a constructor frame (has this_value), return the updated
+        // `this` instead of the explicit return value (unless the constructor
+        // explicitly returns an object).
+        let actual_return = if let Some(ref this_val) = frame.this_value {
+            if let Some(parent) = self.frames.last_mut() {
+                if parent.this_value.is_some() {
+                    parent.this_value = Some(this_val.clone());
+                }
+            }
+            if let Some(ref source) = frame.receiver_source {
+                self.write_receiver_source(source, this_val.clone());
+            }
+            if matches!(return_val, Value::Undefined) {
+                this_val.clone()
+            } else {
+                return_val
+            }
+        } else {
+            return_val
+        };
+
+        self.stack.truncate(frame.stack_base);
+        self.push(actual_return)?;
+        Ok(None)
     }
 
     /// Resume a batch suspension with the values the host's combinator produced.
@@ -1305,22 +1542,10 @@ impl Vm {
                     }
                 }
                 Err(err) => {
-                    // Try to catch the error
-                    if let Some(try_info) = self.try_stack.pop() {
-                        // Unwind to catch block
-                        while self.frames.len() > try_info.frame_depth {
-                            self.frames.pop();
-                            self.tracker.pop_frame();
-                        }
-                        self.stack.truncate(try_info.stack_depth);
-
-                        // Push error value
-                        let error_val = self.caught_error_value(&err);
-                        self.push(error_val)?;
-
-                        // Jump to catch
-                        self.current_frame_mut().ip = try_info.catch_ip;
-                    } else {
+                    // Route the error to the nearest catch or finally. If no
+                    // handler remains it propagates to the host.
+                    let error_val = self.caught_error_value(&err);
+                    if !self.route_thrown(error_val, 0)? {
                         return Err(err);
                     }
                 }
@@ -1702,26 +1927,12 @@ impl Vm {
                     }
                 }
                 Err(err) => {
-                    // Try to catch the error within the callback. Only a try block
-                    // that lives *inside* this internal call (i.e. above the frame
-                    // this call started at) may catch here; an outer try belongs to
-                    // the caller and must be left for it to handle.
-                    if let Some(try_info) = self
-                        .try_stack
-                        .last()
-                        .filter(|t| t.frame_depth > target_frame_depth)
-                        .cloned()
-                    {
-                        self.try_stack.pop();
-                        while self.frames.len() > try_info.frame_depth {
-                            self.frames.pop();
-                            self.tracker.pop_frame();
-                        }
-                        self.stack.truncate(try_info.stack_depth);
-                        let error_val = self.caught_error_value(&err);
-                        self.push(error_val)?;
-                        self.current_frame_mut().ip = try_info.catch_ip;
-                    } else {
+                    // Try to catch (or run a finally) within the callback. Only a
+                    // handler that lives *inside* this internal call (above the
+                    // frame this call started at) may engage here; an outer
+                    // handler belongs to the caller and is left for it.
+                    let error_val = self.caught_error_value(&err);
+                    if !self.route_thrown(error_val, target_frame_depth)? {
                         // Unwind the frame(s) this call pushed so the frame stack is
                         // restored to the caller's depth before propagating. Without
                         // this, a nested internal call (e.g. a cyclic ToPrimitive
@@ -2394,16 +2605,11 @@ impl Vm {
                     }
                 }
                 Err(err) => {
-                    if let Some(try_info) = self.try_stack.pop() {
-                        while self.frames.len() > try_info.frame_depth {
-                            self.frames.pop();
-                            self.tracker.pop_frame();
-                        }
-                        self.stack.truncate(try_info.stack_depth);
-                        let error_val = self.caught_error_value(&err);
-                        self.push(error_val)?;
-                        self.current_frame_mut().ip = try_info.catch_ip;
-                    } else {
+                    // Only handlers inside the generator body (frames above the
+                    // generator's base) may catch here; an outer handler belongs
+                    // to the caller and is left for it.
+                    let error_val = self.caught_error_value(&err);
+                    if !self.route_thrown(error_val, target_frame_depth)? {
                         return Err(err);
                     }
                 }
@@ -3674,42 +3880,14 @@ impl Vm {
             }
             Instruction::Return => {
                 let return_val = self.pop().unwrap_or(Value::Undefined);
-
-                if self.frames.len() <= 1 {
-                    return Ok(Some(VmState::Complete(return_val)));
+                // A `return` must run any `finally` blocks it escapes in the
+                // current call frame before the function actually returns.
+                if self.route_abrupt(Completion::Return(return_val.clone()))? {
+                    return Ok(None);
                 }
-
-                let frame = self.frames.pop().unwrap();
-                self.tracker.pop_frame();
-
-                // If this was a constructor frame (has this_value), return the
-                // updated `this` instead of the explicit return value (unless
-                // the constructor explicitly returns an object).
-                let actual_return = if let Some(ref this_val) = frame.this_value {
-                    // Also propagate this back to parent frame (for super() calls)
-                    if let Some(parent) = self.frames.last_mut() {
-                        if parent.this_value.is_some() {
-                            parent.this_value = Some(this_val.clone());
-                        }
-                    }
-                    // Write back the mutated `this` to the original variable
-                    // that the method receiver came from. This ensures that
-                    // value-type semantics work correctly for method calls
-                    // that mutate `this` properties (e.g., this.count += 1).
-                    if let Some(ref source) = frame.receiver_source {
-                        self.write_receiver_source(source, this_val.clone());
-                    }
-                    if matches!(return_val, Value::Undefined) {
-                        this_val.clone()
-                    } else {
-                        return_val
-                    }
-                } else {
-                    return_val
-                };
-
-                self.stack.truncate(frame.stack_base);
-                self.push(actual_return)?;
+                if let Some(state) = self.perform_return(return_val)? {
+                    return Ok(Some(state));
+                }
             }
             Instruction::CallExternal(name, arg_count) => {
                 if !self.external_functions.contains(&name) {
@@ -3834,8 +4012,17 @@ impl Vm {
 
             // Loops
             Instruction::SetupLoop => {}
-            Instruction::Break | Instruction::Continue => {
-                // These should have been compiled to jumps
+            Instruction::Break(target) => {
+                // Run any `finally` blocks this break escapes (try statements
+                // that enclose the break but are enclosed by the loop), then jump.
+                if !self.route_abrupt(Completion::Break(target))? {
+                    self.current_frame_mut().ip = target;
+                }
+            }
+            Instruction::Continue(target) => {
+                if !self.route_abrupt(Completion::Continue(target))? {
+                    self.current_frame_mut().ip = target;
+                }
             }
 
             // Iterators
@@ -4013,11 +4200,31 @@ impl Vm {
             }
 
             // Error handling
-            Instruction::SetupTry(catch_ip, _) => {
+            Instruction::SetupTry {
+                catch_ip,
+                finally_ip,
+                region_end,
+            } => {
+                // `has_catch` is encoded by the compiler: when there is a catch
+                // handler, catch_ip points at it; when there is none but there is
+                // a finally, catch_ip == finally_ip (so a throw runs the finally).
+                let has_catch = match finally_ip {
+                    Some(fin) => catch_ip != fin,
+                    None => true,
+                };
+                // ip was already advanced past this instruction; the statement
+                // region begins at the SetupTry itself.
+                let region_start = self.current_frame().ip - 1;
                 self.try_stack.push(TryInfo {
                     catch_ip,
                     frame_depth: self.frames.len(),
                     stack_depth: self.stack.len(),
+                    finally_ip,
+                    has_catch,
+                    pending: None,
+                    in_finally: false,
+                    region_start,
+                    region_end,
                 });
             }
             Instruction::Throw => {
@@ -4030,6 +4237,26 @@ impl Vm {
             }
             Instruction::EndTry => {
                 self.try_stack.pop();
+            }
+            Instruction::EnterFinallyNormal(finally_ip) => {
+                // The try (or catch) body completed normally; transition the
+                // active try frame into its finally phase with a Normal pending
+                // completion and run the finally body.
+                if let Some(info) = self.try_stack.last_mut() {
+                    info.pending = Some(Completion::Normal);
+                    info.in_finally = true;
+                    info.has_catch = false;
+                }
+                self.current_frame_mut().ip = finally_ip;
+            }
+            Instruction::EndFinally => {
+                // The finally body finished without its own abrupt completion;
+                // resume whatever the body/catch was doing.
+                let info = self.try_stack.pop();
+                let completion = info.and_then(|i| i.pending).unwrap_or(Completion::Normal);
+                if let Some(state) = self.resume_completion(completion)? {
+                    return Ok(Some(state));
+                }
             }
 
             // Typeof

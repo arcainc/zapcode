@@ -127,11 +127,14 @@ impl Compiler {
             Instruction::Jump(t)
             | Instruction::JumpIfFalse(t)
             | Instruction::JumpIfTrue(t)
-            | Instruction::JumpIfNullish(t) => {
+            | Instruction::JumpIfNullish(t)
+            | Instruction::Break(t)
+            | Instruction::Continue(t)
+            | Instruction::EnterFinallyNormal(t) => {
                 *t = target;
             }
-            Instruction::SetupTry(catch_target, _) => {
-                *catch_target = target;
+            Instruction::SetupTry { catch_ip, .. } => {
+                *catch_ip = target;
             }
             _ => {}
         }
@@ -546,40 +549,16 @@ impl Compiler {
                 finally_body,
                 ..
             } => {
-                let setup = self.emit(Instruction::SetupTry(0, None));
-
-                for s in try_body {
-                    self.compile_statement(s)?;
-                }
-                self.emit(Instruction::EndTry);
-                let jump_past_catch = self.emit(Instruction::Jump(0));
-
-                // Catch block
-                let catch_start = self.current_offset();
-                self.patch_jump(setup, catch_start);
-
-                if let Some(param) = catch_param {
-                    let idx = self.declare_local(param);
-                    self.emit(Instruction::StoreLocal(idx));
-                } else {
-                    self.emit(Instruction::Pop); // discard error
-                }
-
-                for s in catch_body {
-                    self.compile_statement(s)?;
-                }
-
-                let after_catch = self.current_offset();
-                self.patch_jump(jump_past_catch, after_catch);
-
-                if let Some(finally) = finally_body {
-                    for s in finally {
-                        self.compile_statement(s)?;
-                    }
-                }
+                self.compile_try_catch_finally(
+                    try_body,
+                    catch_param.as_deref(),
+                    catch_body,
+                    finally_body.as_deref(),
+                    None,
+                )?;
             }
             Statement::Break { label, .. } => {
-                let idx = self.emit(Instruction::Jump(0));
+                let idx = self.emit(Instruction::Break(0));
                 let target = match label {
                     Some(l) => self
                         .loop_stack
@@ -593,7 +572,7 @@ impl Compiler {
                 }
             }
             Statement::Continue { label, .. } => {
-                let idx = self.emit(Instruction::Jump(0));
+                let idx = self.emit(Instruction::Continue(0));
                 let target = match label {
                     Some(l) => self
                         .loop_stack
@@ -762,28 +741,18 @@ impl Compiler {
                 finally_body,
                 ..
             } => {
-                let setup = self.emit(Instruction::SetupTry(0, None));
-                self.compile_completion_block(try_body)?;
-                self.emit(Instruction::EndTry);
-                let jump_past_catch = self.emit(Instruction::Jump(0));
-                let catch_start = self.current_offset();
-                self.patch_jump(setup, catch_start);
-                if let Some(param) = catch_param {
-                    let idx = self.declare_local(param);
-                    self.emit(Instruction::StoreLocal(idx));
-                } else {
-                    self.emit(Instruction::Pop);
-                }
-                self.compile_completion_block(catch_body)?;
-                let after_catch = self.current_offset();
-                self.patch_jump(jump_past_catch, after_catch);
-                // A finally block runs for effects; its value is discarded (an
-                // abrupt completion inside finally — return/throw — is B2, separate).
-                if let Some(finally) = finally_body {
-                    for s in finally {
-                        self.compile_statement(s)?;
-                    }
-                }
+                // In completion-value position the try and catch arms each leave a
+                // value on the stack. The finally body runs for effects only; its
+                // value is discarded (it pops the completion value), and a normal
+                // finally completion lets the try/catch value through. An abrupt
+                // completion inside finally still supersedes via EndFinally.
+                self.compile_try_catch_finally(
+                    try_body,
+                    catch_param.as_deref(),
+                    catch_body,
+                    finally_body.as_deref(),
+                    Some(()),
+                )?;
             }
             other => {
                 self.compile_statement(other)?;
@@ -815,6 +784,138 @@ impl Compiler {
             }
         }
         Ok(())
+    }
+
+    /// Lower a `try { … } catch (e) { … } finally { … }` statement. When
+    /// `completion` is `Some`, the try and catch arms are compiled in
+    /// completion-value position (each leaves its value on the stack); otherwise
+    /// they are compiled as plain statements.
+    ///
+    /// The finally body — when present — is compiled once at a known ip. Every
+    /// way of leaving the try/catch (normal fall-through, caught/uncaught throw,
+    /// `return`, `break`, `continue`) routes through that finally at runtime via
+    /// the try frame's pending-completion slot; an abrupt completion inside the
+    /// finally supersedes the pending one (`EndFinally`). Without a finally the
+    /// lowering is the classic catch-only shape.
+    fn compile_try_catch_finally(
+        &mut self,
+        try_body: &[Statement],
+        catch_param: Option<&str>,
+        catch_body: &[Statement],
+        finally_body: Option<&[Statement]>,
+        completion: Option<()>,
+    ) -> Result<()> {
+        let has_catch = !catch_body.is_empty() || catch_param.is_some();
+
+        // ---- No finally: the classic catch-only lowering. ----
+        let Some(finally) = finally_body else {
+            let setup = self.emit(Instruction::SetupTry {
+                catch_ip: 0,
+                finally_ip: None,
+                region_end: 0,
+            });
+            self.compile_body(try_body, completion)?;
+            self.emit(Instruction::EndTry);
+            let jump_past_catch = self.emit(Instruction::Jump(0));
+
+            let catch_start = self.current_offset();
+            self.patch_jump(setup, catch_start);
+            if let Some(param) = catch_param {
+                let idx = self.declare_local(param);
+                self.emit(Instruction::StoreLocal(idx));
+            } else {
+                self.emit(Instruction::Pop);
+            }
+            self.compile_body(catch_body, completion)?;
+
+            let after_catch = self.current_offset();
+            self.patch_jump(jump_past_catch, after_catch);
+            if let Instruction::SetupTry { region_end, .. } = &mut self.instructions[setup] {
+                *region_end = after_catch;
+            }
+            return Ok(());
+        };
+
+        // ---- With finally: route every exit through the finally body. ----
+        //
+        // SetupTry's catch_ip is patched to the catch block when there is one,
+        // otherwise to the finally entry (so an uncaught throw runs the finally,
+        // carrying the in-flight exception). finally_ip is filled in once the
+        // finally body is emitted; the runtime reads it when an abrupt completion
+        // (return/break/continue) or a throw must run this finally.
+        let setup = self.emit(Instruction::SetupTry {
+            catch_ip: 0,
+            finally_ip: None,
+            region_end: 0,
+        });
+
+        // Try body. On normal completion, route to the finally with a Normal
+        // completion. (EnterFinallyNormal's operand is patched to finally_ip.)
+        // No EndTry here: the try frame must persist until EndFinally so the
+        // finally body can run and resume the pending completion. EnterFinallyNormal
+        // transitions the frame into its finally phase.
+        self.compile_body(try_body, completion)?;
+        let try_to_finally = self.emit(Instruction::EnterFinallyNormal(0));
+
+        // Catch block (optional).
+        let catch_start = self.current_offset();
+        if has_catch {
+            if let Some(param) = catch_param {
+                let idx = self.declare_local(param);
+                self.emit(Instruction::StoreLocal(idx));
+            } else {
+                self.emit(Instruction::Pop);
+            }
+            self.compile_body(catch_body, completion)?;
+        }
+        // After the catch body (or, when there is no catch, this point is never
+        // reached by fall-through) route to the finally with a Normal completion.
+        let catch_to_finally = self.emit(Instruction::EnterFinallyNormal(0));
+
+        // Finally body.
+        let finally_ip = self.current_offset();
+        self.patch_jump(try_to_finally, finally_ip);
+        self.patch_jump(catch_to_finally, finally_ip);
+
+        // In completion-value position the (try/catch) value sits on the stack
+        // beneath the finally body's temporaries; the finally runs for effects.
+        // The finally body is compiled as statements (stack-neutral), so the
+        // underlying value is preserved automatically — no extra work needed.
+        for s in finally {
+            self.compile_statement(s)?;
+        }
+        self.emit(Instruction::EndFinally);
+        let region_end = self.current_offset();
+
+        // Patch SetupTry now that catch/finally/region ips are known. Throws go
+        // to the catch block if present, otherwise straight to the finally entry
+        // (with the exception pending). finally_ip lets return/break/continue
+        // find this finally; region_end bounds the statement for break/continue.
+        if let Instruction::SetupTry {
+            catch_ip,
+            finally_ip: fin,
+            region_end: end,
+        } = &mut self.instructions[setup]
+        {
+            *catch_ip = if has_catch { catch_start } else { finally_ip };
+            *fin = Some(finally_ip);
+            *end = region_end;
+        }
+
+        Ok(())
+    }
+
+    /// Compile a statement list either as plain statements or (when
+    /// `completion` is `Some`) in completion-value position.
+    fn compile_body(&mut self, body: &[Statement], completion: Option<()>) -> Result<()> {
+        if completion.is_some() {
+            self.compile_completion_block(body)
+        } else {
+            for s in body {
+                self.compile_statement(s)?;
+            }
+            Ok(())
+        }
     }
 
     /// Compile a complete optional chain (`a?.b.c`, `x?.f()`, `arr?.[i]`, …).

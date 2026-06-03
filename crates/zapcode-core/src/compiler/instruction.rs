@@ -140,8 +140,12 @@ pub enum Instruction {
 
     // Loops
     SetupLoop,
-    Break,
-    Continue,
+    /// Transfer control to `target` (a loop's exit / next-iteration ip) the way a
+    /// `break`/`continue` does, but first run any `finally` blocks the transfer
+    /// escapes (try-statements that enclose this jump but are enclosed by the
+    /// loop). Carries the resolved jump target.
+    Break(usize),
+    Continue(usize),
 
     // Iterators
     GetIterator,
@@ -149,9 +153,31 @@ pub enum Instruction {
     IteratorDone,
 
     // Error handling
-    SetupTry(usize, Option<usize>),
+    //
+    // `SetupTry { catch_ip, finally_ip, region_end }` protects the following try
+    // body. On a throw the VM transfers to `catch_ip` if a catch handler exists,
+    // otherwise straight to the `finally` body (recording a Throw completion).
+    // `finally_ip` is the start of the finally body when the statement has one.
+    // `region_end` is the ip just past the whole try/catch/finally statement,
+    // used to decide whether a `break`/`continue` escapes this try (so its
+    // finally must run) or stays inside it.
+    SetupTry {
+        catch_ip: usize,
+        finally_ip: Option<usize>,
+        region_end: usize,
+    },
     Throw,
     EndTry,
+    /// Record a normal completion for the active try/finally and jump to its
+    /// finally body (compiler emits this on the normal fall-through and end-of-
+    /// catch paths so the finally always runs). No-op if the active try has no
+    /// finally. Operand is the finally body's start ip.
+    EnterFinallyNormal(usize),
+    /// Marks the end of a finally body. Pops the active try frame's pending
+    /// completion and resumes it (re-throw / re-return / re-break / re-continue /
+    /// fall through). An abrupt completion *inside* the finally body supersedes
+    /// the pending one and is handled before this instruction is reached.
+    EndFinally,
 
     // Typeof
     TypeOf,
