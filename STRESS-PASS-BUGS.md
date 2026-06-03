@@ -22,6 +22,27 @@
   promise unwraps to its value.
 - **N4 tool calls inside `.then`/`.catch`/`.finally` callbacks — FIXED** (prior commit;
   enables the `primary().catch(() => fallback())` retry pattern). (`stress_then_tools.rs`.)
+- **N9 `for await (const x of …)` — FIXED.** The for-of lowering now reads oxc's
+  `ForOfStatement::await` flag (previously the loop parsed but the flag was silently
+  ignored, so each `x` was the raw Promise object). `Statement::ForOf` carries an
+  `await_each: bool`; when set, the compiler emits an `Await` instruction on each
+  iterated value just after the loop's done-check and before the binding. This reuses
+  the existing `Await` path: a resolved promise unwraps, a rejected promise throws
+  (`Unhandled promise rejection: …`), a non-promise passes through, and a pending
+  external call suspends/resumes back into the same loop iteration. Verified for arrays
+  of promises (`for await ([Promise.resolve(1),Promise.resolve(2)])` sums to 3), plain
+  values, mixed, destructuring bindings, break/continue, nesting (no iterator leak),
+  rejection-in-loop, and suspend/resume across an external call in the loop body.
+  Async-generator *consumption* also works: `for await (… of asyncGen())` drives the
+  generator's iterator and awaits each yielded value (yielding promises and internal
+  promise-awaits both resolve correctly). (`stress_for_await.rs`.)
+  - **Residual gap (deferred):** an `async function*` that suspends on an *external*
+    (host) call mid-iteration is unsupported — it errors `cannot suspend inside a
+    generator`. This is a pre-existing generator limitation (generators run
+    synchronously via `generator_next`, which can't capture/resume a host-call
+    suspension across the yield boundary), not specific to for-await; internal
+    promise-awaits and yielding promises inside an async generator both work. Pinned by
+    `async_generator_external_suspension_is_the_documented_gap` in `stress_for_await.rs`.
 - **Edges:** **O5** (`"key" in obj` no longer a parse error when the line starts with a
   string literal; array `length`/numeric-index `in` membership, own-keys only),
   **H6** (`Map.set`/`Set.add` return the collection so chaining works; returns the same
@@ -36,7 +57,8 @@
 - **Intentionally deferred (still divergent):** **N5** full tool-call-as-deferred-Promise
   (a bare tool-call expression is still an eagerly-resolved value, not a real Promise
   object with `.then`; combinators only defer when an array element is a *direct* external
-  call); **N9** `for await…of` / async-generator consumption (parse-level gap); **G4**
+  call); (**N9** `for await…of` is now FIXED — see Round 4; only async-generator
+  *external-call* suspension mid-iteration remains a documented gap); **G4**
   `match()`/`matchAll` `.index`/`.input`/named `.groups`; **O4** `valueOf`/`toString`/
   `Symbol.toPrimitive` coercion hooks; **G9** UTF-16 string indexing (strings are indexed
   by code point). **N7** `AggregateError` global landed in Round 2; `Promise.any`'s
@@ -44,6 +66,16 @@
 - **Verified:** 579 core tests (0 failed) + `cargo build --workspace` clean (0 warnings) +
   full JS `test:scenarios3` (10 scenarios) and `test:e2e` (all suites incl. `parallel`/
   `stress`/`marshalling`) green.
+- **Pre-existing `security` test issue (NOT a N9/for-await regression):** as of the
+  HEAD commit `O4: honor user valueOf/toString (ToPrimitive)`, the `security` test
+  binary is not clean on this platform. At the default test-thread stack
+  `test_weakref_escape` overflows the stack (SIGABRT), and with a larger stack
+  (`RUST_MIN_STACK=64M`) `test_tostring_not_invoked_during_coercion` fails the
+  assertion at `crates/zapcode-core/tests/security.rs:170` with
+  `ToPrimitive recursion limit exceeded (cyclic valueOf/toString?)` — the O4 hook now
+  invokes a `toString` the test expected to stay dormant during coercion. Confirmed
+  identical on a clean `git stash` of the N9 work; every other test binary (incl. the
+  new `stress_for_await.rs`, `async_await`, `generators`, all `stress_*`) is green.
 
 **Round 3 (branch `arca/heap-handles-rewrite`) — the heap-with-handles rewrite:**
 - **A (reference semantics) — FIXED.** `Value::Array`/`Object` now carry a `Handle`
@@ -425,7 +457,7 @@ Even `throw new Error("x")` arrives with `typeof e === "string"`, `e.message ===
 
 **N4 [HIGH] Tool calls inside `.then`/`.catch`/`.finally` callbacks throw** `runtime error: cannot call an external function inside an array-callback method` (misleading message — it's a promise callback). **Blocks the idiomatic `primary().catch(() => fallback())` retry pattern.**
 
-**N5 [MED] A tool-call expression is an eagerly-resolved value, not a Promise** — `const p = delay(…); typeof p` → exp `"object"`, act `"string"` (resolved value); `p.then` is `undefined`; the op runs to completion at the assignment. **Root cause of N1–N3, N6.** (`Promise.resolve(5)` *is* a real promise — specific to tool calls.) **N7 [MED]** `AggregateError` is undefined and `Promise.any`'s rejection carries no `.errors`/`.name`. **N8 [MED]** `Promise.resolve(thenable)` doesn't adopt the thenable. **N9 [LOW]** `for await…of` / async-generator *consumption* fails to parse (plain `function*` + `.next()` work).
+**N5 [MED] A tool-call expression is an eagerly-resolved value, not a Promise** — `const p = delay(…); typeof p` → exp `"object"`, act `"string"` (resolved value); `p.then` is `undefined`; the op runs to completion at the assignment. **Root cause of N1–N3, N6.** (`Promise.resolve(5)` *is* a real promise — specific to tool calls.) **N7 [MED]** `AggregateError` is undefined and `Promise.any`'s rejection carries no `.errors`/`.name`. **N8 [MED]** `Promise.resolve(thenable)` doesn't adopt the thenable. **N9 [FIXED — Round 4]** `for await…of` now awaits each iterated value (arrays of promises/values, mixed, destructuring, break/continue, nesting, rejection, suspend/resume across an external call in the body). Async-generator *consumption* via for-await also works (yielding promises + internal awaits resolve). Residual gap: an async generator that suspends on an *external* host call mid-iteration errors `cannot suspend inside a generator` (a pre-existing generator limitation). See `stress_for_await.rs`.
 *Good:* `Promise.all` parallelizes and preserves index order; `.then`/`.catch`/`.finally` chaining + value/promise unwrap; `await` non-promise; `allSettled` element shape `{status,value/reason}`.
 
 ## Cluster O — Coercion / operators  *(silent corruption of common code)*

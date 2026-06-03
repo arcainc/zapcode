@@ -601,6 +601,7 @@ impl<'a> AstLowerer<'a> {
             binding,
             iterable,
             body,
+            await_each: false,
             span,
         })
     }
@@ -627,10 +628,15 @@ impl<'a> AstLowerer<'a> {
         };
         let iterable = self.lower_expr(&for_of.right)?;
         let body = self.lower_statement_as_block(&for_of.body)?;
+        // `for await (const x of it)`: oxc sets `for_of.await`. We lower the loop
+        // identically to a sync for-of but flag it so the compiler awaits each
+        // iterated value (resolving promises / suspending on pending external
+        // calls via the existing Await path) before binding it.
         Ok(Statement::ForOf {
             binding,
             iterable,
             body,
+            await_each: for_of.r#await,
             span,
         })
     }

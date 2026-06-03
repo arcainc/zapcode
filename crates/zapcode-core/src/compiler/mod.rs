@@ -466,6 +466,7 @@ impl Compiler {
                 binding,
                 iterable,
                 body,
+                await_each,
                 ..
             } => {
                 self.compile_expr(iterable)?;
@@ -488,6 +489,15 @@ impl Compiler {
                 self.emit(Instruction::IteratorNext);
                 self.emit(Instruction::IteratorDone);
                 let exit_jump = self.emit(Instruction::JumpIfTrue(0));
+
+                // `for await`: the iterated value (now on top of the stack, with
+                // the threaded iterator beneath it) must be awaited before being
+                // bound. Await unwraps a resolved promise, throws a rejected one,
+                // suspends on a pending external call, and passes non-promises
+                // through — exactly the per-element semantics we want.
+                if *await_each {
+                    self.emit(Instruction::Await);
+                }
 
                 // Bind the value
                 match binding {

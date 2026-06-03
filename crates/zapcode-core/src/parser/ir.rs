@@ -96,6 +96,8 @@ pub enum Statement {
         binding: ForBinding,
         iterable: Expr,
         body: Vec<Statement>,
+        /// `for await (const x of it)` — await each iterated value before binding.
+        await_each: bool,
         span: Span,
     },
     For {
