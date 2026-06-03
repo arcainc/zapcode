@@ -3784,11 +3784,34 @@ impl Vm {
                             .and_then(|m| m.get(key.as_ref()).cloned())
                             .unwrap_or(Value::Undefined)
                     }
-                    (Value::String(s), Value::Int(i)) => s
+                    (Value::String(s), Value::Int(i)) => {
+                        if *i < 0 {
+                            Value::Undefined
+                        } else {
+                            s.chars()
+                                .nth(*i as usize)
+                                .map(|c| Value::String(Arc::from(c.to_string().as_str())))
+                                .unwrap_or(Value::Undefined)
+                        }
+                    }
+                    (Value::String(s), Value::Float(f)) if *f >= 0.0 && f.fract() == 0.0 => s
                         .chars()
-                        .nth(*i as usize)
+                        .nth(*f as usize)
                         .map(|c| Value::String(Arc::from(c.to_string().as_str())))
                         .unwrap_or(Value::Undefined),
+                    // A string-typed numeric subscript (`"hello"["1"]`) reads the
+                    // char at that index, like JS (property-key -> integer index).
+                    (Value::String(s), Value::String(key)) => match key.parse::<usize>() {
+                        Ok(i) => s
+                            .chars()
+                            .nth(i)
+                            .map(|c| Value::String(Arc::from(c.to_string().as_str())))
+                            .unwrap_or(Value::Undefined),
+                        Err(_) if key.as_ref() == "length" => {
+                            Value::Int(s.chars().count() as i64)
+                        }
+                        Err(_) => Value::Undefined,
+                    },
                     _ => Value::Undefined,
                 };
                 match result {

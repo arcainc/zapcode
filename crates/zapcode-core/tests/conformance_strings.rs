@@ -79,9 +79,8 @@ fn bracket_indexing() {
     assert_eq!(run_str("'hello'[4]"), "o");
     assert_eq!(run_str("String('hello'[5])"), "undefined");
     assert_eq!(run_str("String('hello'[-1])"), "undefined");
-    // DIVERGENCE: a STRING-typed index ('1') is not coerced to a numeric character
-    // index; only numeric subscripts read a character. Asserting ACTUAL behavior.
-    assert_eq!(run_str("String('hello'['1'])"), "undefined"); // JS: "e"
+    // A STRING-typed numeric index ('1') is coerced to a character index.
+    assert_eq!(run_str("String('hello'['1'])"), "e");
 }
 
 #[test]
@@ -100,9 +99,8 @@ fn at_method() {
     assert_eq!(run_str("'hello'.at(-1)"), "o");
     assert_eq!(run_str("'hello'.at(-2)"), "l");
     assert_eq!(run_str("String('hello'.at(10))"), "undefined"); // forward OOB -> undefined
-    // DIVERGENCE: a negative index beyond the start should be `undefined` in JS,
-    // but zapcode clamps and returns the first char. Asserting ACTUAL behavior.
-    assert_eq!(run_str("'abc'.at(-10)"), "a"); // JS: undefined
+    // A negative index beyond the start is `undefined` (no clamping).
+    assert_eq!(run_str("String('abc'.at(-10))"), "undefined");
 }
 
 #[test]

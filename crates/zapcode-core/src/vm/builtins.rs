@@ -1826,15 +1826,17 @@ fn call_string_method(
         }
         "at" => {
             let idx = arg_int(args, 0);
-            let len = s.len() as i64;
-            let normalized = if idx < 0 {
-                (len + idx).max(0) as usize
+            let len = s.chars().count() as i64;
+            // A negative index counts from the end; an index out of range (either
+            // direction, including too-negative) yields `undefined` — no clamping.
+            let resolved = if idx < 0 { len + idx } else { idx };
+            if resolved < 0 || resolved >= len {
+                Value::Undefined
             } else {
-                idx as usize
-            };
-            match s.chars().nth(normalized) {
-                Some(c) => Value::String(Arc::from(c.to_string().as_str())),
-                None => Value::Undefined,
+                match s.chars().nth(resolved as usize) {
+                    Some(c) => Value::String(Arc::from(c.to_string().as_str())),
+                    None => Value::Undefined,
+                }
             }
         }
         "normalize" => {
