@@ -16,9 +16,12 @@
 //!   * static methods are NOT inherited by subclasses (JS: they are).
 //!   * methods are per-instance, not shared on a prototype object
 //!     (`a.m !== b.m`; JS: `===`).
-//!   * class FIELD declarations (`x = …;`), STATIC fields, and accessor
-//!     GET/SET semantics are not installed; a `get x()` is an ordinary method.
 //!   * `#private` fields and computed method names `[k](){}` are unsupported syntax.
+//!
+//! SUPPORTED (cluster C): instance FIELD declarations (`x = …;`), STATIC fields,
+//! and accessor GET/SET semantics now match real Node — fields initialize on
+//! construction (in order, before the constructor), statics install on the class
+//! object, and `get x()`/`set x(v)` install accessor descriptors.
 //!   * a class expression *returned through a function* and then `new`'d yields a
 //!     plain object (so its method results coerce to "[object Object]"); we exercise
 //!     class expressions assigned directly, which work, and skip the escaping form.
@@ -247,15 +250,20 @@ fn arrow_in_filter_and_reduce_captures_this() {
 }
 
 // ============================================================================
-// 4. Getters used as methods (documented: get x() is an ordinary method)
+// 4. Getter accessors (cluster C): `get x()` installs an accessor descriptor
 // ============================================================================
 
 #[test]
-fn getter_is_treated_as_method() {
-    // DIVERGENCE (documented): `get v()` installs an ordinary method, not an
-    // accessor. A bare read resolves to the function value; *calling* it works.
-    assert_eq!(run_str("class T { get val(){ return 99; } } typeof new T().val"), "function"); // JS: "number"
-    assert_eq!(run_str("class T { get val(){ return 99; } } new T().val()"), "99"); // works when called like a method
+fn getter_is_invoked_on_read() {
+    // `get val()` installs an accessor: a bare read runs the getter body and
+    // yields its return value (matching real Node).
+    assert_eq!(run_str("class T { get val(){ return 99; } } typeof new T().val"), "number");
+    assert_eq!(run_str("class T { get val(){ return 99; } } String(new T().val)"), "99");
+    // The getter reads instance state set by the constructor.
+    assert_eq!(
+        run_str("class Box { constructor(v){ this.v = v; } get doubled(){ return this.v * 2; } } String(new Box(5).doubled)"),
+        "10"
+    );
 }
 
 #[test]
@@ -811,30 +819,41 @@ fn static_methods_not_inherited_documented_divergence() {
 }
 
 #[test]
-fn class_field_declarations_unsupported_documented_divergence() {
-    // DIVERGENCE (documented, cluster C): class FIELD declarations (`x = 10;`) are
-    // not initialized — reading the field yields `undefined`. Use a constructor.
-    assert_eq!(run_str("class C { x = 10; } String(new C().x)"), "undefined"); // JS: 10
-    assert_eq!(run_str("class C { x = 10; y = this.x * 2; } String(new C().y)"), "undefined"); // JS: 20
-    assert_eq!(run_str("class C { x; } String(new C().x)"), "undefined"); // JS: undefined (here coincidentally matches)
+fn class_field_declarations_initialize_on_construction() {
+    // Cluster C: instance FIELD declarations (`x = 10;`) initialize on every
+    // construction, before the constructor body. Initializers run in order and
+    // can read earlier fields via `this`.
+    assert_eq!(run_str("class C { x = 10; } String(new C().x)"), "10");
+    assert_eq!(run_str("class C { x = 10; y = this.x * 2; } String(new C().y)"), "20");
+    // A bare `x;` initializes to undefined.
+    assert_eq!(run_str("class C { x; } String(new C().x)"), "undefined");
+    // The constructor runs after field initializers and can build on them.
+    assert_eq!(run_str("class C { x = 1; constructor(){ this.x += 5; } } String(new C().x)"), "6");
+    // Fields are not enumerated as internal keys.
+    assert_eq!(run_str("class C { a = 1; b = 2; } Object.keys(new C()).join(',')"), "a,b");
 }
 
 #[test]
-fn static_field_declarations_unsupported_documented_divergence() {
-    // DIVERGENCE (documented, cluster C): STATIC field declarations are not
-    // initialized. Static METHODS work (see static_method_basic).
-    assert_eq!(run_str("class C { static count = 5; } String(C.count)"), "undefined"); // JS: 5
-    assert_eq!(run_str("class C { static count = 0; } String(C.count)"), "undefined"); // JS: 0
+fn static_field_declarations_initialize_on_class() {
+    // Cluster C: STATIC field declarations install the value on the class object.
+    assert_eq!(run_str("class C { static count = 5; } String(C.count)"), "5");
+    assert_eq!(run_str("class C { static count = 0; } String(C.count)"), "0");
+    // A static initializer can read earlier static fields via `this`.
+    assert_eq!(run_str("class C { static a = 2; static b = this.a * 3; } String(C.b)"), "6");
 }
 
 #[test]
-fn setter_not_invoked_documented_divergence() {
-    // DIVERGENCE (documented, cluster C): a `set v(...)` is not installed as an
-    // accessor; assigning `t.v = 5` stores an own data property and the setter body
-    // never runs (so `_v` stays undefined).
+fn setter_is_invoked_on_assignment() {
+    // Cluster C: a `set v(...)` installs an accessor — assigning `t.v = 5` runs
+    // the setter body (no backing data property is stored under `v`).
     assert_eq!(
         run_str("class T { set v(x){ this._v = x * 100; } } const t = new T(); t.v = 5; `${String(t._v)},${t.v}`"),
-        "undefined,5" // JS: "500,undefined"
+        "500,undefined"
+    );
+    // A getter/setter pair round-trips through the backing field.
+    assert_eq!(
+        run_str("class Box { constructor(){ this._v = 0; } set v(x){ this._v = x * 2; } get v(){ return this._v; } } const b = new Box(); b.v = 10; `${String(b._v)},${String(b.v)}`"),
+        "20,20"
     );
 }
 

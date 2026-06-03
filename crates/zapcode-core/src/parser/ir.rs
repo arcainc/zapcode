@@ -1,7 +1,14 @@
 use serde::{Deserialize, Serialize};
 
-/// Result type for parsing a class body: (constructor, instance methods, static methods).
-pub type ClassBodyParts = (Option<Box<FunctionDef>>, Vec<ClassMethod>, Vec<ClassMethod>);
+/// Result type for parsing a class body:
+/// (constructor, instance methods, static methods, instance fields, static fields).
+pub type ClassBodyParts = (
+    Option<Box<FunctionDef>>,
+    Vec<ClassMethod>,
+    Vec<ClassMethod>,
+    Vec<ClassField>,
+    Vec<ClassField>,
+);
 
 /// Span information for error reporting.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -165,14 +172,34 @@ pub enum Statement {
         constructor: Option<Box<FunctionDef>>,
         methods: Vec<ClassMethod>,
         static_methods: Vec<ClassMethod>,
+        fields: Vec<ClassField>,
+        static_fields: Vec<ClassField>,
         span: Span,
     },
+}
+
+/// What kind of member a [`ClassMethod`] is: an ordinary method, or a getter /
+/// setter accessor that installs an accessor descriptor on the prototype.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClassMethodKind {
+    Method,
+    Get,
+    Set,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClassMethod {
     pub name: String,
     pub func: FunctionDef,
+    pub kind: ClassMethodKind,
+}
+
+/// A class field declaration (`x = expr;` or bare `y;`), instance or static.
+/// `value` is `None` for an uninitialized declaration (initializes to `undefined`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassField {
+    pub name: String,
+    pub value: Option<Expr>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -367,6 +394,8 @@ pub enum Expr {
         constructor: Option<Box<FunctionDef>>,
         methods: Vec<ClassMethod>,
         static_methods: Vec<ClassMethod>,
+        fields: Vec<ClassField>,
+        static_fields: Vec<ClassField>,
     },
 }
 

@@ -753,7 +753,8 @@ impl<'a> AstLowerer<'a> {
             None => None,
         };
 
-        let (constructor, methods, static_methods) = self.lower_class_body(&class.body)?;
+        let (constructor, methods, static_methods, fields, static_fields) =
+            self.lower_class_body(&class.body)?;
 
         Ok(Statement::ClassDecl {
             name,
@@ -761,6 +762,8 @@ impl<'a> AstLowerer<'a> {
             constructor,
             methods,
             static_methods,
+            fields,
+            static_fields,
             span,
         })
     }
@@ -782,7 +785,8 @@ impl<'a> AstLowerer<'a> {
             None => None,
         };
 
-        let (constructor, methods, static_methods) = self.lower_class_body(&class.body)?;
+        let (constructor, methods, static_methods, fields, static_fields) =
+            self.lower_class_body(&class.body)?;
 
         Ok(Expr::ClassExpr {
             name,
@@ -790,6 +794,8 @@ impl<'a> AstLowerer<'a> {
             constructor,
             methods,
             static_methods,
+            fields,
+            static_fields,
         })
     }
 
@@ -797,10 +803,17 @@ impl<'a> AstLowerer<'a> {
         let mut constructor = None;
         let mut methods = Vec::new();
         let mut static_methods = Vec::new();
+        let mut fields = Vec::new();
+        let mut static_fields = Vec::new();
 
         for element in &body.body {
             match element {
                 ast::ClassElement::MethodDefinition(method) => {
+                    // `#private` methods are unsupported syntax.
+                    if matches!(&method.key, ast::PropertyKey::PrivateIdentifier(_)) {
+                        return Err(self
+                            .unsupported(method.span, "private fields are not supported"));
+                    }
                     let method_name = match &method.key {
                         ast::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
                         ast::PropertyKey::StringLiteral(s) => s.value.to_string(),
@@ -824,43 +837,57 @@ impl<'a> AstLowerer<'a> {
                         span: self.span(func.span),
                     };
 
-                    match method.kind {
+                    let kind = match method.kind {
                         ast::MethodDefinitionKind::Constructor => {
                             constructor = Some(Box::new(func_def));
+                            continue;
                         }
-                        ast::MethodDefinitionKind::Method => {
-                            if method.r#static {
-                                static_methods.push(ClassMethod {
-                                    name: method_name,
-                                    func: func_def,
-                                });
-                            } else {
-                                methods.push(ClassMethod {
-                                    name: method_name,
-                                    func: func_def,
-                                });
-                            }
-                        }
-                        ast::MethodDefinitionKind::Get | ast::MethodDefinitionKind::Set => {
-                            // Getters/setters: treat as regular methods for now
-                            if method.r#static {
-                                static_methods.push(ClassMethod {
-                                    name: method_name,
-                                    func: func_def,
-                                });
-                            } else {
-                                methods.push(ClassMethod {
-                                    name: method_name,
-                                    func: func_def,
-                                });
-                            }
-                        }
+                        ast::MethodDefinitionKind::Method => ClassMethodKind::Method,
+                        ast::MethodDefinitionKind::Get => ClassMethodKind::Get,
+                        ast::MethodDefinitionKind::Set => ClassMethodKind::Set,
+                    };
+
+                    let entry = ClassMethod {
+                        name: method_name,
+                        func: func_def,
+                        kind,
+                    };
+                    if method.r#static {
+                        static_methods.push(entry);
+                    } else {
+                        methods.push(entry);
                     }
                 }
-                ast::ClassElement::PropertyDefinition(_) => {
-                    // Class property declarations (e.g., `name: string;`) are type-level
-                    // and are handled at runtime through constructor assignments.
-                    // Skip them in the IR.
+                ast::ClassElement::PropertyDefinition(prop) => {
+                    // `#private` fields are unsupported syntax.
+                    if matches!(&prop.key, ast::PropertyKey::PrivateIdentifier(_)) {
+                        return Err(self
+                            .unsupported(prop.span, "private fields are not supported"));
+                    }
+                    // Computed field names (`[k] = …`) are not supported.
+                    let field_name = match &prop.key {
+                        ast::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+                        ast::PropertyKey::StringLiteral(s) => s.value.to_string(),
+                        _ => continue,
+                    };
+                    // `declare x: T;` is a TypeScript type-only declaration with no
+                    // runtime initialization — skip it.
+                    if prop.declare {
+                        continue;
+                    }
+                    let value = match &prop.value {
+                        Some(expr) => Some(self.lower_expr(expr)?),
+                        None => None,
+                    };
+                    let entry = ClassField {
+                        name: field_name,
+                        value,
+                    };
+                    if prop.r#static {
+                        static_fields.push(entry);
+                    } else {
+                        fields.push(entry);
+                    }
                 }
                 ast::ClassElement::AccessorProperty(s) => {
                     return Err(self
@@ -875,7 +902,7 @@ impl<'a> AstLowerer<'a> {
             }
         }
 
-        Ok((constructor, methods, static_methods))
+        Ok((constructor, methods, static_methods, fields, static_fields))
     }
 
     fn lower_switch(&mut self, switch: &ast::SwitchStatement<'_>) -> Result<Statement> {

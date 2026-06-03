@@ -197,13 +197,32 @@ pub enum Instruction {
     DestructureArray(usize),
 
     // Classes
-    /// Create a class: pops constructor closure (or undefined), then n_methods method closures
-    /// with method names, then n_static static closures with names, then optional super class.
-    /// Pushes the class object (an Object with __constructor__, __prototype__, __class_name__).
+    /// Create a class. The compiler pushes the following groups onto the stack, in
+    /// this order (so they pop in reverse — constructor first):
+    ///   [optional super class]
+    ///   n_static_fields  * (name, init_closure) pairs
+    ///   n_fields         * (name, init_closure) pairs
+    ///   n_static_setters * (name, closure) pairs
+    ///   n_static_getters * (name, closure) pairs
+    ///   n_setters        * (name, closure) pairs
+    ///   n_getters        * (name, closure) pairs
+    ///   n_statics        * (name, closure) pairs   (static methods)
+    ///   n_methods        * (name, closure) pairs   (instance methods)
+    ///   constructor closure (or undefined)   <- top of stack
+    /// Field init closures take no args and run with `this` bound to the instance;
+    /// getter/setter closures are installed as accessor descriptors. Pushes the
+    /// class object (an Object with __constructor__, __prototype__, __class_name__,
+    /// and any __getters__/__setters__/__field_inits__/__static_field_inits__).
     CreateClass {
         name: String,
         n_methods: usize,
         n_statics: usize,
+        n_getters: usize,
+        n_setters: usize,
+        n_static_getters: usize,
+        n_static_setters: usize,
+        n_fields: usize,
+        n_static_fields: usize,
         has_super: bool,
     },
     /// Construct: pops class object + args, creates instance, calls constructor, pushes instance.

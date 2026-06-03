@@ -105,6 +105,13 @@ pub(crate) struct CallFrame {
     pub(crate) this_value: Option<Value>,
     /// Where the method receiver came from, so we can write back mutations.
     pub(crate) receiver_source: Option<ReceiverSource>,
+    /// True for a synthesized class field-initializer frame. Such a frame has a
+    /// bound `this` (so `this.x` resolves) but must NOT be treated as a
+    /// constructor on return: an implicit/explicit `undefined` return is the
+    /// field's value, not the instance. These frames run synchronously inside
+    /// `Construct`, so they are never serialized mid-flight.
+    #[serde(default)]
+    pub(crate) is_field_init: bool,
     /// Local slots that have been promoted to shared upvalue cells (captured by
     /// a nested closure): slot -> cell id. Reads/writes of these slots route
     /// through the cell arena so the closure and this frame stay in sync.
@@ -188,6 +195,20 @@ enum PromiseMethodOutcome {
     NotAPromise,
 }
 
+/// Decoded operands of a `CreateClass` instruction, passed to `Vm::create_class`.
+struct CreateClassParts<'a> {
+    name: &'a str,
+    n_methods: usize,
+    n_statics: usize,
+    n_getters: usize,
+    n_setters: usize,
+    n_static_getters: usize,
+    n_static_setters: usize,
+    n_fields: usize,
+    n_static_fields: usize,
+    has_super: bool,
+}
+
 /// The Zapcode VM.
 pub struct Vm {
     pub(crate) programs: Vec<CompiledProgram>,
@@ -246,6 +267,11 @@ pub struct Vm {
     /// another object); this bounds that recursion so a pathological hook can't
     /// loop forever. Transient — never serialized.
     pub(crate) to_primitive_depth: u32,
+    /// One-shot flag: when set, the very next frame pushed by `push_call_frame`
+    /// is a class field-initializer (its `undefined` return is the field value,
+    /// not a constructor `this`). Consumed immediately on push. Transient —
+    /// never serialized and never live across a suspension.
+    pub(crate) next_frame_is_field_init: bool,
     /// What to do with the value the host pushes when resuming a suspension that
     /// was triggered by *consuming a deferred single-call promise* (N5). For a
     /// plain `await p` this is `None` (the pushed value is exactly the await
@@ -416,6 +442,7 @@ impl Vm {
             rng_state: 0,
             pending_throw: None,
             to_primitive_depth: 0,
+            next_frame_is_field_init: false,
             resume_action: None,
         }
     }
@@ -502,6 +529,7 @@ impl Vm {
             rng_state: 0,
             pending_throw: None,
             to_primitive_depth: 0,
+            next_frame_is_field_init: false,
             resume_action: None,
         }
     }
@@ -822,10 +850,12 @@ impl Vm {
         let frame = self.frames.pop().unwrap();
         self.tracker.pop_frame();
 
-        // If this was a constructor frame (has this_value), return the updated
-        // `this` instead of the explicit return value (unless the constructor
-        // explicitly returns an object).
-        let actual_return = if let Some(ref this_val) = frame.this_value {
+        // A field-initializer frame binds `this` but is not a constructor: its
+        // return value IS the field value (even `undefined`), so skip the
+        // constructor `this`-rewrite below.
+        let actual_return = if frame.is_field_init {
+            return_val
+        } else if let Some(ref this_val) = frame.this_value {
             if let Some(parent) = self.frames.last_mut() {
                 if parent.this_value.is_some() {
                     parent.this_value = Some(this_val.clone());
@@ -1469,6 +1499,9 @@ impl Vm {
         // shared cell so LoadGlobal/StoreGlobal in the body see and mutate it.
         let env: HashMap<String, u64> = closure.env.iter().cloned().collect();
 
+        // Consume the one-shot field-initializer flag (set by `call_field_init`).
+        let is_field_init = std::mem::take(&mut self.next_frame_is_field_init);
+
         self.frames.push(CallFrame {
             program_index: closure.func_ref.program_id,
             func_index: Some(closure.func_ref.function_id),
@@ -1479,6 +1512,7 @@ impl Vm {
             receiver_source,
             boxed: HashMap::new(),
             env,
+            is_field_init,
         });
         Ok(())
     }
@@ -1501,6 +1535,7 @@ impl Vm {
             receiver_source: None,
             boxed: HashMap::new(),
             env: HashMap::new(),
+            is_field_init: false,
         });
 
         self.execute()
@@ -1873,6 +1908,21 @@ impl Vm {
     /// Returns the function's return value.
     fn call_function_internal(&mut self, callee: &Value, args: Vec<Value>) -> Result<Value> {
         self.call_closure_internal(callee, args, None)
+    }
+
+    /// Run a synthesized class field-initializer closure with `this` bound to the
+    /// instance/class object, returning the field's value. Unlike a constructor,
+    /// an `undefined` result stays `undefined` (see `CallFrame::is_field_init`).
+    /// The one-shot `next_frame_is_field_init` flag tags the pushed frame without
+    /// adding a wrapper to the hot internal-call path.
+    fn call_field_init(&mut self, callee: &Value, receiver: Value) -> Result<Value> {
+        self.last_receiver_source = None;
+        self.next_frame_is_field_init = true;
+        let r = self.call_closure_internal(callee, Vec::new(), Some(receiver));
+        // Cleared in push_call_frame on success; reset here defensively in case
+        // the callee wasn't a function and no frame was pushed.
+        self.next_frame_is_field_init = false;
+        r
     }
 
     /// Shared body for the internal-call helpers: push a frame (optionally with a
@@ -2893,6 +2943,7 @@ impl Vm {
                     receiver_source: None,
                     boxed: HashMap::new(),
                     env,
+                    is_field_init: false,
                 });
                 self.run_generator_until_yield_or_return(gen_obj)
             }
@@ -2914,6 +2965,7 @@ impl Vm {
                     receiver_source: None,
                     boxed: HashMap::new(),
                     env,
+                    is_field_init: false,
                 });
                 self.run_generator_until_yield_or_return(gen_obj)
             }
@@ -3441,6 +3493,20 @@ impl Vm {
                 let obj = self.pop()?;
                 // Place of the object we're reading the property from.
                 let obj_place = self.last_place.take();
+                // Accessor getter: if this object carries a getter for `name`
+                // (instance accessor, or a static accessor on a class object),
+                // invoke it with `this` bound to the object and use its result.
+                let getter = self
+                    .instance_accessor(&obj, "__getters__", &name)
+                    .or_else(|| self.instance_accessor(&obj, "__static_getters__", &name));
+                if let Some(getter) = getter {
+                    self.last_global_name = None;
+                    self.last_receiver_source = None;
+                    self.last_place = None;
+                    let v = self.call_method_internal(&getter, obj, Vec::new())?;
+                    self.push(v)?;
+                    return Ok(None);
+                }
                 let result = self.get_property(&obj, &name)?;
                 // Consume the builtin-global shortcut: it applies only to this
                 // single read immediately after a `LoadGlobal`, never to a later
@@ -3485,6 +3551,18 @@ impl Vm {
                 // (compile_store pushes object after the value)
                 let obj_val = self.pop()?;
                 let value = self.pop()?;
+                // Accessor setter: if this object carries a setter for `name`
+                // (instance accessor, or a static accessor on a class object),
+                // invoke it with `this` bound to the object instead of storing a
+                // data property (accessor properties have no backing slot).
+                let setter = self
+                    .instance_accessor(&obj_val, "__setters__", &name)
+                    .or_else(|| self.instance_accessor(&obj_val, "__static_setters__", &name));
+                if let Some(setter) = setter {
+                    self.call_method_internal(&setter, obj_val.clone(), vec![value])?;
+                    self.push(obj_val)?;
+                    return Ok(None);
+                }
                 match obj_val {
                     Value::Object(h) => {
                         // A frozen object silently ignores property writes (sloppy
@@ -4917,113 +4995,28 @@ impl Vm {
                 name,
                 n_methods,
                 n_statics,
+                n_getters,
+                n_setters,
+                n_static_getters,
+                n_static_setters,
+                n_fields,
+                n_static_fields,
                 has_super,
             } => {
-                // Stack layout (top to bottom):
-                // constructor closure (or undefined)
-                // n_methods * (closure, method_name_string) pairs
-                // n_statics * (closure, method_name_string) pairs
-                // [optional super class if has_super]
-
-                let constructor = self.pop()?;
-
-                // Pop instance methods
-                let mut prototype = IndexMap::new();
-                for _ in 0..n_methods {
-                    let method_closure = self.pop()?;
-                    let method_name = self.pop()?;
-                    if let Value::String(mn) = method_name {
-                        prototype.insert(mn, method_closure);
-                    }
-                }
-
-                // Pop static methods
-                let mut statics = IndexMap::new();
-                for _ in 0..n_statics {
-                    let method_closure = self.pop()?;
-                    let method_name = self.pop()?;
-                    if let Value::String(mn) = method_name {
-                        statics.insert(mn, method_closure);
-                    }
-                }
-
-                // Pop super class if present
-                let super_class = if has_super { Some(self.pop()?) } else { None };
-
-                // If super class, copy its prototype methods to ours (inheritance)
-                if let Some(Value::Object(sc)) = &super_class {
-                    if let Some(Value::Object(super_proto_h)) =
-                        self.heap.object(*sc).and_then(|m| m.get("__prototype__").cloned())
-                    {
-                        // Super prototype methods go first, then our own (which override)
-                        let mut merged = self.heap.object_map(super_proto_h);
-                        for (k, v) in prototype {
-                            merged.insert(k, v);
-                        }
-                        prototype = merged;
-                    }
-                }
-
-                // The inheritance chain of class names (self first), so
-                // `instanceof` matches ancestor classes too.
-                let mut chain = vec![Value::String(Arc::from(name.as_str()))];
-                // If the class (transitively) extends a built-in Error, record the
-                // error base name so instances get the `__error__` brand (making
-                // `e instanceof Error` true) and `super(message)` sets `.message`.
-                let mut error_base: Option<Arc<str>> = None;
-                if let Some(Value::Object(sc)) = &super_class {
-                    let scm = self.heap.object_map(*sc);
-                    match scm.get("__class_chain__") {
-                        Some(Value::Array(c)) => chain.extend(self.heap.array_vec(*c)),
-                        _ => {
-                            if let Some(n) = scm.get("__class_name__") {
-                                chain.push(n.clone());
-                            }
-                        }
-                    }
-                    // A built-in Error constructor as the direct super.
-                    if let Some(Value::String(ctor)) = scm.get("__builtin_constructor__") {
-                        if is_error_ctor_name(ctor) {
-                            error_base = Some(ctor.clone());
-                        }
-                    }
-                    // Or a user class that itself extends an Error.
-                    if error_base.is_none() {
-                        if let Some(Value::String(base)) = scm.get("__error_base__") {
-                            error_base = Some(base.clone());
-                        }
-                    }
-                }
-
-                let chain_arr = Value::Array(self.heap.alloc_array(chain));
-                let proto_obj = Value::Object(self.heap.alloc_object(prototype));
-
-                // Build the class object
-                let mut class_obj = IndexMap::new();
-                class_obj.insert(
-                    Arc::from("__class_name__"),
-                    Value::String(Arc::from(name.as_str())),
-                );
-                class_obj.insert(Arc::from("__class_chain__"), chain_arr);
-                class_obj.insert(Arc::from("__constructor__"), constructor);
-                class_obj.insert(Arc::from("__prototype__"), proto_obj);
-
-                // Store super class reference for super() calls
-                if let Some(sc) = super_class {
-                    class_obj.insert(Arc::from("__super__"), sc);
-                }
-                // Record the built-in Error base so instances are branded as errors.
-                if let Some(base) = error_base {
-                    class_obj.insert(Arc::from("__error_base__"), Value::String(base));
-                }
-
-                // Add static methods directly on the class object
-                for (k, v) in statics {
-                    class_obj.insert(k, v);
-                }
-
-                let h = self.heap.alloc_object(class_obj);
-                self.push(Value::Object(h))?;
+                // Delegated to a dedicated method so this large arm does not bloat
+                // the `dispatch` stack frame (which recurses through ToPrimitive).
+                self.create_class(CreateClassParts {
+                    name: &name,
+                    n_methods,
+                    n_statics,
+                    n_getters,
+                    n_setters,
+                    n_static_getters,
+                    n_static_setters,
+                    n_fields,
+                    n_static_fields,
+                    has_super,
+                })?;
             }
 
             Instruction::Construct(arg_count) => {
@@ -5167,8 +5160,54 @@ impl Vm {
                                 .entry(Arc::from("name"))
                                 .or_insert_with(|| Value::String(base.clone()));
                         }
+                        // Carry accessor descriptors onto the instance so a later
+                        // GetProperty/SetProperty invokes the getter/setter body.
+                        if let Some(g @ Value::Object(_)) = class_obj.get("__getters__") {
+                            instance.insert(Arc::from("__getters__"), g.clone());
+                        }
+                        if let Some(s @ Value::Object(_)) = class_obj.get("__setters__") {
+                            instance.insert(Arc::from("__setters__"), s.clone());
+                        }
+
+                        // Collect this class's own instance field initializers so we
+                        // can run them on the new instance below (before the
+                        // constructor body for a base class, matching JS field-init
+                        // ordering for the supported base-class case).
+                        let field_inits: Vec<(Arc<str>, Value)> =
+                            match class_obj.get("__field_inits__") {
+                                Some(Value::Array(h)) => self
+                                    .heap
+                                    .array_vec(*h)
+                                    .into_iter()
+                                    .filter_map(|pair| match pair {
+                                        Value::Array(ph) => {
+                                            let p = self.heap.array_vec(ph);
+                                            match (p.first(), p.get(1)) {
+                                                (Some(Value::String(n)), Some(init)) => {
+                                                    Some((n.clone(), init.clone()))
+                                                }
+                                                _ => None,
+                                            }
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect(),
+                                _ => Vec::new(),
+                            };
 
                         let instance_val = Value::Object(self.heap.alloc_object(instance));
+
+                        // Run instance field initializers with `this` bound to the
+                        // instance, so `x = 10` and `y = this.x * 2` install values.
+                        if let Value::Object(inst_h) = &instance_val {
+                            let inst_h = *inst_h;
+                            for (fname, init) in field_inits {
+                                let v = self.call_field_init(&init, instance_val.clone())?;
+                                if let Some(map) = self.heap.object_mut(inst_h) {
+                                    map.insert(fname, v);
+                                }
+                            }
+                        }
 
                         // Call the constructor with `this` bound to the instance.
                         // A subclass with no own constructor forwards to the nearest
@@ -5409,6 +5448,232 @@ impl Vm {
         self.heap
             .object(proto_h)
             .and_then(|m| m.get(member).cloned())
+    }
+
+    /// Build a class object from the groups pushed before a `CreateClass`
+    /// instruction (see `CreateClassParts` / the instruction docs) and leave it on
+    /// the stack. Extracted out of `dispatch` so its locals don't enlarge the
+    /// recursive interpreter frame.
+    #[inline(never)]
+    fn create_class(&mut self, parts: CreateClassParts<'_>) -> Result<()> {
+        let CreateClassParts {
+            name,
+            n_methods,
+            n_statics,
+            n_getters,
+            n_setters,
+            n_static_getters,
+            n_static_setters,
+            n_fields,
+            n_static_fields,
+            has_super,
+        } = parts;
+
+        // Stack layout (top to bottom — popped in this order):
+        //   constructor closure (or undefined)
+        //   n_methods         * (name, closure) pairs   instance methods
+        //   n_statics         * (name, closure) pairs   static methods
+        //   n_getters         * (name, closure) pairs   instance getters
+        //   n_setters         * (name, closure) pairs   instance setters
+        //   n_static_getters  * (name, closure) pairs   static getters
+        //   n_static_setters  * (name, closure) pairs   static setters
+        //   n_fields          * (name, init_closure) pairs
+        //   n_static_fields   * (name, init_closure) pairs
+        //   [optional super class if has_super]
+
+        let constructor = self.pop()?;
+        let mut prototype = self.pop_named_closure_pairs(n_methods)?;
+        let statics = self.pop_named_closure_pairs(n_statics)?;
+        let getters = self.pop_named_closure_pairs(n_getters)?;
+        let setters = self.pop_named_closure_pairs(n_setters)?;
+        let static_getters = self.pop_named_closure_pairs(n_static_getters)?;
+        let static_setters = self.pop_named_closure_pairs(n_static_setters)?;
+        // Field-initializer (name, closure) pairs, in declaration order.
+        let field_inits = self.pop_named_closure_pairs(n_fields)?;
+        let static_field_inits = self.pop_named_closure_pairs(n_static_fields)?;
+
+        // Pop super class if present
+        let super_class = if has_super { Some(self.pop()?) } else { None };
+
+        // Accessor descriptors for this class's instances. Start from the
+        // super prototype's accessors (inherited) and let our own override.
+        let mut getters = getters;
+        let mut setters = setters;
+
+        // If super class, copy its prototype methods to ours (inheritance)
+        if let Some(Value::Object(sc)) = &super_class {
+            let scm = self.heap.object_map(*sc);
+            if let Some(Value::Object(super_proto_h)) = scm.get("__prototype__").cloned() {
+                // Super prototype methods go first, then our own (which override)
+                let mut merged = self.heap.object_map(super_proto_h);
+                for (k, v) in prototype {
+                    merged.insert(k, v);
+                }
+                prototype = merged;
+            }
+            // Inherit accessor descriptors (our own override per-name below).
+            if let Some(Value::Object(sg)) = scm.get("__getters__").cloned() {
+                let mut merged = self.heap.object_map(sg);
+                for (k, v) in getters {
+                    merged.insert(k, v);
+                }
+                getters = merged;
+            }
+            if let Some(Value::Object(ss)) = scm.get("__setters__").cloned() {
+                let mut merged = self.heap.object_map(ss);
+                for (k, v) in setters {
+                    merged.insert(k, v);
+                }
+                setters = merged;
+            }
+        }
+
+        // The inheritance chain of class names (self first), so
+        // `instanceof` matches ancestor classes too.
+        let mut chain = vec![Value::String(Arc::from(name))];
+        // If the class (transitively) extends a built-in Error, record the
+        // error base name so instances get the `__error__` brand (making
+        // `e instanceof Error` true) and `super(message)` sets `.message`.
+        let mut error_base: Option<Arc<str>> = None;
+        if let Some(Value::Object(sc)) = &super_class {
+            let scm = self.heap.object_map(*sc);
+            match scm.get("__class_chain__") {
+                Some(Value::Array(c)) => chain.extend(self.heap.array_vec(*c)),
+                _ => {
+                    if let Some(n) = scm.get("__class_name__") {
+                        chain.push(n.clone());
+                    }
+                }
+            }
+            // A built-in Error constructor as the direct super.
+            if let Some(Value::String(ctor)) = scm.get("__builtin_constructor__") {
+                if is_error_ctor_name(ctor) {
+                    error_base = Some(ctor.clone());
+                }
+            }
+            // Or a user class that itself extends an Error.
+            if error_base.is_none() {
+                if let Some(Value::String(base)) = scm.get("__error_base__") {
+                    error_base = Some(base.clone());
+                }
+            }
+        }
+
+        let chain_arr = Value::Array(self.heap.alloc_array(chain));
+        let proto_obj = Value::Object(self.heap.alloc_object(prototype));
+
+        // Build the class object
+        let mut class_obj = IndexMap::new();
+        class_obj.insert(Arc::from("__class_name__"), Value::String(Arc::from(name)));
+        class_obj.insert(Arc::from("__class_chain__"), chain_arr);
+        class_obj.insert(Arc::from("__constructor__"), constructor);
+        class_obj.insert(Arc::from("__prototype__"), proto_obj);
+
+        // Accessor descriptors (getters/setters) shared by every instance.
+        if !getters.is_empty() {
+            let g = Value::Object(self.heap.alloc_object(getters));
+            class_obj.insert(Arc::from("__getters__"), g);
+        }
+        if !setters.is_empty() {
+            let s = Value::Object(self.heap.alloc_object(setters));
+            class_obj.insert(Arc::from("__setters__"), s);
+        }
+        // Static accessors live on the class object itself.
+        if !static_getters.is_empty() {
+            let g = Value::Object(self.heap.alloc_object(static_getters));
+            class_obj.insert(Arc::from("__static_getters__"), g);
+        }
+        if !static_setters.is_empty() {
+            let s = Value::Object(self.heap.alloc_object(static_setters));
+            class_obj.insert(Arc::from("__static_setters__"), s);
+        }
+
+        // Instance field initializers: a list of [name, init_closure] pairs
+        // run on each new instance (after super() in a derived class).
+        if !field_inits.is_empty() {
+            let mut pairs = Vec::with_capacity(field_inits.len());
+            for (k, v) in field_inits {
+                let pair = vec![Value::String(k), v];
+                pairs.push(Value::Array(self.heap.alloc_array(pair)));
+            }
+            let arr = Value::Array(self.heap.alloc_array(pairs));
+            class_obj.insert(Arc::from("__field_inits__"), arr);
+        }
+
+        // Store super class reference for super() calls
+        if let Some(sc) = super_class {
+            class_obj.insert(Arc::from("__super__"), sc);
+        }
+        // Record the built-in Error base so instances are branded as errors.
+        if let Some(base) = error_base {
+            class_obj.insert(Arc::from("__error_base__"), Value::String(base));
+        }
+
+        // Add static methods directly on the class object
+        for (k, v) in statics {
+            class_obj.insert(k, v);
+        }
+
+        let h = self.heap.alloc_object(class_obj);
+
+        // Run static field initializers with `this` bound to the class
+        // object, so `static count = 5` installs `Class.count === 5`
+        // (and `static b = this.a` can read earlier static fields).
+        let class_val = Value::Object(h);
+        for (k, init) in static_field_inits {
+            let v = self.call_field_init(&init, class_val.clone())?;
+            if let Some(map) = self.heap.object_mut(h) {
+                map.insert(k, v);
+            }
+        }
+
+        self.push(class_val)?;
+        Ok(())
+    }
+
+    /// Pop `n` `(name_string, closure)` pairs off the stack (the closure is on top
+    /// of each pair, pushed after its name) into a map preserving DECLARATION order
+    /// (they were pushed in declaration order, so they pop in reverse). Used by
+    /// `CreateClass` to collect method/accessor/field-init groups.
+    fn pop_named_closure_pairs(&mut self, n: usize) -> Result<IndexMap<Arc<str>, Value>> {
+        let mut popped = Vec::with_capacity(n);
+        for _ in 0..n {
+            let closure = self.pop()?;
+            let name = self.pop()?;
+            popped.push((name, closure));
+        }
+        // Reverse back to declaration order before inserting.
+        let mut out = IndexMap::new();
+        for (name, closure) in popped.into_iter().rev() {
+            if let Value::String(nm) = name {
+                out.insert(nm, closure);
+            }
+        }
+        Ok(out)
+    }
+
+    /// If `obj` carries an accessor descriptor map under `kind`
+    /// (`"__getters__"`/`"__setters__"` for instances, or
+    /// `"__static_getters__"`/`"__static_setters__"` for class objects) with an
+    /// entry for `name`, return the accessor closure to invoke (with `this` bound
+    /// to `obj`). The instance keys are ignored on a class object itself (an
+    /// instance getter belongs to the prototype, not the constructor).
+    fn instance_accessor(&self, obj: &Value, kind: &str, name: &str) -> Option<Value> {
+        let Value::Object(h) = obj else { return None };
+        let map = self.heap.object(*h)?;
+        let is_class_object = map.contains_key("__class_name__");
+        let is_instance_key = matches!(kind, "__getters__" | "__setters__");
+        if is_class_object && is_instance_key {
+            return None;
+        }
+        let descs = match map.get(kind)? {
+            Value::Object(d) => *d,
+            _ => return None,
+        };
+        match self.heap.object(descs)?.get(name) {
+            Some(f @ Value::Function(_)) => Some(f.clone()),
+            _ => None,
+        }
     }
 
     fn get_property(&self, obj: &Value, name: &str) -> Result<Value> {

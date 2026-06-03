@@ -743,6 +743,8 @@ impl Compiler {
                 constructor,
                 methods,
                 static_methods,
+                fields,
+                static_fields,
                 ..
             } => {
                 self.compile_class(
@@ -751,6 +753,8 @@ impl Compiler {
                     constructor.as_deref(),
                     methods,
                     static_methods,
+                    fields,
+                    static_fields,
                 )?;
                 if self.is_session_chunk() {
                     self.record_top_level_binding(name, TopLevelBindingKind::Class)?;
@@ -2177,6 +2181,8 @@ impl Compiler {
                 constructor,
                 methods,
                 static_methods,
+                fields,
+                static_fields,
             } => {
                 self.compile_class(
                     name.as_deref(),
@@ -2184,6 +2190,8 @@ impl Compiler {
                     constructor.as_deref(),
                     methods,
                     static_methods,
+                    fields,
+                    static_fields,
                 )?;
             }
         }
@@ -2266,6 +2274,7 @@ impl Compiler {
         None
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn compile_class(
         &mut self,
         name: Option<&str>,
@@ -2273,6 +2282,8 @@ impl Compiler {
         constructor: Option<&FunctionDef>,
         methods: &[ClassMethod],
         static_methods: &[ClassMethod],
+        fields: &[ClassField],
+        static_fields: &[ClassField],
     ) -> Result<()> {
         let class_name = name.unwrap_or("AnonymousClass").to_string();
 
@@ -2292,23 +2303,28 @@ impl Compiler {
         let prev_class = self.current_class.take();
         self.current_class = Some(class_name.clone());
 
-        // Push static methods: name, closure pairs
-        for sm in static_methods {
-            self.emit(Instruction::Push(Constant::String(sm.name.clone())));
-            let compiled = self.compile_function_def(&sm.func)?;
-            let func_idx = self.functions.len();
-            self.functions.push(compiled);
-            self.emit(Instruction::CreateClosure(func_idx));
-        }
+        // Split methods by kind so getters/setters install accessor descriptors.
+        let plain = |ms: &[ClassMethod], k: ClassMethodKind| -> Vec<ClassMethod> {
+            ms.iter().filter(|m| m.kind == k).cloned().collect()
+        };
+        let inst_methods = plain(methods, ClassMethodKind::Method);
+        let inst_getters = plain(methods, ClassMethodKind::Get);
+        let inst_setters = plain(methods, ClassMethodKind::Set);
+        let stat_methods = plain(static_methods, ClassMethodKind::Method);
+        let stat_getters = plain(static_methods, ClassMethodKind::Get);
+        let stat_setters = plain(static_methods, ClassMethodKind::Set);
 
-        // Push instance methods: name, closure pairs
-        for m in methods {
-            self.emit(Instruction::Push(Constant::String(m.name.clone())));
-            let compiled = self.compile_function_def(&m.func)?;
-            let func_idx = self.functions.len();
-            self.functions.push(compiled);
-            self.emit(Instruction::CreateClosure(func_idx));
-        }
+        // Push, in CreateClass's documented order (popped in reverse):
+        //   static_fields, fields, static setters, static getters,
+        //   instance setters, instance getters, statics, methods, constructor.
+        self.push_class_field_pairs(static_fields)?;
+        self.push_class_field_pairs(fields)?;
+        self.push_class_method_pairs(&stat_setters)?;
+        self.push_class_method_pairs(&stat_getters)?;
+        self.push_class_method_pairs(&inst_setters)?;
+        self.push_class_method_pairs(&inst_getters)?;
+        self.push_class_method_pairs(&stat_methods)?;
+        self.push_class_method_pairs(&inst_methods)?;
 
         // Push constructor closure (or undefined if none)
         if let Some(ctor) = constructor {
@@ -2324,11 +2340,56 @@ impl Compiler {
 
         self.emit(Instruction::CreateClass {
             name: class_name,
-            n_methods: methods.len(),
-            n_statics: static_methods.len(),
+            n_methods: inst_methods.len(),
+            n_statics: stat_methods.len(),
+            n_getters: inst_getters.len(),
+            n_setters: inst_setters.len(),
+            n_static_getters: stat_getters.len(),
+            n_static_setters: stat_setters.len(),
+            n_fields: fields.len(),
+            n_static_fields: static_fields.len(),
             has_super: super_class.is_some(),
         });
 
+        Ok(())
+    }
+
+    /// Emit `(name_string, closure)` pairs for a group of class methods/accessors.
+    fn push_class_method_pairs(&mut self, ms: &[ClassMethod]) -> Result<()> {
+        for m in ms {
+            self.emit(Instruction::Push(Constant::String(m.name.clone())));
+            let compiled = self.compile_function_def(&m.func)?;
+            let func_idx = self.functions.len();
+            self.functions.push(compiled);
+            self.emit(Instruction::CreateClosure(func_idx));
+        }
+        Ok(())
+    }
+
+    /// Emit `(name_string, init_closure)` pairs for class field declarations. Each
+    /// initializer is a zero-arg function whose body `return`s the field value
+    /// (or `undefined` for a bare `x;`), run later with `this` bound to the
+    /// instance/class so `this.other` references resolve.
+    fn push_class_field_pairs(&mut self, fields: &[ClassField]) -> Result<()> {
+        for f in fields {
+            self.emit(Instruction::Push(Constant::String(f.name.clone())));
+            let init = FunctionDef {
+                name: None,
+                params: Vec::new(),
+                body: vec![Statement::Return {
+                    value: f.value.clone(),
+                    span: Span { start: 0, end: 0 },
+                }],
+                is_async: false,
+                is_generator: false,
+                is_arrow: false,
+                span: Span { start: 0, end: 0 },
+            };
+            let compiled = self.compile_function_def(&init)?;
+            let func_idx = self.functions.len();
+            self.functions.push(compiled);
+            self.emit(Instruction::CreateClosure(func_idx));
+        }
         Ok(())
     }
 
