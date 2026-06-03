@@ -85,7 +85,17 @@ fn wrap_trailing_object(source: &str) -> String {
         // If preceded by =, (, return, =>, etc. — it's already in expression context.
         // `)` means the `{` is a control-flow / function block (if/for/while/catch/
         // switch/function with params), never an object literal — don't wrap it.
-        if matches!(last_char, '=' | '(' | ',' | ':' | '>' | '[' | ')') {
+        //
+        // Binary / unary operator characters (`& | ? + - * / % < ! ^ ~`) likewise
+        // mean the `{` is the right-hand operand of an expression (e.g. the object
+        // literal in `"a" in {a:1}` once the `in` keyword's trailing space is
+        // trimmed away leaves no operator char, so the keyword check below handles
+        // `in`/`of`; the operator chars here cover things like `x ?? {y:1}`).
+        if matches!(
+            last_char,
+            '=' | '(' | ',' | ':' | '>' | '[' | ')' | '&' | '|' | '?' | '+' | '-' | '*' | '/'
+                | '%' | '<' | '!' | '^' | '~'
+        ) {
             return source.to_string();
         }
         // If preceded by a keyword that takes a block, don't wrap
@@ -105,6 +115,21 @@ fn wrap_trailing_object(source: &str) -> String {
                 | "class"
                 | "function"
                 | "switch"
+                // Keywords that introduce expression context: a trailing `{...}` is
+                // an object literal operand, not a statement-level block. Wrapping it
+                // with `;(` would split the expression and cause a parse error
+                // (e.g. `"a" in {a:1}`, `x instanceof {}`, `return {a:1}`).
+                | "in"
+                | "of"
+                | "instanceof"
+                | "typeof"
+                | "return"
+                | "yield"
+                | "new"
+                | "delete"
+                | "void"
+                | "await"
+                | "case"
         ) {
             return source.to_string();
         }

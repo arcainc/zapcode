@@ -1211,7 +1211,12 @@ impl Compiler {
                 self.emit(Instruction::Push(Constant::String(pattern.clone())));
                 self.emit(Instruction::Push(Constant::String("flags".to_string())));
                 self.emit(Instruction::Push(Constant::String(flags.clone())));
-                self.emit(Instruction::CreateObject(3));
+                // `lastIndex` is the mutable cursor maintained by `exec`/`test` on
+                // /g (and /y) regexes so that repeated calls advance through the
+                // subject string and eventually terminate (G3).
+                self.emit(Instruction::Push(Constant::String("lastIndex".to_string())));
+                self.emit(Instruction::Push(Constant::Int(0)));
+                self.emit(Instruction::CreateObject(4));
             }
             Expr::Ident(name) => {
                 if name == "this" {

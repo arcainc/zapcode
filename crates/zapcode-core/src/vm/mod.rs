@@ -2063,6 +2063,13 @@ impl Vm {
                 self.push(val)?;
             }
             Instruction::LoadLocal(idx) => {
+                // Loading a local clears any pending builtin-global name: the
+                // `last_global_name` shortcut (used so `Math.floor` resolves to a
+                // builtin method) must only apply to a property read *immediately*
+                // after the matching `LoadGlobal`. Otherwise a stale name leaks into
+                // an unrelated member access — e.g. `String(o.zzz)` would wrongly
+                // resolve missing `o.zzz` to a `String` builtin method.
+                self.last_global_name = None;
                 let frame_index = self.frames.len() - 1;
                 let val = self.read_local(frame_index, idx);
                 // If the slot is boxed, write-back must target the cell so the
@@ -2416,6 +2423,10 @@ impl Vm {
                 // Place of the object we're reading the property from.
                 let obj_place = self.last_place.take();
                 let result = self.get_property(&obj, &name)?;
+                // Consume the builtin-global shortcut: it applies only to this
+                // single read immediately after a `LoadGlobal`, never to a later
+                // chained access on the produced value.
+                self.last_global_name = None;
                 match result {
                     Value::BuiltinMethod {
                         object_name,
@@ -2775,10 +2786,24 @@ impl Vm {
                         self.heap.object(*h).is_some_and(|m| m.contains_key(key.as_str()))
                     }
                     Value::Array(h) => {
-                        if let Value::Int(i) = left {
-                            (i as usize) < self.heap.array(*h).len()
-                        } else {
-                            false
+                        let len = self.heap.array(*h).len();
+                        match &left {
+                            // Numeric index membership: `0 in [1,2]`.
+                            Value::Int(i) => *i >= 0 && (*i as usize) < len,
+                            // String keys: `"length"` is an own property of every
+                            // array; numeric string keys like `"0"` are indices.
+                            // (Inherited prototype methods such as "push"/"map"
+                            // stay absent — own-key membership only.)
+                            _ => {
+                                let key = left.to_js_string(&self.heap);
+                                if key == "length" {
+                                    true
+                                } else if let Ok(idx) = key.parse::<usize>() {
+                                    idx < len
+                                } else {
+                                    false
+                                }
+                            }
                         }
                     }
                     _ => false,
@@ -2995,6 +3020,12 @@ impl Vm {
                                 _ => None,
                             },
                             "__regexp__" => {
+                                // The receiver handle is needed so /g exec/test can
+                                // read and advance the `lastIndex` slot in place.
+                                let regex_handle = match receiver.as_ref() {
+                                    Some(Value::Object(h)) => Some(*h),
+                                    _ => None,
+                                };
                                 match receiver
                                     .as_ref()
                                     .and_then(|v| builtins::regexp_parts(v, &self.heap))
@@ -3004,6 +3035,7 @@ impl Vm {
                                         &flags,
                                         &method_name,
                                         &args,
+                                        regex_handle,
                                         &mut self.heap,
                                     )?,
                                     None => None,
@@ -3559,9 +3591,33 @@ impl Vm {
             Instruction::TypeOf => {
                 let val = self.pop()?;
                 // `typeof null === "object"` (a long-standing JS quirk).
-                // Everything else matches type_name().
-                let type_str = match val {
+                // Callable builtin markers (bare global fns like `String`/`parseInt`,
+                // builtin constructors like `Object`/`Map`, and `Symbol`) are objects
+                // internally but must report as "function" (O8 needs
+                // `typeof Symbol === "function"`). Pure namespaces (`Math`, `JSON`,
+                // `console`) carry no callable marker and stay "object".
+                let type_str = match &val {
                     Value::Null => "object",
+                    // A produced Symbol value reports `typeof === "symbol"`.
+                    Value::Object(h)
+                        if self.heap.object(*h).is_some_and(|m| m.contains_key("__symbol__")) =>
+                    {
+                        "symbol"
+                    }
+                    // Callable builtin markers (bare global fns like `String`/`parseInt`,
+                    // builtin constructors like `Object`/`Map`, and the `Symbol`
+                    // factory) are objects internally but must report as "function"
+                    // (O8 needs `typeof Symbol === "function"`). Pure namespaces
+                    // (`Math`, `JSON`, `console`) carry no callable marker and stay
+                    // "object".
+                    Value::Object(h)
+                        if self.heap.object(*h).is_some_and(|m| {
+                            m.contains_key("__global_fn__")
+                                || m.contains_key("__builtin_constructor__")
+                        }) =>
+                    {
+                        "function"
+                    }
                     other => other.type_name(),
                 };
                 self.push(Value::String(Arc::from(type_str)))?;
@@ -3963,6 +4019,9 @@ impl Vm {
             }
 
             Instruction::LoadThis => {
+                // See LoadLocal: clear any stale builtin-global name so a property
+                // read on `this` can't pick up the wrong builtin method.
+                self.last_global_name = None;
                 // Walk frames from top to find the nearest `this` value
                 let this_val = self
                     .frames

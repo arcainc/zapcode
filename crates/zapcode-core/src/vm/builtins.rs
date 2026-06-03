@@ -4,7 +4,7 @@ use std::sync::Arc;
 use indexmap::IndexMap;
 
 use crate::error::{Result, ZapcodeError};
-use crate::heap::Heap;
+use crate::heap::{Handle, Heap};
 use crate::sandbox::ResourceLimits;
 use crate::value::Value;
 
@@ -56,6 +56,9 @@ pub fn register_globals(globals: &mut HashMap<String, Value>, heap: &mut Heap) {
         "isNaN",
         "isFinite",
         "structuredClone",
+        // Minimal Symbol factory (O8): callable, typeof === "function", and
+        // `Symbol()` yields a unique marker value.
+        "Symbol",
     ] {
         let v = global_fn(name, heap);
         globals.insert(name.to_string(), v);
@@ -535,6 +538,25 @@ pub fn call_global_fn(kind: &str, args: &[Value], heap: &mut Heap) -> Result<Val
             }
             _ => false,
         }),
+        // Minimal Symbol(): returns a fresh, unique primitive-ish marker so that
+        // feature-detection (`typeof Symbol === "function"`) and simple use don't
+        // throw (O8). Uniqueness comes from heap-handle identity — each call
+        // allocates a new object, so `Symbol() !== Symbol()` under `strict_eq`
+        // (reference equality), while a symbol equals itself. This is NOT full
+        // Symbol semantics (no global registry, no well-known symbols, no
+        // Symbol.toPrimitive dispatch).
+        "Symbol" => {
+            let mut s = IndexMap::new();
+            s.insert(Arc::from("__symbol__"), Value::Bool(true));
+            // Optional description, coerced to string per spec (undefined stays absent).
+            if !matches!(arg, Value::Undefined) {
+                s.insert(
+                    Arc::from("description"),
+                    Value::String(Arc::from(arg.to_js_string(heap).as_str())),
+                );
+            }
+            Value::Object(heap.alloc_object(s))
+        }
         other => {
             return Err(ZapcodeError::TypeError(format!(
                 "{} is not a function",
@@ -1101,25 +1123,116 @@ pub fn call_regexp_method(
     flags: &str,
     method: &str,
     args: &[Value],
+    // Heap handle of the regex object, so /g (and /y) `exec`/`test` can read and
+    // advance the mutable `lastIndex` cursor in place (G3). `None` only when the
+    // receiver is not a heap object (shouldn't happen for regex literals).
+    regex_handle: Option<Handle>,
     heap: &mut Heap,
 ) -> Result<Option<Value>> {
     let subject = arg_str(args, 0, heap);
     let re = compile_regex(pattern, flags)?;
-    Ok(match method {
-        "test" => Some(Value::Bool(re.is_match(&subject))),
-        "exec" => Some(match re.captures(&subject) {
-            Some(caps) => {
-                let items: Vec<Value> = caps
-                    .iter()
-                    .map(|c| {
-                        c.map(|m| Value::String(Arc::from(m.as_str())))
-                            .unwrap_or(Value::Undefined)
-                    })
-                    .collect();
-                Value::Array(heap.alloc_array(items))
+    // /g and /y are "stateful": exec/test resume from `lastIndex` and advance it.
+    let stateful = flags.contains('g') || flags.contains('y');
+
+    // Read the current `lastIndex` (in chars) from the heap slot, if present.
+    let read_last_index = |heap: &Heap| -> usize {
+        regex_handle
+            .and_then(|h| heap.object(h))
+            .and_then(|m| m.get("lastIndex"))
+            .map(|v| v.to_number().max(0.0) as usize)
+            .unwrap_or(0)
+    };
+    // Write `lastIndex` (in chars) back into the heap slot.
+    let write_last_index = |heap: &mut Heap, idx: usize| {
+        if let Some(h) = regex_handle {
+            if let Some(map) = heap.object_mut(h) {
+                map.insert(Arc::from("lastIndex"), Value::Int(idx as i64));
             }
-            None => Value::Null,
-        }),
+        }
+    };
+    // Map a char index into a byte offset within `subject`.
+    let char_to_byte = |s: &str, char_idx: usize| -> usize {
+        s.char_indices().nth(char_idx).map_or(s.len(), |(b, _)| b)
+    };
+
+    Ok(match method {
+        "test" => {
+            if stateful {
+                let start_char = read_last_index(heap);
+                let start_byte = char_to_byte(&subject, start_char);
+                if start_byte > subject.len() {
+                    write_last_index(heap, 0);
+                    Some(Value::Bool(false))
+                } else {
+                    match re.find_at(&subject, start_byte) {
+                        Some(m) => {
+                            let end_char = subject[..m.end()].chars().count();
+                            write_last_index(heap, end_char);
+                            Some(Value::Bool(true))
+                        }
+                        None => {
+                            write_last_index(heap, 0);
+                            Some(Value::Bool(false))
+                        }
+                    }
+                }
+            } else {
+                Some(Value::Bool(re.is_match(&subject)))
+            }
+        }
+        "exec" => {
+            // Determine the byte offset to start matching from.
+            let start_byte = if stateful {
+                let start_char = read_last_index(heap);
+                char_to_byte(&subject, start_char)
+            } else {
+                0
+            };
+
+            let caps_opt = if start_byte > subject.len() {
+                None
+            } else {
+                re.captures_at(&subject, start_byte)
+            };
+
+            match caps_opt {
+                Some(caps) => {
+                    let full = caps.get(0);
+                    if stateful {
+                        // Advance lastIndex past the whole match so the next call
+                        // makes progress (and a zero-width match still terminates).
+                        let new_char = match full {
+                            Some(m) => {
+                                let end = m.end();
+                                let end_char = subject[..end].chars().count();
+                                if m.start() == end {
+                                    end_char + 1
+                                } else {
+                                    end_char
+                                }
+                            }
+                            None => read_last_index(heap) + 1,
+                        };
+                        write_last_index(heap, new_char);
+                    }
+                    let items: Vec<Value> = caps
+                        .iter()
+                        .map(|c| {
+                            c.map(|m| Value::String(Arc::from(m.as_str())))
+                                .unwrap_or(Value::Undefined)
+                        })
+                        .collect();
+                    Some(Value::Array(heap.alloc_array(items)))
+                }
+                None => {
+                    // No (further) match: reset the cursor and report exhaustion.
+                    if stateful {
+                        write_last_index(heap, 0);
+                    }
+                    Some(Value::Null)
+                }
+            }
+        }
         _ => None,
     })
 }
