@@ -2,6 +2,49 @@
 
 ## Fix status (in progress)
 
+**Round 5 (branch `arca/heap-handles-rewrite`) — N5 bare tool-call as a deferred Promise:**
+- **N5 — FIXED (general case).** A bare (un-awaited) tool-call expression now
+  evaluates to a real *deferred* Promise object instead of an eagerly-resolved
+  value. `const p = tool(); typeof p === "object"` and the host call is **not**
+  made until `p` is awaited, `.then`/`.catch`/`.finally`-ed, or returned-and-awaited.
+  - Compilation: a non-spread bare external call lowers to
+    `CallExternalDeferred(name,argc)` + `MakeCallPromise`, producing a promise
+    object `{__promise__:true, status:"pending_call", __call_id__:id}` whose call
+    is held in `pending_calls`. The *directly-awaited* form `await tool()` keeps
+    the pre-N5 eager-suspend `CallExternal` path (special-cased in the compiler's
+    `Expr::Await`), so that hot path is byte-for-byte unchanged.
+  - `Await` on a `pending_call` promise suspends once on its host call (an
+    ordinary `VmState::Suspended { name, args }` the existing host bridge already
+    handles) and resumes with the result.
+  - `.then`/`.catch`/`.finally` on a `pending_call` promise force the call via the
+    same suspension, recording a `ResumeAction::PromiseMethod`; on resume the
+    settled value is wrapped (resolved) or, via `resume_with_error`, rejected, and
+    the method runs through the existing N4 promise-callback machinery (so a tool
+    call *inside* the callback still suspends/resumes). `.then` chaining works
+    (`tool().then(a).then(b)`), and a promise callback that itself *returns* a
+    deferred promise (thenable adoption) is forced via `ResumeAction::ChainResult`.
+  - State (`resume_action`) is serialized in the snapshot (`#[serde(default)]`), so
+    a deferred-promise suspension survives dump/load/resume.
+  - `Promise.all`/`race`/`any`/`allSettled` batching is unchanged: direct
+    external-call array elements still lower to `CallExternalDeferred` +
+    `MakeBatchPromise` and never reach the single-call path. (Verified by
+    `stress_promise_combinators.rs`, `parallel_calls.rs`, JS `parallel`/`stress`.)
+  - Tests: `stress_call_promise.rs` (13) — typeof/deferral, await of a stored
+    promise, `.then` single + chain, `.then` callback making a tool call, `.catch`
+    rejection + pass-through, `.finally` pass-through, snapshot round-trip,
+    return-then-await, and the unchanged `await tool()` form.
+  - **Residual / behavior change (documented):** a bare tool-call promise
+    string-coerces to `[object Object]` rather than the spec `[object Promise]`
+    (shared with all heap-Object promises here — a stringification detail, not
+    N5-specific). Two N4 tests in `stress_then_tools.rs` were updated to the
+    now-correct JS semantics: a callback's *returned* deferred promise is adopted
+    (so `.finally(() => tool())` drives the call), and a tool error is only
+    catchable by an inner `try` when the call is `await`-ed inside it (a bare
+    `return tool()` defers past the `try`, matching JS). Pre-N5 snapshot/session/
+    wire-format tests that used bare un-awaited calls purely to trigger a
+    suspension were switched to `await tool()` (same suspension, correct N5
+    semantics).
+
 **Round 4 (branch `arca/heap-handles-rewrite`) — Promise combinators + `super.method` + MED/LOW edges:**
 - **C3 `super.method()` / `super.prop` — FIXED.** Class methods now track their
   defining class on the frame, so `super.g()` dispatches to the parent method with
@@ -54,10 +97,10 @@
   member access (`String(o.missing)` → `"undefined"`, not `"function"`). (`stress_edges_round1.rs`.)
 - **Binding parity:** `zapcode-wasm` and `zapcode-py` now destructure and surface the new
   `combinator` field on `SuspendedMany`, so `cargo build --workspace` is clean.
-- **Intentionally deferred (still divergent):** **N5** full tool-call-as-deferred-Promise
-  (a bare tool-call expression is still an eagerly-resolved value, not a real Promise
-  object with `.then`; combinators only defer when an array element is a *direct* external
-  call); (**N9** `for await…of` is now FIXED — see Round 4; only async-generator
+- **Intentionally deferred (still divergent):** **N5** is now FIXED in Round 5 — a
+  bare tool-call expression is a real deferred Promise object with `.then`/`.catch`/
+  `.finally`, deferred until awaited/then-ed (see Round 5 above);
+  (**N9** `for await…of` is now FIXED — see Round 4; only async-generator
   *external-call* suspension mid-iteration remains a documented gap); **G4**
   `match()`/`matchAll` `.index`/`.input`/named `.groups`; **O4** `valueOf`/`toString`/
   `Symbol.toPrimitive` coercion hooks; **G9** UTF-16 string indexing (strings are indexed

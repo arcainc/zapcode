@@ -124,7 +124,7 @@ fn session_resume_then_continue_with_new_chunk() {
         .run_chunk(
             r#"
             const prefix = "hello ";
-            const data = fetch(url);
+            const data = await fetch(url);
             prefix + data
             "#
             .to_string(),

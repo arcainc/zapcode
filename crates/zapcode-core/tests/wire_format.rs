@@ -5,7 +5,7 @@ use zapcode_core::{ResourceLimits, Value, ZapcodeRun, ZapcodeSessionSnapshot, Za
 
 fn suspended_snapshot() -> ZapcodeSnapshot {
     let runner = ZapcodeRun::new(
-        r#"const r = fetch("https://example.com");"#.to_string(),
+        r#"const r = await fetch("https://example.com");"#.to_string(),
         Vec::new(),
         vec!["fetch".to_string()],
         ResourceLimits::default(),

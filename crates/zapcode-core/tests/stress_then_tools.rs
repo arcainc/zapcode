@@ -155,14 +155,17 @@ fn promise_callback_continuation_survives_snapshot_roundtrip() {
 }
 
 /// A failing tool inside `.catch` whose error is caught by an inner try/catch.
+/// The tool call is `await`-ed inside the try so its rejection surfaces there
+/// (post-N5 a bare `return tool()` returns a deferred promise that settles
+/// *after* the try exits — matching JS — so the catchable form must await).
 #[test]
 fn tool_error_inside_catch_callback_is_catchable() {
     let state = start(
         r#"
         const result = await Promise.reject("primary")
-            .catch(() => {
+            .catch(async () => {
                 try {
-                    return callTool("flaky");
+                    return await callTool("flaky");
                 } catch (e) {
                     return "handled:" + e;
                 }

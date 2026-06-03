@@ -1676,7 +1676,13 @@ impl Compiler {
                     }
                 }
                 let has_spread = args.iter().any(|a| matches!(a, Expr::Spread(_)));
-                // Check if this is a direct call to an external function
+                // Check if this is a direct call to an external function. A bare
+                // (un-awaited) tool call evaluates to a deferred single-call
+                // Promise object (N5): the host call is registered but not made
+                // until the promise is awaited or driven by .then/.catch/.finally.
+                // A *directly awaited* tool call (`await tool()`) is special-cased
+                // in `Expr::Await` to use the eager-suspend `CallExternal` path,
+                // so it never reaches here — keeping that hot path unchanged.
                 if let Expr::Ident(name) = callee.as_ref() {
                     if self.external_functions.contains(name) {
                         if has_spread {
@@ -1686,7 +1692,8 @@ impl Compiler {
                             for arg in args {
                                 self.compile_expr(arg)?;
                             }
-                            self.emit(Instruction::CallExternal(name.clone(), args.len()));
+                            self.emit(Instruction::CallExternalDeferred(name.clone(), args.len()));
+                            self.emit(Instruction::MakeCallPromise);
                         }
                         return Ok(());
                     }
@@ -1714,10 +1721,36 @@ impl Compiler {
                 self.emit(Instruction::CreateClosure(*func_index));
             }
             Expr::Await(expr) => {
-                self.compile_expr(expr)?;
-                // Emit Await instruction to unwrap Promise objects.
-                // External call suspension is already handled by CallExternal
-                // before this point — Await only handles internal promise values.
+                // Fast path: `await tool(args)` where `tool` is a direct external
+                // call (no spread). Compile to the eager-suspend `CallExternal`,
+                // exactly as before N5 — the call suspends here and resumes with
+                // the result, and the following `Await` passes the (non-promise)
+                // result through. This keeps the overwhelmingly common
+                // await-a-tool-call path byte-for-byte unchanged and off the new
+                // deferred single-call-promise machinery.
+                let mut handled = false;
+                if let Expr::Call { callee, args, .. } = expr.as_ref() {
+                    if !expr_is_optional_chain(expr)
+                        && !args.iter().any(|a| matches!(a, Expr::Spread(_)))
+                    {
+                        if let Expr::Ident(name) = callee.as_ref() {
+                            if self.external_functions.contains(name) {
+                                for arg in args {
+                                    self.compile_expr(arg)?;
+                                }
+                                self.emit(Instruction::CallExternal(name.clone(), args.len()));
+                                handled = true;
+                            }
+                        }
+                    }
+                }
+                if !handled {
+                    self.compile_expr(expr)?;
+                }
+                // Emit Await instruction to unwrap Promise objects (including a
+                // deferred single-call promise, which suspends here on its host
+                // call). External call suspension for the direct `await tool()`
+                // form is handled by CallExternal above.
                 self.emit(Instruction::Await);
             }
             Expr::Yield { value, delegate: _ } => {

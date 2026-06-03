@@ -19,9 +19,9 @@ fn start_with_externals(
 
 #[test]
 fn test_snapshot_dump_load_roundtrip() {
-    // Code that calls an external function, causing suspension.
+    // Code that awaits an external function, causing suspension.
     let code = r#"
-        const result = fetch("https://example.com");
+        const result = await fetch("https://example.com");
     "#;
 
     let state = start_with_externals(code, vec!["fetch"], Vec::new());
@@ -46,9 +46,9 @@ fn test_snapshot_dump_load_roundtrip() {
 
 #[test]
 fn test_snapshot_resume_simple() {
-    // Code: call external, use return value
+    // Code: await external, use return value
     let code = r#"
-        const data = fetch("https://example.com");
+        const data = await fetch("https://example.com");
         data
     "#;
 
@@ -85,9 +85,9 @@ fn test_snapshot_resume_simple() {
 
 #[test]
 fn test_snapshot_resume_with_computation_after() {
-    // Code: call external, then do computation with the result
+    // Code: await external, then do computation with the result
     let code = r#"
-        const x = fetch("url");
+        const x = await fetch("url");
         x + " processed"
     "#;
 
@@ -112,10 +112,10 @@ fn test_snapshot_resume_with_computation_after() {
 
 #[test]
 fn test_snapshot_resume_chain() {
-    // Code that calls two external functions in sequence
+    // Code that awaits two external functions in sequence
     let code = r#"
-        const a = fetch("url1");
-        const b = db(a);
+        const a = await fetch("url1");
+        const b = await db(a);
         b
     "#;
 
@@ -167,7 +167,7 @@ fn test_snapshot_preserves_locals_and_globals() {
     // Verify that local variables survive snapshot/resume
     let code = r#"
         const prefix = "hello";
-        const suffix = fetch("url");
+        const suffix = await fetch("url");
         prefix + " " + suffix
     "#;
 
@@ -190,7 +190,7 @@ fn test_snapshot_preserves_locals_and_globals() {
 #[test]
 fn test_snapshot_with_inputs() {
     let code = r#"
-        const result = fetch(url);
+        const result = await fetch(url);
         result
     "#;
 
@@ -214,9 +214,9 @@ fn test_snapshot_with_inputs() {
 fn test_snapshot_size() {
     // Verify snapshot is compact — should be well under 10KB for simple code
     let code = r#"
-        const a = fetch("url1");
-        const b = db(a);
-        const c = fetch("url2");
+        const a = await fetch("url1");
+        const b = await db(a);
+        const c = await fetch("url2");
         c
     "#;
 
@@ -245,7 +245,7 @@ fn test_snapshot_size() {
 fn test_snapshot_dump_load_resume() {
     // Full round-trip: capture → dump → load → resume
     let code = r#"
-        const data = fetch("https://example.com");
+        const data = await fetch("https://example.com");
         data + "!"
     "#;
 
@@ -276,7 +276,7 @@ fn test_snapshot_dump_load_resume() {
 #[test]
 fn test_snapshot_resume_with_numeric_result() {
     let code = r#"
-        const count = getCount();
+        const count = await getCount();
         count * 2 + 1
     "#;
 

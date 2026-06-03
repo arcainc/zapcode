@@ -124,6 +124,13 @@ pub enum Instruction {
     /// of its pending calls; the host settles them per the combinator and the
     /// VM assembles the final value accordingly.
     MakeBatchPromise(BatchKind, usize),
+    /// Pops a single `Value::Pending(id)` (just produced by `CallExternalDeferred`)
+    /// and wraps it in a deferred single-call Promise object (`status:
+    /// "pending_call"`). The host call is not made until the promise is awaited
+    /// or driven by `.then`/`.catch`/`.finally`. Emitted for a bare (un-awaited)
+    /// tool-call expression so `const p = tool(); typeof p === "object"` and
+    /// `p.then(...)` behave like a real Promise (N5).
+    MakeCallPromise,
 
     // Control flow
     Jump(usize),

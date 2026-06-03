@@ -2148,7 +2148,72 @@ fn call_array_static_method(method: &str, args: &[Value], heap: &mut Heap) -> Re
 
 // ── Promise ──────────────────────────────────────────────────────────
 
+/// If a `Promise.{all,allSettled,race,any}(arr)` call's array contains any
+/// *deferred single-call promise* (N5 — a bare tool call collected dynamically,
+/// e.g. via `.map`), lower the whole call to a `pending_all` batch promise so the
+/// `Await` path forces every deferred call through the existing batch machinery
+/// (`await_batch`). Each `pending_call` element is replaced by the `Value::Pending`
+/// marker `await_batch` understands; non-deferred elements (resolved promises,
+/// plain values) pass through unchanged. Returns `None` when no element is a
+/// deferred call (so the normal synchronous combinator runs).
+fn try_lower_pending_call_batch(method: &str, args: &[Value], heap: &mut Heap) -> Option<Value> {
+    let kind = match method {
+        "all" => "all",
+        "allSettled" => "allSettled",
+        "race" => "race",
+        "any" => "any",
+        _ => return None,
+    };
+    let arr = match args.first() {
+        Some(Value::Array(h)) => heap.array_vec(*h),
+        _ => return None,
+    };
+    let has_pending_call = arr.iter().any(|item| {
+        matches!(item, Value::Object(h) if matches!(
+            heap.object(*h).and_then(|m| m.get("status")),
+            Some(Value::String(s)) if s.as_ref() == "pending_call"
+        ))
+    });
+    if !has_pending_call {
+        return None;
+    }
+    // Replace each deferred single-call promise with its `Value::Pending(id)`.
+    let items: Vec<Value> = arr
+        .into_iter()
+        .map(|item| {
+            if let Value::Object(h) = &item {
+                let map = heap.object_map(*h);
+                let is_pending_call = matches!(
+                    map.get("status"),
+                    Some(Value::String(s)) if s.as_ref() == "pending_call"
+                );
+                if is_pending_call {
+                    if let Some(Value::Int(id)) = map.get("__call_id__") {
+                        return Value::Pending(*id as u64);
+                    }
+                }
+            }
+            item
+        })
+        .collect();
+    let items_arr = Value::Array(heap.alloc_array(items));
+    let mut obj = IndexMap::new();
+    obj.insert(Arc::from("__promise__"), Value::Bool(true));
+    obj.insert(Arc::from("status"), Value::String(Arc::from("pending_all")));
+    obj.insert(Arc::from("__batch_kind__"), Value::String(Arc::from(kind)));
+    obj.insert(Arc::from("items"), items_arr);
+    Some(Value::Object(heap.alloc_object(obj)))
+}
+
 fn call_promise_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<Option<Value>> {
+    // Deferred single-call promises (N5) collected into a dynamic
+    // `Promise.{all,allSettled,race,any}(arr)` lower to a batch promise so the
+    // host runs all of their calls; this keeps `Promise.all(items.map(f))` working
+    // when `f` is a bare tool call. Literal-array combinators of *direct* external
+    // calls are already lowered at compile time (`MakeBatchPromise`).
+    if let Some(batch) = try_lower_pending_call_batch(method, args, heap) {
+        return Ok(Some(batch));
+    }
     match method {
         "resolve" => {
             let val = args.first().cloned().unwrap_or(Value::Undefined);
@@ -2328,6 +2393,15 @@ pub fn make_resolved_promise(val: Value, heap: &mut Heap) -> Value {
     obj.insert(Arc::from("__promise__"), Value::Bool(true));
     obj.insert(Arc::from("status"), Value::String(Arc::from("resolved")));
     obj.insert(Arc::from("value"), val);
+    Value::Object(heap.alloc_object(obj))
+}
+
+/// Create a rejected promise carrying the given reason.
+pub fn make_rejected_promise(reason: Value, heap: &mut Heap) -> Value {
+    let mut obj = IndexMap::new();
+    obj.insert(Arc::from("__promise__"), Value::Bool(true));
+    obj.insert(Arc::from("status"), Value::String(Arc::from("rejected")));
+    obj.insert(Arc::from("reason"), reason);
     Value::Object(heap.alloc_object(obj))
 }
 

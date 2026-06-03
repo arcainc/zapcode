@@ -180,6 +180,10 @@ enum PromiseMethodOutcome {
     /// A callback frame + [`Continuation::PromiseCallback`] were pushed; the
     /// dispatch caller must return `Ok(None)` so the main loop drives it.
     ContinuationStarted,
+    /// The method was called on a deferred single-call promise (N5), forcing its
+    /// host call: the VM must suspend on it. The dispatch caller returns this
+    /// `VmState` up to the host; on resume, `resume_action` finishes the method.
+    Suspend(VmState),
     /// The receiver was not a promise, or the method is unknown.
     NotAPromise,
 }
@@ -242,6 +246,39 @@ pub struct Vm {
     /// another object); this bounds that recursion so a pathological hook can't
     /// loop forever. Transient — never serialized.
     pub(crate) to_primitive_depth: u32,
+    /// What to do with the value the host pushes when resuming a suspension that
+    /// was triggered by *consuming a deferred single-call promise* (N5). For a
+    /// plain `await p` this is `None` (the pushed value is exactly the await
+    /// result). For `p.then(cb)`/`.catch`/`.finally` it carries the promise
+    /// method + callbacks so the resumed value is wrapped in a settled promise
+    /// and the callback chain runs. Serialized so it survives dump/load/resume.
+    pub(crate) resume_action: Option<ResumeAction>,
+}
+
+/// Deferred action applied to the value the host delivers when resuming a
+/// single-call-promise suspension. See [`Vm::resume_action`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) enum ResumeAction {
+    /// The suspension was driven by a `.then`/`.catch`/`.finally` on a deferred
+    /// single-call promise. On resume, wrap the host value in a settled promise
+    /// (`resolved` on success; the error path uses `resume_with_error` instead)
+    /// and run `method` with `args`, threading through the normal promise-method
+    /// machinery (which supports tool calls inside the callback, per N4).
+    PromiseMethod { method: String, args: Vec<Value> },
+    /// The suspension was driven by a promise callback *returning* a deferred
+    /// single-call promise (thenable adoption): the chain forced that call. On
+    /// resume, the settled promise becomes (or is folded into) the chain's
+    /// result per `mode`. See the `PromiseCallback` arm of `process_continuation`.
+    ChainResult {
+        mode: PromiseCallbackMode,
+        original_promise: Value,
+    },
+    /// A plain `await p` on a deferred single-call promise forced its call. The
+    /// resumed value is the await result (pushed by the host) — but we also cache
+    /// it under the call id so a *second* `await p` / `p.then(...)` on the same
+    /// promise reuses the settled value instead of re-invoking the host (matching
+    /// JS, where a promise settles once).
+    CacheValue { id: u64 },
 }
 
 /// The preferred type passed to [`Vm::to_primitive`], mirroring the JS
@@ -323,6 +360,7 @@ impl Vm {
             rng_state: 0,
             pending_throw: None,
             to_primitive_depth: 0,
+            resume_action: None,
         }
     }
 
@@ -408,6 +446,7 @@ impl Vm {
             rng_state: 0,
             pending_throw: None,
             to_primitive_depth: 0,
+            resume_action: None,
         }
     }
 
@@ -426,7 +465,107 @@ impl Vm {
     /// the external function should already be pushed onto the stack.
     pub(crate) fn resume_execution(&mut self) -> Result<VmState> {
         self.tracker.start();
+        // If this suspension was a `.then`/`.catch`/`.finally` forcing a deferred
+        // single-call promise (N5), the host value on the stack is the call's
+        // *fulfilled* result. Shape it into a resolved promise and run the
+        // method, so the callback chain proceeds (possibly suspending again for
+        // a tool call inside the callback). A plain `await` has no resume_action,
+        // so the value is already the await result — fall through to `execute`.
+        if let Some(action) = self.resume_action.take() {
+            match action {
+                // Plain `await p`: the host value on the stack IS the await result.
+                // Cache it under the call id (so a later await/then on the same
+                // promise settles once) and leave it on the stack.
+                ResumeAction::CacheValue { id } => {
+                    let value = self.peek()?.clone();
+                    self.resolved.insert(id, value);
+                }
+                other => {
+                    let value = self.pop()?;
+                    let settled = builtins::make_resolved_promise(value, &mut self.heap);
+                    if let Some(state) = self.run_resume_action(other, settled)? {
+                        return Ok(state);
+                    }
+                }
+            }
+        }
         self.execute()
+    }
+
+    /// Apply a [`ResumeAction`] to the settled (resolved/rejected) promise that a
+    /// resumed single-call promise produced, dispatching the deferred promise
+    /// method. Returns `Some(state)` if running the method itself suspends (a
+    /// tool call inside the callback) and `None` once the method's result has
+    /// been pushed / a callback continuation has been started (in which case the
+    /// caller drives the main loop). Used by both the success and error resume
+    /// paths.
+    fn run_resume_action(
+        &mut self,
+        action: ResumeAction,
+        settled: Value,
+    ) -> Result<Option<VmState>> {
+        match action {
+            ResumeAction::PromiseMethod { method, args } => {
+                match self.execute_promise_method(settled.clone(), &method, args)? {
+                    // The method completed synchronously — push its promise and
+                    // let the following instructions (typically `Await`) consume.
+                    PromiseMethodOutcome::Value(v) => {
+                        self.push(v)?;
+                        Ok(None)
+                    }
+                    // A callback frame + continuation were started; the main loop
+                    // drives them.
+                    PromiseMethodOutcome::ContinuationStarted => Ok(None),
+                    // The callback itself was a tool call that suspended again.
+                    PromiseMethodOutcome::Suspend(state) => Ok(Some(state)),
+                    PromiseMethodOutcome::NotAPromise => {
+                        // Should not happen — `make_resolved_promise` always yields
+                        // a promise. Push the settled value defensively.
+                        self.push(settled)?;
+                        Ok(None)
+                    }
+                }
+            }
+            ResumeAction::ChainResult {
+                mode,
+                original_promise,
+            } => {
+                // A promise callback returned a deferred single-call promise; its
+                // host call has now settled into `settled`. Fold it into the chain
+                // result per the callback mode, then continue the execute loop.
+                let is_rejected = matches!(
+                    &settled,
+                    Value::Object(h) if matches!(
+                        self.heap.object(*h).and_then(|m| m.get("status")),
+                        Some(Value::String(s)) if s.as_ref() == "rejected"
+                    )
+                );
+                let chain_result = match mode {
+                    // `.then`/`.catch`: adopt the settled promise as the chain's
+                    // next promise (resolved value flows on; a rejection rejects).
+                    PromiseCallbackMode::WrapResult => settled,
+                    // `.finally`: the returned promise is awaited but its *value*
+                    // is discarded — the original promise passes through on
+                    // success; a rejection from the cleanup promise wins.
+                    PromiseCallbackMode::PassThrough => {
+                        if is_rejected {
+                            settled
+                        } else {
+                            original_promise
+                        }
+                    }
+                };
+                self.push(chain_result)?;
+                Ok(None)
+            }
+            // `CacheValue` is handled inline by `resume_execution` /
+            // `resume_with_error` (it needs the raw value / throw path), never via
+            // this helper. Push the settled promise defensively if it ever arrives.
+            ResumeAction::CacheValue { .. } => {
+                self.push(settled)?;
+                Ok(None)
+            }
+        }
     }
 
     /// Resume a suspended external call by making it *throw* `error` instead of
@@ -436,6 +575,24 @@ impl Vm {
     /// how a real failing tool/activity should look to agent-written code.
     pub(crate) fn resume_with_error(&mut self, error: Value) -> Result<VmState> {
         self.tracker.start();
+        // If this suspension was a `.then`/`.catch`/`.finally` forcing a deferred
+        // single-call promise (N5), a rejection becomes a *rejected* promise and
+        // the method runs so a `.catch`/onRejected can handle it — rather than
+        // propagating the error out of the chain.
+        if let Some(action) = self.resume_action.take() {
+            // A plain `await p` whose deferred call rejected: fall through to the
+            // normal throw-at-await-site path below (the error surfaces in guest
+            // try/catch or propagates to the host), exactly like `await tool()`.
+            if matches!(action, ResumeAction::CacheValue { .. }) {
+                // (no shaping needed — the error is raised at the await site)
+            } else {
+                let rejected = builtins::make_rejected_promise(error.clone(), &mut self.heap);
+                return match self.run_resume_action(action, rejected)? {
+                    Some(state) => Ok(state),
+                    None => self.execute(),
+                };
+            }
+        }
         match self.try_stack.pop() {
             Some(try_info) => {
                 // Unwind frames and stack to the nearest enclosing try block,
@@ -647,6 +804,30 @@ impl Vm {
         Ok(Some(VmState::SuspendedMany {
             calls,
             combinator: kind,
+            snapshot,
+        }))
+    }
+
+    /// Suspend on a deferred single-call promise's host call (N5). The call was
+    /// registered by `CallExternalDeferred` and is held in `pending_calls`. We
+    /// present it to the host as an ordinary single suspension (`name`/`args`),
+    /// so the existing host bridge resolves it exactly like `await tool()`. The
+    /// pending-call record is removed so it can't be invoked twice. The resumed
+    /// value is pushed onto the stack; any post-resume shaping (for
+    /// `.then`/`.catch`/`.finally`) is governed by `self.resume_action`.
+    fn suspend_on_pending_call(&mut self, id: u64) -> Result<Option<VmState>> {
+        let pos = self
+            .pending_calls
+            .iter()
+            .position(|c| c.id == id)
+            .ok_or_else(|| {
+                ZapcodeError::RuntimeError(format!("unknown pending call {}", id))
+            })?;
+        let pc = self.pending_calls.remove(pos);
+        let snapshot = ZapcodeSnapshot::capture(self)?;
+        Ok(Some(VmState::Suspended {
+            function_name: pc.name,
+            args: pc.args,
             snapshot,
         }))
     }
@@ -1102,7 +1283,9 @@ impl Vm {
                         self.push(Value::Undefined)?;
                     }
                     // Check if a continuation callback just completed
-                    self.process_continuation()?;
+                    if let Some(state) = self.process_continuation()? {
+                        return Ok(state);
+                    }
                     continue;
                 }
             }
@@ -1114,9 +1297,11 @@ impl Vm {
                 Ok(Some(state)) => return Ok(state),
                 Ok(None) => {
                     // After dispatch, check if a continuation callback returned
-                    // (via Return instruction or ip overflow)
-                    if self.process_continuation()? {
-                        continue;
+                    // (via Return instruction or ip overflow). A continuation may
+                    // itself suspend — e.g. a promise callback that returned a
+                    // deferred single-call promise, which must be forced (N5).
+                    if let Some(state) = self.process_continuation()? {
+                        return Ok(state);
                     }
                 }
                 Err(err) => {
@@ -1144,12 +1329,15 @@ impl Vm {
     }
 
     /// Process the top continuation if the current frame depth indicates a callback
-    /// has returned. Returns `true` if a continuation was processed (caller should
-    /// `continue` the execute loop).
-    fn process_continuation(&mut self) -> Result<bool> {
+    /// has returned. Returns `Ok(Some(state))` if processing the continuation must
+    /// suspend the VM (e.g. a promise callback returned a deferred single-call
+    /// promise that has to be forced), otherwise `Ok(None)` (the caller simply
+    /// proceeds to the next execute-loop iteration, whether or not a continuation
+    /// was advanced).
+    fn process_continuation(&mut self) -> Result<Option<VmState>> {
         let cont = match self.continuations.last() {
             Some(c) => c,
-            None => return Ok(false),
+            None => return Ok(None),
         };
 
         // Check if the callback's specific frame has been popped — only then
@@ -1175,13 +1363,13 @@ impl Vm {
 
         // The callback frame is still active — not done yet
         if self.frames.len() > callback_frame_index {
-            return Ok(false);
+            return Ok(None);
         }
 
         // Guard against stale continuations on stack unwinds — we must be
         // back at the original caller's frame depth.
         if self.frames.len() != caller_frame_depth {
-            return Ok(false);
+            return Ok(None);
         }
 
         // The callback just returned — collect its result from the stack.
@@ -1265,12 +1453,12 @@ impl Vm {
                         caller_frame_depth,
                         callback_frame_index: new_frame_index,
                     });
-                    Ok(true)
+                    Ok(None)
                 } else {
                     // All done — push final array.
                     let h = self.heap.alloc_array(results);
                     self.push(Value::Array(h))?;
-                    Ok(true)
+                    Ok(None)
                 }
             }
             Continuation::ArrayForEach {
@@ -1297,10 +1485,10 @@ impl Vm {
                         caller_frame_depth,
                         callback_frame_index: new_frame_index,
                     });
-                    Ok(true)
+                    Ok(None)
                 } else {
                     self.push(Value::Undefined)?;
-                    Ok(true)
+                    Ok(None)
                 }
             }
             Continuation::PromiseCallback {
@@ -1308,6 +1496,35 @@ impl Vm {
                 original_promise,
                 ..
             } => {
+                // If the callback returned a *deferred single-call promise* (a bare
+                // tool call, N5), the chain must adopt it: force its host call now
+                // and let the settled value flow into the chain. This makes
+                // `.then(() => tool())`, `.catch(() => tool())`, and
+                // `.finally(() => tool())` all drive the deferred call (matching JS
+                // thenable adoption), and preserves the pre-N5 eager behavior where
+                // a bare tool call inside a callback ran the tool.
+                if let Value::Object(h) = &callback_result {
+                    let is_pending_call = matches!(
+                        self.heap.object(*h).and_then(|m| m.get("status")),
+                        Some(Value::String(s)) if s.as_ref() == "pending_call"
+                    );
+                    if is_pending_call {
+                        let id = match self.heap.object(*h).and_then(|m| m.get("__call_id__")) {
+                            Some(Value::Int(n)) => *n as u64,
+                            _ => {
+                                return Err(ZapcodeError::RuntimeError(
+                                    "internal error: pending_call promise missing __call_id__"
+                                        .to_string(),
+                                ))
+                            }
+                        };
+                        self.resume_action = Some(ResumeAction::ChainResult {
+                            mode,
+                            original_promise,
+                        });
+                        return self.suspend_on_pending_call(id);
+                    }
+                }
                 // The promise callback finished (possibly after suspending for a
                 // tool call). Shape its result into the chain's next promise.
                 let chain_result = match mode {
@@ -1322,7 +1539,7 @@ impl Vm {
                     PromiseCallbackMode::PassThrough => original_promise,
                 };
                 self.push(chain_result)?;
-                Ok(true)
+                Ok(None)
             }
         }
     }
@@ -1824,6 +2041,38 @@ impl Vm {
                 Some(Value::String(s)) => s.to_string(),
                 _ => "pending".to_string(),
             };
+            // A deferred single-call promise (N5): `.then`/`.catch`/`.finally`
+            // forces its host call to settle. Suspend on the call now, recording
+            // a `ResumeAction::PromiseMethod` so that on resume the settled value
+            // is wrapped in a resolved promise and the method (with its callbacks)
+            // re-runs through the normal promise-method path — which itself
+            // supports a tool call inside the callback (N4). A *rejection* is
+            // delivered via `resume_with_error`, which raises at the call site and
+            // is shaped into a rejected promise there.
+            if status == "pending_call" {
+                let id = match map.get("__call_id__") {
+                    Some(Value::Int(n)) => *n as u64,
+                    _ => {
+                        return Err(ZapcodeError::RuntimeError(
+                            "internal error: pending_call promise missing __call_id__".to_string(),
+                        ))
+                    }
+                };
+                // Already settled (the promise was awaited before): run the method
+                // synchronously against the cached resolved value — no re-invoke.
+                if let Some(cached) = self.resolved.get(&id).cloned() {
+                    let resolved = builtins::make_resolved_promise(cached, &mut self.heap);
+                    return self.execute_promise_method(resolved, method, args);
+                }
+                self.resume_action = Some(ResumeAction::PromiseMethod {
+                    method: method.to_string(),
+                    args,
+                });
+                return match self.suspend_on_pending_call(id)? {
+                    Some(state) => Ok(PromiseMethodOutcome::Suspend(state)),
+                    None => unreachable!("suspend_on_pending_call always suspends"),
+                };
+            }
             let value = map.get("value").cloned().unwrap_or(Value::Undefined);
             let reason = map.get("reason").cloned().unwrap_or(Value::Undefined);
             (status, value, reason)
@@ -3225,6 +3474,12 @@ impl Vm {
                                         PromiseMethodOutcome::ContinuationStarted => {
                                             return Ok(None);
                                         }
+                                        // A deferred single-call promise forced its
+                                        // host call — propagate the suspension; the
+                                        // recorded resume_action finishes the method.
+                                        PromiseMethodOutcome::Suspend(state) => {
+                                            return Ok(Some(state));
+                                        }
                                         PromiseMethodOutcome::NotAPromise => None,
                                     }
                                 } else {
@@ -3505,6 +3760,27 @@ impl Vm {
                 obj.insert(Arc::from("status"), Value::String(Arc::from("pending_all")));
                 obj.insert(Arc::from("__batch_kind__"), Value::String(Arc::from(kind.as_str())));
                 obj.insert(Arc::from("items"), items_arr);
+                let h = self.heap.alloc_object(obj);
+                self.push(Value::Object(h))?;
+            }
+            Instruction::MakeCallPromise => {
+                // Wrap the just-registered deferred call (a `Value::Pending(id)`
+                // on the stack) in a single-call Promise object. The host call is
+                // deferred until the promise is awaited or driven by
+                // `.then`/`.catch`/`.finally` (N5).
+                let id = match self.pop()? {
+                    Value::Pending(id) => id,
+                    other => {
+                        return Err(ZapcodeError::RuntimeError(format!(
+                            "internal error: MakeCallPromise expected a pending call, got {}",
+                            other.type_name()
+                        )))
+                    }
+                };
+                let mut obj = IndexMap::new();
+                obj.insert(Arc::from("__promise__"), Value::Bool(true));
+                obj.insert(Arc::from("status"), Value::String(Arc::from("pending_call")));
+                obj.insert(Arc::from("__call_id__"), Value::Int(id as i64));
                 let h = self.heap.alloc_object(obj);
                 self.push(Value::Object(h))?;
             }
@@ -3894,6 +4170,30 @@ impl Vm {
                                 // Suspend on the whole batch (or resolve inline if
                                 // every element is already available).
                                 return self.await_batch(kind, items);
+                            }
+                            Value::String(s) if s.as_ref() == "pending_call" => {
+                                // A deferred single-call promise (N5): trigger its
+                                // host call now. Suspend with the call's name/args;
+                                // resume pushes the settled value, which is exactly
+                                // what `await` should produce. The value is also
+                                // cached under the call id (`CacheValue`) so a
+                                // second await/then on the same promise reuses it.
+                                let id = match map.get("__call_id__") {
+                                    Some(Value::Int(n)) => *n as u64,
+                                    _ => {
+                                        return Err(ZapcodeError::RuntimeError(
+                                            "internal error: pending_call promise missing __call_id__"
+                                                .to_string(),
+                                        ))
+                                    }
+                                };
+                                // Already settled (awaited before): reuse the value.
+                                if let Some(cached) = self.resolved.get(&id).cloned() {
+                                    self.push(cached)?;
+                                } else {
+                                    self.resume_action = Some(ResumeAction::CacheValue { id });
+                                    return self.suspend_on_pending_call(id);
+                                }
                             }
                             _ => {
                                 // Unknown status — pass through

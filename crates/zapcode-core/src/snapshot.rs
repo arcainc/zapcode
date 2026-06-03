@@ -7,8 +7,8 @@ use crate::heap::Heap;
 use crate::sandbox::ResourceLimits;
 use crate::value::Value;
 use crate::vm::{
-    CallFrame, Continuation, PendingBatch, PendingExternalCall, ReceiverSource, RunResult, TryInfo,
-    Vm,
+    CallFrame, Continuation, PendingBatch, PendingExternalCall, ReceiverSource, ResumeAction,
+    RunResult, TryInfo, Vm,
 };
 use crate::wire::FrameKind;
 
@@ -39,6 +39,10 @@ pub(crate) struct VmSnapshot {
     pub(crate) resolved: BTreeMap<u64, Value>,
     pub(crate) next_call_id: u64,
     pub(crate) pending_batch: Option<PendingBatch>,
+    /// Deferred action for resuming a single-call-promise suspension (N5). New
+    /// field — defaults to `None` so snapshots written before N5 still load.
+    #[serde(default)]
+    pub(crate) resume_action: Option<ResumeAction>,
     /// Cumulative allocation count, carried across resumes so a long-running
     /// suspend/resume chain can't evade `max_allocations` by resetting it.
     pub(crate) allocations: usize,
@@ -92,6 +96,7 @@ impl VmSnapshot {
             resolved: vm.resolved.clone(),
             next_call_id: vm.next_call_id,
             pending_batch: vm.pending_batch.clone(),
+            resume_action: vm.resume_action.clone(),
             allocations: vm.tracker.allocations,
             rng_state: vm.rng_state,
             heap: vm.heap.clone(),
@@ -124,6 +129,7 @@ impl VmSnapshot {
         vm.resolved = self.resolved;
         vm.next_call_id = self.next_call_id;
         vm.pending_batch = self.pending_batch;
+        vm.resume_action = self.resume_action;
         vm.tracker.allocations = self.allocations;
         vm.rng_state = self.rng_state;
         vm.cells = self.cells;
