@@ -722,32 +722,34 @@ fn call_math_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
             Value::Float(y.atan2(x))
         }
         "max" => {
-            if args.is_empty() {
-                Value::Float(f64::NEG_INFINITY)
-            } else {
-                let mut max = arg_num(args, 0);
-                for arg in &args[1..] {
-                    let n = arg.to_number();
-                    if n > max {
-                        max = n;
-                    }
+            // Per spec, ANY NaN argument poisons the result to NaN.
+            let mut max = f64::NEG_INFINITY;
+            for arg in args {
+                let n = arg.to_number();
+                if n.is_nan() {
+                    return Ok(Some(Value::Float(f64::NAN)));
                 }
-                Value::Float(max)
+                // Treat +0 as greater than -0 (Math.max(-0, +0) === +0).
+                if n > max || (n == 0.0 && max == 0.0 && n.is_sign_positive()) {
+                    max = n;
+                }
             }
+            Value::Float(max)
         }
         "min" => {
-            if args.is_empty() {
-                Value::Float(f64::INFINITY)
-            } else {
-                let mut min = arg_num(args, 0);
-                for arg in &args[1..] {
-                    let n = arg.to_number();
-                    if n < min {
-                        min = n;
-                    }
+            // Per spec, ANY NaN argument poisons the result to NaN.
+            let mut min = f64::INFINITY;
+            for arg in args {
+                let n = arg.to_number();
+                if n.is_nan() {
+                    return Ok(Some(Value::Float(f64::NAN)));
                 }
-                Value::Float(min)
+                // Treat -0 as less than +0 (Math.min(-0, +0) === -0).
+                if n < min || (n == 0.0 && min == 0.0 && n.is_sign_negative()) {
+                    min = n;
+                }
             }
+            Value::Float(min)
         }
         "sign" => {
             let n = arg_num(args, 0);
@@ -1444,14 +1446,44 @@ fn call_string_method(
         }
         "lastIndexOf" => {
             let search = arg_str(args, 0, heap);
-            match s.rfind(&*search) {
-                Some(pos) => Value::Int(pos as i64),
-                None => Value::Int(-1),
-            }
+            // Optional fromIndex (in chars): the match must START at or before it.
+            // Default is +Infinity (search the whole string).
+            let total_chars = s.chars().count();
+            let from_char = match args.get(1) {
+                Some(v) if !matches!(v, Value::Undefined) => {
+                    let n = v.to_number();
+                    if n.is_nan() {
+                        total_chars
+                    } else {
+                        (n.max(0.0) as usize).min(total_chars)
+                    }
+                }
+                _ => total_chars,
+            };
+            // Last byte at which a match may begin: the byte offset of char
+            // `from_char` (or end of string).
+            let max_start_byte = s
+                .char_indices()
+                .nth(from_char)
+                .map_or(s.len(), |(i, _)| i);
+            // Find the last match whose start byte is <= max_start_byte.
+            let result = s
+                .match_indices(&*search)
+                .filter(|(byte, _)| *byte <= max_start_byte)
+                .last()
+                .map(|(byte, _)| s[..byte].chars().count() as i64)
+                .unwrap_or(-1);
+            Value::Int(result)
         }
         "includes" => {
             let search = arg_str(args, 0, heap);
-            Value::Bool(s.contains(&*search))
+            // Optional position (in chars): search begins there.
+            let from = match args.get(1) {
+                Some(v) if !matches!(v, Value::Undefined) => v.to_number().max(0.0) as usize,
+                _ => 0,
+            };
+            let byte_start = s.char_indices().nth(from).map_or(s.len(), |(i, _)| i);
+            Value::Bool(s[byte_start..].contains(&*search))
         }
         "startsWith" => {
             let search = arg_str(args, 0, heap);
@@ -1567,6 +1599,12 @@ fn call_string_method(
             };
             if limit == 0 {
                 return Ok(Some(Value::Array(heap.alloc_array(Vec::new()))));
+            }
+            // `"abc".split()` (separator omitted/undefined) returns the whole
+            // string as a single element — NOT a per-character split.
+            if matches!(args.first(), None | Some(Value::Undefined)) {
+                let whole = vec![Value::String(s.clone())];
+                return Ok(Some(Value::Array(heap.alloc_array(whole))));
             }
             if let Some((pat, flags)) = args.first().and_then(|v| regexp_parts(v, heap)) {
                 let re = compile_regex(&pat, &flags)?;

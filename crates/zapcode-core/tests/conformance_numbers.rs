@@ -840,13 +840,12 @@ fn math_min() {
 
 #[test]
 fn math_min_max_nan_handling() {
-    // JS: any NaN argument poisons min/max to NaN. zapcode only propagates NaN when
-    // it is the *first* argument (its fold seeds with arg0 and skips later NaNs).
-    // Assert zapcode's actual behavior (documented divergence) for non-first NaN.
-    assert_eq!(run_str("String(Math.max(NaN, 1))"), "NaN"); // NaN first: agrees w/ JS
-    assert_eq!(run_str("String(Math.min(NaN, 1))"), "NaN"); // NaN first: agrees w/ JS
-    assert_eq!(run_str("Math.max(1, NaN)"), "1"); // zapcode residual (JS: NaN)
-    assert_eq!(run_str("Math.min(1, NaN)"), "1"); // zapcode residual (JS: NaN)
+    // Any NaN argument poisons min/max to NaN, regardless of position (spec).
+    assert_eq!(run_str("String(Math.max(NaN, 1))"), "NaN");
+    assert_eq!(run_str("String(Math.min(NaN, 1))"), "NaN");
+    assert_eq!(run_str("String(Math.max(1, NaN))"), "NaN");
+    assert_eq!(run_str("String(Math.min(1, NaN))"), "NaN");
+    assert_eq!(run_str("String(Math.max(1, 2, NaN, 3))"), "NaN");
 }
 
 // ============================================================================

@@ -200,10 +200,10 @@ fn last_index_of() {
     assert_eq!(run_str("'abc'.lastIndexOf('z')"), "-1");
     assert_eq!(run_str("'abc'.lastIndexOf('')"), "3"); // empty -> length
     assert_eq!(run_str("'aXaXa'.lastIndexOf('a')"), "4");
-    // DIVERGENCE: with a `fromIndex` the JS semantics search backward from that
-    // index ("abcabc".lastIndexOf("bc",3) === 1); zapcode reports the last overall
-    // occurrence instead. Asserting ACTUAL behavior.
-    assert_eq!(run_str("'abcabc'.lastIndexOf('bc', 3)"), "4"); // JS: 1
+    // With a `fromIndex`, the match must START at or before that index.
+    assert_eq!(run_str("'abcabc'.lastIndexOf('bc', 3)"), "1");
+    assert_eq!(run_str("'canal'.lastIndexOf('a', 2)"), "1");
+    assert_eq!(run_str("'canal'.lastIndexOf('a')"), "3");
 }
 
 #[test]
@@ -212,9 +212,10 @@ fn includes() {
     assert_eq!(run_str("'hello'.includes('xyz')"), "false");
     assert_eq!(run_str("'hello'.includes('')"), "true"); // empty always present
     assert_eq!(run_str("'hello'.includes('h')"), "true");
-    // DIVERGENCE: a search-from `position` argument is not honored, so a needle
-    // before `position` is still found. Asserting ACTUAL behavior.
-    assert_eq!(run_str("'hello'.includes('he', 1)"), "true"); // JS: false
+    // A search-from `position` argument is honored: a needle before `position`
+    // is not found, but one at/after it is.
+    assert_eq!(run_str("'hello'.includes('he', 1)"), "false");
+    assert_eq!(run_str("'hello'.includes('ell', 1)"), "true");
 }
 
 #[test]
@@ -346,10 +347,9 @@ fn split_string_separator() {
 #[test]
 fn split_char_and_default() {
     assert_eq!(run_str("JSON.stringify('abc'.split(''))"), "[\"a\",\"b\",\"c\"]"); // char split
-    // DIVERGENCE: a missing separator argument is treated like the empty string
-    // (char split) rather than returning the whole string in a single-element array.
-    // Asserting ACTUAL behavior. (`split(undefined)` below DOES match JS.)
-    assert_eq!(run_str("JSON.stringify('abc'.split())"), "[\"a\",\"b\",\"c\"]"); // JS: ["abc"]
+    // A missing/undefined separator returns the whole string in a single-element
+    // array (NOT a per-character split).
+    assert_eq!(run_str("JSON.stringify('abc'.split())"), "[\"abc\"]");
     assert_eq!(run_str("JSON.stringify('abc'.split(undefined))"), "[\"abc\"]");
 }
 
