@@ -13,8 +13,9 @@
 //!     value is string-coerced to "function" and inserted literally. Pinned below.
 //!   * A handful of small `replace`/`includes`/`at`/`lastIndexOf` argument-edge
 //!     divergences, each pinned to actual behavior with a `DIVERGENCE` comment.
-//!   * `String.prototype.normalize` and tagged templates (`String.raw\`…\``) are not
-//!     provided — exercised as "unsupported" so a future fix flips a known check.
+//!   * Tagged templates (`String.raw\`…\``) are not provided — exercised as
+//!     "unsupported" so a future fix flips a known check. `String.prototype.normalize`
+//!     is now implemented (NFC/NFD/NFKC/NFKD).
 
 use zapcode_core::vm::VmState;
 use zapcode_core::{ResourceLimits, ZapcodeRun};
@@ -78,9 +79,8 @@ fn bracket_indexing() {
     assert_eq!(run_str("'hello'[4]"), "o");
     assert_eq!(run_str("String('hello'[5])"), "undefined");
     assert_eq!(run_str("String('hello'[-1])"), "undefined");
-    // DIVERGENCE: a STRING-typed index ('1') is not coerced to a numeric character
-    // index; only numeric subscripts read a character. Asserting ACTUAL behavior.
-    assert_eq!(run_str("String('hello'['1'])"), "undefined"); // JS: "e"
+    // A STRING-typed numeric index ('1') is coerced to a character index.
+    assert_eq!(run_str("String('hello'['1'])"), "e");
 }
 
 #[test]
@@ -99,9 +99,8 @@ fn at_method() {
     assert_eq!(run_str("'hello'.at(-1)"), "o");
     assert_eq!(run_str("'hello'.at(-2)"), "l");
     assert_eq!(run_str("String('hello'.at(10))"), "undefined"); // forward OOB -> undefined
-    // DIVERGENCE: a negative index beyond the start should be `undefined` in JS,
-    // but zapcode clamps and returns the first char. Asserting ACTUAL behavior.
-    assert_eq!(run_str("'abc'.at(-10)"), "a"); // JS: undefined
+    // A negative index beyond the start is `undefined` (no clamping).
+    assert_eq!(run_str("String('abc'.at(-10))"), "undefined");
 }
 
 #[test]
@@ -199,10 +198,10 @@ fn last_index_of() {
     assert_eq!(run_str("'abc'.lastIndexOf('z')"), "-1");
     assert_eq!(run_str("'abc'.lastIndexOf('')"), "3"); // empty -> length
     assert_eq!(run_str("'aXaXa'.lastIndexOf('a')"), "4");
-    // DIVERGENCE: with a `fromIndex` the JS semantics search backward from that
-    // index ("abcabc".lastIndexOf("bc",3) === 1); zapcode reports the last overall
-    // occurrence instead. Asserting ACTUAL behavior.
-    assert_eq!(run_str("'abcabc'.lastIndexOf('bc', 3)"), "4"); // JS: 1
+    // With a `fromIndex`, the match must START at or before that index.
+    assert_eq!(run_str("'abcabc'.lastIndexOf('bc', 3)"), "1");
+    assert_eq!(run_str("'canal'.lastIndexOf('a', 2)"), "1");
+    assert_eq!(run_str("'canal'.lastIndexOf('a')"), "3");
 }
 
 #[test]
@@ -211,9 +210,10 @@ fn includes() {
     assert_eq!(run_str("'hello'.includes('xyz')"), "false");
     assert_eq!(run_str("'hello'.includes('')"), "true"); // empty always present
     assert_eq!(run_str("'hello'.includes('h')"), "true");
-    // DIVERGENCE: a search-from `position` argument is not honored, so a needle
-    // before `position` is still found. Asserting ACTUAL behavior.
-    assert_eq!(run_str("'hello'.includes('he', 1)"), "true"); // JS: false
+    // A search-from `position` argument is honored: a needle before `position`
+    // is not found, but one at/after it is.
+    assert_eq!(run_str("'hello'.includes('he', 1)"), "false");
+    assert_eq!(run_str("'hello'.includes('ell', 1)"), "true");
 }
 
 #[test]
@@ -345,10 +345,9 @@ fn split_string_separator() {
 #[test]
 fn split_char_and_default() {
     assert_eq!(run_str("JSON.stringify('abc'.split(''))"), "[\"a\",\"b\",\"c\"]"); // char split
-    // DIVERGENCE: a missing separator argument is treated like the empty string
-    // (char split) rather than returning the whole string in a single-element array.
-    // Asserting ACTUAL behavior. (`split(undefined)` below DOES match JS.)
-    assert_eq!(run_str("JSON.stringify('abc'.split())"), "[\"a\",\"b\",\"c\"]"); // JS: ["abc"]
+    // A missing/undefined separator returns the whole string in a single-element
+    // array (NOT a per-character split).
+    assert_eq!(run_str("JSON.stringify('abc'.split())"), "[\"abc\"]");
     assert_eq!(run_str("JSON.stringify('abc'.split(undefined))"), "[\"abc\"]");
 }
 
@@ -405,35 +404,33 @@ fn replace_dollar_patterns() {
 }
 
 #[test]
-fn replace_dollar_edge_divergences() {
-    // DIVERGENCE: `$$` should yield a single literal `$` in JS; zapcode leaves it as
-    // `$$`. Asserting ACTUAL behavior.
-    assert_eq!(run_str("'ab'.replace('a', '$$')"), "$$b"); // JS: "$b"
-    // DIVERGENCE: `$1` with no corresponding capture group is left LITERAL in JS
-    // ("a$1c"); zapcode drops it. Asserting ACTUAL behavior.
-    assert_eq!(run_str("'abc'.replace(/b/, '$1')"), "ac"); // JS: "a$1c"
-    // DIVERGENCE: `` $` `` (prefix) and `$'` (suffix) substitutions are not
-    // implemented; the tokens are inserted literally. Asserting ACTUAL behavior.
-    assert_eq!(run_str("'abc'.replace('b', '$`')"), "a$`c"); // JS: "aac"
-    assert_eq!(run_str("'abc'.replace('b', \"$'\")"), "a$'c"); // JS: "acc"
+fn replace_dollar_patterns_edges() {
+    // `$$` yields a single literal `$`.
+    assert_eq!(run_str("'ab'.replace('a', '$$')"), "$b");
+    // `$1` with no corresponding capture group is left LITERAL.
+    assert_eq!(run_str("'abc'.replace(/b/, '$1')"), "a$1c");
+    // `` $` `` (prefix) and `$'` (suffix) substitutions are honored.
+    assert_eq!(run_str("'abc'.replace('b', '$`')"), "aac");
+    assert_eq!(run_str("'abc'.replace('b', \"$'\")"), "acc");
+    // `$&` is the matched substring (string-search path).
+    assert_eq!(run_str("'abc'.replace('b', '[$&]')"), "a[b]c");
 }
 
 #[test]
-fn replace_function_replacer_documented_divergence() {
-    // DIVERGENCE (documented residual): a FUNCTION replacer is NOT invoked. The
-    // function value is string-coerced to "function" and inserted literally. Only
-    // string replacements (with $-substitutions) are honored. Asserting ACTUAL.
+fn replace_function_replacer() {
+    // A FUNCTION replacer is invoked per match with (match, ...groups, offset,
+    // string); its return value is string-coerced and substituted.
     assert_eq!(
         run_str("'a1b2'.replace(/\\d/g, m => '[' + m + ']')"),
-        "afunctionbfunction" // JS: "a[1]b[2]"
+        "a[1]b[2]"
     );
     assert_eq!(
         run_str("'hello'.replace('l', m => m.toUpperCase())"),
-        "hefunctionlo" // JS: "heLlo"
+        "heLlo"
     );
     assert_eq!(
         run_str("'abcabc'.replace(/b/g, (m, off) => off)"),
-        "afunctioncafunctionc" // JS: "a1ca4c"
+        "a1ca4c"
     );
 }
 
@@ -453,10 +450,10 @@ fn replace_all_string() {
 fn replace_all_regex_and_patterns() {
     assert_eq!(run_str("'a1b2'.replaceAll(/\\d/g, '#')"), "a#b#");
     assert_eq!(run_str("'x1x2x3'.replaceAll(/x(\\d)/g, '[$1]')"), "[1][2][3]");
-    // DIVERGENCE (documented): function replacer not invoked here either.
+    // A function replacer is invoked per match here too.
     assert_eq!(
         run_str("'a1b2'.replaceAll(/\\d/g, m => '<' + m + '>')"),
-        "afunctionbfunction" // JS: "a<1>b<2>"
+        "a<1>b<2>"
     );
 }
 
@@ -538,13 +535,18 @@ fn regex_test() {
 
 #[test]
 fn regex_exec() {
-    assert_eq!(run_str("JSON.stringify(/(\\w)(\\d)/.exec('a1').slice(0, 3))"), "[\"a1\",\"a\",\"1\"]");
+    // The `exec` result is an array-LIKE object (it carries the extra `.index` /
+    // `.input` / `.groups` props that a Vec-backed heap array can't hold — the same
+    // documented trade-off as `match()`), so read groups by index, not `.slice`.
+    assert_eq!(
+        run_str("const m=/(\\w)(\\d)/.exec('a1'); JSON.stringify([m[0], m[1], m[2]])"),
+        "[\"a1\",\"a\",\"1\"]"
+    );
     assert_eq!(run_str("String(/\\d/.exec('abc'))"), "null"); // no match -> null
     assert_eq!(run_str("/(\\d+)/.exec('xy42')[0]"), "42"); // group 0 = whole match
     assert_eq!(run_str("/(\\d+)/.exec('xy42')[1]"), "42"); // group 1
-    // DIVERGENCE: the `exec` result does not carry `.index` (only `.match()` /
-    // `.matchAll()` results expose it). Asserting ACTUAL behavior.
-    assert_eq!(run_str("String(/(\\d+)/.exec('xy42').index)"), "undefined"); // JS: 2
+    // The `exec` result carries `.index` (match start in chars), like JS.
+    assert_eq!(run_str("String(/(\\d+)/.exec('xy42').index)"), "2");
 }
 
 #[test]
@@ -641,13 +643,11 @@ fn template_nesting_and_escapes() {
 // ============================================================================
 
 #[test]
-fn normalize_is_unsupported_residual() {
-    // DIVERGENCE (documented): String.prototype.normalize is not provided; calling
-    // it raises a TypeError instead of returning the (already-NFC) BMP string.
-    assert!(
-        run_err("'abc'.normalize()").contains("normalize"),
-        "expected a normalize TypeError"
-    );
+fn normalize_returns_normalized_string() {
+    // String.prototype.normalize returns the (already-NFC) string unchanged.
+    assert_eq!(run_str("'abc'.normalize()"), "abc");
+    // A decomposed sequence composes under the default NFC form.
+    assert_eq!(run_str("'cafe\\u0301'.normalize('NFC') === 'café'"), "true");
 }
 
 #[test]

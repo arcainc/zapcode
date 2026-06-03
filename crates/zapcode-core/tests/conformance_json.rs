@@ -2,11 +2,10 @@
 //!
 //! Serialization (nested values, undefined/function dropping, control-char &
 //! quote escaping, NaN/Infinity -> null, indentation, array & date handling) and
-//! parsing (objects/arrays/primitives, round-trips). The deferred I4-family gaps
-//! are pinned to actual behavior: a FUNCTION replacer (stringify) and a reviver
-//! (parse) are not invoked, and a user-defined `toJSON()` on a plain object is not
-//! honored (built-in `Date#toJSON` IS). Array replacers, string replacers, and
-//! indentation all work and match Node.
+//! parsing (objects/arrays/primitives, round-trips). A FUNCTION replacer
+//! (stringify) and a reviver (parse) are invoked per entry, and a user-defined
+//! `toJSON()` on a plain object is honored (as is built-in `Date#toJSON`). Array
+//! replacers, string replacers, and indentation all work and match Node.
 
 use zapcode_core::vm::VmState;
 use zapcode_core::{ResourceLimits, ZapcodeRun};
@@ -143,25 +142,35 @@ fn round_trip_stringify_parse() {
 // ----------------------------------------------------------------------------
 
 #[test]
-fn function_replacer_and_reviver_unsupported_documented_divergence() {
-    // DIVERGENCE (documented, I4-family): a FUNCTION replacer (stringify) and a
-    // reviver (parse) are not invoked — the value is serialized/parsed unmodified.
-    // (Array replacers DO work; see stringify_with_array_replacer_whitelist.)
+fn function_replacer_and_reviver() {
+    // A FUNCTION replacer (stringify) transforms each entry; a reviver (parse) is
+    // invoked per entry. (Array replacers also work; see
+    // stringify_with_array_replacer_whitelist.)
     assert_eq!(
         run_str("JSON.stringify({a:1, b:2}, (k, v) => typeof v === 'number' ? v * 10 : v)"),
-        "{\"a\":1,\"b\":2}" // JS: {"a":10,"b":20}
+        "{\"a\":10,\"b\":20}"
     );
     assert_eq!(
         run_str("JSON.parse('{\"a\":1}', (k, v) => typeof v === 'number' ? v + 100 : v).a"),
-        "1" // JS: 101
+        "101"
+    );
+    // A replacer returning undefined drops the property.
+    assert_eq!(
+        run_str("JSON.stringify({a:1, b:2}, (k, v) => k === 'b' ? undefined : v)"),
+        "{\"a\":1}"
+    );
+    // A reviver returning undefined drops the property.
+    assert_eq!(
+        run_str("JSON.stringify(JSON.parse('{\"a\":1,\"b\":2}', (k, v) => k === 'b' ? undefined : v))"),
+        "{\"a\":1}"
     );
 }
 
 #[test]
-fn user_to_json_on_plain_object_not_honored_documented_divergence() {
-    // DIVERGENCE (documented): a user-defined `toJSON()` on a PLAIN object is not
-    // called (the object serializes by its own data props, dropping the method).
-    // Built-in `Date#toJSON` IS honored (see stringify_honors_builtin_date_to_json).
-    assert_eq!(run_str("JSON.stringify({toJSON(){ return 'custom'; }})"), "{}"); // JS: "custom"
-    assert_eq!(run_str("JSON.stringify({x: {toJSON(){ return 5; }}})"), "{\"x\":{}}"); // JS: {"x":5}
+fn user_to_json_on_plain_object_honored() {
+    // A user-defined `toJSON()` on a PLAIN object is called; its return value is
+    // serialized in place of the object (matching built-in `Date#toJSON`, see
+    // stringify_honors_builtin_date_to_json).
+    assert_eq!(run_str("JSON.stringify({toJSON(){ return 'custom'; }})"), "\"custom\"");
+    assert_eq!(run_str("JSON.stringify({x: {toJSON(){ return 5; }}})"), "{\"x\":5}");
 }

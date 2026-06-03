@@ -140,18 +140,49 @@ pub enum Instruction {
 
     // Loops
     SetupLoop,
-    Break,
-    Continue,
+    /// Transfer control to `target` (a loop's exit / next-iteration ip) the way a
+    /// `break`/`continue` does, but first run any `finally` blocks the transfer
+    /// escapes (try-statements that enclose this jump but are enclosed by the
+    /// loop). Carries the resolved jump target.
+    Break(usize),
+    Continue(usize),
 
     // Iterators
     GetIterator,
     IteratorNext,
     IteratorDone,
+    /// Pop the top value and push a freshly materialized array of its iterated
+    /// elements. Drives generators, iterates strings (by char), Sets, Maps (as
+    /// [k,v] pairs) and copies arrays. Used by spread (`[...x]`) and array
+    /// destructuring (`const [a,b] = x`) so non-array iterables are consumed.
+    IterableToArray,
 
     // Error handling
-    SetupTry(usize, Option<usize>),
+    //
+    // `SetupTry { catch_ip, finally_ip, region_end }` protects the following try
+    // body. On a throw the VM transfers to `catch_ip` if a catch handler exists,
+    // otherwise straight to the `finally` body (recording a Throw completion).
+    // `finally_ip` is the start of the finally body when the statement has one.
+    // `region_end` is the ip just past the whole try/catch/finally statement,
+    // used to decide whether a `break`/`continue` escapes this try (so its
+    // finally must run) or stays inside it.
+    SetupTry {
+        catch_ip: usize,
+        finally_ip: Option<usize>,
+        region_end: usize,
+    },
     Throw,
     EndTry,
+    /// Record a normal completion for the active try/finally and jump to its
+    /// finally body (compiler emits this on the normal fall-through and end-of-
+    /// catch paths so the finally always runs). No-op if the active try has no
+    /// finally. Operand is the finally body's start ip.
+    EnterFinallyNormal(usize),
+    /// Marks the end of a finally body. Pops the active try frame's pending
+    /// completion and resumes it (re-throw / re-return / re-break / re-continue /
+    /// fall through). An abrupt completion *inside* the finally body supersedes
+    /// the pending one and is handled before this instruction is reached.
+    EndFinally,
 
     // Typeof
     TypeOf,
@@ -171,13 +202,32 @@ pub enum Instruction {
     DestructureArray(usize),
 
     // Classes
-    /// Create a class: pops constructor closure (or undefined), then n_methods method closures
-    /// with method names, then n_static static closures with names, then optional super class.
-    /// Pushes the class object (an Object with __constructor__, __prototype__, __class_name__).
+    /// Create a class. The compiler pushes the following groups onto the stack, in
+    /// this order (so they pop in reverse — constructor first):
+    ///   [optional super class]
+    ///   n_static_fields  * (name, init_closure) pairs
+    ///   n_fields         * (name, init_closure) pairs
+    ///   n_static_setters * (name, closure) pairs
+    ///   n_static_getters * (name, closure) pairs
+    ///   n_setters        * (name, closure) pairs
+    ///   n_getters        * (name, closure) pairs
+    ///   n_statics        * (name, closure) pairs   (static methods)
+    ///   n_methods        * (name, closure) pairs   (instance methods)
+    ///   constructor closure (or undefined)   <- top of stack
+    /// Field init closures take no args and run with `this` bound to the instance;
+    /// getter/setter closures are installed as accessor descriptors. Pushes the
+    /// class object (an Object with __constructor__, __prototype__, __class_name__,
+    /// and any __getters__/__setters__/__field_inits__/__static_field_inits__).
     CreateClass {
         name: String,
         n_methods: usize,
         n_statics: usize,
+        n_getters: usize,
+        n_setters: usize,
+        n_static_getters: usize,
+        n_static_setters: usize,
+        n_fields: usize,
+        n_static_fields: usize,
         has_super: bool,
     },
     /// Construct: pops class object + args, creates instance, calls constructor, pushes instance.

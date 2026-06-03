@@ -12,8 +12,8 @@
  *   BUG-H  Closure scope sharing — two closures from same factory share captured vars
  *          `function wrap(x){return ()=>x}; f1=wrap(1); f2=wrap(2); f1()` → 2 not 1
  *   BUG-I  obj[varKey].push(v) — push result discarded; array in object unchanged
- *   BUG-J  class getter returns null — `get prop() {...}` always null
- *   BUG-K  class setter has no effect — `set v(x) { this._v = x; }` does nothing
+ *   BUG-J  FIXED (cluster C): class getter `get prop() {...}` now runs on read
+ *   BUG-K  FIXED (cluster C): class setter `set v(x) {...}` now runs on assignment
  *   BUG-L  instanceof returns false for Array/Object — `[] instanceof Array` → false
  *   BUG-M  Destructuring defaults not applied — `const {a=10}={}; a` → null
  *   BUG-N  Computed property name in object literal is null — `{[expr]: val}` → null
@@ -1218,7 +1218,7 @@ await check("BUG-J: class getter always returns null", async () => {
     `,
     {}
   );
-  // BUG: returns null instead of 10
+  // FIXED (cluster C): the getter body runs on read, returning 10.
   assert.equal(r.output, 10);
 });
 
@@ -1236,7 +1236,7 @@ await check("BUG-K: class setter has no effect — assigned value not stored", a
     `,
     {}
   );
-  // BUG: returns 0 (setter ignored); expected 20
+  // FIXED (cluster C): the setter runs on assignment, so _v becomes 20.
   assert.equal(r.output, 20);
 });
 

@@ -208,9 +208,10 @@ cd packages/zapcode-ai && npm run test:e2e-full
 
 Both must be fully green. As of this writing the gate is:
 
-- **Rust:** ~2026 core + conformance tests pass (0 failed); the conformance layer
+- **Rust:** 2029 core + conformance tests pass (0 failed); the conformance layer
   alone is ~1392 `#[test]` functions across the `conformance_*.rs` files.
-- **JS:** ~237 e2e + scenario checks pass across the `test:e2e-full` chain.
+- **JS:** 237 e2e + scenario checks pass across the `test:e2e-full` chain
+  (incl. `test:scenarios3`'s 77 checks).
 
 ---
 

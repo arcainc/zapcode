@@ -8,15 +8,12 @@
 //! the suite stays green and the divergence is recorded rather than silently
 //! tolerated. The known function-area residuals exercised here are:
 //!   * `call` / `apply` / `bind` are absent (not defined on functions).
-//!   * the `arguments` object is not bound (it reads as `undefined`).
 //!   * `new` only constructs `class` instances; `new fn()` with a plain function
 //!     that mutates `this` throws (an explicit object return still works).
 //!   * `fn.length` and `fn.name` are not reflected (`undefined`).
 //!   * a named function EXPRESSION's internal name is not bound for self-recursion.
 //!   * an arrow that ESCAPES its defining method (returned then called later) loses
 //!     the method's `this`; synchronously-invoked nested arrows keep it.
-//!   * array-pattern element defaults and NESTED array patterns don't bind;
-//!     a destructured PARAMETER's own `={}` default isn't applied.
 
 use zapcode_core::vm::VmState;
 use zapcode_core::{ResourceLimits, ZapcodeRun};
@@ -352,17 +349,15 @@ fn manual_this_redirection_via_closures_works() {
 // ----------------------------------------------------------------------------
 
 #[test]
-fn arguments_object_is_unbound_documented_divergence() {
-    // DIVERGENCE (documented): the `arguments` object is not provided; it reads as
-    // `undefined` inside a function body. JS exposes an array-like `arguments`.
-    assert_eq!(run_str("function f(){ return typeof arguments; } f(1, 2, 3)"), "undefined");
-    assert_eq!(run_str("function f(){ return arguments === undefined; } f(1)"), "true");
-    // reading a property off it therefore throws
-    assert_eq!(
-        run_err("function f(){ return arguments.length; } f(1, 2, 3)"),
-        "type error: Cannot read properties of undefined (reading 'length')"
-    );
-    // rest parameters are the supported substitute for variadic access
+fn arguments_object_is_bound() {
+    // An ordinary function exposes an array-like `arguments` of all passed args.
+    assert_eq!(run_str("function f(){ return typeof arguments; } f(1, 2, 3)"), "object");
+    assert_eq!(run_str("function f(){ return arguments.length; } f(1, 2, 3)"), "3");
+    assert_eq!(run_str("function f(){ return arguments[0] + arguments[2]; } f(10, 20, 30)"), "40");
+    // `arguments` reflects ALL args, not just the declared params.
+    assert_eq!(run_str("function f(a){ return arguments.length; } f(1, 2, 3, 4)"), "4");
+    assert_eq!(run_str("function f(a, b){ return arguments[2]; } f(1, 2, 3)"), "3");
+    // rest parameters remain available alongside it
     assert_eq!(run_str("function f(...args){ return args.length; } f(1, 2, 3)"), "3");
     assert_eq!(run_str("function f(...args){ return args[0] + args[1]; } f(10, 20)"), "30");
 }
@@ -505,13 +500,11 @@ fn parameter_object_destructuring() {
 }
 
 #[test]
-fn destructured_param_own_default_documented_divergence() {
-    // DIVERGENCE (documented): a destructured PARAMETER's own `= {}` default (used
-    // so the function can be called with no args) is not applied, and the inner
-    // element defaults don't fire either — so `a`/`b` end up NaN under `a + b`.
-    // JS would yield 3 for `f()` and 12 for `f({a:10})`.
-    assert_eq!(run_str("function f({a = 1, b = 2} = {}){ return a + b; } f()"), "NaN"); // JS: 3
-    assert_eq!(run_str("function f({a = 1, b = 2} = {}){ return a + b; } f({a: 10})"), "NaN"); // JS: 12
+fn destructured_param_own_default() {
+    // A destructured PARAMETER's own `= {}` default (so the function can be called
+    // with no args) applies, and inner element defaults fire too.
+    assert_eq!(run_str("function f({a = 1, b = 2} = {}){ return a + b; } f()"), "3");
+    assert_eq!(run_str("function f({a = 1, b = 2} = {}){ return a + b; } f({a: 10})"), "12");
 }
 
 // ----------------------------------------------------------------------------
@@ -527,21 +520,18 @@ fn array_destructuring() {
 }
 
 #[test]
-fn nested_array_destructuring_documented_divergence() {
-    // DIVERGENCE (documented, cluster D): NESTED array patterns do not bind — the
-    // inner elements come out `undefined`. (One level of array destructuring, and
-    // object patterns nested inside object patterns, do work — see other tests.)
-    assert_eq!(run_str("const [[a], [b]] = [[1], [2]]; String(a) + ',' + String(b)"), "undefined,undefined"); // JS: 1,2
-    assert_eq!(run_str("const {arr: [x, y]} = {arr: [1, 2]}; String(x) + ',' + String(y)"), "undefined,undefined"); // JS: 1,2
+fn nested_array_destructuring() {
+    // NESTED array patterns bind their inner elements, including an array pattern
+    // nested inside an object pattern.
+    assert_eq!(run_str("const [[a], [b]] = [[1], [2]]; String(a) + ',' + String(b)"), "1,2");
+    assert_eq!(run_str("const {arr: [x, y]} = {arr: [1, 2]}; String(x) + ',' + String(y)"), "1,2");
 }
 
 #[test]
-fn array_destructuring_defaults_documented_divergence() {
-    // DIVERGENCE (documented, cluster D): array-pattern element DEFAULTS are not
-    // applied — a missing element binds `undefined` instead of the default.
-    // (Object-pattern defaults DO work; see object_destructuring_defaults_work.)
-    assert_eq!(run_str("const [a = 10, b = 20] = [1]; `${a},${b}`"), "1,undefined"); // JS: 1,20
-    assert_eq!(run_str("const [a = 10] = []; String(a)"), "undefined"); // JS: 10
+fn array_destructuring_defaults() {
+    // Array-pattern element DEFAULTS apply when the element is missing/undefined.
+    assert_eq!(run_str("const [a = 10, b = 20] = [1]; `${a},${b}`"), "1,20");
+    assert_eq!(run_str("const [a = 10] = []; String(a)"), "10");
 }
 
 // ----------------------------------------------------------------------------
@@ -549,13 +539,17 @@ fn array_destructuring_defaults_documented_divergence() {
 // ----------------------------------------------------------------------------
 
 #[test]
-fn function_length_and_name_are_unreflected_documented_divergence() {
-    // DIVERGENCE (documented): functions do not reflect `.length` (arity) or
-    // `.name`; both read as `undefined`. JS exposes the param count and the name.
-    assert_eq!(run_str("function f(a, b, c){} typeof f.length"), "undefined"); // JS: number 3
-    assert_eq!(run_str("const g = (a, b) => 0; typeof g.length"), "undefined"); // JS: number 2
-    assert_eq!(run_str("function named(){} typeof named.name"), "undefined"); // JS: "named"
-    assert_eq!(run_str("const bar = function(){}; typeof bar.name"), "undefined"); // JS: "bar"
+fn function_length_and_name_are_reflected() {
+    // Functions reflect `.length` (arity = leading params before any default/rest)
+    // and `.name` (declared, or inferred from the binding for an anonymous expr).
+    assert_eq!(run_str("function f(a, b, c){} f.length"), "3");
+    assert_eq!(run_str("const g = (a, b) => 0; g.length"), "2");
+    // `.length` counts only params before the first default or rest.
+    assert_eq!(run_str("function h(a, b = 1, c){} h.length"), "1");
+    assert_eq!(run_str("function r(a, ...rest){} r.length"), "1");
+    assert_eq!(run_str("function named(){} named.name"), "named");
+    assert_eq!(run_str("const bar = function(){}; bar.name"), "bar");
+    assert_eq!(run_str("const arrow = () => 0; arrow.name"), "arrow");
 }
 
 #[test]

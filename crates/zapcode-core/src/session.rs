@@ -124,6 +124,14 @@ struct IdleSessionState {
     /// those handles dangle when the next chunk runs.
     #[serde(default)]
     heap: crate::heap::Heap,
+    /// Shared upvalue cells (captured function-local variables) backing any
+    /// persisted closure's `env`. A closure RETURNED from a nested call keeps
+    /// its captured locals in cells whose ids its `env` references; without
+    /// carrying the arena forward, the next chunk starts with an empty `cells`
+    /// and those captures read `undefined`. Indices double as ids, so preserving
+    /// the `Vec` keeps every closure's `env` ids aligned across reload.
+    #[serde(default)]
+    cells: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +156,7 @@ impl ZapcodeSessionSnapshot {
                 allocations: 0,
                 rng_state: 0,
                 heap: crate::heap::Heap::new(),
+                cells: Vec::new(),
             }),
         })
     }
@@ -259,6 +268,11 @@ impl ZapcodeSessionSnapshot {
         // Carry the cumulative allocation budget and PRNG state forward.
         vm.tracker.allocations = idle.allocations;
         vm.rng_state = idle.rng_state;
+        // Restore the shared upvalue cells so closures persisted from earlier
+        // chunks (including ones returned from a nested call) keep their captured
+        // function-local state. New cells allocated by this chunk append past
+        // these, so the persisted closures' `env` ids stay valid.
+        vm.cells = idle.cells;
 
         let state = vm.run_program(program_index)?;
         build_session_state(state, vm, top_level_bindings, 0, transient_input_names)
@@ -405,6 +419,9 @@ fn build_session_state(
                     // Carry the heap so persisted array/object globals stay valid
                     // for the next chunk.
                     heap: vm.heap.clone(),
+                    // Carry the upvalue-cell arena so persisted closures keep
+                    // their captured function-local state across the reload.
+                    cells: vm.cells.clone(),
                 }),
             },
         }),

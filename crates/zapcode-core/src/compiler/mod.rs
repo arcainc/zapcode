@@ -42,6 +42,9 @@ pub struct CompiledFunction {
     pub local_names: Vec<String>,
     pub is_async: bool,
     pub is_generator: bool,
+    /// True iff the body references `arguments` and the function is non-arrow, so
+    /// the VM must bind an array-like `arguments` local right after the params.
+    pub needs_arguments: bool,
 }
 
 struct Compiler {
@@ -127,11 +130,14 @@ impl Compiler {
             Instruction::Jump(t)
             | Instruction::JumpIfFalse(t)
             | Instruction::JumpIfTrue(t)
-            | Instruction::JumpIfNullish(t) => {
+            | Instruction::JumpIfNullish(t)
+            | Instruction::Break(t)
+            | Instruction::Continue(t)
+            | Instruction::EnterFinallyNormal(t) => {
                 *t = target;
             }
-            Instruction::SetupTry(catch_target, _) => {
-                *catch_target = target;
+            Instruction::SetupTry { catch_ip, .. } => {
+                *catch_ip = target;
             }
             _ => {}
         }
@@ -206,6 +212,119 @@ impl Compiler {
         Ok(())
     }
 
+    /// True iff `arguments` is referenced directly in this function body. Nested
+    /// function/arrow bodies live in the separate `Program.functions` table
+    /// (referenced here only by index), so this scan stops at the current
+    /// function boundary — exactly the lexical scope `arguments` belongs to.
+    fn body_uses_arguments(body: &[Statement]) -> bool {
+        body.iter().any(Self::stmt_uses_arguments)
+    }
+
+    fn stmt_uses_arguments(stmt: &Statement) -> bool {
+        match stmt {
+            Statement::VariableDecl { declarations, .. } => declarations
+                .iter()
+                .any(|d| d.init.as_ref().is_some_and(Self::expr_uses_arguments)),
+            Statement::Expression { expr, .. } => Self::expr_uses_arguments(expr),
+            Statement::Return { value, .. } => value.as_ref().is_some_and(Self::expr_uses_arguments),
+            Statement::Throw { value, .. } => Self::expr_uses_arguments(value),
+            Statement::If {
+                test,
+                consequent,
+                alternate,
+                ..
+            } => {
+                Self::expr_uses_arguments(test)
+                    || Self::body_uses_arguments(consequent)
+                    || alternate.as_deref().is_some_and(Self::body_uses_arguments)
+            }
+            Statement::While { test, body, .. } | Statement::DoWhile { body, test, .. } => {
+                Self::expr_uses_arguments(test) || Self::body_uses_arguments(body)
+            }
+            Statement::For {
+                init,
+                test,
+                update,
+                body,
+                ..
+            } => {
+                init.as_deref().is_some_and(Self::stmt_uses_arguments)
+                    || test.as_ref().is_some_and(Self::expr_uses_arguments)
+                    || update.as_ref().is_some_and(Self::expr_uses_arguments)
+                    || Self::body_uses_arguments(body)
+            }
+            Statement::ForOf { iterable, body, .. } => {
+                Self::expr_uses_arguments(iterable) || Self::body_uses_arguments(body)
+            }
+            Statement::Block { body, .. } => Self::body_uses_arguments(body),
+            Statement::TryCatch {
+                try_body,
+                catch_body,
+                finally_body,
+                ..
+            } => {
+                Self::body_uses_arguments(try_body)
+                    || Self::body_uses_arguments(catch_body)
+                    || finally_body.as_deref().is_some_and(Self::body_uses_arguments)
+            }
+            Statement::Labeled { body, .. } => Self::stmt_uses_arguments(body),
+            Statement::Switch {
+                discriminant,
+                cases,
+                ..
+            } => {
+                Self::expr_uses_arguments(discriminant)
+                    || cases.iter().any(|c| {
+                        c.test.as_ref().is_some_and(Self::expr_uses_arguments)
+                            || Self::body_uses_arguments(&c.consequent)
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    fn expr_uses_arguments(expr: &Expr) -> bool {
+        match expr {
+            Expr::Ident(name) => name == "arguments",
+            Expr::TemplateLit { exprs, .. } => exprs.iter().any(Self::expr_uses_arguments),
+            Expr::Array(items) => items
+                .iter()
+                .any(|e| e.as_ref().is_some_and(Self::expr_uses_arguments)),
+            Expr::Object(props) => props.iter().any(|p| Self::expr_uses_arguments(&p.value)),
+            Expr::Spread(e)
+            | Expr::Unary { operand: e, .. }
+            | Expr::Update { operand: e, .. }
+            | Expr::Await(e)
+            | Expr::TypeOf(e)
+            | Expr::Delete(e) => Self::expr_uses_arguments(e),
+            Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
+                Self::expr_uses_arguments(left) || Self::expr_uses_arguments(right)
+            }
+            Expr::Conditional {
+                test,
+                consequent,
+                alternate,
+            } => {
+                Self::expr_uses_arguments(test)
+                    || Self::expr_uses_arguments(consequent)
+                    || Self::expr_uses_arguments(alternate)
+            }
+            Expr::Assignment { target, value, .. } => {
+                Self::expr_uses_arguments(target) || Self::expr_uses_arguments(value)
+            }
+            Expr::Sequence(items) => items.iter().any(Self::expr_uses_arguments),
+            Expr::Member { object, .. } => Self::expr_uses_arguments(object),
+            Expr::ComputedMember {
+                object, property, ..
+            } => Self::expr_uses_arguments(object) || Self::expr_uses_arguments(property),
+            Expr::Call { callee, args, .. } | Expr::New { callee, args } => {
+                Self::expr_uses_arguments(callee) || args.iter().any(Self::expr_uses_arguments)
+            }
+            Expr::Yield { value, .. } => value.as_deref().is_some_and(Self::expr_uses_arguments),
+            _ => false,
+        }
+    }
+
     fn compile_function_def(&mut self, func: &FunctionDef) -> Result<CompiledFunction> {
         let mut func_compiler = Compiler::new(self.external_functions.clone());
         // Inherit the enclosing class context so `super` inside a method/constructor
@@ -214,8 +333,9 @@ impl Compiler {
         // class context, matching JS lexical `super` scoping.
         func_compiler.current_class = self.current_class.clone();
 
-        // Set up parameters as locals
-        for param in &func.params {
+        // Set up parameters as locals. The slot layout MUST match the order the
+        // VM's `bind_params` pushes values (see vm::bind_params).
+        for (i, param) in func.params.iter().enumerate() {
             match param {
                 ParamPattern::Ident(name) => {
                     func_compiler.declare_local(name);
@@ -223,43 +343,61 @@ impl Compiler {
                 ParamPattern::Rest(name) => {
                     func_compiler.declare_local(name);
                 }
-                ParamPattern::DefaultValue { pattern, .. } => {
-                    if let ParamPattern::Ident(name) = pattern.as_ref() {
+                ParamPattern::DefaultValue { pattern, .. } => match pattern.as_ref() {
+                    ParamPattern::Ident(name) | ParamPattern::Rest(name) => {
                         func_compiler.declare_local(name);
                     }
-                }
+                    // `function f({a} = {})` / `function f([a] = […])`: a hidden
+                    // temp holds the raw argument (so the whole-pattern default can
+                    // be re-destructured when it is undefined), then the inner
+                    // pattern's leaf locals, matching the VM's push order.
+                    nested => {
+                        func_compiler.declare_local(&Self::param_temp_name(i));
+                        func_compiler.declare_param_pattern_locals(nested);
+                    }
+                },
                 ParamPattern::ObjectDestructure(fields) => {
                     func_compiler.declare_destructure_locals(fields);
                 }
                 ParamPattern::ArrayDestructure(elems) => {
                     for elem in elems.iter().flatten() {
-                        if let ParamPattern::Ident(name) | ParamPattern::Rest(name) = elem {
-                            func_compiler.declare_local(name);
-                        }
+                        func_compiler.declare_param_pattern_locals(elem);
                     }
                 }
             }
         }
 
+        // `arguments`: an ordinary (non-arrow) function that references
+        // `arguments` gets an array-like bound right after the params. The VM
+        // (`bind_params`) pushes the full argument list into this slot, so it must
+        // be declared immediately after the param-derived locals. Arrows inherit
+        // the enclosing `arguments` lexically (handled by global/closure lookup),
+        // so they do NOT declare their own.
+        let needs_arguments = !func.is_arrow && Self::body_uses_arguments(&func.body);
+        if needs_arguments {
+            func_compiler.declare_local("arguments");
+        }
+
         // Apply default parameter values: `if (param === undefined) param = <default>`.
-        for param in &func.params {
+        for (i, param) in func.params.iter().enumerate() {
             match param {
                 ParamPattern::DefaultValue { pattern, default } => match pattern.as_ref() {
-                    ParamPattern::Ident(name) => {
+                    ParamPattern::Ident(name) | ParamPattern::Rest(name) => {
                         if let Some(slot) = func_compiler.resolve_local(name) {
                             func_compiler.emit_slot_default(slot, default)?;
                         }
                     }
-                    // `function f({a = 5} = {})`: a missing argument leaves the
-                    // destructured fields undefined, so the field defaults below
-                    // already cover it.
-                    ParamPattern::ObjectDestructure(fields) => {
-                        func_compiler.emit_object_param_defaults(fields)?;
+                    // `function f({a = 5} = {})` / `function f([a, b] = [7, 8])`:
+                    // when the argument is undefined, evaluate the whole-pattern
+                    // default and destructure it into the leaf slots; then apply
+                    // any inner field/element defaults.
+                    nested => {
+                        func_compiler.emit_pattern_param_default(&Self::param_temp_name(i), nested, default)?;
+                        func_compiler.emit_pattern_inner_defaults(nested)?;
                     }
-                    _ => {}
                 },
-                ParamPattern::ObjectDestructure(fields) => {
-                    func_compiler.emit_object_param_defaults(fields)?;
+                ParamPattern::ObjectDestructure(_) | ParamPattern::ArrayDestructure(_) => {
+                    func_compiler.emit_pattern_inner_defaults(param)?;
                 }
                 _ => {}
             }
@@ -283,6 +421,7 @@ impl Compiler {
             local_names: func_compiler.locals,
             is_async: func.is_async,
             is_generator: func.is_generator,
+            needs_arguments,
         })
     }
 
@@ -546,40 +685,16 @@ impl Compiler {
                 finally_body,
                 ..
             } => {
-                let setup = self.emit(Instruction::SetupTry(0, None));
-
-                for s in try_body {
-                    self.compile_statement(s)?;
-                }
-                self.emit(Instruction::EndTry);
-                let jump_past_catch = self.emit(Instruction::Jump(0));
-
-                // Catch block
-                let catch_start = self.current_offset();
-                self.patch_jump(setup, catch_start);
-
-                if let Some(param) = catch_param {
-                    let idx = self.declare_local(param);
-                    self.emit(Instruction::StoreLocal(idx));
-                } else {
-                    self.emit(Instruction::Pop); // discard error
-                }
-
-                for s in catch_body {
-                    self.compile_statement(s)?;
-                }
-
-                let after_catch = self.current_offset();
-                self.patch_jump(jump_past_catch, after_catch);
-
-                if let Some(finally) = finally_body {
-                    for s in finally {
-                        self.compile_statement(s)?;
-                    }
-                }
+                self.compile_try_catch_finally(
+                    try_body,
+                    catch_param.as_deref(),
+                    catch_body,
+                    finally_body.as_deref(),
+                    None,
+                )?;
             }
             Statement::Break { label, .. } => {
-                let idx = self.emit(Instruction::Jump(0));
+                let idx = self.emit(Instruction::Break(0));
                 let target = match label {
                     Some(l) => self
                         .loop_stack
@@ -593,7 +708,7 @@ impl Compiler {
                 }
             }
             Statement::Continue { label, .. } => {
-                let idx = self.emit(Instruction::Jump(0));
+                let idx = self.emit(Instruction::Continue(0));
                 let target = match label {
                     Some(l) => self
                         .loop_stack
@@ -628,6 +743,8 @@ impl Compiler {
                 constructor,
                 methods,
                 static_methods,
+                fields,
+                static_fields,
                 ..
             } => {
                 self.compile_class(
@@ -636,6 +753,8 @@ impl Compiler {
                     constructor.as_deref(),
                     methods,
                     static_methods,
+                    fields,
+                    static_fields,
                 )?;
                 if self.is_session_chunk() {
                     self.record_top_level_binding(name, TopLevelBindingKind::Class)?;
@@ -762,28 +881,18 @@ impl Compiler {
                 finally_body,
                 ..
             } => {
-                let setup = self.emit(Instruction::SetupTry(0, None));
-                self.compile_completion_block(try_body)?;
-                self.emit(Instruction::EndTry);
-                let jump_past_catch = self.emit(Instruction::Jump(0));
-                let catch_start = self.current_offset();
-                self.patch_jump(setup, catch_start);
-                if let Some(param) = catch_param {
-                    let idx = self.declare_local(param);
-                    self.emit(Instruction::StoreLocal(idx));
-                } else {
-                    self.emit(Instruction::Pop);
-                }
-                self.compile_completion_block(catch_body)?;
-                let after_catch = self.current_offset();
-                self.patch_jump(jump_past_catch, after_catch);
-                // A finally block runs for effects; its value is discarded (an
-                // abrupt completion inside finally — return/throw — is B2, separate).
-                if let Some(finally) = finally_body {
-                    for s in finally {
-                        self.compile_statement(s)?;
-                    }
-                }
+                // In completion-value position the try and catch arms each leave a
+                // value on the stack. The finally body runs for effects only; its
+                // value is discarded (it pops the completion value), and a normal
+                // finally completion lets the try/catch value through. An abrupt
+                // completion inside finally still supersedes via EndFinally.
+                self.compile_try_catch_finally(
+                    try_body,
+                    catch_param.as_deref(),
+                    catch_body,
+                    finally_body.as_deref(),
+                    Some(()),
+                )?;
             }
             other => {
                 self.compile_statement(other)?;
@@ -815,6 +924,138 @@ impl Compiler {
             }
         }
         Ok(())
+    }
+
+    /// Lower a `try { … } catch (e) { … } finally { … }` statement. When
+    /// `completion` is `Some`, the try and catch arms are compiled in
+    /// completion-value position (each leaves its value on the stack); otherwise
+    /// they are compiled as plain statements.
+    ///
+    /// The finally body — when present — is compiled once at a known ip. Every
+    /// way of leaving the try/catch (normal fall-through, caught/uncaught throw,
+    /// `return`, `break`, `continue`) routes through that finally at runtime via
+    /// the try frame's pending-completion slot; an abrupt completion inside the
+    /// finally supersedes the pending one (`EndFinally`). Without a finally the
+    /// lowering is the classic catch-only shape.
+    fn compile_try_catch_finally(
+        &mut self,
+        try_body: &[Statement],
+        catch_param: Option<&str>,
+        catch_body: &[Statement],
+        finally_body: Option<&[Statement]>,
+        completion: Option<()>,
+    ) -> Result<()> {
+        let has_catch = !catch_body.is_empty() || catch_param.is_some();
+
+        // ---- No finally: the classic catch-only lowering. ----
+        let Some(finally) = finally_body else {
+            let setup = self.emit(Instruction::SetupTry {
+                catch_ip: 0,
+                finally_ip: None,
+                region_end: 0,
+            });
+            self.compile_body(try_body, completion)?;
+            self.emit(Instruction::EndTry);
+            let jump_past_catch = self.emit(Instruction::Jump(0));
+
+            let catch_start = self.current_offset();
+            self.patch_jump(setup, catch_start);
+            if let Some(param) = catch_param {
+                let idx = self.declare_local(param);
+                self.emit(Instruction::StoreLocal(idx));
+            } else {
+                self.emit(Instruction::Pop);
+            }
+            self.compile_body(catch_body, completion)?;
+
+            let after_catch = self.current_offset();
+            self.patch_jump(jump_past_catch, after_catch);
+            if let Instruction::SetupTry { region_end, .. } = &mut self.instructions[setup] {
+                *region_end = after_catch;
+            }
+            return Ok(());
+        };
+
+        // ---- With finally: route every exit through the finally body. ----
+        //
+        // SetupTry's catch_ip is patched to the catch block when there is one,
+        // otherwise to the finally entry (so an uncaught throw runs the finally,
+        // carrying the in-flight exception). finally_ip is filled in once the
+        // finally body is emitted; the runtime reads it when an abrupt completion
+        // (return/break/continue) or a throw must run this finally.
+        let setup = self.emit(Instruction::SetupTry {
+            catch_ip: 0,
+            finally_ip: None,
+            region_end: 0,
+        });
+
+        // Try body. On normal completion, route to the finally with a Normal
+        // completion. (EnterFinallyNormal's operand is patched to finally_ip.)
+        // No EndTry here: the try frame must persist until EndFinally so the
+        // finally body can run and resume the pending completion. EnterFinallyNormal
+        // transitions the frame into its finally phase.
+        self.compile_body(try_body, completion)?;
+        let try_to_finally = self.emit(Instruction::EnterFinallyNormal(0));
+
+        // Catch block (optional).
+        let catch_start = self.current_offset();
+        if has_catch {
+            if let Some(param) = catch_param {
+                let idx = self.declare_local(param);
+                self.emit(Instruction::StoreLocal(idx));
+            } else {
+                self.emit(Instruction::Pop);
+            }
+            self.compile_body(catch_body, completion)?;
+        }
+        // After the catch body (or, when there is no catch, this point is never
+        // reached by fall-through) route to the finally with a Normal completion.
+        let catch_to_finally = self.emit(Instruction::EnterFinallyNormal(0));
+
+        // Finally body.
+        let finally_ip = self.current_offset();
+        self.patch_jump(try_to_finally, finally_ip);
+        self.patch_jump(catch_to_finally, finally_ip);
+
+        // In completion-value position the (try/catch) value sits on the stack
+        // beneath the finally body's temporaries; the finally runs for effects.
+        // The finally body is compiled as statements (stack-neutral), so the
+        // underlying value is preserved automatically — no extra work needed.
+        for s in finally {
+            self.compile_statement(s)?;
+        }
+        self.emit(Instruction::EndFinally);
+        let region_end = self.current_offset();
+
+        // Patch SetupTry now that catch/finally/region ips are known. Throws go
+        // to the catch block if present, otherwise straight to the finally entry
+        // (with the exception pending). finally_ip lets return/break/continue
+        // find this finally; region_end bounds the statement for break/continue.
+        if let Instruction::SetupTry {
+            catch_ip,
+            finally_ip: fin,
+            region_end: end,
+        } = &mut self.instructions[setup]
+        {
+            *catch_ip = if has_catch { catch_start } else { finally_ip };
+            *fin = Some(finally_ip);
+            *end = region_end;
+        }
+
+        Ok(())
+    }
+
+    /// Compile a statement list either as plain statements or (when
+    /// `completion` is `Some`) in completion-value position.
+    fn compile_body(&mut self, body: &[Statement], completion: Option<()>) -> Result<()> {
+        if completion.is_some() {
+            self.compile_completion_block(body)
+        } else {
+            for s in body {
+                self.compile_statement(s)?;
+            }
+            Ok(())
+        }
     }
 
     /// Compile a complete optional chain (`a?.b.c`, `x?.f()`, `arr?.[i]`, …).
@@ -966,6 +1207,18 @@ impl Compiler {
                     }
                 }
             }
+            // Object/array destructuring var-decls share the recursive pattern
+            // path used for parameters and `for…of` (handles element defaults and
+            // arbitrary object/array nesting).
+            AssignTarget::Pattern(pattern) => {
+                if let Some(expr) = &decl.init {
+                    self.compile_expr(expr)?;
+                } else {
+                    self.emit(Instruction::Push(Constant::Undefined));
+                }
+                self.compile_destructure_pattern(pattern, kind)?;
+                self.emit(Instruction::Pop); // pop source value
+            }
             AssignTarget::ObjectDestructure(fields) => {
                 if let Some(expr) = &decl.init {
                     self.compile_expr(expr)?;
@@ -1018,10 +1271,32 @@ impl Compiler {
                 let name = field.alias.as_ref().unwrap_or(&field.key);
                 self.declare_local(name);
             } else if let Some(nested) = &field.nested {
-                self.declare_destructure_locals(nested);
+                self.declare_param_pattern_locals(nested);
             } else {
                 let name = field.alias.as_ref().unwrap_or(&field.key);
                 self.declare_local(name);
+            }
+        }
+    }
+
+    /// Declare the locals a parameter pattern binds, in the exact order the VM's
+    /// `extract_pattern` pushes them (so positionally-bound destructured params
+    /// land in the matching slots).
+    fn declare_param_pattern_locals(&mut self, pattern: &ParamPattern) {
+        match pattern {
+            ParamPattern::Ident(name) | ParamPattern::Rest(name) => {
+                self.declare_local(name);
+            }
+            ParamPattern::DefaultValue { pattern, .. } => {
+                self.declare_param_pattern_locals(pattern);
+            }
+            ParamPattern::ObjectDestructure(fields) => {
+                self.declare_destructure_locals(fields);
+            }
+            ParamPattern::ArrayDestructure(elems) => {
+                for elem in elems.iter().flatten() {
+                    self.declare_param_pattern_locals(elem);
+                }
             }
         }
     }
@@ -1062,6 +1337,10 @@ impl Compiler {
                 self.compile_object_destructure(fields, kind)
             }
             ParamPattern::ArrayDestructure(elems) => {
+                // The source must be iterated, not merely indexed: a generator or
+                // an object with a custom `[Symbol.iterator]` is materialized into
+                // an array first (arrays/strings/etc. pass through unchanged).
+                self.emit(Instruction::IterableToArray);
                 for (i, elem) in elems.iter().enumerate() {
                     let Some(p) = elem else { continue };
                     if let ParamPattern::Rest(name) = p {
@@ -1070,28 +1349,50 @@ impl Compiler {
                         self.store_binding(name, kind)?;
                         continue;
                     }
+                    // Read element `i` of the source array onto the stack.
                     self.emit(Instruction::Dup);
                     self.emit(Instruction::Push(Constant::Int(i as i64)));
                     self.emit(Instruction::GetIndex);
-                    match p {
-                        ParamPattern::Ident(name) => self.store_binding(name, kind)?,
-                        ParamPattern::ObjectDestructure(_) | ParamPattern::ArrayDestructure(_) => {
-                            self.compile_destructure_pattern(p, kind)?;
-                            self.emit(Instruction::Pop);
-                        }
-                        _ => {
-                            self.emit(Instruction::Pop);
-                        }
-                    }
+                    // `[a = expr]`: a missing/undefined element takes its default;
+                    // the default may reference earlier-bound names in the pattern.
+                    let inner = if let ParamPattern::DefaultValue { pattern, default } = p {
+                        self.emit_apply_default(Some(default))?;
+                        pattern.as_ref()
+                    } else {
+                        p
+                    };
+                    self.bind_element_pattern(inner, kind)?;
                 }
                 Ok(())
             }
             ParamPattern::Ident(name) => self.store_binding(name, kind),
+            ParamPattern::DefaultValue { pattern, .. } => {
+                // A whole-pattern default (`function f([a, b] = [7, 8])`) is
+                // applied by the parameter-default path before this runs; here we
+                // just destructure the (possibly defaulted) value.
+                self.compile_destructure_pattern(pattern, kind)
+            }
             _ => {
                 self.emit(Instruction::Pop);
                 Ok(())
             }
         }
+    }
+
+    /// Bind a single array-element pattern whose value is already on top of the
+    /// stack (after any default has been applied). Consumes that value.
+    fn bind_element_pattern(&mut self, p: &ParamPattern, kind: VarKind) -> Result<()> {
+        match p {
+            ParamPattern::Ident(name) => self.store_binding(name, kind)?,
+            ParamPattern::ObjectDestructure(_) | ParamPattern::ArrayDestructure(_) => {
+                self.compile_destructure_pattern(p, kind)?;
+                self.emit(Instruction::Pop);
+            }
+            _ => {
+                self.emit(Instruction::Pop);
+            }
+        }
+        Ok(())
     }
 
     fn compile_object_destructure(
@@ -1112,10 +1413,19 @@ impl Compiler {
                 let name = field.alias.as_ref().unwrap_or(&field.key);
                 self.store_binding(name, kind)?;
             } else {
-                self.emit(Instruction::GetProperty(field.key.clone()));
+                // Read the field's value: a computed key (`{[k]: v}`) evaluates
+                // the key expression at runtime; a static key uses GetProperty.
+                if let Some(key_expr) = &field.computed_key {
+                    self.compile_expr(key_expr)?;
+                    self.emit(Instruction::GetIndex);
+                } else {
+                    self.emit(Instruction::GetProperty(field.key.clone()));
+                }
                 self.emit_apply_default(field.default.as_ref())?;
                 if let Some(nested) = &field.nested {
-                    self.compile_object_destructure(nested, kind)?;
+                    // The nested pattern (object or array) destructures the
+                    // field's value, which sits on top of the stack.
+                    self.compile_destructure_pattern(nested, kind)?;
                     self.emit(Instruction::Pop);
                 } else {
                     let name = field.alias.as_ref().unwrap_or(&field.key);
@@ -1139,19 +1449,87 @@ impl Compiler {
         Ok(())
     }
 
-    /// Apply field defaults for a destructured object parameter (`function
-    /// f({a = 5})`), whose fields were bound positionally by `bind_params`.
-    fn emit_object_param_defaults(&mut self, fields: &[DestructureField]) -> Result<()> {
-        for field in fields {
-            if field.rest {
-                continue;
-            }
-            let name = field.alias.as_ref().unwrap_or(&field.key);
-            if let (Some(def), Some(slot)) = (&field.default, self.resolve_local(name)) {
-                self.emit_slot_default(slot, def)?;
-            }
-        }
+    /// A reserved, un-typable local name for the hidden temp that holds a
+    /// destructured parameter's raw argument (parameter index `i`).
+    fn param_temp_name(i: usize) -> String {
+        format!("<param${i}>")
+    }
+
+    /// `function f({a} = {})`: when the raw argument (held in `temp`) is
+    /// undefined, evaluate the whole-pattern default and destructure it into the
+    /// pattern's already-declared leaf slots.
+    fn emit_pattern_param_default(
+        &mut self,
+        temp: &str,
+        pattern: &ParamPattern,
+        default: &Expr,
+    ) -> Result<()> {
+        let Some(slot) = self.resolve_local(temp) else {
+            return Ok(());
+        };
+        self.emit(Instruction::LoadLocal(slot));
+        self.emit(Instruction::Push(Constant::Undefined));
+        self.emit(Instruction::StrictEq);
+        let skip = self.emit(Instruction::JumpIfFalse(0));
+        self.compile_expr(default)?;
+        // Store the default's destructured pieces into the leaf slots (they were
+        // declared up-front), then drop the source value.
+        self.compile_destructure_pattern(pattern, VarKind::Let)?;
+        self.emit(Instruction::Pop);
+        let after = self.current_offset();
+        self.patch_jump(skip, after);
         Ok(())
+    }
+
+    /// Apply the inner field/element defaults of a destructured parameter
+    /// pattern, whose leaves were bound positionally by `bind_params`. Walks
+    /// object fields (`{a = 5}`), array elements (`[a = 1]`), and nesting.
+    fn emit_pattern_inner_defaults(&mut self, pattern: &ParamPattern) -> Result<()> {
+        match pattern {
+            ParamPattern::DefaultValue { pattern, .. } => {
+                self.emit_pattern_inner_defaults(pattern)
+            }
+            ParamPattern::ObjectDestructure(fields) => {
+                for field in fields {
+                    if field.rest {
+                        continue;
+                    }
+                    if let Some(nested) = &field.nested {
+                        // Defaults applied directly to the field (`{a: [x] = []}`)
+                        // are handled at the destructure site; here we only descend
+                        // into the nested pattern's own leaf defaults.
+                        self.emit_pattern_inner_defaults(nested)?;
+                    } else {
+                        let name = field.alias.as_ref().unwrap_or(&field.key);
+                        if let (Some(def), Some(slot)) = (&field.default, self.resolve_local(name)) {
+                            self.emit_slot_default(slot, def)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            ParamPattern::ArrayDestructure(elems) => {
+                for elem in elems.iter().flatten() {
+                    match elem {
+                        ParamPattern::DefaultValue { pattern, default } => {
+                            if let ParamPattern::Ident(name) = pattern.as_ref() {
+                                if let Some(slot) = self.resolve_local(name) {
+                                    self.emit_slot_default(slot, default)?;
+                                }
+                            } else {
+                                self.emit_pattern_inner_defaults(pattern)?;
+                            }
+                        }
+                        ParamPattern::ObjectDestructure(_) | ParamPattern::ArrayDestructure(_) => {
+                            self.emit_pattern_inner_defaults(elem)?;
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     /// If the top-of-stack value is `undefined`, replace it with the evaluated
@@ -1545,6 +1923,9 @@ impl Compiler {
                     }
                 }
             }
+            Expr::DestructureAssign { pattern, value } => {
+                self.compile_destructure_assign(pattern, value)?;
+            }
             Expr::Sequence(exprs) => {
                 for (i, e) in exprs.iter().enumerate() {
                     self.compile_expr(e)?;
@@ -1753,16 +2134,49 @@ impl Compiler {
                 // form is handled by CallExternal above.
                 self.emit(Instruction::Await);
             }
-            Expr::Yield { value, delegate: _ } => {
-                // Compile the yielded value (or undefined if none)
-                match value {
-                    Some(expr) => self.compile_expr(expr)?,
-                    None => {
-                        self.emit(Instruction::Push(Constant::Undefined));
+            Expr::Yield { value, delegate } => {
+                if *delegate {
+                    // `yield* X` delegates to an iterable: iterate X and yield each
+                    // element individually (flattening), then leave the delegate's
+                    // completion value on the stack as the value of the `yield*`
+                    // expression. We reuse the iterator protocol so arrays,
+                    // strings, generators, Sets and Maps all delegate correctly.
+                    let expr = value
+                        .as_deref()
+                        .expect("yield* always carries an operand expression");
+                    self.compile_expr(expr)?;
+                    self.emit(Instruction::GetIterator);
+                    // loop:
+                    let loop_start = self.current_offset();
+                    self.emit(Instruction::IteratorNext); // -> [advanced_iter, value]
+                    self.emit(Instruction::IteratorDone); // -> [iter, value(if !done), done]
+                    let exit_jump = self.emit(Instruction::JumpIfTrue(0));
+                    // Stack: [iter, value]. Yield pops the value, suspends, and on
+                    // resume pushes the value sent into `.next(v)`. We discard that
+                    // resumed value (sent values are not threaded into the delegate).
+                    self.emit(Instruction::Yield);
+                    self.emit(Instruction::Pop);
+                    self.emit(Instruction::Jump(loop_start));
+                    // exit: stack is [iter] (IteratorDone did not push a value when done).
+                    let exit = self.current_offset();
+                    self.patch_jump(exit_jump, exit);
+                    self.emit(Instruction::Pop); // pop the exhausted iterator
+                    // Completion value of `yield* X` (the iterator's return value).
+                    // For array/string/Set/Map iterators this is `undefined`, which
+                    // matches JS. (A delegated generator's explicit return value is
+                    // not propagated here.)
+                    self.emit(Instruction::Push(Constant::Undefined));
+                } else {
+                    // Compile the yielded value (or undefined if none)
+                    match value {
+                        Some(expr) => self.compile_expr(expr)?,
+                        None => {
+                            self.emit(Instruction::Push(Constant::Undefined));
+                        }
                     }
+                    // Yield instruction: suspends the generator, pops value, pushes received value on resume
+                    self.emit(Instruction::Yield);
                 }
-                // Yield instruction: suspends the generator, pops value, pushes received value on resume
-                self.emit(Instruction::Yield);
             }
             Expr::TypeOf(operand) => {
                 self.compile_expr(operand)?;
@@ -1804,6 +2218,8 @@ impl Compiler {
                 constructor,
                 methods,
                 static_methods,
+                fields,
+                static_fields,
             } => {
                 self.compile_class(
                     name.as_deref(),
@@ -1811,6 +2227,8 @@ impl Compiler {
                     constructor.as_deref(),
                     methods,
                     static_methods,
+                    fields,
+                    static_fields,
                 )?;
             }
         }
@@ -1893,6 +2311,7 @@ impl Compiler {
         None
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn compile_class(
         &mut self,
         name: Option<&str>,
@@ -1900,6 +2319,8 @@ impl Compiler {
         constructor: Option<&FunctionDef>,
         methods: &[ClassMethod],
         static_methods: &[ClassMethod],
+        fields: &[ClassField],
+        static_fields: &[ClassField],
     ) -> Result<()> {
         let class_name = name.unwrap_or("AnonymousClass").to_string();
 
@@ -1919,23 +2340,28 @@ impl Compiler {
         let prev_class = self.current_class.take();
         self.current_class = Some(class_name.clone());
 
-        // Push static methods: name, closure pairs
-        for sm in static_methods {
-            self.emit(Instruction::Push(Constant::String(sm.name.clone())));
-            let compiled = self.compile_function_def(&sm.func)?;
-            let func_idx = self.functions.len();
-            self.functions.push(compiled);
-            self.emit(Instruction::CreateClosure(func_idx));
-        }
+        // Split methods by kind so getters/setters install accessor descriptors.
+        let plain = |ms: &[ClassMethod], k: ClassMethodKind| -> Vec<ClassMethod> {
+            ms.iter().filter(|m| m.kind == k).cloned().collect()
+        };
+        let inst_methods = plain(methods, ClassMethodKind::Method);
+        let inst_getters = plain(methods, ClassMethodKind::Get);
+        let inst_setters = plain(methods, ClassMethodKind::Set);
+        let stat_methods = plain(static_methods, ClassMethodKind::Method);
+        let stat_getters = plain(static_methods, ClassMethodKind::Get);
+        let stat_setters = plain(static_methods, ClassMethodKind::Set);
 
-        // Push instance methods: name, closure pairs
-        for m in methods {
-            self.emit(Instruction::Push(Constant::String(m.name.clone())));
-            let compiled = self.compile_function_def(&m.func)?;
-            let func_idx = self.functions.len();
-            self.functions.push(compiled);
-            self.emit(Instruction::CreateClosure(func_idx));
-        }
+        // Push, in CreateClass's documented order (popped in reverse):
+        //   static_fields, fields, static setters, static getters,
+        //   instance setters, instance getters, statics, methods, constructor.
+        self.push_class_field_pairs(static_fields)?;
+        self.push_class_field_pairs(fields)?;
+        self.push_class_method_pairs(&stat_setters)?;
+        self.push_class_method_pairs(&stat_getters)?;
+        self.push_class_method_pairs(&inst_setters)?;
+        self.push_class_method_pairs(&inst_getters)?;
+        self.push_class_method_pairs(&stat_methods)?;
+        self.push_class_method_pairs(&inst_methods)?;
 
         // Push constructor closure (or undefined if none)
         if let Some(ctor) = constructor {
@@ -1951,12 +2377,123 @@ impl Compiler {
 
         self.emit(Instruction::CreateClass {
             name: class_name,
-            n_methods: methods.len(),
-            n_statics: static_methods.len(),
+            n_methods: inst_methods.len(),
+            n_statics: stat_methods.len(),
+            n_getters: inst_getters.len(),
+            n_setters: inst_setters.len(),
+            n_static_getters: stat_getters.len(),
+            n_static_setters: stat_setters.len(),
+            n_fields: fields.len(),
+            n_static_fields: static_fields.len(),
             has_super: super_class.is_some(),
         });
 
         Ok(())
+    }
+
+    /// Emit `(name_string, closure)` pairs for a group of class methods/accessors.
+    fn push_class_method_pairs(&mut self, ms: &[ClassMethod]) -> Result<()> {
+        for m in ms {
+            self.emit(Instruction::Push(Constant::String(m.name.clone())));
+            let compiled = self.compile_function_def(&m.func)?;
+            let func_idx = self.functions.len();
+            self.functions.push(compiled);
+            self.emit(Instruction::CreateClosure(func_idx));
+        }
+        Ok(())
+    }
+
+    /// Emit `(name_string, init_closure)` pairs for class field declarations. Each
+    /// initializer is a zero-arg function whose body `return`s the field value
+    /// (or `undefined` for a bare `x;`), run later with `this` bound to the
+    /// instance/class so `this.other` references resolve.
+    fn push_class_field_pairs(&mut self, fields: &[ClassField]) -> Result<()> {
+        for f in fields {
+            self.emit(Instruction::Push(Constant::String(f.name.clone())));
+            let init = FunctionDef {
+                name: None,
+                params: Vec::new(),
+                body: vec![Statement::Return {
+                    value: f.value.clone(),
+                    span: Span { start: 0, end: 0 },
+                }],
+                is_async: false,
+                is_generator: false,
+                is_arrow: false,
+                span: Span { start: 0, end: 0 },
+            };
+            let compiled = self.compile_function_def(&init)?;
+            let func_idx = self.functions.len();
+            self.functions.push(compiled);
+            self.emit(Instruction::CreateClosure(func_idx));
+        }
+        Ok(())
+    }
+
+    /// Compile a destructuring ASSIGNMENT expression (`[a, b] = …`,
+    /// `({x: o.p} = …)`). The whole expression evaluates to the right-hand value
+    /// (left on the stack), matching JS.
+    fn compile_destructure_assign(
+        &mut self,
+        pattern: &AssignPattern,
+        value: &Expr,
+    ) -> Result<()> {
+        self.compile_expr(value)?;
+        // Keep one copy of the source as the expression's result; destructure a
+        // duplicate into the targets.
+        self.emit(Instruction::Dup);
+        self.compile_assign_pattern_value(pattern)?;
+        Ok(())
+    }
+
+    /// Destructure the value on top of the stack into `pattern`, consuming it.
+    fn compile_assign_pattern_value(&mut self, pattern: &AssignPattern) -> Result<()> {
+        match pattern {
+            // A leaf lvalue: store the (already-on-stack) value into it.
+            AssignPattern::Target(target) => self.compile_store(target),
+            AssignPattern::Array { elements, rest } => {
+                for (i, elem) in elements.iter().enumerate() {
+                    if let Some(elem) = elem {
+                        self.emit(Instruction::Dup);
+                        self.emit(Instruction::Push(Constant::Int(i as i64)));
+                        self.emit(Instruction::GetIndex);
+                        self.emit_apply_default(elem.default.as_ref())?;
+                        self.compile_assign_pattern_value(&elem.pattern)?;
+                    }
+                }
+                if let Some(rest) = rest {
+                    self.emit(Instruction::Dup);
+                    self.emit(Instruction::ArrayRestFrom(elements.len()));
+                    self.compile_assign_pattern_value(rest)?;
+                }
+                // Drop the source value.
+                self.emit(Instruction::Pop);
+                Ok(())
+            }
+            AssignPattern::Object { fields, rest } => {
+                let excluded: Vec<String> =
+                    fields.iter().map(|f| f.key.clone()).collect();
+                for field in fields {
+                    self.emit(Instruction::Dup);
+                    if let Some(key_expr) = &field.computed_key {
+                        self.compile_expr(key_expr)?;
+                        self.emit(Instruction::GetIndex);
+                    } else {
+                        self.emit(Instruction::GetProperty(field.key.clone()));
+                    }
+                    self.emit_apply_default(field.default.as_ref())?;
+                    self.compile_assign_pattern_value(&field.pattern)?;
+                }
+                if let Some(rest) = rest {
+                    self.emit(Instruction::Dup);
+                    self.emit(Instruction::ObjectRest(excluded));
+                    self.compile_assign_pattern_value(rest)?;
+                }
+                // Drop the source value.
+                self.emit(Instruction::Pop);
+                Ok(())
+            }
+        }
     }
 
     fn compile_store(&mut self, target: &Expr) -> Result<()> {

@@ -2,6 +2,80 @@
 
 ## Fix status (in progress)
 
+**Round 8 (branch `arca/conformance-fixes`) — cluster wrap-up + reflection / RegExp / coercion-builtin edges.**
+
+This round confirms the earlier-landed clusters are GREEN-by-construction (asserting
+real Node, not pinned divergences) and closes a batch of remaining reflection /
+builtin / string-method divergences. Both gates are green: `cargo test -p
+zapcode-core` = **2029 passed, 0 failed**; `cargo build --workspace` clean;
+`npm run test:e2e-full` (237 checks) + `npm run test:scenarios3` (77 checks) green.
+
+Confirmed FIXED & asserting correct JS (clusters from the round brief):
+- **try/finally completion override (B2)** — `finally`'s `return`/`throw` wins over
+  `try`/`catch`; verified in `conformance_errors.rs` and the knowledge/durable e2e.
+- **destructuring defaults (D4)** — object- and array-pattern element defaults and
+  whole-pattern `={}`/`=[…]` param defaults all apply (`conformance_destructuring.rs`).
+- **class fields / static / accessors (cluster C)** — instance & static field
+  declarations initialize, getter/setter accessors round-trip (`conformance_classes.rs`).
+- **JSON replacers / reviver / toJSON (I3/I4) + function replacer (G1)** — array &
+  function `JSON.stringify` replacers, `JSON.parse` reviver, plain-object `toJSON`,
+  and function `replace`/`replaceAll` replacers (`conformance_json.rs`, e2e).
+- **generators `yield*` / spread** — delegation and `[...gen()]` spread/destructure,
+  custom `Symbol.iterator` (`conformance_generators.rs`).
+- **class extends Error** — `super(message)` propagates `.message`, `instanceof Error`
+  chain established, `this.name` honored (`conformance_dates_errors.rs`/`conformance_errors.rs`).
+- **Object.freeze** — actually prevents mutation; `Object.isFrozen` true (`security.rs`).
+- **durable nested-closure capture (K1)** — factory-local closure state survives
+  `dump()`/`loadSession()` (scenarios3-statemachine, e2e-durable-serialization).
+
+Newly FIXED this round (the "added builtins" / reflection / coercion edges):
+- **Class & function reflection.** `typeof Class === "function"`; `Class.name`;
+  `new C().constructor === C` (instances carry a `.constructor` back-link to the
+  class value); static methods/fields inherit through the `__super__` chain
+  (`B.f()` resolves a parent static). Functions expose `.length` (arity = leading
+  params before the first default/rest) and `.name` (declared, or inferred from a
+  `const f = function(){}` / `=> {}` binding). *Residual:* per-instance method
+  identity still differs (`a.m !== b.m`) because heap `Value::Function` has no
+  identity — pinned honestly in `conformance_classes.rs`.
+- **RegExp constructor (G8) + `instanceof RegExp` (O9).** `new RegExp(pat, flags)` /
+  `RegExp(pat, flags)` build a usable regex (`typeof RegExp === "function"`),
+  copying source/flags from an existing regex arg; bad patterns throw. Read-only
+  accessors `.source`/`.global`/`.ignoreCase`/`.multiline`/`.dotAll`/`.sticky`.
+  *Residual:* regex backreferences (`\1`) and lookbehind/lookahead are unsupported
+  (the `regex` crate lacks them) — pinned in `conformance_regex.rs`.
+- **`exec()` rich result.** `re.exec(s)` now returns the same array-LIKE match
+  result `match()` does — `.index`, `.input`, named `.groups`, indexed groups,
+  `.length` — instead of a bare positional array. *Trade-off (shared with G4):* it
+  is an object, not an `Array`, so use indexed access, not `.slice`/`.map`.
+- **`Math.min`/`Math.max` NaN poisoning.** Any NaN argument (in ANY position) makes
+  the result `NaN` (was only honored as arg 0); `-0`/`+0` ordering respected.
+- **String method edges.** `includes(needle, position)` honors the start position;
+  `lastIndexOf(needle, fromIndex)` searches backward from `fromIndex`; `split()`
+  with an omitted/undefined separator returns `[wholeString]` (not a char split);
+  `at()` returns `undefined` for any out-of-range index (no negative clamping); a
+  string-typed numeric subscript (`"hello"["1"]`) reads the char.
+- **`String.replace`/`replaceAll` `$`-tokens.** The string-search path expands
+  `$$`/`$&`/`` $` ``/`$'` against the match (were inserted literally); a regex
+  replacement referencing a non-existent group (`$1` on `/b/`) is left literal,
+  matching JS.
+
+*Tuning note:* the ToPrimitive recursion guard was lowered 8 → 5 so the
+cyclic-`toString(){ return "" + this }` security case is still caught with a clean
+`RuntimeError` rather than overflowing the native stack (the extra `dispatch` match
+arms added this round shrank the prior margin). 5 is still comfortably above any
+legitimate `valueOf`→`toString` fallback nesting. (`security.rs`.)
+
+Still-pinned residuals (deliberately deferred, asserting actual): UTF-16 vs
+code-point string indexing (G9); `[Symbol.toPrimitive]` dispatch (O4 tail); block-
+scoped `let`/`const` redeclaration shadowing (compiler uses a flat slot model);
+integer-key enumeration order (J1) and one `continue`-outer-label edge (J4 variant);
+per-instance method identity (function values have no identity); `#private` fields
+(unsupported syntax); named-function-expression internal self-binding; `String(1e21)`
+exponential formatting (F9); the match/exec result *brand* (object vs Array, G4);
+regex backreferences / lookaround. Plus the tool-boundary / session residuals (L4
+errors-as-strings, L8 per-param descriptions, F4 NaN/Infinity→null output, P1 live
+generator, P2 chunk scope), which are boundary-marshalling / persistence limits.
+
 **Round 6 (branch `arca/heap-handles-rewrite`) — deferred-five final disposition + O4 security-regression fix:**
 
 This round finishes the "deferred five" (G4 / O4 / G9 / N9 / N5) and, critically,

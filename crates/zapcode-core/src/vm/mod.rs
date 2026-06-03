@@ -13,6 +13,7 @@ use crate::snapshot::ZapcodeSnapshot;
 use crate::trace::{ExecutionTrace, SpanBuilder, TraceStatus};
 use crate::value::{
     Closure, FunctionRef, GeneratorObject, Place, PlaceRoot, PlaceSeg, SuspendedFrame, Value,
+    MAX_RENDER_DEPTH,
 };
 
 mod builtins;
@@ -105,6 +106,13 @@ pub(crate) struct CallFrame {
     pub(crate) this_value: Option<Value>,
     /// Where the method receiver came from, so we can write back mutations.
     pub(crate) receiver_source: Option<ReceiverSource>,
+    /// True for a synthesized class field-initializer frame. Such a frame has a
+    /// bound `this` (so `this.x` resolves) but must NOT be treated as a
+    /// constructor on return: an implicit/explicit `undefined` return is the
+    /// field's value, not the instance. These frames run synchronously inside
+    /// `Construct`, so they are never serialized mid-flight.
+    #[serde(default)]
+    pub(crate) is_field_init: bool,
     /// Local slots that have been promoted to shared upvalue cells (captured by
     /// a nested closure): slot -> cell id. Reads/writes of these slots route
     /// through the cell arena so the closure and this frame stay in sync.
@@ -188,6 +196,20 @@ enum PromiseMethodOutcome {
     NotAPromise,
 }
 
+/// Decoded operands of a `CreateClass` instruction, passed to `Vm::create_class`.
+struct CreateClassParts<'a> {
+    name: &'a str,
+    n_methods: usize,
+    n_statics: usize,
+    n_getters: usize,
+    n_setters: usize,
+    n_static_getters: usize,
+    n_static_setters: usize,
+    n_fields: usize,
+    n_static_fields: usize,
+    has_super: bool,
+}
+
 /// The Zapcode VM.
 pub struct Vm {
     pub(crate) programs: Vec<CompiledProgram>,
@@ -246,6 +268,11 @@ pub struct Vm {
     /// another object); this bounds that recursion so a pathological hook can't
     /// loop forever. Transient — never serialized.
     pub(crate) to_primitive_depth: u32,
+    /// One-shot flag: when set, the very next frame pushed by `push_call_frame`
+    /// is a class field-initializer (its `undefined` return is the field value,
+    /// not a constructor `this`). Consumed immediately on push. Transient —
+    /// never serialized and never live across a suspension.
+    pub(crate) next_frame_is_field_init: bool,
     /// What to do with the value the host pushes when resuming a suspension that
     /// was triggered by *consuming a deferred single-call promise* (N5). For a
     /// plain `await p` this is `None` (the pushed value is exactly the await
@@ -298,6 +325,62 @@ pub(crate) struct TryInfo {
     pub(crate) catch_ip: usize,
     pub(crate) frame_depth: usize,
     pub(crate) stack_depth: usize,
+    /// Start ip of the `finally` body, if this try statement has one. Abrupt
+    /// completions (`return`/`break`/`continue`) and uncaught throws that leave
+    /// the protected region run this finally before continuing.
+    #[serde(default)]
+    pub(crate) finally_ip: Option<usize>,
+    /// Whether this try statement has a `catch` handler. When it does not, a
+    /// throw routes straight to the finally (carrying the exception) instead of
+    /// being treated as caught.
+    #[serde(default)]
+    pub(crate) has_catch: bool,
+    /// The completion to resume once the finally body finishes (`EndFinally`).
+    /// `None` while executing the protected body; set when control enters the
+    /// finally. A `Normal` completion simply falls through.
+    #[serde(default)]
+    pub(crate) pending: Option<Completion>,
+    /// Set once control has entered this try's finally body, so a further abrupt
+    /// completion raised *inside* the finally does not re-run the same finally
+    /// (it supersedes the pending completion and propagates outward).
+    #[serde(default)]
+    pub(crate) in_finally: bool,
+    /// ip just past the whole try/catch/finally statement. A `break`/`continue`
+    /// whose target lies inside `[setup_ip, region_end)` stays within this try
+    /// (its finally is skipped); a target outside escapes (the finally runs).
+    #[serde(default)]
+    pub(crate) region_start: usize,
+    #[serde(default)]
+    pub(crate) region_end: usize,
+}
+
+/// An abrupt or normal completion threaded through `finally` blocks. JS requires
+/// a `finally` to run on every way of leaving its `try`/`catch`, and an abrupt
+/// completion *inside* the finally to supersede whatever the body was doing.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) enum Completion {
+    /// Fall through to the code after the try statement.
+    Normal,
+    /// Resume a pending `return value;`.
+    Return(Value),
+    /// Re-raise a pending exception once the finally finishes.
+    Throw(Value),
+    /// Resume a pending `break`/`continue`, transferring control to `target`.
+    Break(usize),
+    Continue(usize),
+}
+
+/// Whether `completion` escapes the try statement described by `info` (i.e.
+/// transferring control out of it must run its `finally`). A `return` always
+/// escapes the enclosing trys in its frame; a `break`/`continue` escapes a try
+/// only when its target lands outside that try statement's ip range.
+fn completion_escapes(completion: &Completion, info: &TryInfo) -> bool {
+    match completion {
+        Completion::Return(_) | Completion::Throw(_) | Completion::Normal => true,
+        Completion::Break(target) | Completion::Continue(target) => {
+            !(info.region_start..info.region_end).contains(target)
+        }
+    }
 }
 
 impl Vm {
@@ -360,6 +443,7 @@ impl Vm {
             rng_state: 0,
             pending_throw: None,
             to_primitive_depth: 0,
+            next_frame_is_field_init: false,
             resume_action: None,
         }
     }
@@ -373,6 +457,7 @@ impl Vm {
         "Math",
         "Promise",
         "Map",
+        "RegExp",
         "Date",
         "String",
         "Number",
@@ -446,6 +531,7 @@ impl Vm {
             rng_state: 0,
             pending_throw: None,
             to_primitive_depth: 0,
+            next_frame_is_field_init: false,
             resume_action: None,
         }
     }
@@ -593,22 +679,205 @@ impl Vm {
                 };
             }
         }
-        match self.try_stack.pop() {
-            Some(try_info) => {
-                // Unwind frames and stack to the nearest enclosing try block,
-                // exactly as the execute loop does for a runtime error.
-                while self.frames.len() > try_info.frame_depth {
-                    self.frames.pop();
-                    self.tracker.pop_frame();
-                }
-                self.stack.truncate(try_info.stack_depth);
-                self.push(error)?;
-                self.current_frame_mut().ip = try_info.catch_ip;
-                self.execute()
-            }
+        // Route the rejection to the nearest catch or finally (running finallys
+        // on the way), exactly as the execute loop does for a runtime error.
+        if self.route_thrown(error.clone(), 0)? {
+            self.execute()
+        } else {
             // No handler — the failure is the program's failure.
-            None => Err(ZapcodeError::ExternalError(error.to_js_string(&self.heap))),
+            Err(ZapcodeError::ExternalError(error.to_js_string(&self.heap)))
         }
+    }
+
+    /// Route a thrown value to the nearest enclosing handler (a `catch` or a
+    /// `finally`). Returns `true` if a handler was engaged (control was
+    /// transferred and execution should continue), or `false` if the throw is
+    /// uncaught (no remaining handler) and must propagate to the host.
+    ///
+    /// `min_frame_depth` limits how far unwinding may go: only try frames at
+    /// depth `> min_frame_depth` are considered, so an internal call (which sets
+    /// it to the caller's depth) does not steal the caller's handlers.
+    fn route_thrown(&mut self, error_val: Value, min_frame_depth: usize) -> Result<bool> {
+        loop {
+            let Some(try_info) = self
+                .try_stack
+                .last()
+                .filter(|t| t.frame_depth > min_frame_depth)
+                .cloned()
+            else {
+                // No handler at this level. Preserve the thrown value so a
+                // caller that re-raises (e.g. a generator surfacing the error at
+                // its driving `.next()`) reconstructs the original error object /
+                // value rather than a stringified one.
+                self.pending_throw = Some(error_val);
+                return Ok(false);
+            };
+            self.try_stack.pop();
+
+            // Unwind to the protected region's frame/stack depth.
+            while self.frames.len() > try_info.frame_depth {
+                self.frames.pop();
+                self.tracker.pop_frame();
+            }
+            self.stack.truncate(try_info.stack_depth);
+
+            if try_info.in_finally {
+                // The exception was raised *inside* this try's finally body. It
+                // supersedes whatever the finally was resuming; drop this frame
+                // and keep unwinding to an outer handler.
+                continue;
+            }
+
+            if try_info.has_catch {
+                // Enter the catch block. The catch protection is consumed: a
+                // throw inside the catch body must route to this try's finally
+                // (if any) or propagate, never back to the same catch.
+                self.push(error_val)?;
+                if try_info.finally_ip.is_some() {
+                    let mut info = try_info;
+                    info.has_catch = false;
+                    let catch_ip = info.catch_ip;
+                    self.try_stack.push(info);
+                    self.current_frame_mut().ip = catch_ip;
+                } else {
+                    self.current_frame_mut().ip = try_info.catch_ip;
+                }
+                return Ok(true);
+            }
+
+            if let Some(finally_ip) = try_info.finally_ip {
+                // No catch (or catch already consumed): run the finally with the
+                // exception pending, then re-raise it via EndFinally.
+                let mut info = try_info;
+                info.pending = Some(Completion::Throw(error_val));
+                info.in_finally = true;
+                info.has_catch = false;
+                self.try_stack.push(info);
+                self.current_frame_mut().ip = finally_ip;
+                return Ok(true);
+            }
+
+            // This try frame neither catches nor has a finally for this throw;
+            // keep unwinding to an outer handler.
+        }
+    }
+
+    /// Run any `finally` blocks in the current frame that an abrupt completion
+    /// (`return`/`break`/`continue`) is escaping, then perform the completion.
+    /// Returns `Ok(true)` if a finally was entered (execution continues at the
+    /// finally body); the caller should resume the main loop. Returns `Ok(false)`
+    /// if no intervening finally needs to run and the caller should carry out the
+    /// completion itself.
+    ///
+    /// `escapes` decides, per candidate try frame in the current call frame,
+    /// whether the completion leaves it (always true for return; for break/
+    /// continue, true unless the jump target stays within the try statement).
+    fn route_abrupt(&mut self, completion: Completion) -> Result<bool> {
+        let frame_depth = self.frames.len();
+        // Find the innermost try frame in the *current* call frame that still has
+        // an un-run finally and that this completion escapes.
+        let idx = self.try_stack.iter().rposition(|t| {
+            t.frame_depth == frame_depth
+                && t.finally_ip.is_some()
+                && !t.in_finally
+                && completion_escapes(&completion, t)
+        });
+        let Some(idx) = idx else {
+            return Ok(false);
+        };
+
+        // Any inner try frames (above idx) in this call frame are being escaped
+        // too; drop them (their finallys, if any, were handled by recursion when
+        // their own bodies completed — here they are inner-to-idx and already
+        // resolved, so simply discard).
+        self.try_stack.truncate(idx + 1);
+
+        let try_info = &mut self.try_stack[idx];
+        let finally_ip = try_info.finally_ip.unwrap();
+        let stack_depth = try_info.stack_depth;
+        try_info.pending = Some(completion);
+        try_info.in_finally = true;
+        try_info.has_catch = false;
+        self.stack.truncate(stack_depth);
+        self.current_frame_mut().ip = finally_ip;
+        Ok(true)
+    }
+
+    /// Resume a completion saved by a `finally` (via `EndFinally`). A `Normal`
+    /// completion falls through; the abrupt ones re-perform their transfer,
+    /// routing through any *further* enclosing finallys first. Returns a
+    /// `VmState` only when the resumed completion ends the program/suspends.
+    fn resume_completion(&mut self, completion: Completion) -> Result<Option<VmState>> {
+        match completion {
+            Completion::Normal => Ok(None),
+            Completion::Return(v) => {
+                if self.route_abrupt(Completion::Return(v.clone()))? {
+                    return Ok(None);
+                }
+                self.perform_return(v)
+            }
+            Completion::Throw(v) => {
+                // Re-raise the pending exception. Routing to the next handler is
+                // done uniformly by the execute loop's error path, which reads
+                // `pending_throw` so the original value/identity is preserved.
+                let msg = v.to_js_string(&self.heap);
+                self.pending_throw = Some(v);
+                Err(ZapcodeError::RuntimeError(msg))
+            }
+            Completion::Break(target) => {
+                if self.route_abrupt(Completion::Break(target))? {
+                    return Ok(None);
+                }
+                self.current_frame_mut().ip = target;
+                Ok(None)
+            }
+            Completion::Continue(target) => {
+                if self.route_abrupt(Completion::Continue(target))? {
+                    return Ok(None);
+                }
+                self.current_frame_mut().ip = target;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Pop the current call frame and deliver `return_val` to the caller (the
+    /// body of the old `Return` instruction). Returns `VmState::Complete` at the
+    /// top level. The caller must already have run any escaped `finally` blocks.
+    fn perform_return(&mut self, return_val: Value) -> Result<Option<VmState>> {
+        if self.frames.len() <= 1 {
+            return Ok(Some(VmState::Complete(return_val)));
+        }
+
+        let frame = self.frames.pop().unwrap();
+        self.tracker.pop_frame();
+
+        // A field-initializer frame binds `this` but is not a constructor: its
+        // return value IS the field value (even `undefined`), so skip the
+        // constructor `this`-rewrite below.
+        let actual_return = if frame.is_field_init {
+            return_val
+        } else if let Some(ref this_val) = frame.this_value {
+            if let Some(parent) = self.frames.last_mut() {
+                if parent.this_value.is_some() {
+                    parent.this_value = Some(this_val.clone());
+                }
+            }
+            if let Some(ref source) = frame.receiver_source {
+                self.write_receiver_source(source, this_val.clone());
+            }
+            if matches!(return_val, Value::Undefined) {
+                this_val.clone()
+            } else {
+                return_val
+            }
+        } else {
+            return_val
+        };
+
+        self.stack.truncate(frame.stack_base);
+        self.push(actual_return)?;
+        Ok(None)
     }
 
     /// Resume a batch suspension with the values the host's combinator produced.
@@ -957,6 +1226,7 @@ impl Vm {
         }
         let (name, message) = match err {
             ZapcodeError::TypeError(s) => ("TypeError", s.clone()),
+            ZapcodeError::RangeError(s) => ("RangeError", s.clone()),
             ZapcodeError::ReferenceError(s) => {
                 ("ReferenceError", format!("{} is not defined", s))
             }
@@ -1136,6 +1406,29 @@ impl Vm {
             .expect("internal error: invalid function reference")
     }
 
+    /// JS `Function.prototype.length`: the count of leading parameters that have
+    /// neither a default value nor are a rest element (counting stops at the
+    /// first such parameter).
+    fn function_arity(&self, func_ref: FunctionRef) -> i64 {
+        let f = match self
+            .program(func_ref.program_id)
+            .functions
+            .get(func_ref.function_id)
+        {
+            Some(f) => f,
+            None => return 0,
+        };
+        let mut n = 0i64;
+        for p in &f.params {
+            match p {
+                crate::parser::ir::ParamPattern::DefaultValue { .. }
+                | crate::parser::ir::ParamPattern::Rest(_) => break,
+                _ => n += 1,
+            }
+        }
+        n
+    }
+
     #[allow(dead_code)]
     fn instructions(&self) -> &[Instruction] {
         match self.current_frame().func_index {
@@ -1150,6 +1443,7 @@ impl Vm {
         params: &[ParamPattern],
         args: &[Value],
         local_count: usize,
+        needs_arguments: bool,
         heap: &mut Heap,
     ) -> Vec<Value> {
         let mut locals = Vec::with_capacity(local_count);
@@ -1162,10 +1456,21 @@ impl Vm {
                     let rest: Vec<Value> = args.get(i..).map(|s| s.to_vec()).unwrap_or_default();
                     locals.push(Value::Array(heap.alloc_array(rest)));
                 }
-                ParamPattern::DefaultValue { .. } => {
+                ParamPattern::DefaultValue { pattern, .. } => {
                     let val = args.get(i).cloned().unwrap_or(Value::Undefined);
-                    // Keep Undefined so the compiler-emitted default init can fire
-                    locals.push(val);
+                    match pattern.as_ref() {
+                        // `function f(p = …)`: one local holds the (possibly
+                        // undefined) argument; the compiler-emitted default fires.
+                        ParamPattern::Ident(_) | ParamPattern::Rest(_) => locals.push(val),
+                        // `function f({a} = …)` / `function f([a] = …)`: push the
+                        // raw argument as a hidden temp FIRST, then the extracted
+                        // leaves. The compiler re-destructures the temp's default
+                        // into the leaves when the argument is undefined.
+                        nested => {
+                            locals.push(val.clone());
+                            extract_pattern(nested, &val, &mut locals, heap);
+                        }
+                    }
                 }
                 // Destructuring params bind multiple locals in declaration order;
                 // extract the fields from the argument into those slots.
@@ -1174,6 +1479,11 @@ impl Vm {
                     extract_pattern(param, &arg, &mut locals, heap);
                 }
             }
+        }
+        // `arguments`: an array-like of ALL passed arguments, bound right after
+        // the param-derived locals (its slot was reserved by the compiler).
+        if needs_arguments {
+            locals.push(Value::Array(heap.alloc_array(args.to_vec())));
         }
         locals
     }
@@ -1198,7 +1508,8 @@ impl Vm {
         let func = self.current_function(closure.func_ref);
         let params = func.params.clone();
         let local_count = func.local_count;
-        let locals = Self::bind_params(&params, args, local_count, &mut self.heap);
+        let needs_arguments = func.needs_arguments;
+        let locals = Self::bind_params(&params, args, local_count, needs_arguments, &mut self.heap);
 
         // If this is a method call (has this_value from a receiver), transfer
         // the receiver source so we can write back mutations on return.
@@ -1213,6 +1524,9 @@ impl Vm {
         // shared cell so LoadGlobal/StoreGlobal in the body see and mutate it.
         let env: HashMap<String, u64> = closure.env.iter().cloned().collect();
 
+        // Consume the one-shot field-initializer flag (set by `call_field_init`).
+        let is_field_init = std::mem::take(&mut self.next_frame_is_field_init);
+
         self.frames.push(CallFrame {
             program_index: closure.func_ref.program_id,
             func_index: Some(closure.func_ref.function_id),
@@ -1223,6 +1537,7 @@ impl Vm {
             receiver_source,
             boxed: HashMap::new(),
             env,
+            is_field_init,
         });
         Ok(())
     }
@@ -1245,6 +1560,7 @@ impl Vm {
             receiver_source: None,
             boxed: HashMap::new(),
             env: HashMap::new(),
+            is_field_init: false,
         });
 
         self.execute()
@@ -1305,22 +1621,10 @@ impl Vm {
                     }
                 }
                 Err(err) => {
-                    // Try to catch the error
-                    if let Some(try_info) = self.try_stack.pop() {
-                        // Unwind to catch block
-                        while self.frames.len() > try_info.frame_depth {
-                            self.frames.pop();
-                            self.tracker.pop_frame();
-                        }
-                        self.stack.truncate(try_info.stack_depth);
-
-                        // Push error value
-                        let error_val = self.caught_error_value(&err);
-                        self.push(error_val)?;
-
-                        // Jump to catch
-                        self.current_frame_mut().ip = try_info.catch_ip;
-                    } else {
+                    // Route the error to the nearest catch or finally. If no
+                    // handler remains it propagates to the host.
+                    let error_val = self.caught_error_value(&err);
+                    if !self.route_thrown(error_val, 0)? {
                         return Err(err);
                     }
                 }
@@ -1579,9 +1883,11 @@ impl Vm {
         // so the cap must be low enough that a cyclic hook (e.g.
         // `toString(){ return "" + this }`) is caught with a clean RuntimeError
         // rather than overflowing the Rust stack and aborting the host process.
-        // 8 is far above any legitimate valueOf->toString fallback nesting (which
-        // is at most a couple of levels) yet well below native-stack exhaustion.
-        if self.to_primitive_depth >= 8 {
+        // 5 is comfortably above any legitimate valueOf->toString fallback nesting
+        // (which is at most a couple of levels) yet well below native-stack
+        // exhaustion across the various interpreter frame sizes on the recursion
+        // path (a cyclic `toString(){ return "" + this }` is caught cleanly here).
+        if self.to_primitive_depth >= 5 {
             return Err(ZapcodeError::RuntimeError(
                 "ToPrimitive recursion limit exceeded (cyclic valueOf/toString?)".to_string(),
             ));
@@ -1629,6 +1935,21 @@ impl Vm {
     /// Returns the function's return value.
     fn call_function_internal(&mut self, callee: &Value, args: Vec<Value>) -> Result<Value> {
         self.call_closure_internal(callee, args, None)
+    }
+
+    /// Run a synthesized class field-initializer closure with `this` bound to the
+    /// instance/class object, returning the field's value. Unlike a constructor,
+    /// an `undefined` result stays `undefined` (see `CallFrame::is_field_init`).
+    /// The one-shot `next_frame_is_field_init` flag tags the pushed frame without
+    /// adding a wrapper to the hot internal-call path.
+    fn call_field_init(&mut self, callee: &Value, receiver: Value) -> Result<Value> {
+        self.last_receiver_source = None;
+        self.next_frame_is_field_init = true;
+        let r = self.call_closure_internal(callee, Vec::new(), Some(receiver));
+        // Cleared in push_call_frame on success; reset here defensively in case
+        // the callee wasn't a function and no frame was pushed.
+        self.next_frame_is_field_init = false;
+        r
     }
 
     /// Shared body for the internal-call helpers: push a frame (optionally with a
@@ -1702,26 +2023,12 @@ impl Vm {
                     }
                 }
                 Err(err) => {
-                    // Try to catch the error within the callback. Only a try block
-                    // that lives *inside* this internal call (i.e. above the frame
-                    // this call started at) may catch here; an outer try belongs to
-                    // the caller and must be left for it to handle.
-                    if let Some(try_info) = self
-                        .try_stack
-                        .last()
-                        .filter(|t| t.frame_depth > target_frame_depth)
-                        .cloned()
-                    {
-                        self.try_stack.pop();
-                        while self.frames.len() > try_info.frame_depth {
-                            self.frames.pop();
-                            self.tracker.pop_frame();
-                        }
-                        self.stack.truncate(try_info.stack_depth);
-                        let error_val = self.caught_error_value(&err);
-                        self.push(error_val)?;
-                        self.current_frame_mut().ip = try_info.catch_ip;
-                    } else {
+                    // Try to catch (or run a finally) within the callback. Only a
+                    // handler that lives *inside* this internal call (above the
+                    // frame this call started at) may engage here; an outer
+                    // handler belongs to the caller and is left for it.
+                    let error_val = self.caught_error_value(&err);
+                    if !self.route_thrown(error_val, target_frame_depth)? {
                         // Unwind the frame(s) this call pushed so the frame stack is
                         // restored to the caller's depth before propagating. Without
                         // this, a nested internal call (e.g. a cyclic ToPrimitive
@@ -1748,6 +2055,427 @@ impl Vm {
         index: usize,
     ) -> Result<Value> {
         self.call_function_internal(callback, vec![item.clone(), Value::Int(index as i64)])
+    }
+
+    /// `String.prototype.replace` / `replaceAll` with a FUNCTION replacer.
+    /// Invokes the callback per match with `(match, p1, p2, …, offset, string)`
+    /// (named groups appended as a final `groups` object when present) and
+    /// substitutes the callback's string-coerced return value. The pure builtin
+    /// can't reach the guest-closure call path, so this runs at the VM layer.
+    fn string_replace_with_function(
+        &mut self,
+        s: &Arc<str>,
+        method: &str,
+        args: &[Value],
+    ) -> Result<Value> {
+        let replacer = args[1].clone();
+        // Regex search: walk matches (all for /g or replaceAll, else first).
+        if let Some((pat, flags)) = args.first().and_then(|v| builtins::regexp_parts(v, &self.heap))
+        {
+            let re = builtins::compile_regex(&pat, &flags)?;
+            let global = method == "replaceAll" || flags.contains('g');
+            let has_named = re.capture_names().any(|n| n.is_some());
+            // Collect match spans + captured groups up front; the regex borrows
+            // `s`, so we can't hold it across the guest call that needs `&mut self`.
+            struct MatchInfo {
+                start: usize,
+                end: usize,
+                whole: String,
+                groups: Vec<Value>,
+                named: Vec<(String, Value)>,
+            }
+            let mut matches: Vec<MatchInfo> = Vec::new();
+            for caps in re.captures_iter(s) {
+                let m0 = caps.get(0).unwrap();
+                let mut groups = Vec::with_capacity(caps.len().saturating_sub(1));
+                for i in 1..caps.len() {
+                    groups.push(
+                        caps.get(i)
+                            .map(|g| Value::String(Arc::from(g.as_str())))
+                            .unwrap_or(Value::Undefined),
+                    );
+                }
+                let named = if has_named {
+                    re.capture_names()
+                        .flatten()
+                        .map(|name| {
+                            (
+                                name.to_string(),
+                                caps.name(name)
+                                    .map(|g| Value::String(Arc::from(g.as_str())))
+                                    .unwrap_or(Value::Undefined),
+                            )
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                matches.push(MatchInfo {
+                    start: m0.start(),
+                    end: m0.end(),
+                    whole: m0.as_str().to_string(),
+                    groups,
+                    named,
+                });
+                if !global {
+                    break;
+                }
+            }
+            let mut out = String::with_capacity(s.len());
+            let mut last = 0usize;
+            for info in matches {
+                out.push_str(&s[last..info.start]);
+                // offset is the char index of the match start (JS uses code-unit
+                // index; we align with the rest of the codebase on char count).
+                let offset = s[..info.start].chars().count() as i64;
+                let mut call_args: Vec<Value> =
+                    Vec::with_capacity(info.groups.len() + info.named.len() + 3);
+                call_args.push(Value::String(Arc::from(info.whole.as_str())));
+                call_args.extend(info.groups);
+                call_args.push(Value::Int(offset));
+                call_args.push(Value::String(s.clone()));
+                if !info.named.is_empty() {
+                    let mut g: IndexMap<Arc<str>, Value> = IndexMap::new();
+                    for (k, v) in info.named {
+                        g.insert(Arc::from(k.as_str()), v);
+                    }
+                    call_args.push(Value::Object(self.heap.alloc_object(g)));
+                }
+                let result = self.call_function_internal(&replacer, call_args)?;
+                out.push_str(&result.to_js_string(&self.heap));
+                last = info.end;
+            }
+            out.push_str(&s[last..]);
+            return Ok(Value::String(Arc::from(out.as_str())));
+        }
+
+        // String search: `replace` substitutes the first occurrence, `replaceAll`
+        // every occurrence. The callback receives (match, offset, string).
+        let search = args
+            .first()
+            .map(|v| v.to_js_string(&self.heap))
+            .unwrap_or_default();
+        let subject = s.to_string();
+        if search.is_empty() {
+            // Empty search matches at position 0 (and replaceAll between every
+            // char). Keep it simple and JS-correct for the common case: a single
+            // call at offset 0 prepending the result. JS replaceAll('') inserts at
+            // every boundary; that's an edge case we don't expect agents to hit, so
+            // handle only the first-position case to stay predictable.
+            let result =
+                self.call_function_internal(&replacer, vec![
+                    Value::String(Arc::from("")),
+                    Value::Int(0),
+                    Value::String(s.clone()),
+                ])?;
+            let ins = result.to_js_string(&self.heap);
+            return Ok(Value::String(Arc::from(format!("{}{}", ins, subject).as_str())));
+        }
+        let mut out = String::with_capacity(subject.len());
+        let mut search_from = 0usize;
+        let replace_all = method == "replaceAll";
+        loop {
+            match subject[search_from..].find(&search) {
+                Some(rel) => {
+                    let abs = search_from + rel;
+                    out.push_str(&subject[search_from..abs]);
+                    let offset = subject[..abs].chars().count() as i64;
+                    let result = self.call_function_internal(&replacer, vec![
+                        Value::String(Arc::from(search.as_str())),
+                        Value::Int(offset),
+                        Value::String(s.clone()),
+                    ])?;
+                    out.push_str(&result.to_js_string(&self.heap));
+                    search_from = abs + search.len();
+                    if !replace_all {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+        out.push_str(&subject[search_from..]);
+        Ok(Value::String(Arc::from(out.as_str())))
+    }
+
+    /// `JSON.stringify(value, replacer?, space?)`. Honors a user `toJSON()` on
+    /// plain objects and a FUNCTION replacer `(key, value)` (both need the
+    /// guest-closure call path). Array replacers / indent reuse the builtin's
+    /// formatting helpers.
+    fn json_stringify(&mut self, args: &[Value]) -> Result<Value> {
+        let value = args.first().cloned().unwrap_or(Value::Undefined);
+        let replacer_fn = match args.get(1) {
+            Some(Value::Function(_)) => args.get(1).cloned(),
+            _ => None,
+        };
+        // Array replacer (whitelist of keys) — only when not a function.
+        let whitelist: Option<Vec<String>> = if replacer_fn.is_some() {
+            None
+        } else {
+            match args.get(1) {
+                Some(Value::Array(h)) => Some(
+                    self.heap
+                        .array_vec(*h)
+                        .iter()
+                        .filter_map(|v| match v {
+                            Value::String(s) => Some(s.to_string()),
+                            Value::Int(n) => Some(n.to_string()),
+                            _ => None,
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            }
+        };
+        let indent = match args.get(2) {
+            Some(Value::Int(n)) if *n > 0 => Some(" ".repeat((*n).min(10) as usize)),
+            Some(Value::Float(n)) if *n >= 1.0 => Some(" ".repeat((*n as usize).min(10))),
+            Some(Value::String(s)) if !s.is_empty() => Some(s.to_string()),
+            _ => None,
+        };
+        // The replacer is applied at the root with key `""` and the value (JS
+        // SerializeJSONProperty applies it to a synthetic holder `{ "": value }`;
+        // we don't bind `this` since the receiver-writeback machinery would
+        // corrupt the value being serialized — replacers that read `this` are an
+        // accepted gap).
+        let transformed = if let Some(ref f) = replacer_fn {
+            self.call_function_internal(f, vec![
+                Value::String(Arc::from("")),
+                value.clone(),
+            ])?
+        } else {
+            value
+        };
+        let mut seen: Vec<Handle> = Vec::new();
+        match self.serialize_json_dynamic(
+            &transformed,
+            replacer_fn.as_ref(),
+            whitelist.as_deref(),
+            indent.as_deref(),
+            0,
+            &mut seen,
+        )? {
+            Some(s) => Ok(Value::String(Arc::from(s.as_str()))),
+            None => Ok(Value::Undefined),
+        }
+    }
+
+    /// Recursive JSON serializer that honors `toJSON()` hooks and a function
+    /// replacer. Returns `None` for values JSON omits (undefined / functions) so
+    /// callers drop object props / emit `null` in arrays.
+    fn serialize_json_dynamic(
+        &mut self,
+        val: &Value,
+        replacer: Option<&Value>,
+        whitelist: Option<&[String]>,
+        indent: Option<&str>,
+        depth: usize,
+        seen: &mut Vec<Handle>,
+    ) -> Result<Option<String>> {
+        // Defense-in-depth: bound nesting so a pathologically deep (but acyclic)
+        // structure can't overflow the native stack. True reference cycles are
+        // caught by the `seen` set in the array/object arms below; this guards the
+        // deep-but-finite case. Mirrors the pure `builtins::serialize_json` guard so
+        // the toJSON/replacer-aware VM path is just as crash-safe.
+        if depth > MAX_RENDER_DEPTH {
+            return Err(ZapcodeError::RuntimeError(format!(
+                "JSON nesting depth exceeded (max {})",
+                MAX_RENDER_DEPTH
+            )));
+        }
+        // Honor a `toJSON()` method on objects (plain objects and Date alike). The
+        // hook's return value is serialized in place of the object.
+        let val = if let Value::Object(h) = val {
+            let to_json = self
+                .heap
+                .object(*h)
+                .and_then(|m| m.get("toJSON"))
+                .filter(|v| matches!(v, Value::Function(_)))
+                .cloned();
+            if let Some(f) = to_json {
+                std::borrow::Cow::Owned(self.call_method_internal(&f, val.clone(), vec![])?)
+            } else {
+                std::borrow::Cow::Borrowed(val)
+            }
+        } else {
+            std::borrow::Cow::Borrowed(val)
+        };
+        let val: &Value = &val;
+        Ok(match val {
+            Value::Undefined
+            | Value::Function(_)
+            | Value::BuiltinMethod { .. }
+            | Value::Generator(_)
+            | Value::Pending(_) => None,
+            Value::Null => Some("null".to_string()),
+            Value::Bool(b) => Some(b.to_string()),
+            Value::Int(n) => Some(n.to_string()),
+            Value::Float(n) => Some(if n.is_finite() {
+                builtins::format_number(*n)
+            } else {
+                "null".to_string()
+            }),
+            Value::String(s) => Some(builtins::json_escape_string(s)),
+            Value::Array(h) => {
+                if seen.contains(h) {
+                    return Err(ZapcodeError::TypeError(
+                        "Converting circular structure to JSON".to_string(),
+                    ));
+                }
+                seen.push(*h);
+                let items_src = self.heap.array_vec(*h);
+                let mut items: Vec<String> = Vec::with_capacity(items_src.len());
+                for (i, item) in items_src.iter().enumerate() {
+                    // Apply the replacer with the array index (as a string) as key.
+                    let item = if let Some(f) = replacer {
+                        self.call_function_internal(f, vec![
+                            Value::String(Arc::from(i.to_string().as_str())),
+                            item.clone(),
+                        ])?
+                    } else {
+                        item.clone()
+                    };
+                    let s = self
+                        .serialize_json_dynamic(&item, replacer, whitelist, indent, depth + 1, seen)?
+                        .unwrap_or_else(|| "null".to_string());
+                    items.push(s);
+                }
+                seen.pop();
+                Some(builtins::join_json_array(&items, indent, depth))
+            }
+            Value::Object(h) => {
+                // Clone the map out: the per-entry replacer call borrows `&mut self`,
+                // which would conflict with a live borrow into the heap.
+                let map = match self.heap.object(*h) {
+                    Some(m) => m.clone(),
+                    None => return Ok(Some("{}".to_string())),
+                };
+                // Date with no toJSON hook handled above falls here only if it had
+                // its hook stripped; emit ISO via __date_ms__ for safety.
+                if let Some(ms) = map.get("__date_ms__") {
+                    let ms = ms.to_number() as i64;
+                    return Ok(Some(builtins::json_escape_string(&unix_millis_to_iso(ms))));
+                }
+                if map.contains_key("__map__")
+                    || map.contains_key("__set__")
+                    || map.contains_key("__regexp__")
+                    || map.contains_key("__error__")
+                {
+                    return Ok(Some("{}".to_string()));
+                }
+                if seen.contains(h) {
+                    return Err(ZapcodeError::TypeError(
+                        "Converting circular structure to JSON".to_string(),
+                    ));
+                }
+                seen.push(*h);
+                let mut pairs: Vec<(String, String)> = Vec::new();
+                for (k, v) in map.iter() {
+                    if k.starts_with("__") {
+                        continue;
+                    }
+                    if let Some(w) = whitelist {
+                        if !w.iter().any(|x| x == k.as_ref()) {
+                            continue;
+                        }
+                    }
+                    let v = if let Some(f) = replacer {
+                        self.call_function_internal(f, vec![
+                            Value::String(k.clone()),
+                            v.clone(),
+                        ])?
+                    } else {
+                        v.clone()
+                    };
+                    if let Some(s) =
+                        self.serialize_json_dynamic(&v, replacer, whitelist, indent, depth + 1, seen)?
+                    {
+                        pairs.push((k.to_string(), s));
+                    }
+                }
+                seen.pop();
+                Some(builtins::join_json_object(&pairs, indent, depth))
+            }
+        })
+    }
+
+    /// `JSON.parse(text, reviver)`: parse normally, then walk the result
+    /// bottom-up calling `reviver(key, value)` with `this` bound to the holder.
+    /// A reviver returning `undefined` deletes the property.
+    fn json_parse_with_reviver(&mut self, args: &[Value]) -> Result<Value> {
+        let text = match args.first() {
+            Some(Value::String(s)) => s.to_string(),
+            _ => {
+                return Err(ZapcodeError::TypeError(
+                    "JSON.parse requires a string argument".to_string(),
+                ))
+            }
+        };
+        let reviver = args[1].clone();
+        let parsed = builtins::json_to_value(&text, &mut self.heap)?;
+        // Root holder: { "": parsed }.
+        let holder = {
+            let mut m: IndexMap<Arc<str>, Value> = IndexMap::new();
+            m.insert(Arc::from(""), parsed);
+            Value::Object(self.heap.alloc_object(m))
+        };
+        self.revive_walk(&holder, "", &reviver)
+    }
+
+    /// Recursively revive a value: process children first, then call the reviver
+    /// for this `key`. Returning `undefined` from the reviver removes the entry.
+    fn revive_walk(&mut self, holder: &Value, key: &str, reviver: &Value) -> Result<Value> {
+        let value = match holder {
+            Value::Object(h) => self
+                .heap
+                .object(*h)
+                .and_then(|m| m.get(key))
+                .cloned()
+                .unwrap_or(Value::Undefined),
+            _ => Value::Undefined,
+        };
+        match &value {
+            Value::Array(h) => {
+                let len = self.heap.array_vec(*h).len();
+                for i in 0..len {
+                    let ik = i.to_string();
+                    let revived = self.revive_walk(&value, &ik, reviver)?;
+                    if let Some(arr) = self.heap.array_mut(*h) {
+                        if i < arr.len() {
+                            // Array elements are kept (set to undefined if dropped),
+                            // mirroring JS InternalizeJSONProperty for arrays.
+                            arr[i] = revived;
+                        }
+                    }
+                }
+            }
+            Value::Object(h) => {
+                let keys: Vec<Arc<str>> = self
+                    .heap
+                    .object(*h)
+                    .map(|m| m.keys().cloned().collect())
+                    .unwrap_or_default();
+                for k in keys {
+                    let revived = self.revive_walk(&value, &k, reviver)?;
+                    if matches!(revived, Value::Undefined) {
+                        if let Some(m) = self.heap.object_mut(*h) {
+                            m.shift_remove(k.as_ref());
+                        }
+                    } else if let Some(m) = self.heap.object_mut(*h) {
+                        m.insert(k, revived);
+                    }
+                }
+            }
+            _ => {}
+        }
+        // Call reviver(key, value). JS binds `this` to the holder, but the
+        // receiver-writeback machinery would corrupt the value being revived, so
+        // we leave `this` undefined — revivers that read `this` are an accepted
+        // gap (none of the supported scenarios need it).
+        self.call_function_internal(reviver, vec![
+            Value::String(Arc::from(key)),
+            value,
+        ])
     }
 
     /// Check if a callback value is an async function that might suspend.
@@ -2270,6 +2998,7 @@ impl Vm {
                     receiver_source: None,
                     boxed: HashMap::new(),
                     env,
+                    is_field_init: false,
                 });
                 self.run_generator_until_yield_or_return(gen_obj)
             }
@@ -2291,6 +3020,7 @@ impl Vm {
                     receiver_source: None,
                     boxed: HashMap::new(),
                     env,
+                    is_field_init: false,
                 });
                 self.run_generator_until_yield_or_return(gen_obj)
             }
@@ -2394,21 +3124,145 @@ impl Vm {
                     }
                 }
                 Err(err) => {
-                    if let Some(try_info) = self.try_stack.pop() {
-                        while self.frames.len() > try_info.frame_depth {
-                            self.frames.pop();
-                            self.tracker.pop_frame();
-                        }
-                        self.stack.truncate(try_info.stack_depth);
-                        let error_val = self.caught_error_value(&err);
-                        self.push(error_val)?;
-                        self.current_frame_mut().ip = try_info.catch_ip;
-                    } else {
+                    // Only handlers inside the generator body (frames above the
+                    // generator's base) may catch here; an outer handler belongs
+                    // to the caller and is left for it.
+                    let error_val = self.caught_error_value(&err);
+                    if !self.route_thrown(error_val, target_frame_depth)? {
                         return Err(err);
                     }
                 }
             }
         }
+    }
+
+    /// Materialize an iterable into a Vec of its elements, consuming it.
+    /// Handles arrays (copied), strings (per char), built-in Set/Map (as
+    /// `[k,v]` pairs), generators (driven to completion), and plain objects
+    /// exposing a custom `[Symbol.iterator]()` method (the iterator protocol is
+    /// invoked: call `[Symbol.iterator]()`, then repeatedly call `.next()` until
+    /// a `{ done: true }` result). Used by spread and array destructuring.
+    fn drain_iterable(&mut self, val: Value) -> Result<Vec<Value>> {
+        match &val {
+            Value::Array(a) => Ok(self.heap.array_vec(*a)),
+            Value::String(s) => Ok(s
+                .chars()
+                .map(|c| Value::String(Arc::from(c.to_string().as_str())))
+                .collect()),
+            Value::Object(_) if is_set_object(&val, &self.heap) => Ok(set_items(&val, &self.heap)),
+            Value::Object(_) if is_map_object(&val, &self.heap) => {
+                Ok(map_entry_pairs(&val, &mut self.heap))
+            }
+            Value::Generator(gen_obj) => self.drain_generator(gen_obj.clone()),
+            Value::Object(_) => {
+                if let Some(items) = self.drain_custom_iterator(&val)? {
+                    Ok(items)
+                } else {
+                    Err(ZapcodeError::TypeError(format!(
+                        "{} is not iterable",
+                        val.type_name()
+                    )))
+                }
+            }
+            other => Err(ZapcodeError::TypeError(format!(
+                "{} is not iterable",
+                other.type_name()
+            ))),
+        }
+    }
+
+    /// Drive a generator to completion, collecting each yielded value.
+    fn drain_generator(&mut self, mut gen_obj: GeneratorObject) -> Result<Vec<Value>> {
+        let mut out = Vec::new();
+        loop {
+            self.tracker.track_allocation(&self.limits)?;
+            let result = self.generator_next(gen_obj.clone(), Value::Undefined)?;
+            let (value, done) = match &result {
+                Value::Object(h) => {
+                    let m = self.heap.object_map(*h);
+                    (
+                        m.get("value").cloned().unwrap_or(Value::Undefined),
+                        m.get("done").is_some_and(|v| matches!(v, Value::Bool(true))),
+                    )
+                }
+                _ => (Value::Undefined, true),
+            };
+            if done {
+                break;
+            }
+            out.push(value);
+            // Reload the (now-suspended) generator state so the next pull
+            // resumes from where this one left off.
+            let gen_key = format!("__gen_{}", gen_obj.id);
+            match self.globals.get(&gen_key) {
+                Some(Value::Generator(g)) => gen_obj = g.clone(),
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
+
+    /// If `val` is a plain object exposing a callable `[Symbol.iterator]`,
+    /// run the iterator protocol and return its elements; otherwise `None`.
+    fn drain_custom_iterator(&mut self, val: &Value) -> Result<Option<Vec<Value>>> {
+        let Value::Object(h) = val else {
+            return Ok(None);
+        };
+        // A `[Symbol.iterator]` computed key stringifies to the symbol object's
+        // debug form; we resolve the method by reading the well-known key.
+        let iter_fn = match self.heap.object(*h) {
+            Some(m) => m.get(builtins::SYMBOL_ITERATOR_KEY).cloned(),
+            None => None,
+        };
+        let Some(iter_fn) = iter_fn else {
+            return Ok(None);
+        };
+        if !matches!(iter_fn, Value::Function(_)) {
+            return Ok(None);
+        }
+        // Call obj[Symbol.iterator]() (with `this` bound to the object) to
+        // obtain the iterator object.
+        let iterator = self.call_method_internal(&iter_fn, val.clone(), vec![])?;
+        let iter_h = match &iterator {
+            Value::Object(ih) => *ih,
+            _ => {
+                return Err(ZapcodeError::TypeError(
+                    "[Symbol.iterator]() did not return an object".into(),
+                ))
+            }
+        };
+        let next_fn = match self.heap.object(iter_h) {
+            Some(m) => m.get("next").cloned(),
+            None => None,
+        };
+        let next_fn = match next_fn {
+            Some(v @ Value::Function(_)) => v,
+            _ => {
+                return Err(ZapcodeError::TypeError(
+                    "iterator has no next() method".into(),
+                ))
+            }
+        };
+        let mut out = Vec::new();
+        loop {
+            self.tracker.track_allocation(&self.limits)?;
+            let result = self.call_method_internal(&next_fn, iterator.clone(), vec![])?;
+            let (value, done) = match &result {
+                Value::Object(rh) => {
+                    let m = self.heap.object_map(*rh);
+                    (
+                        m.get("value").cloned().unwrap_or(Value::Undefined),
+                        m.get("done").is_some_and(|v| v.is_truthy()),
+                    )
+                }
+                _ => (Value::Undefined, true),
+            };
+            if done {
+                break;
+            }
+            out.push(value);
+        }
+        Ok(Some(out))
     }
 
     fn make_iterator_result(&mut self, value: Value, done: bool) -> Value {
@@ -2823,6 +3677,20 @@ impl Vm {
                 let obj = self.pop()?;
                 // Place of the object we're reading the property from.
                 let obj_place = self.last_place.take();
+                // Accessor getter: if this object carries a getter for `name`
+                // (instance accessor, or a static accessor on a class object),
+                // invoke it with `this` bound to the object and use its result.
+                let getter = self
+                    .instance_accessor(&obj, "__getters__", &name)
+                    .or_else(|| self.instance_accessor(&obj, "__static_getters__", &name));
+                if let Some(getter) = getter {
+                    self.last_global_name = None;
+                    self.last_receiver_source = None;
+                    self.last_place = None;
+                    let v = self.call_method_internal(&getter, obj, Vec::new())?;
+                    self.push(v)?;
+                    return Ok(None);
+                }
                 let result = self.get_property(&obj, &name)?;
                 // Consume the builtin-global shortcut: it applies only to this
                 // single read immediately after a `LoadGlobal`, never to a later
@@ -2867,12 +3735,28 @@ impl Vm {
                 // (compile_store pushes object after the value)
                 let obj_val = self.pop()?;
                 let value = self.pop()?;
+                // Accessor setter: if this object carries a setter for `name`
+                // (instance accessor, or a static accessor on a class object),
+                // invoke it with `this` bound to the object instead of storing a
+                // data property (accessor properties have no backing slot).
+                let setter = self
+                    .instance_accessor(&obj_val, "__setters__", &name)
+                    .or_else(|| self.instance_accessor(&obj_val, "__static_setters__", &name));
+                if let Some(setter) = setter {
+                    self.call_method_internal(&setter, obj_val.clone(), vec![value])?;
+                    self.push(obj_val)?;
+                    return Ok(None);
+                }
                 match obj_val {
                     Value::Object(h) => {
-                        // Mutate the heap slot in place; the handle is shared so the
-                        // write is visible through every alias (reference semantics).
-                        if let Some(obj) = self.heap.object_mut(h) {
-                            obj.insert(Arc::from(name.as_str()), value);
+                        // A frozen object silently ignores property writes (sloppy
+                        // mode), matching Object.freeze enforcement.
+                        if !is_frozen_object(h, &self.heap) {
+                            // Mutate the heap slot in place; the handle is shared so the
+                            // write is visible through every alias (reference semantics).
+                            if let Some(obj) = self.heap.object_mut(h) {
+                                obj.insert(Arc::from(name.as_str()), value);
+                            }
                         }
                         // Push the (same) object handle back so compile_store can store it.
                         self.push(Value::Object(h))?;
@@ -2929,11 +3813,34 @@ impl Vm {
                             .and_then(|m| m.get(key.as_ref()).cloned())
                             .unwrap_or(Value::Undefined)
                     }
-                    (Value::String(s), Value::Int(i)) => s
+                    (Value::String(s), Value::Int(i)) => {
+                        if *i < 0 {
+                            Value::Undefined
+                        } else {
+                            s.chars()
+                                .nth(*i as usize)
+                                .map(|c| Value::String(Arc::from(c.to_string().as_str())))
+                                .unwrap_or(Value::Undefined)
+                        }
+                    }
+                    (Value::String(s), Value::Float(f)) if *f >= 0.0 && f.fract() == 0.0 => s
                         .chars()
-                        .nth(*i as usize)
+                        .nth(*f as usize)
                         .map(|c| Value::String(Arc::from(c.to_string().as_str())))
                         .unwrap_or(Value::Undefined),
+                    // A string-typed numeric subscript (`"hello"["1"]`) reads the
+                    // char at that index, like JS (property-key -> integer index).
+                    (Value::String(s), Value::String(key)) => match key.parse::<usize>() {
+                        Ok(i) => s
+                            .chars()
+                            .nth(i)
+                            .map(|c| Value::String(Arc::from(c.to_string().as_str())))
+                            .unwrap_or(Value::Undefined),
+                        Err(_) if key.as_ref() == "length" => {
+                            Value::Int(s.chars().count() as i64)
+                        }
+                        Err(_) => Value::Undefined,
+                    },
                     _ => Value::Undefined,
                 };
                 match result {
@@ -3002,9 +3909,12 @@ impl Vm {
                         }
                     }
                     Value::Object(h) => {
-                        let key: Arc<str> = Arc::from(index.to_js_string(&self.heap).as_str());
-                        if let Some(map) = self.heap.object_mut(*h) {
-                            map.insert(key, value);
+                        // Frozen objects ignore index writes too.
+                        if !is_frozen_object(*h, &self.heap) {
+                            let key: Arc<str> = Arc::from(index.to_js_string(&self.heap).as_str());
+                            if let Some(map) = self.heap.object_mut(*h) {
+                                map.insert(key, value);
+                            }
                         }
                     }
                     _ => {}
@@ -3029,8 +3939,11 @@ impl Vm {
             Instruction::DeleteProperty(name) => {
                 let obj = self.pop()?;
                 if let Value::Object(h) = &obj {
-                    if let Some(map) = self.heap.object_mut(*h) {
-                        map.shift_remove(name.as_str());
+                    // Frozen objects are non-configurable: delete is a no-op.
+                    if !is_frozen_object(*h, &self.heap) {
+                        if let Some(map) = self.heap.object_mut(*h) {
+                            map.shift_remove(name.as_str());
+                        }
                     }
                 }
                 self.push(obj)?;
@@ -3040,9 +3953,11 @@ impl Vm {
                 let obj = self.pop()?;
                 match &obj {
                     Value::Object(h) => {
-                        let k = key.to_js_string(&self.heap);
-                        if let Some(map) = self.heap.object_mut(*h) {
-                            map.shift_remove(k.as_str());
+                        if !is_frozen_object(*h, &self.heap) {
+                            let k = key.to_js_string(&self.heap);
+                            if let Some(map) = self.heap.object_mut(*h) {
+                                map.shift_remove(k.as_str());
+                            }
                         }
                     }
                     Value::Array(h) => {
@@ -3095,25 +4010,14 @@ impl Vm {
                         )))
                     }
                 };
-                let extra: Vec<Value> = match &iterable {
-                    Value::Array(items) => self.heap.array_vec(*items),
-                    Value::String(s) => s
-                        .chars()
-                        .map(|c| Value::String(Arc::from(c.to_string().as_str())))
-                        .collect(),
-                    Value::Object(_) if is_set_object(&iterable, &self.heap) => {
-                        set_items(&iterable, &self.heap)
+                // Generators, arrays, strings, Sets/Maps, and plain objects with a
+                // custom `[Symbol.iterator]` are all consumed via `drain_iterable`.
+                let extra: Vec<Value> = self.drain_iterable(iterable).map_err(|e| match e {
+                    ZapcodeError::TypeError(msg) => {
+                        ZapcodeError::TypeError(format!("{msg} (spread)"))
                     }
-                    Value::Object(_) if is_map_object(&iterable, &self.heap) => {
-                        map_entry_pairs(&iterable, &mut self.heap)
-                    }
-                    other => {
-                        return Err(ZapcodeError::TypeError(format!(
-                            "{} is not iterable (spread)",
-                            other.type_name()
-                        )))
-                    }
-                };
+                    other => other,
+                })?;
                 if let Some(v) = self.heap.array_mut(acc) {
                     v.extend(extra);
                 }
@@ -3251,6 +4155,9 @@ impl Vm {
                             "Date" => {
                                 matches!(&left, Value::Object(i) if has_key(*i, "__date_ms__", &self.heap))
                             }
+                            "RegExp" => {
+                                matches!(&left, Value::Object(i) if has_key(*i, "__regexp__", &self.heap))
+                            }
                             _ => false,
                         }
                     } else if let (Value::Object(instance), Some(class_name)) =
@@ -3387,14 +4294,29 @@ impl Vm {
                             }
                             "__string__" => {
                                 if let Some(Value::String(s)) = &receiver {
-                                    builtins::call_builtin(
-                                        &Value::String(s.clone()),
-                                        &method_name,
-                                        &args,
-                                        &self.limits,
-                                        &mut self.stdout,
-                                        &mut self.heap,
-                                    )?
+                                    // replace/replaceAll with a FUNCTION replacer must
+                                    // invoke the callback per match with
+                                    // (match, ...groups, offset, string) and splice in
+                                    // its return value. The pure builtin can't reach the
+                                    // call path, so handle it here at the dispatch layer.
+                                    if matches!(method_name.as_ref(), "replace" | "replaceAll")
+                                        && matches!(args.get(1), Some(Value::Function(_)))
+                                    {
+                                        Some(self.string_replace_with_function(
+                                            &s.clone(),
+                                            &method_name,
+                                            &args,
+                                        )?)
+                                    } else {
+                                        builtins::call_builtin(
+                                            &Value::String(s.clone()),
+                                            &method_name,
+                                            &args,
+                                            &self.limits,
+                                            &mut self.stdout,
+                                            &mut self.heap,
+                                        )?
+                                    }
                                 } else {
                                     None
                                 }
@@ -3620,6 +4542,19 @@ impl Vm {
                                 let h = self.heap.alloc_array(out);
                                 Some(Value::Array(h))
                             }
+                            // JSON.stringify must honor a user `toJSON()` on plain
+                            // objects and a FUNCTION replacer; JSON.parse must invoke a
+                            // reviver. All three need the guest-closure call path, so
+                            // route through the VM here rather than the pure builtin.
+                            "JSON" if method_name.as_ref() == "stringify" => {
+                                Some(self.json_stringify(&args)?)
+                            }
+                            "JSON"
+                                if method_name.as_ref() == "parse"
+                                    && matches!(args.get(1), Some(Value::Function(_))) =>
+                            {
+                                Some(self.json_parse_with_reviver(&args)?)
+                            }
                             // Array.from(arrayLike) / Array.of(...) allocate an
                             // array sized from guest-controlled input. Charge the
                             // length against the memory limit *before* the builtin
@@ -3696,6 +4631,17 @@ impl Vm {
                         let value = builtins::call_global_fn(kind.as_ref(), &args, &mut self.heap)?;
                         self.push(value)?;
                     }
+                    // `RegExp(pattern, flags)` called WITHOUT `new` behaves like the
+                    // constructor (JS allows both forms).
+                    Value::Object(h)
+                        if self.heap.object(h).is_some_and(|m| {
+                            matches!(m.get("__builtin_constructor__"),
+                                Some(Value::String(s)) if s.as_ref() == "RegExp")
+                        }) =>
+                    {
+                        let r = self.construct_regexp(&args)?;
+                        self.push(r)?;
+                    }
                     _ => {
                         let msg = callee.to_js_string(&self.heap);
                         return Err(ZapcodeError::TypeError(format!("{} is not a function", msg)));
@@ -3704,42 +4650,14 @@ impl Vm {
             }
             Instruction::Return => {
                 let return_val = self.pop().unwrap_or(Value::Undefined);
-
-                if self.frames.len() <= 1 {
-                    return Ok(Some(VmState::Complete(return_val)));
+                // A `return` must run any `finally` blocks it escapes in the
+                // current call frame before the function actually returns.
+                if self.route_abrupt(Completion::Return(return_val.clone()))? {
+                    return Ok(None);
                 }
-
-                let frame = self.frames.pop().unwrap();
-                self.tracker.pop_frame();
-
-                // If this was a constructor frame (has this_value), return the
-                // updated `this` instead of the explicit return value (unless
-                // the constructor explicitly returns an object).
-                let actual_return = if let Some(ref this_val) = frame.this_value {
-                    // Also propagate this back to parent frame (for super() calls)
-                    if let Some(parent) = self.frames.last_mut() {
-                        if parent.this_value.is_some() {
-                            parent.this_value = Some(this_val.clone());
-                        }
-                    }
-                    // Write back the mutated `this` to the original variable
-                    // that the method receiver came from. This ensures that
-                    // value-type semantics work correctly for method calls
-                    // that mutate `this` properties (e.g., this.count += 1).
-                    if let Some(ref source) = frame.receiver_source {
-                        self.write_receiver_source(source, this_val.clone());
-                    }
-                    if matches!(return_val, Value::Undefined) {
-                        this_val.clone()
-                    } else {
-                        return_val
-                    }
-                } else {
-                    return_val
-                };
-
-                self.stack.truncate(frame.stack_base);
-                self.push(actual_return)?;
+                if let Some(state) = self.perform_return(return_val)? {
+                    return Ok(Some(state));
+                }
             }
             Instruction::CallExternal(name, arg_count) => {
                 if !self.external_functions.contains(&name) {
@@ -3864,8 +4782,17 @@ impl Vm {
 
             // Loops
             Instruction::SetupLoop => {}
-            Instruction::Break | Instruction::Continue => {
-                // These should have been compiled to jumps
+            Instruction::Break(target) => {
+                // Run any `finally` blocks this break escapes (try statements
+                // that enclose the break but are enclosed by the loop), then jump.
+                if !self.route_abrupt(Completion::Break(target))? {
+                    self.current_frame_mut().ip = target;
+                }
+            }
+            Instruction::Continue(target) => {
+                if !self.route_abrupt(Completion::Continue(target))? {
+                    self.current_frame_mut().ip = target;
+                }
             }
 
             // Iterators
@@ -3910,6 +4837,23 @@ impl Vm {
                         let pairs = map_entry_pairs(&val, &mut self.heap);
                         let iter_obj = iter_from_items(pairs, &mut self.heap);
                         self.push(iter_obj)?;
+                    }
+                    // A plain object exposing a custom `[Symbol.iterator]()`:
+                    // run the iterator protocol to materialize its elements, then
+                    // hand `for...of` a normal array-iterator over them.
+                    Value::Object(_) => {
+                        match self.drain_custom_iterator(&val)? {
+                            Some(items) => {
+                                let iter_obj = iter_from_items(items, &mut self.heap);
+                                self.push(iter_obj)?;
+                            }
+                            None => {
+                                return Err(ZapcodeError::TypeError(format!(
+                                    "{} is not iterable",
+                                    val.type_name()
+                                )));
+                            }
+                        }
                     }
                     _ => {
                         return Err(ZapcodeError::TypeError(format!(
@@ -4041,13 +4985,57 @@ impl Vm {
                     self.push(Value::Bool(true))?;
                 }
             }
+            Instruction::IterableToArray => {
+                // Used by array destructuring (`const [a,b] = x`). Only GENERATORS
+                // and plain objects with a custom `[Symbol.iterator]` need to be
+                // materialized into an array so the positional element reads can
+                // index them. Arrays/strings/Sets/Maps and lenient non-iterables
+                // (number/null/plain object) are left UNCHANGED so the existing
+                // index-based destructure path keeps its current behavior.
+                let val = self.pop()?;
+                match &val {
+                    Value::Generator(gen_obj) => {
+                        let items = self.drain_generator(gen_obj.clone())?;
+                        let h = self.heap.alloc_array(items);
+                        self.push(Value::Array(h))?;
+                    }
+                    Value::Object(_) => match self.drain_custom_iterator(&val)? {
+                        Some(items) => {
+                            let h = self.heap.alloc_array(items);
+                            self.push(Value::Array(h))?;
+                        }
+                        None => self.push(val)?,
+                    },
+                    _ => self.push(val)?,
+                }
+            }
 
             // Error handling
-            Instruction::SetupTry(catch_ip, _) => {
+            Instruction::SetupTry {
+                catch_ip,
+                finally_ip,
+                region_end,
+            } => {
+                // `has_catch` is encoded by the compiler: when there is a catch
+                // handler, catch_ip points at it; when there is none but there is
+                // a finally, catch_ip == finally_ip (so a throw runs the finally).
+                let has_catch = match finally_ip {
+                    Some(fin) => catch_ip != fin,
+                    None => true,
+                };
+                // ip was already advanced past this instruction; the statement
+                // region begins at the SetupTry itself.
+                let region_start = self.current_frame().ip - 1;
                 self.try_stack.push(TryInfo {
                     catch_ip,
                     frame_depth: self.frames.len(),
                     stack_depth: self.stack.len(),
+                    finally_ip,
+                    has_catch,
+                    pending: None,
+                    in_finally: false,
+                    region_start,
+                    region_end,
                 });
             }
             Instruction::Throw => {
@@ -4060,6 +5048,26 @@ impl Vm {
             }
             Instruction::EndTry => {
                 self.try_stack.pop();
+            }
+            Instruction::EnterFinallyNormal(finally_ip) => {
+                // The try (or catch) body completed normally; transition the
+                // active try frame into its finally phase with a Normal pending
+                // completion and run the finally body.
+                if let Some(info) = self.try_stack.last_mut() {
+                    info.pending = Some(Completion::Normal);
+                    info.in_finally = true;
+                    info.has_catch = false;
+                }
+                self.current_frame_mut().ip = finally_ip;
+            }
+            Instruction::EndFinally => {
+                // The finally body finished without its own abrupt completion;
+                // resume whatever the body/catch was doing.
+                let info = self.try_stack.pop();
+                let completion = info.and_then(|i| i.pending).unwrap_or(Completion::Normal);
+                if let Some(state) = self.resume_completion(completion)? {
+                    return Ok(Some(state));
+                }
             }
 
             // Typeof
@@ -4089,6 +5097,9 @@ impl Vm {
                         if self.heap.object(*h).is_some_and(|m| {
                             m.contains_key("__global_fn__")
                                 || m.contains_key("__builtin_constructor__")
+                                // A user class value is callable (constructor), so
+                                // `typeof Class === "function"` like JS.
+                                || m.contains_key("__class_name__")
                         }) =>
                     {
                         "function"
@@ -4268,93 +5279,28 @@ impl Vm {
                 name,
                 n_methods,
                 n_statics,
+                n_getters,
+                n_setters,
+                n_static_getters,
+                n_static_setters,
+                n_fields,
+                n_static_fields,
                 has_super,
             } => {
-                // Stack layout (top to bottom):
-                // constructor closure (or undefined)
-                // n_methods * (closure, method_name_string) pairs
-                // n_statics * (closure, method_name_string) pairs
-                // [optional super class if has_super]
-
-                let constructor = self.pop()?;
-
-                // Pop instance methods
-                let mut prototype = IndexMap::new();
-                for _ in 0..n_methods {
-                    let method_closure = self.pop()?;
-                    let method_name = self.pop()?;
-                    if let Value::String(mn) = method_name {
-                        prototype.insert(mn, method_closure);
-                    }
-                }
-
-                // Pop static methods
-                let mut statics = IndexMap::new();
-                for _ in 0..n_statics {
-                    let method_closure = self.pop()?;
-                    let method_name = self.pop()?;
-                    if let Value::String(mn) = method_name {
-                        statics.insert(mn, method_closure);
-                    }
-                }
-
-                // Pop super class if present
-                let super_class = if has_super { Some(self.pop()?) } else { None };
-
-                // If super class, copy its prototype methods to ours (inheritance)
-                if let Some(Value::Object(sc)) = &super_class {
-                    if let Some(Value::Object(super_proto_h)) =
-                        self.heap.object(*sc).and_then(|m| m.get("__prototype__").cloned())
-                    {
-                        // Super prototype methods go first, then our own (which override)
-                        let mut merged = self.heap.object_map(super_proto_h);
-                        for (k, v) in prototype {
-                            merged.insert(k, v);
-                        }
-                        prototype = merged;
-                    }
-                }
-
-                // The inheritance chain of class names (self first), so
-                // `instanceof` matches ancestor classes too.
-                let mut chain = vec![Value::String(Arc::from(name.as_str()))];
-                if let Some(Value::Object(sc)) = &super_class {
-                    let scm = self.heap.object_map(*sc);
-                    match scm.get("__class_chain__") {
-                        Some(Value::Array(c)) => chain.extend(self.heap.array_vec(*c)),
-                        _ => {
-                            if let Some(n) = scm.get("__class_name__") {
-                                chain.push(n.clone());
-                            }
-                        }
-                    }
-                }
-
-                let chain_arr = Value::Array(self.heap.alloc_array(chain));
-                let proto_obj = Value::Object(self.heap.alloc_object(prototype));
-
-                // Build the class object
-                let mut class_obj = IndexMap::new();
-                class_obj.insert(
-                    Arc::from("__class_name__"),
-                    Value::String(Arc::from(name.as_str())),
-                );
-                class_obj.insert(Arc::from("__class_chain__"), chain_arr);
-                class_obj.insert(Arc::from("__constructor__"), constructor);
-                class_obj.insert(Arc::from("__prototype__"), proto_obj);
-
-                // Store super class reference for super() calls
-                if let Some(sc) = super_class {
-                    class_obj.insert(Arc::from("__super__"), sc);
-                }
-
-                // Add static methods directly on the class object
-                for (k, v) in statics {
-                    class_obj.insert(k, v);
-                }
-
-                let h = self.heap.alloc_object(class_obj);
-                self.push(Value::Object(h))?;
+                // Delegated to a dedicated method so this large arm does not bloat
+                // the `dispatch` stack frame (which recurses through ToPrimitive).
+                self.create_class(CreateClassParts {
+                    name: &name,
+                    n_methods,
+                    n_statics,
+                    n_getters,
+                    n_setters,
+                    n_static_getters,
+                    n_static_setters,
+                    n_fields,
+                    n_static_fields,
+                    has_super,
+                })?;
             }
 
             Instruction::Construct(arg_count) => {
@@ -4396,6 +5342,11 @@ impl Vm {
                             "Date" => {
                                 let d = construct_date(&args, &mut self.heap);
                                 self.push(d)?;
+                                return Ok(None);
+                            }
+                            "RegExp" => {
+                                let r = self.construct_regexp(&args)?;
+                                self.push(r)?;
                                 return Ok(None);
                             }
                             "Error" | "TypeError" | "RangeError" | "SyntaxError"
@@ -4488,8 +5439,64 @@ impl Vm {
                         if let Some(chain) = class_obj.get("__class_chain__") {
                             instance.insert(Arc::from("__class_chain__"), chain.clone());
                         }
+                        // A subclass of a built-in Error gets the `__error__` brand so
+                        // `e instanceof Error` is true and it stringifies as an error.
+                        // The default `name` is the error base (e.g. "Error"); a
+                        // constructor that assigns `this.name` overrides it.
+                        if let Some(Value::String(base)) = class_obj.get("__error_base__") {
+                            instance.insert(Arc::from("__error__"), Value::Bool(true));
+                            instance
+                                .entry(Arc::from("name"))
+                                .or_insert_with(|| Value::String(base.clone()));
+                        }
+                        // Carry accessor descriptors onto the instance so a later
+                        // GetProperty/SetProperty invokes the getter/setter body.
+                        if let Some(g @ Value::Object(_)) = class_obj.get("__getters__") {
+                            instance.insert(Arc::from("__getters__"), g.clone());
+                        }
+                        if let Some(s @ Value::Object(_)) = class_obj.get("__setters__") {
+                            instance.insert(Arc::from("__setters__"), s.clone());
+                        }
+
+                        // Collect this class's own instance field initializers so we
+                        // can run them on the new instance below (before the
+                        // constructor body for a base class, matching JS field-init
+                        // ordering for the supported base-class case).
+                        let field_inits: Vec<(Arc<str>, Value)> =
+                            match class_obj.get("__field_inits__") {
+                                Some(Value::Array(h)) => self
+                                    .heap
+                                    .array_vec(*h)
+                                    .into_iter()
+                                    .filter_map(|pair| match pair {
+                                        Value::Array(ph) => {
+                                            let p = self.heap.array_vec(ph);
+                                            match (p.first(), p.get(1)) {
+                                                (Some(Value::String(n)), Some(init)) => {
+                                                    Some((n.clone(), init.clone()))
+                                                }
+                                                _ => None,
+                                            }
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect(),
+                                _ => Vec::new(),
+                            };
 
                         let instance_val = Value::Object(self.heap.alloc_object(instance));
+
+                        // Run instance field initializers with `this` bound to the
+                        // instance, so `x = 10` and `y = this.x * 2` install values.
+                        if let Value::Object(inst_h) = &instance_val {
+                            let inst_h = *inst_h;
+                            for (fname, init) in field_inits {
+                                let v = self.call_field_init(&init, instance_val.clone())?;
+                                if let Some(map) = self.heap.object_mut(inst_h) {
+                                    map.insert(fname, v);
+                                }
+                            }
+                        }
 
                         // Call the constructor with `this` bound to the instance.
                         // A subclass with no own constructor forwards to the nearest
@@ -4503,6 +5510,42 @@ impl Vm {
                                 self.last_receiver = None;
                             }
                             _ => {
+                                // No user constructor. A built-in Error subclass with
+                                // no own constructor still has an implicit
+                                // `constructor(...a){ super(...a) }`, so forward the
+                                // message argument (and derive the stack) like JS.
+                                if class_obj.contains_key("__error_base__") {
+                                    if let Value::Object(inst_h) = &instance_val {
+                                        let inst_h = *inst_h;
+                                        let msg = match args.first() {
+                                            Some(v) if !matches!(v, Value::Undefined) => {
+                                                v.to_js_string(&self.heap)
+                                            }
+                                            _ => String::new(),
+                                        };
+                                        let name = self
+                                            .heap
+                                            .object(inst_h)
+                                            .and_then(|m| m.get("name"))
+                                            .map(|v| v.to_js_string(&self.heap))
+                                            .unwrap_or_else(|| "Error".to_string());
+                                        let stack = if msg.is_empty() {
+                                            name
+                                        } else {
+                                            format!("{}: {}", name, msg)
+                                        };
+                                        if let Some(map) = self.heap.object_mut(inst_h) {
+                                            map.insert(
+                                                Arc::from("message"),
+                                                Value::String(Arc::from(msg.as_str())),
+                                            );
+                                            map.insert(
+                                                Arc::from("stack"),
+                                                Value::String(Arc::from(stack.as_str())),
+                                            );
+                                        }
+                                    }
+                                }
                                 self.push(instance_val)?;
                             }
                         }
@@ -4588,7 +5631,37 @@ impl Vm {
                     self.push_call_frame(&closure, &args, Some(this_val))?;
                     self.last_receiver = None;
                 } else {
-                    // No super constructor found — push undefined
+                    // No user super constructor. If the chain bottoms out at a
+                    // built-in Error, `super(message)` runs the Error constructor:
+                    // set `this.message`/`this.stack` (and a default `name`) on the
+                    // instance, matching real JS. Otherwise it's a no-op.
+                    let error_base = class
+                        .as_deref()
+                        .and_then(|name| self.class_error_base_of(name));
+                    if let (Some(base), Value::Object(inst_h)) = (error_base, &this_val) {
+                        // Only set message when an argument was passed and isn't
+                        // undefined (JS leaves message as the prototype "" otherwise).
+                        let msg = match args.first() {
+                            Some(Value::Undefined) | None => None,
+                            Some(v) => Some(v.to_js_string(&self.heap)),
+                        };
+                        if let Some(map) = self.heap.object_mut(*inst_h) {
+                            let name = match map.get("name") {
+                                Some(Value::String(n)) => n.to_string(),
+                                _ => base.to_string(),
+                            };
+                            if let Some(m) = &msg {
+                                map.insert(Arc::from("message"), Value::String(Arc::from(m.as_str())));
+                            }
+                            let stack_msg = msg.as_deref().unwrap_or("");
+                            let stack = if stack_msg.is_empty() {
+                                name.clone()
+                            } else {
+                                format!("{}: {}", name, stack_msg)
+                            };
+                            map.insert(Arc::from("stack"), Value::String(Arc::from(stack.as_str())));
+                        }
+                    }
                     self.push(Value::Undefined)?;
                 }
             }
@@ -4648,6 +5721,71 @@ impl Vm {
         }
     }
 
+    /// Construct a regex object (the same `{__regexp__, pattern, flags, lastIndex}`
+    /// shape a regex literal compiles to) from `new RegExp(pattern, flags)` /
+    /// `RegExp(pattern, flags)`. `pattern` may be a string or an existing regex
+    /// (whose source/flags are copied; an explicit `flags` arg overrides). The
+    /// pattern is validated up front so a bad pattern throws like JS.
+    fn construct_regexp(&mut self, args: &[Value]) -> Result<Value> {
+        let (pattern, src_flags) = match args.first() {
+            Some(v) => match builtins::regexp_parts(v, &self.heap) {
+                Some((p, f)) => (p, f),
+                None => match v {
+                    Value::Undefined | Value::Null => (String::new(), String::new()),
+                    other => (other.to_js_string(&self.heap), String::new()),
+                },
+            },
+            None => (String::new(), String::new()),
+        };
+        let flags = match args.get(1) {
+            Some(Value::Undefined) | None => src_flags,
+            Some(f) => f.to_js_string(&self.heap),
+        };
+        // Validate the pattern/flags eagerly (mirrors JS throwing on a bad regex).
+        builtins::compile_regex(&pattern, &flags)?;
+        let mut obj = IndexMap::new();
+        obj.insert(Arc::from("__regexp__"), Value::Bool(true));
+        obj.insert(Arc::from("pattern"), Value::String(Arc::from(pattern.as_str())));
+        obj.insert(Arc::from("flags"), Value::String(Arc::from(flags.as_str())));
+        obj.insert(Arc::from("lastIndex"), Value::Int(0));
+        Ok(Value::Object(self.heap.alloc_object(obj)))
+    }
+
+    /// Resolve a static member `name` inherited from a class's `__super__` chain.
+    /// Statics are stored directly on the class object (alongside the internal
+    /// `__…__` keys), so we walk parent class objects skipping those internals.
+    /// Returns the first match, mirroring JS static inheritance through the
+    /// constructor's prototype chain.
+    fn inherited_static_member(&self, class_map: &IndexMap<Arc<str>, Value>, name: &str) -> Option<Value> {
+        let mut current = match class_map.get("__super__") {
+            Some(Value::Object(h)) => *h,
+            _ => return None,
+        };
+        loop {
+            let parent = self.heap.object(current)?;
+            if let Some(v) = parent.get(name) {
+                if !matches!(v, Value::Undefined) {
+                    return Some(v.clone());
+                }
+            }
+            current = match parent.get("__super__") {
+                Some(Value::Object(h)) => *h,
+                _ => return None,
+            };
+        }
+    }
+
+    /// The built-in Error base name a class (named `name`) transitively extends,
+    /// if any — used so `super(message)` in an Error subclass runs the Error
+    /// constructor (sets `.message`/`.stack`).
+    fn class_error_base_of(&self, name: &str) -> Option<Arc<str>> {
+        let class_h = self.class_handle_by_name(name)?;
+        match self.heap.object(class_h).and_then(|m| m.get("__error_base__")) {
+            Some(Value::String(base)) => Some(base.clone()),
+            _ => None,
+        }
+    }
+
     /// The `__super__` class handle of the class named `name`, if any.
     fn super_class_handle_of(&self, name: &str) -> Option<Handle> {
         let class_h = self.class_handle_by_name(name)?;
@@ -4691,6 +5829,232 @@ impl Vm {
             .and_then(|m| m.get(member).cloned())
     }
 
+    /// Build a class object from the groups pushed before a `CreateClass`
+    /// instruction (see `CreateClassParts` / the instruction docs) and leave it on
+    /// the stack. Extracted out of `dispatch` so its locals don't enlarge the
+    /// recursive interpreter frame.
+    #[inline(never)]
+    fn create_class(&mut self, parts: CreateClassParts<'_>) -> Result<()> {
+        let CreateClassParts {
+            name,
+            n_methods,
+            n_statics,
+            n_getters,
+            n_setters,
+            n_static_getters,
+            n_static_setters,
+            n_fields,
+            n_static_fields,
+            has_super,
+        } = parts;
+
+        // Stack layout (top to bottom — popped in this order):
+        //   constructor closure (or undefined)
+        //   n_methods         * (name, closure) pairs   instance methods
+        //   n_statics         * (name, closure) pairs   static methods
+        //   n_getters         * (name, closure) pairs   instance getters
+        //   n_setters         * (name, closure) pairs   instance setters
+        //   n_static_getters  * (name, closure) pairs   static getters
+        //   n_static_setters  * (name, closure) pairs   static setters
+        //   n_fields          * (name, init_closure) pairs
+        //   n_static_fields   * (name, init_closure) pairs
+        //   [optional super class if has_super]
+
+        let constructor = self.pop()?;
+        let mut prototype = self.pop_named_closure_pairs(n_methods)?;
+        let statics = self.pop_named_closure_pairs(n_statics)?;
+        let getters = self.pop_named_closure_pairs(n_getters)?;
+        let setters = self.pop_named_closure_pairs(n_setters)?;
+        let static_getters = self.pop_named_closure_pairs(n_static_getters)?;
+        let static_setters = self.pop_named_closure_pairs(n_static_setters)?;
+        // Field-initializer (name, closure) pairs, in declaration order.
+        let field_inits = self.pop_named_closure_pairs(n_fields)?;
+        let static_field_inits = self.pop_named_closure_pairs(n_static_fields)?;
+
+        // Pop super class if present
+        let super_class = if has_super { Some(self.pop()?) } else { None };
+
+        // Accessor descriptors for this class's instances. Start from the
+        // super prototype's accessors (inherited) and let our own override.
+        let mut getters = getters;
+        let mut setters = setters;
+
+        // If super class, copy its prototype methods to ours (inheritance)
+        if let Some(Value::Object(sc)) = &super_class {
+            let scm = self.heap.object_map(*sc);
+            if let Some(Value::Object(super_proto_h)) = scm.get("__prototype__").cloned() {
+                // Super prototype methods go first, then our own (which override)
+                let mut merged = self.heap.object_map(super_proto_h);
+                for (k, v) in prototype {
+                    merged.insert(k, v);
+                }
+                prototype = merged;
+            }
+            // Inherit accessor descriptors (our own override per-name below).
+            if let Some(Value::Object(sg)) = scm.get("__getters__").cloned() {
+                let mut merged = self.heap.object_map(sg);
+                for (k, v) in getters {
+                    merged.insert(k, v);
+                }
+                getters = merged;
+            }
+            if let Some(Value::Object(ss)) = scm.get("__setters__").cloned() {
+                let mut merged = self.heap.object_map(ss);
+                for (k, v) in setters {
+                    merged.insert(k, v);
+                }
+                setters = merged;
+            }
+        }
+
+        // The inheritance chain of class names (self first), so
+        // `instanceof` matches ancestor classes too.
+        let mut chain = vec![Value::String(Arc::from(name))];
+        // If the class (transitively) extends a built-in Error, record the
+        // error base name so instances get the `__error__` brand (making
+        // `e instanceof Error` true) and `super(message)` sets `.message`.
+        let mut error_base: Option<Arc<str>> = None;
+        if let Some(Value::Object(sc)) = &super_class {
+            let scm = self.heap.object_map(*sc);
+            match scm.get("__class_chain__") {
+                Some(Value::Array(c)) => chain.extend(self.heap.array_vec(*c)),
+                _ => {
+                    if let Some(n) = scm.get("__class_name__") {
+                        chain.push(n.clone());
+                    }
+                }
+            }
+            // A built-in Error constructor as the direct super.
+            if let Some(Value::String(ctor)) = scm.get("__builtin_constructor__") {
+                if is_error_ctor_name(ctor) {
+                    error_base = Some(ctor.clone());
+                }
+            }
+            // Or a user class that itself extends an Error.
+            if error_base.is_none() {
+                if let Some(Value::String(base)) = scm.get("__error_base__") {
+                    error_base = Some(base.clone());
+                }
+            }
+        }
+
+        let chain_arr = Value::Array(self.heap.alloc_array(chain));
+        let proto_obj = Value::Object(self.heap.alloc_object(prototype));
+
+        // Build the class object
+        let mut class_obj = IndexMap::new();
+        class_obj.insert(Arc::from("__class_name__"), Value::String(Arc::from(name)));
+        class_obj.insert(Arc::from("__class_chain__"), chain_arr);
+        class_obj.insert(Arc::from("__constructor__"), constructor);
+        class_obj.insert(Arc::from("__prototype__"), proto_obj);
+
+        // Accessor descriptors (getters/setters) shared by every instance.
+        if !getters.is_empty() {
+            let g = Value::Object(self.heap.alloc_object(getters));
+            class_obj.insert(Arc::from("__getters__"), g);
+        }
+        if !setters.is_empty() {
+            let s = Value::Object(self.heap.alloc_object(setters));
+            class_obj.insert(Arc::from("__setters__"), s);
+        }
+        // Static accessors live on the class object itself.
+        if !static_getters.is_empty() {
+            let g = Value::Object(self.heap.alloc_object(static_getters));
+            class_obj.insert(Arc::from("__static_getters__"), g);
+        }
+        if !static_setters.is_empty() {
+            let s = Value::Object(self.heap.alloc_object(static_setters));
+            class_obj.insert(Arc::from("__static_setters__"), s);
+        }
+
+        // Instance field initializers: a list of [name, init_closure] pairs
+        // run on each new instance (after super() in a derived class).
+        if !field_inits.is_empty() {
+            let mut pairs = Vec::with_capacity(field_inits.len());
+            for (k, v) in field_inits {
+                let pair = vec![Value::String(k), v];
+                pairs.push(Value::Array(self.heap.alloc_array(pair)));
+            }
+            let arr = Value::Array(self.heap.alloc_array(pairs));
+            class_obj.insert(Arc::from("__field_inits__"), arr);
+        }
+
+        // Store super class reference for super() calls
+        if let Some(sc) = super_class {
+            class_obj.insert(Arc::from("__super__"), sc);
+        }
+        // Record the built-in Error base so instances are branded as errors.
+        if let Some(base) = error_base {
+            class_obj.insert(Arc::from("__error_base__"), Value::String(base));
+        }
+
+        // Add static methods directly on the class object
+        for (k, v) in statics {
+            class_obj.insert(k, v);
+        }
+
+        let h = self.heap.alloc_object(class_obj);
+
+        // Run static field initializers with `this` bound to the class
+        // object, so `static count = 5` installs `Class.count === 5`
+        // (and `static b = this.a` can read earlier static fields).
+        let class_val = Value::Object(h);
+        for (k, init) in static_field_inits {
+            let v = self.call_field_init(&init, class_val.clone())?;
+            if let Some(map) = self.heap.object_mut(h) {
+                map.insert(k, v);
+            }
+        }
+
+        self.push(class_val)?;
+        Ok(())
+    }
+
+    /// Pop `n` `(name_string, closure)` pairs off the stack (the closure is on top
+    /// of each pair, pushed after its name) into a map preserving DECLARATION order
+    /// (they were pushed in declaration order, so they pop in reverse). Used by
+    /// `CreateClass` to collect method/accessor/field-init groups.
+    fn pop_named_closure_pairs(&mut self, n: usize) -> Result<IndexMap<Arc<str>, Value>> {
+        let mut popped = Vec::with_capacity(n);
+        for _ in 0..n {
+            let closure = self.pop()?;
+            let name = self.pop()?;
+            popped.push((name, closure));
+        }
+        // Reverse back to declaration order before inserting.
+        let mut out = IndexMap::new();
+        for (name, closure) in popped.into_iter().rev() {
+            if let Value::String(nm) = name {
+                out.insert(nm, closure);
+            }
+        }
+        Ok(out)
+    }
+
+    /// If `obj` carries an accessor descriptor map under `kind`
+    /// (`"__getters__"`/`"__setters__"` for instances, or
+    /// `"__static_getters__"`/`"__static_setters__"` for class objects) with an
+    /// entry for `name`, return the accessor closure to invoke (with `this` bound
+    /// to `obj`). The instance keys are ignored on a class object itself (an
+    /// instance getter belongs to the prototype, not the constructor).
+    fn instance_accessor(&self, obj: &Value, kind: &str, name: &str) -> Option<Value> {
+        let Value::Object(h) = obj else { return None };
+        let map = self.heap.object(*h)?;
+        let is_class_object = map.contains_key("__class_name__");
+        let is_instance_key = matches!(kind, "__getters__" | "__setters__");
+        if is_class_object && is_instance_key {
+            return None;
+        }
+        let descs = match map.get(kind)? {
+            Value::Object(d) => *d,
+            _ => return None,
+        };
+        match self.heap.object(descs)?.get(name) {
+            Some(f @ Value::Function(_)) => Some(f.clone()),
+            _ => None,
+        }
+    }
+
     fn get_property(&self, obj: &Value, name: &str) -> Result<Value> {
         // Property access on null/undefined throws TypeError (like JS)
         if matches!(obj, Value::Null | Value::Undefined) {
@@ -4707,6 +6071,29 @@ impl Vm {
                 if let Some(val) = map.get(name) {
                     if !matches!(val, Value::Undefined) {
                         return Ok(val.clone());
+                    }
+                }
+                // Reflection on a class value: `Class.name` is the declared name,
+                // and static members not found above are inherited from `__super__`
+                // (statics walk the constructor's prototype chain in JS).
+                if map.contains_key("__class_name__") {
+                    if name == "name" {
+                        if let Some(n @ Value::String(_)) = map.get("__class_name__") {
+                            return Ok(n.clone());
+                        }
+                    }
+                    if let Some(v) = self.inherited_static_member(&map, name) {
+                        return Ok(v);
+                    }
+                }
+                // `instance.constructor` resolves to the instance's class value.
+                // Instances carry `__class__` (the class name); the class object is
+                // bound to that name in globals.
+                if name == "constructor" && map.contains_key("__class__") {
+                    if let Some(Value::String(cname)) = map.get("__class__") {
+                        if let Some(ch) = self.class_handle_by_name(cname) {
+                            return Ok(Value::Object(ch));
+                        }
                     }
                 }
                 // Check if this is a promise instance — expose .then/.catch/.finally
@@ -4737,10 +6124,23 @@ impl Vm {
                 if is_date_object(obj, &self.heap) && is_date_method(name) {
                     return Ok(builtin_method("__date__", name));
                 }
-                if builtins::regexp_parts(obj, &self.heap).is_some()
-                    && matches!(name, "test" | "exec")
-                {
-                    return Ok(builtin_method("__regexp__", name));
+                if let Some((pattern, flags)) = builtins::regexp_parts(obj, &self.heap) {
+                    if matches!(name, "test" | "exec") {
+                        return Ok(builtin_method("__regexp__", name));
+                    }
+                    // Read-only regex accessors derived from source/flags.
+                    match name {
+                        "source" => {
+                            let s = if pattern.is_empty() { "(?:)" } else { &pattern };
+                            return Ok(Value::String(Arc::from(s)));
+                        }
+                        "global" => return Ok(Value::Bool(flags.contains('g'))),
+                        "ignoreCase" => return Ok(Value::Bool(flags.contains('i'))),
+                        "multiline" => return Ok(Value::Bool(flags.contains('m'))),
+                        "dotAll" => return Ok(Value::Bool(flags.contains('s'))),
+                        "sticky" => return Ok(Value::Bool(flags.contains('y'))),
+                        _ => {}
+                    }
                 }
                 // Check if this is a known global object — return builtin method handle
                 if let Some(global_name) = &self.last_global_name {
@@ -4768,6 +6168,20 @@ impl Vm {
             Value::String(s) => match name {
                 "length" => Ok(Value::Int(s.chars().count() as i64)),
                 _ if is_string_method(name) => Ok(builtin_method("__string__", name)),
+                _ => Ok(Value::Undefined),
+            },
+            Value::Function(closure) => match name {
+                // Function reflection: `.length` is the arity (params before the
+                // first default/rest), `.name` is the declared/inferred name.
+                "length" => Ok(Value::Int(self.function_arity(closure.func_ref))),
+                "name" => {
+                    let n = self
+                        .current_function(closure.func_ref)
+                        .name
+                        .clone()
+                        .unwrap_or_default();
+                    Ok(Value::String(Arc::from(n.as_str())))
+                }
                 _ => Ok(Value::Undefined),
             },
             Value::Generator(_) => match name {
@@ -4858,7 +6272,7 @@ fn extract_object_fields(
         } else if let Some(nested) = &field.nested {
             consumed.push(field.key.clone());
             let child = field_of(value, &field.key, heap);
-            extract_object_fields(nested, &child, out, heap);
+            extract_pattern(nested, &child, out, heap);
         } else {
             consumed.push(field.key.clone());
             out.push(field_of(value, &field.key, heap));
@@ -4869,6 +6283,28 @@ fn extract_object_fields(
 /// JS `ToInt32`: truncate, take modulo 2^32, then interpret as a signed 32-bit
 /// integer. A plain `f64 as i32` cast in Rust *saturates* at i32::MIN/MAX, which
 /// is wrong for operands >= 2^31 (e.g. `4294967296 | 0` must be 0, not i32::MAX).
+/// True if `name` is one of the built-in Error constructor names.
+fn is_error_ctor_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Error"
+            | "TypeError"
+            | "RangeError"
+            | "SyntaxError"
+            | "ReferenceError"
+            | "AggregateError"
+    )
+}
+
+/// True if the object at `h` has been `Object.freeze`d (carries the internal
+/// `__frozen__` brand). Frozen objects reject property/index writes and deletes.
+fn is_frozen_object(h: Handle, heap: &Heap) -> bool {
+    matches!(
+        heap.object(h).and_then(|m| m.get("__frozen__")),
+        Some(Value::Bool(true))
+    )
+}
+
 fn js_to_int32(n: f64) -> i32 {
     if !n.is_finite() || n == 0.0 {
         return 0;

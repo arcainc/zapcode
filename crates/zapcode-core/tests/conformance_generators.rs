@@ -9,31 +9,29 @@
 //!   * `.return(v)` early termination (standalone + mid-`for...of`)
 //!   * consuming via `for...of` (totals, accumulation, nesting, early `break`,
 //!     `return`-stops-iteration, re-iterating an exhausted generator)
-//!   * `yield*` delegation to an ARRAY (flattens), and the delegate's
-//!     completion value via `const r = yield* arr`
+//!   * `yield*` delegation that FLATTENS the delegate: arrays, strings (by
+//!     char), Sets/Maps, and nested GENERATORS; plus the delegate's completion
+//!     value via `const r = yield* arr`
+//!   * spread (`[...gen()]`) and array-destructuring (`const [a,b]=gen()`) of a
+//!     generator, which consume its iterator
+//!   * a plain object exposing a custom `[Symbol.iterator]()` is iterable by
+//!     `for...of`, spread, and destructuring (the well-known-symbol iterator
+//!     protocol is dispatched)
 //!   * lazy / on-demand evaluation (side effects only fire as far as consumed)
 //!   * returning values from a generator body (surfaced on the final result)
 //!   * independent, isolated generator instances
 //!   * infinite generators with a bounded "take"
 //!   * generators as object-literal methods and free function values
 //!
-//! Several behaviors are KNOWN, DOCUMENTED divergences from real JS (see
-//! `STRESS-PASS-BUGS.md`). Those are pinned to zapcode's ACTUAL behavior, each
-//! with a comment stating the real-JS answer, so the suite stays GREEN without
-//! asserting something false:
-//!   * `yield*` delegating to another GENERATOR does not flatten (yields the
-//!     generator object → `[object Generator]`). JS: it flattens.
-//!   * `yield*` over an EMPTY ARRAY yields one stray `undefined`. JS: nothing.
-//!   * `yield*` over a STRING yields the whole string as one value (JS: chars).
-//!   * `yield*` over a Set / Map does not iterate the collection's elements.
+//! A few residual behaviors remain KNOWN, DOCUMENTED divergences from real JS.
+//! They are pinned to zapcode's ACTUAL behavior, each with a comment stating the
+//! real-JS answer, so the suite stays GREEN without asserting something false:
 //!   * a generator's `.throw(...)` method does not exist.
 //!   * `it[Symbol.iterator]()` (generator self-iterability via the well-known
-//!     symbol) is not dispatched.
-//!   * `[...gen()]` spread and array-destructuring of a generator are not
-//!     supported.
+//!     symbol) is not dispatched — `it[Symbol.iterator]` reads as undefined, so
+//!     calling it errors. (`for...of`/spread/destructure over a generator work.)
 //!   * a class method declared `*method(){}` does not compile its body as a
 //!     generator (object-literal `*m(){}` does).
-//!   * a plain object exposing a custom `[Symbol.iterator]` is not `for...of`-able.
 
 use zapcode_core::vm::VmState;
 use zapcode_core::{ResourceLimits, ZapcodeRun};
@@ -459,17 +457,16 @@ fn yield_star_multiple_delegations() {
 }
 
 #[test]
-fn yield_star_over_string_yields_whole_string_divergence() {
-    // DIVERGENCE (documented-style): `yield* 'abc'` yields the WHOLE string as a
-    // single value rather than iterating it character-by-character. Asserting
-    // actual behavior; JS would yield 'a','b','c' (three values).
+fn yield_star_over_string_yields_each_char() {
+    // `yield* 'abc'` delegates to the string's iterator, yielding each character
+    // individually (three values), matching JS.
     assert_eq!(
         run_str("function* g(){ yield* 'abc'; } const it=g(); let c=0; let r=it.next(); while(!r.done){ c++; r=it.next(); } c"),
-        "1" // JS: 3
+        "3"
     );
     assert_eq!(
         run_str("function* g(){ yield* 'abc'; } g().next().value"),
-        "abc" // JS: "a"
+        "a"
     );
 }
 
@@ -624,14 +621,17 @@ fn try_catch_inside_generator_continues_iteration() {
 // ============================================================================
 
 #[test]
-fn yield_star_over_generator_documented_divergence() {
-    // DIVERGENCE (documented): `yield*` delegating to another GENERATOR does not
-    // flatten — the delegate generator object is yielded as a single value
-    // (rendering "[object Generator]"). `yield*` over an ARRAY/STRING works.
-    // Asserting actual behavior. JS would give "0,1,2,3".
+fn yield_star_over_generator_flattens() {
+    // `yield*` delegating to another GENERATOR iterates the inner generator and
+    // re-yields each of its values, flattening into the outer sequence (JS).
     assert_eq!(
         run_str("function* inner(){ yield 1; yield 2; } function* outer(){ yield 0; yield* inner(); yield 3; } let o=[]; for(const x of outer()) o.push(String(x)); o.join(',')"),
-        "0,[object Generator],3"
+        "0,1,2,3"
+    );
+    // Nested delegation chains through multiple generators.
+    assert_eq!(
+        run_str("function* a(){ yield 1; yield* b(); yield 4; } function* b(){ yield 2; yield 3; } let o=[]; for(const x of a()) o.push(x); o.join(',')"),
+        "1,2,3,4"
     );
 }
 
@@ -646,24 +646,25 @@ fn manual_drive_of_inner_generator_is_the_workaround() {
 }
 
 #[test]
-fn yield_star_over_empty_array_yields_stray_undefined_divergence() {
-    // DIVERGENCE (documented-style): `yield* []` yields a single `undefined`
-    // instead of yielding nothing. Asserting actual behavior; JS would give
-    // exactly "0,1" (two values).
+fn yield_star_over_empty_array_yields_nothing() {
+    // `yield* []` delegates to an empty iterator and yields nothing, so only the
+    // two surrounding `yield`s produce values (JS).
     assert_eq!(
         run_str("function* g(){ yield 0; yield* []; yield 1; } const it=g(); let c=0; let r=it.next(); while(!r.done){ c++; r=it.next(); } c"),
-        "3" // JS: 2
+        "2"
     );
 }
 
 #[test]
-fn yield_star_over_set_does_not_iterate_elements_divergence() {
-    // DIVERGENCE (documented): `yield*` over a Set does not iterate the set's
-    // elements (the Set is not recognized as an iterable by the delegation
-    // path). Asserting actual behavior; JS would yield 1,2,3.
+fn yield_star_over_set_iterates_elements() {
+    // `yield*` over a Set delegates to its iterator, yielding each element (JS).
     assert_eq!(
         run_str("function* g(){ yield* new Set([1,2,3]); } g().next().value"),
-        "[object Object]"
+        "1"
+    );
+    assert_eq!(
+        run_str("function* g(){ yield* new Set([1,2,3]); } let o=[]; for(const x of g()) o.push(x); o.join(',')"),
+        "1,2,3"
     );
 }
 
@@ -687,17 +688,21 @@ fn generator_symbol_iterator_self_reference_unsupported_divergence() {
 }
 
 #[test]
-fn spread_and_destructure_of_generator_documented_divergence() {
-    // DIVERGENCE (documented): spread `[...gen()]` and array-destructuring of a
-    // generator are not supported. Use `for...of` or `.next()`.
-    assert!(
-        run_or_err("function* g(){ yield 1; yield 2; } [...g()].join(',')").starts_with("ERR:"),
-        "expected spread of a generator to error"
+fn spread_and_destructure_of_generator_consume_it() {
+    // Spread `[...gen()]` consumes the generator, collecting all yielded values.
+    assert_eq!(
+        run_str("function* g(){ yield 1; yield 2; } [...g()].join(',')"),
+        "1,2"
     );
-    // array-destructuring binds undefined rather than pulling from the iterator
+    // Array-destructuring pulls positionally from the generator's iterator.
     assert_eq!(
         run_str("function* g(){ yield 1; yield 2; } const [a,b]=g(); `${String(a)},${String(b)}`"),
-        "undefined,undefined" // JS: "1,2"
+        "1,2"
+    );
+    // A rest element collects the remaining yielded values.
+    assert_eq!(
+        run_str("function* g(){ yield 1; yield 2; yield 3; } const [a,...rest]=g(); `${a}:${rest.join(',')}`"),
+        "1:2,3"
     );
 }
 
@@ -715,12 +720,28 @@ fn class_generator_method_does_not_compile_as_generator_divergence() {
 }
 
 #[test]
-fn custom_symbol_iterator_object_documented_divergence() {
-    // DIVERGENCE (documented): a plain object exposing a custom `[Symbol.iterator]`
-    // is not recognized as iterable by `for...of` (the well-known-symbol iterator
-    // protocol is not dispatched). Arrays/strings/generators iterate fine.
-    let out = run_or_err(
-        "const obj={ [Symbol.iterator](){ let i=0; return { next(){ return i<2 ? {value:i++,done:false} : {value:undefined,done:true}; } }; } }; let o=[]; for(const x of obj) o.push(x); o.join(',')",
+fn custom_symbol_iterator_object_is_iterable() {
+    // A plain object exposing a custom `[Symbol.iterator]()` is iterable: the
+    // well-known-symbol iterator protocol is dispatched by `for...of`, spread,
+    // and array-destructuring.
+    assert_eq!(
+        run_str(
+            "const obj={ [Symbol.iterator](){ let i=0; return { next(){ return i<2 ? {value:i++,done:false} : {value:undefined,done:true}; } }; } }; let o=[]; for(const x of obj) o.push(x); o.join(',')",
+        ),
+        "0,1"
     );
-    assert!(out.starts_with("ERR:"), "expected custom Symbol.iterator object to be non-iterable, got {out}");
+    // spread
+    assert_eq!(
+        run_str(
+            "const obj={ [Symbol.iterator](){ let i=0; return { next(){ return i<3 ? {value:i++,done:false} : {value:undefined,done:true}; } }; } }; [...obj].join(',')",
+        ),
+        "0,1,2"
+    );
+    // array-destructuring
+    assert_eq!(
+        run_str(
+            "const obj={ [Symbol.iterator](){ let i=10; return { next(){ return i<13 ? {value:i++,done:false} : {value:undefined,done:true}; } }; } }; const [a,b]=obj; `${a},${b}`",
+        ),
+        "10,11"
+    );
 }

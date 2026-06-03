@@ -152,11 +152,9 @@ fn replace_with_string_replacement() {
 }
 
 #[test]
-fn replace_with_function_replacer_documented_divergence() {
-    // DIVERGENCE (documented): a FUNCTION replacer is not invoked — the function
-    // value is coerced to the string "function" and inserted literally. Only
-    // string replacements (with $-substitutions) are supported. Asserting actual.
-    assert_eq!(run_str("'a1b2'.replace(/\\d/g, m => '[' + m + ']')"), "afunctionbfunction"); // JS: a[1]b[2]
+fn replace_with_function_replacer() {
+    // A FUNCTION replacer is invoked per match; its return value is substituted.
+    assert_eq!(run_str("'a1b2'.replace(/\\d/g, m => '[' + m + ']')"), "a[1]b[2]");
 }
 
 // ----------------------------------------------------------------------------
@@ -198,7 +196,12 @@ fn regex_test_and_exec() {
     assert_eq!(run_str("/\\d/.test('abc123')"), "true");
     assert_eq!(run_str("/\\d/.test('abc')"), "false");
     assert_eq!(run_str("/^a.*z$/.test('abcz')"), "true");
-    assert_eq!(run_str("JSON.stringify(/(\\w)(\\d)/.exec('a1').slice(0, 3))"), "[\"a1\",\"a\",\"1\"]");
+    // The `exec` result is an array-LIKE object (carries `.index`/`.input`/`.groups`),
+    // so read capture groups by index rather than via array `.slice`.
+    assert_eq!(
+        run_str("const m=/(\\w)(\\d)/.exec('a1'); JSON.stringify([m[0], m[1], m[2]])"),
+        "[\"a1\",\"a\",\"1\"]"
+    );
     assert_eq!(run_str("String(/\\d/.exec('abc'))"), "null");
 }
 

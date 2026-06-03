@@ -346,15 +346,11 @@ fn regex_literal_flags_property() {
     assert_eq!(run_str("/abc/i.flags"), "i");
     assert_eq!(run_str("/abc/m.flags"), "m");
     assert_eq!(run_str("/abc/.flags"), ""); // no flags
-    // NOTE: this interpreter does not expose `.source`, `.global`, `.ignoreCase`,
-    // or `.multiline` accessor properties; bound to a variable they read back
-    // `undefined` (V8 would give the source string / booleans). Documented
-    // residual — pinned to the actual undefined value (via-variable form, which
-    // resolves cleanly) so a future addition is a deliberate change:
-    assert_eq!(run_str("let r = /abc/; String(r.source)"), "undefined");
-    assert_eq!(run_str("let r = /abc/g; String(r.global)"), "undefined");
-    assert_eq!(run_str("let r = /abc/i; String(r.ignoreCase)"), "undefined");
-    assert_eq!(run_str("let r = /abc/m; String(r.multiline)"), "undefined");
+    // Regex accessor properties derived from source/flags now resolve like V8.
+    assert_eq!(run_str("let r = /abc/; String(r.source)"), "abc");
+    assert_eq!(run_str("let r = /abc/g; String(r.global)"), "true");
+    assert_eq!(run_str("let r = /abc/i; String(r.ignoreCase)"), "true");
+    assert_eq!(run_str("let r = /abc/m; String(r.multiline)"), "true");
 }
 
 #[test]

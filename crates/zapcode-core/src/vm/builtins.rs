@@ -8,6 +8,15 @@ use crate::heap::{Handle, Heap};
 use crate::sandbox::ResourceLimits;
 use crate::value::{Value, MAX_RENDER_DEPTH};
 
+/// Stable string property key used to stand in for the well-known
+/// `Symbol.iterator`. This crate has no symbol-keyed storage, so `Symbol.iterator`
+/// resolves to this sentinel string; a computed key `{ [Symbol.iterator]() {} }`
+/// stores its method under this key, and the iteration protocol reads it back.
+/// The `__`-prefix follows the crate's internal-key convention so the synthetic
+/// key is hidden from `Object.keys`/`for-in`/`JSON.stringify`/`getOwnPropertyNames`
+/// (real `Symbol.iterator` is a non-enumerable symbol, not an own string key).
+pub const SYMBOL_ITERATOR_KEY: &str = "__@@iterator";
+
 /// Register built-in global objects and functions, allocating their backing
 /// objects in `heap`.
 pub fn register_globals(globals: &mut HashMap<String, Value>, heap: &mut Heap) {
@@ -22,6 +31,7 @@ pub fn register_globals(globals: &mut HashMap<String, Value>, heap: &mut Heap) {
     globals.insert("Promise".to_string(), Value::Object(empty));
     globals.insert("Map".to_string(), builtin_constructor("Map", heap));
     globals.insert("Set".to_string(), builtin_constructor("Set", heap));
+    globals.insert("RegExp".to_string(), builtin_constructor("RegExp", heap));
     globals.insert("Date".to_string(), {
         let mut d = IndexMap::new();
         d.insert(
@@ -103,6 +113,17 @@ fn builtin_constructor(name: &str, heap: &mut Heap) -> Value {
 fn global_fn(name: &str, heap: &mut Heap) -> Value {
     let mut obj = IndexMap::new();
     obj.insert(Arc::from("__global_fn__"), Value::String(Arc::from(name)));
+    if name == "Symbol" {
+        // Well-known `Symbol.iterator`. Real JS exposes a unique symbol; this
+        // crate has no symbol-keyed property storage, so the well-known iterator
+        // resolves to a stable sentinel STRING. A computed key
+        // `{ [Symbol.iterator]() {} }` then stores the method under this string
+        // key, and `for...of`/spread/destructure look it up to run the protocol.
+        obj.insert(
+            Arc::from("iterator"),
+            Value::String(Arc::from(SYMBOL_ITERATOR_KEY)),
+        );
+    }
     if name == "String" {
         for (prop, target) in [
             ("fromCharCode", "String.fromCharCode"),
@@ -449,7 +470,7 @@ fn radix_to_string(n: f64, radix: u32) -> String {
 }
 
 /// Format a number the way the VM's `to_js_string` does (no trailing `.0`).
-fn format_number(n: f64) -> String {
+pub fn format_number(n: f64) -> String {
     if n.is_nan() {
         "NaN".to_string()
     } else if n.is_infinite() {
@@ -701,32 +722,34 @@ fn call_math_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
             Value::Float(y.atan2(x))
         }
         "max" => {
-            if args.is_empty() {
-                Value::Float(f64::NEG_INFINITY)
-            } else {
-                let mut max = arg_num(args, 0);
-                for arg in &args[1..] {
-                    let n = arg.to_number();
-                    if n > max {
-                        max = n;
-                    }
+            // Per spec, ANY NaN argument poisons the result to NaN.
+            let mut max = f64::NEG_INFINITY;
+            for arg in args {
+                let n = arg.to_number();
+                if n.is_nan() {
+                    return Ok(Some(Value::Float(f64::NAN)));
                 }
-                Value::Float(max)
+                // Treat +0 as greater than -0 (Math.max(-0, +0) === +0).
+                if n > max || (n == 0.0 && max == 0.0 && n.is_sign_positive()) {
+                    max = n;
+                }
             }
+            Value::Float(max)
         }
         "min" => {
-            if args.is_empty() {
-                Value::Float(f64::INFINITY)
-            } else {
-                let mut min = arg_num(args, 0);
-                for arg in &args[1..] {
-                    let n = arg.to_number();
-                    if n < min {
-                        min = n;
-                    }
+            // Per spec, ANY NaN argument poisons the result to NaN.
+            let mut min = f64::INFINITY;
+            for arg in args {
+                let n = arg.to_number();
+                if n.is_nan() {
+                    return Ok(Some(Value::Float(f64::NAN)));
                 }
-                Value::Float(min)
+                // Treat -0 as less than +0 (Math.min(-0, +0) === -0).
+                if n < min || (n == 0.0 && min == 0.0 && n.is_sign_negative()) {
+                    min = n;
+                }
             }
+            Value::Float(min)
         }
         "sign" => {
             let n = arg_num(args, 0);
@@ -747,6 +770,27 @@ fn call_math_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
         "sinh" => Value::Float(arg_num(args, 0).sinh()),
         "cosh" => Value::Float(arg_num(args, 0).cosh()),
         "tanh" => Value::Float(arg_num(args, 0).tanh()),
+        // Inverse hyperbolics (asinh/acosh/atanh).
+        "asinh" => Value::Float(arg_num(args, 0).asinh()),
+        "acosh" => Value::Float(arg_num(args, 0).acosh()),
+        "atanh" => Value::Float(arg_num(args, 0).atanh()),
+        // Math.clz32: count leading zeros of the ToUint32 of the argument.
+        "clz32" => {
+            let n = arg_num(args, 0);
+            let u = to_uint32(n);
+            Value::Float(u.leading_zeros() as f64)
+        }
+        // Math.fround: round to the nearest 32-bit float.
+        "fround" => {
+            let n = arg_num(args, 0);
+            Value::Float(n as f32 as f64)
+        }
+        // Math.imul: 32-bit integer multiplication (wrapping), result as i32.
+        "imul" => {
+            let a = to_int32(arg_num(args, 0));
+            let b = to_int32(arg_num(args, 1));
+            Value::Float(a.wrapping_mul(b) as f64)
+        }
         "random" => {
             // Math.random is served by the VM's seeded PRNG (see Vm::next_random)
             // so the sequence is deterministic across replay yet varied. This
@@ -812,7 +856,7 @@ fn call_json_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<Opt
 
 /// JSON-escape a string, including control characters (`\n`, `\t`, …) which
 /// must not appear raw in valid JSON.
-fn json_escape_string(s: &str) -> String {
+pub fn json_escape_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
@@ -931,7 +975,7 @@ fn serialize_json(
     }
 }
 
-fn join_json_array(items: &[String], indent: Option<&str>, depth: usize) -> String {
+pub fn join_json_array(items: &[String], indent: Option<&str>, depth: usize) -> String {
     if items.is_empty() {
         return "[]".to_string();
     }
@@ -950,7 +994,7 @@ fn join_json_array(items: &[String], indent: Option<&str>, depth: usize) -> Stri
     }
 }
 
-fn join_json_object(pairs: &[(String, String)], indent: Option<&str>, depth: usize) -> String {
+pub fn join_json_object(pairs: &[(String, String)], indent: Option<&str>, depth: usize) -> String {
     if pairs.is_empty() {
         return "{}".to_string();
     }
@@ -979,7 +1023,7 @@ fn join_json_object(pairs: &[(String, String)], indent: Option<&str>, depth: usi
 /// Maximum nesting depth for JSON parsing to prevent stack overflow.
 const JSON_MAX_DEPTH: usize = 64;
 
-fn json_to_value(s: &str, heap: &mut Heap) -> Result<Value> {
+pub fn json_to_value(s: &str, heap: &mut Heap) -> Result<Value> {
     json_to_value_depth(s, 0, heap)
 }
 
@@ -1142,7 +1186,7 @@ pub fn regexp_parts(v: &Value, heap: &Heap) -> Option<(String, String)> {
 /// Compile a JS-ish regex with the supported flags (i, m, s). The `g` flag is
 /// handled by callers (all matches vs first). Lookaround/backreferences aren't
 /// supported by the linear-time engine and produce a clear error.
-fn compile_regex(pattern: &str, flags: &str) -> Result<regex::Regex> {
+pub fn compile_regex(pattern: &str, flags: &str) -> Result<regex::Regex> {
     regex::RegexBuilder::new(pattern)
         .case_insensitive(flags.contains('i'))
         .multi_line(flags.contains('m'))
@@ -1251,14 +1295,13 @@ pub fn call_regexp_method(
                         };
                         write_last_index(heap, new_char);
                     }
-                    let items: Vec<Value> = caps
-                        .iter()
-                        .map(|c| {
-                            c.map(|m| Value::String(Arc::from(m.as_str())))
-                                .unwrap_or(Value::Undefined)
-                        })
-                        .collect();
-                    Some(Value::Array(heap.alloc_array(items)))
+                    // Return the rich match-result object (same shape as
+                    // `match()`'s non-global result): integer-string keys for the
+                    // capture groups plus `length`, `index`, `input`, and `groups`
+                    // (named captures). `m[0]`, `m[1]`, `m.index`, `m.input`, and
+                    // `m.groups.name` all resolve through object key access.
+                    let subject_arc: Arc<str> = Arc::from(subject.as_str());
+                    Some(alloc_match_result(&re, &caps, &subject_arc, heap))
                 }
                 None => {
                     // No (further) match: reset the cursor and report exhaustion.
@@ -1273,9 +1316,56 @@ pub fn call_regexp_method(
     })
 }
 
+/// Expand JS string-replacement tokens for a *string-search* replace (no capture
+/// groups): `$$` -> `$`, `$&` -> the matched substring, `` $` `` -> the portion
+/// before the match, `$'` -> the portion after the match. A `$n` (digits) and any
+/// other `$x` are left literal, exactly like `String.prototype.replace` with a
+/// plain-string search value (which has no captures to reference).
+fn expand_string_replacement(repl: &str, whole: &str, match_start: usize, match_len: usize) -> String {
+    if !repl.contains('$') {
+        return repl.to_string();
+    }
+    let matched = &whole[match_start..match_start + match_len];
+    let before = &whole[..match_start];
+    let after = &whole[match_start + match_len..];
+    let mut out = String::with_capacity(repl.len());
+    let mut chars = repl.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('$') => {
+                chars.next();
+                out.push('$');
+            }
+            Some('&') => {
+                chars.next();
+                out.push_str(matched);
+            }
+            Some('`') => {
+                chars.next();
+                out.push_str(before);
+            }
+            Some('\'') => {
+                chars.next();
+                out.push_str(after);
+            }
+            // `$n` / `$<name>` and any other `$x`: literal (no captures here).
+            _ => out.push('$'),
+        }
+    }
+    out
+}
+
 /// Translate JS replacement tokens (`$&`, `$1`, `$$`) to the regex crate's
-/// `${0}`/`${1}`/`$` so group substitution works as agents expect.
-fn translate_replacement(repl: &str) -> String {
+/// `${0}`/`${1}`/`$` so group substitution works as agents expect. `group_count`
+/// is the number of capture groups *including* group 0 (i.e. `re.captures_len()`);
+/// a `$n` that references a group `>= group_count` is left literal, matching JS
+/// (`"abc".replace(/b/, "$1")` keeps `$1` because `/b/` has no group 1). To skip
+/// the range check (translate every `$n`), pass `usize::MAX`.
+pub fn translate_replacement(repl: &str, group_count: usize) -> String {
     let mut out = String::new();
     let mut chars = repl.chars().peekable();
     while let Some(c) = chars.next() {
@@ -1314,7 +1404,19 @@ fn translate_replacement(repl: &str) -> String {
                         break;
                     }
                 }
-                out.push_str(&format!("${{{}}}", num));
+                // A group reference past the pattern's groups stays literal (JS).
+                // Emit `$$` (the regex crate's literal-`$` escape) so the crate's
+                // own replacer renders a literal `$n` rather than re-interpreting it.
+                let in_range = num
+                    .parse::<usize>()
+                    .map(|n| n < group_count)
+                    .unwrap_or(false);
+                if in_range {
+                    out.push_str(&format!("${{{}}}", num));
+                } else {
+                    out.push_str("$$");
+                    out.push_str(&num);
+                }
             }
             _ => out.push('$'),
         }
@@ -1439,14 +1541,44 @@ fn call_string_method(
         }
         "lastIndexOf" => {
             let search = arg_str(args, 0, heap);
-            match s.rfind(&*search) {
-                Some(pos) => Value::Int(pos as i64),
-                None => Value::Int(-1),
-            }
+            // Optional fromIndex (in chars): the match must START at or before it.
+            // Default is +Infinity (search the whole string).
+            let total_chars = s.chars().count();
+            let from_char = match args.get(1) {
+                Some(v) if !matches!(v, Value::Undefined) => {
+                    let n = v.to_number();
+                    if n.is_nan() {
+                        total_chars
+                    } else {
+                        (n.max(0.0) as usize).min(total_chars)
+                    }
+                }
+                _ => total_chars,
+            };
+            // Last byte at which a match may begin: the byte offset of char
+            // `from_char` (or end of string).
+            let max_start_byte = s
+                .char_indices()
+                .nth(from_char)
+                .map_or(s.len(), |(i, _)| i);
+            // Find the last match whose start byte is <= max_start_byte.
+            let result = s
+                .match_indices(&*search)
+                .filter(|(byte, _)| *byte <= max_start_byte)
+                .last()
+                .map(|(byte, _)| s[..byte].chars().count() as i64)
+                .unwrap_or(-1);
+            Value::Int(result)
         }
         "includes" => {
             let search = arg_str(args, 0, heap);
-            Value::Bool(s.contains(&*search))
+            // Optional position (in chars): search begins there.
+            let from = match args.get(1) {
+                Some(v) if !matches!(v, Value::Undefined) => v.to_number().max(0.0) as usize,
+                _ => 0,
+            };
+            let byte_start = s.char_indices().nth(from).map_or(s.len(), |(i, _)| i);
+            Value::Bool(s[byte_start..].contains(&*search))
         }
         "startsWith" => {
             let search = arg_str(args, 0, heap);
@@ -1568,6 +1700,12 @@ fn call_string_method(
             if limit == 0 {
                 return Ok(Some(Value::Array(heap.alloc_array(Vec::new()))));
             }
+            // `"abc".split()` (separator omitted/undefined) returns the whole
+            // string as a single element — NOT a per-character split.
+            if matches!(args.first(), None | Some(Value::Undefined)) {
+                let whole = vec![Value::String(s.clone())];
+                return Ok(Some(Value::Array(heap.alloc_array(whole))));
+            }
             if let Some((pat, flags)) = args.first().and_then(|v| regexp_parts(v, heap)) {
                 let re = compile_regex(&pat, &flags)?;
                 // Splice in capture groups between the surrounding pieces, like JS.
@@ -1605,7 +1743,7 @@ fn call_string_method(
         "replace" => {
             if let Some((pat, flags)) = args.first().and_then(|v| regexp_parts(v, heap)) {
                 let re = compile_regex(&pat, &flags)?;
-                let repl = translate_replacement(&arg_str(args, 1, heap));
+                let repl = translate_replacement(&arg_str(args, 1, heap), re.captures_len());
                 let out = if flags.contains('g') {
                     re.replace_all(s, repl.as_str())
                 } else {
@@ -1615,18 +1753,51 @@ fn call_string_method(
             }
             let search = arg_str(args, 0, heap);
             let replacement = arg_str(args, 1, heap);
-            Value::String(Arc::from(s.replacen(&*search, &replacement, 1).as_str()))
+            // Replace the first occurrence, expanding `$`-tokens against the match.
+            match s.find(&*search) {
+                Some(byte) => {
+                    let expanded =
+                        expand_string_replacement(&replacement, s, byte, search.len());
+                    let mut out = String::with_capacity(s.len());
+                    out.push_str(&s[..byte]);
+                    out.push_str(&expanded);
+                    out.push_str(&s[byte + search.len()..]);
+                    Value::String(Arc::from(out.as_str()))
+                }
+                None => Value::String(s.clone()),
+            }
         }
         "replaceAll" => {
             if let Some((pat, flags)) = args.first().and_then(|v| regexp_parts(v, heap)) {
                 let re = compile_regex(&pat, &flags)?;
-                let repl = translate_replacement(&arg_str(args, 1, heap));
+                let repl = translate_replacement(&arg_str(args, 1, heap), re.captures_len());
                 let out = re.replace_all(s, repl.as_str());
                 return Ok(Some(Value::String(Arc::from(out.as_ref()))));
             }
             let search = arg_str(args, 0, heap);
             let replacement = arg_str(args, 1, heap);
-            Value::String(Arc::from(s.replace(&*search, &replacement).as_str()))
+            if search.is_empty() {
+                // Match JS empty-search edge: insert between every char (and ends).
+                // Fall back to the simple replace which already handles this shape.
+                Value::String(Arc::from(s.replace(&*search, &replacement).as_str()))
+            } else {
+                // Replace every non-overlapping occurrence, expanding `$`-tokens
+                // against each match.
+                let mut out = String::with_capacity(s.len());
+                let mut last = 0usize;
+                for (byte, _) in s.match_indices(&*search) {
+                    out.push_str(&s[last..byte]);
+                    out.push_str(&expand_string_replacement(
+                        &replacement,
+                        s,
+                        byte,
+                        search.len(),
+                    ));
+                    last = byte + search.len();
+                }
+                out.push_str(&s[last..]);
+                Value::String(Arc::from(out.as_str()))
+            }
         }
         "match" => {
             if let Some((pat, flags)) = args.first().and_then(|v| regexp_parts(v, heap)) {
@@ -1704,16 +1875,41 @@ fn call_string_method(
         }
         "at" => {
             let idx = arg_int(args, 0);
-            let len = s.len() as i64;
-            let normalized = if idx < 0 {
-                (len + idx).max(0) as usize
+            let len = s.chars().count() as i64;
+            // A negative index counts from the end; an index out of range (either
+            // direction, including too-negative) yields `undefined` — no clamping.
+            let resolved = if idx < 0 { len + idx } else { idx };
+            if resolved < 0 || resolved >= len {
+                Value::Undefined
             } else {
-                idx as usize
-            };
-            match s.chars().nth(normalized) {
-                Some(c) => Value::String(Arc::from(c.to_string().as_str())),
-                None => Value::Undefined,
+                match s.chars().nth(resolved as usize) {
+                    Some(c) => Value::String(Arc::from(c.to_string().as_str())),
+                    None => Value::Undefined,
+                }
             }
+        }
+        "normalize" => {
+            // Unicode normalization (default NFC), per String.prototype.normalize.
+            use unicode_normalization::UnicodeNormalization;
+            let form = args
+                .first()
+                .map(|v| v.to_js_string(heap))
+                .filter(|f| !f.is_empty())
+                .unwrap_or_else(|| "NFC".to_string());
+            let normalized: String = match form.as_str() {
+                "NFC" => s.nfc().collect(),
+                "NFD" => s.nfd().collect(),
+                "NFKC" => s.nfkc().collect(),
+                "NFKD" => s.nfkd().collect(),
+                other => {
+                    // Match JS: an invalid form throws a RangeError.
+                    return Err(ZapcodeError::RangeError(format!(
+                        "The normalization form should be one of NFC, NFD, NFKC, NFKD. Received: {}",
+                        other
+                    )));
+                }
+            };
+            Value::String(Arc::from(normalized.as_str()))
         }
         _ => return Ok(None),
     };
@@ -2026,7 +2222,12 @@ fn call_object_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<O
             let keys: Vec<Value> = match &first {
                 Value::Object(h) => heap
                     .object(*h)
-                    .map(|m| m.keys().map(|k| Value::String(k.clone())).collect())
+                    .map(|m| {
+                        m.keys()
+                            .filter(|k| !k.starts_with("__"))
+                            .map(|k| Value::String(k.clone()))
+                            .collect()
+                    })
                     .unwrap_or_default(),
                 // Object.keys([...]) yields index strings.
                 Value::Array(h) => (0..heap.array(*h).len())
@@ -2040,7 +2241,12 @@ fn call_object_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<O
             let values: Vec<Value> = match &first {
                 Value::Object(h) => heap
                     .object(*h)
-                    .map(|m| m.values().cloned().collect())
+                    .map(|m| {
+                        m.iter()
+                            .filter(|(k, _)| !k.starts_with("__"))
+                            .map(|(_, v)| v.clone())
+                            .collect()
+                    })
                     .unwrap_or_default(),
                 Value::Array(h) => heap.array_vec(*h),
                 _ => Vec::new(),
@@ -2053,6 +2259,7 @@ fn call_object_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<O
                     .object(*h)
                     .map(|m| {
                         m.iter()
+                            .filter(|(k, _)| !k.starts_with("__"))
                             .map(|(k, v)| (Value::String(k.clone()), v.clone()))
                             .collect()
                     })
@@ -2126,11 +2333,129 @@ fn call_object_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<O
             }
             Ok(Some(Value::Object(heap.alloc_object(obj))))
         }
-        "freeze" | "seal" => {
-            // No-op in sandbox — return object as-is
+        "freeze" => {
+            // Mark the object (or array) frozen so subsequent property/index
+            // writes are silently ignored (sloppy mode) and Object.isFrozen
+            // reports true. Returns the same reference.
+            match &first {
+                Value::Object(h) => {
+                    if let Some(map) = heap.object_mut(*h) {
+                        map.insert(Arc::from("__frozen__"), Value::Bool(true));
+                    }
+                }
+                _ => {}
+            }
             Ok(Some(first))
         }
+        "seal" => {
+            // No-op in sandbox — return object as-is (sealing's distinction from
+            // freeze, value-mutability, is not modeled).
+            Ok(Some(first))
+        }
+        "isFrozen" => {
+            let frozen = match &first {
+                Value::Object(h) => matches!(
+                    heap.object(*h).and_then(|m| m.get("__frozen__")),
+                    Some(Value::Bool(true))
+                ),
+                // Primitives are considered frozen in JS.
+                Value::Undefined | Value::Null | Value::Bool(_) | Value::Int(_)
+                | Value::Float(_) | Value::String(_) => true,
+                _ => false,
+            };
+            Ok(Some(Value::Bool(frozen)))
+        }
+        "is" => {
+            // SameValue: like ===, but NaN is equal to NaN and +0 !== -0.
+            let a = args.first().cloned().unwrap_or(Value::Undefined);
+            let b = args.get(1).cloned().unwrap_or(Value::Undefined);
+            Ok(Some(Value::Bool(same_value(&a, &b))))
+        }
+        "create" => {
+            // Minimal: create a fresh object whose own properties come from the
+            // optional second argument's property descriptors. The prototype
+            // argument's chain is not modeled, but `Object.create(null)` /
+            // `Object.create(proto)` both yield a usable plain object.
+            let mut obj = IndexMap::new();
+            if let Some(Value::Object(props_h)) = args.get(1) {
+                let props = heap.object_map(*props_h);
+                for (k, desc) in props {
+                    // Each descriptor is `{ value: ... }` (data) — pull `value`.
+                    let val = match &desc {
+                        Value::Object(dh) => heap
+                            .object(*dh)
+                            .and_then(|m| m.get("value").cloned())
+                            .unwrap_or(Value::Undefined),
+                        other => other.clone(),
+                    };
+                    obj.insert(k, val);
+                }
+            }
+            Ok(Some(Value::Object(heap.alloc_object(obj))))
+        }
+        "getPrototypeOf" => {
+            // Prototype chains aren't modeled; for a plain object we report a
+            // stand-in empty object (so `Object.getPrototypeOf({})` is non-null
+            // and usable), and null for null/undefined.
+            match &first {
+                Value::Object(_) | Value::Array(_) => {
+                    Ok(Some(Value::Object(heap.alloc_object(IndexMap::new()))))
+                }
+                _ => Ok(Some(Value::Null)),
+            }
+        }
+        "getOwnPropertyNames" => {
+            // Like Object.keys but conceptually includes non-enumerable names;
+            // internal brand keys (prefixed `__`) are hidden from guest view.
+            let keys: Vec<Value> = match &first {
+                Value::Object(h) => heap
+                    .object(*h)
+                    .map(|m| {
+                        m.keys()
+                            .filter(|k| !k.starts_with("__"))
+                            .map(|k| Value::String(k.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                Value::Array(h) => {
+                    let mut names: Vec<Value> = (0..heap.array(*h).len())
+                        .map(|i| Value::String(Arc::from(i.to_string().as_str())))
+                        .collect();
+                    names.push(Value::String(Arc::from("length")));
+                    names
+                }
+                _ => Vec::new(),
+            };
+            Ok(Some(Value::Array(heap.alloc_array(keys))))
+        }
         _ => Ok(None),
+    }
+}
+
+/// JS `SameValue` (the algorithm behind `Object.is`): strict equality except
+/// `NaN` is the same as `NaN`, and `+0` is distinct from `-0`.
+fn same_value(a: &Value, b: &Value) -> bool {
+    let an = numeric(a);
+    let bn = numeric(b);
+    if let (Some(x), Some(y)) = (an, bn) {
+        if x.is_nan() && y.is_nan() {
+            return true;
+        }
+        if x == 0.0 && y == 0.0 {
+            // Distinguish +0 from -0 via sign bit.
+            return x.is_sign_negative() == y.is_sign_negative();
+        }
+        return x == y;
+    }
+    a.strict_eq(b)
+}
+
+/// Extract an `f64` for SameValue numeric handling, or None for non-numbers.
+fn numeric(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(n) => Some(*n as f64),
+        Value::Float(n) => Some(*n),
+        _ => None,
     }
 }
 
@@ -2517,6 +2842,27 @@ pub fn make_rejected_promise(reason: Value, heap: &mut Heap) -> Value {
 
 fn arg_num(args: &[Value], idx: usize) -> f64 {
     args.get(idx).map(|v| v.to_number()).unwrap_or(f64::NAN)
+}
+
+/// JS `ToInt32` — wrap to a signed 32-bit integer (NaN/Infinity -> 0).
+fn to_int32(n: f64) -> i32 {
+    if !n.is_finite() || n == 0.0 {
+        return 0;
+    }
+    let m = n.trunc().rem_euclid(4_294_967_296.0); // [0, 2^32)
+    if m >= 2_147_483_648.0 {
+        (m - 4_294_967_296.0) as i32
+    } else {
+        m as i32
+    }
+}
+
+/// JS `ToUint32` — wrap to an unsigned 32-bit integer (NaN/Infinity -> 0).
+fn to_uint32(n: f64) -> u32 {
+    if !n.is_finite() || n == 0.0 {
+        return 0;
+    }
+    n.trunc().rem_euclid(4_294_967_296.0) as u32
 }
 
 fn arg_int(args: &[Value], idx: usize) -> i64 {

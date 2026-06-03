@@ -558,22 +558,27 @@ fn structured_clone_of_date_keeps_value_and_brand() {
 }
 
 #[test]
-fn structured_clone_internal_shared_ref_documented_divergence() {
-    // DOCUMENTED DIVERGENCE (asserting the interpreter's actual behavior, NOT
-    // real JS): when one handle is reachable by two paths in the source object
-    // (o.a === o.b), real `structuredClone` preserves that aliasing in the clone
-    // (clone.a === clone.b). This interpreter instead deep-copies each path into
-    // an INDEPENDENT node, so the clone's two paths are distinct objects.
-    // (Real JS would be `true` / `42` here.)
-    assert_false("const shared={n:1}; const o={a:shared,b:shared}; const c=structuredClone(o); c.a===c.b");
+fn structured_clone_preserves_internal_shared_refs() {
+    // When one handle is reachable by two paths in the source object
+    // (o.a === o.b), `structuredClone` preserves that aliasing in the clone
+    // (clone.a === clone.b) — matching real JS. The heap-with-handles clone
+    // walks a visited map so a node reached twice is cloned ONCE and both
+    // paths point at the single cloned handle.
+    assert_true("const shared={n:1}; const o={a:shared,b:shared}; const c=structuredClone(o); c.a===c.b");
+    // Mutating through one path is visible through the other (single shared node).
     assert_eq!(
         run_str(
             "const shared={n:1}; const o={a:shared,b:shared}; const c=structuredClone(o); \
              const ca=c.a; ca.n=42; const cb=c.b; cb.n"
         ),
-        "1" // real JS: 42 (clone preserves the alias). Interpreter copies twice.
+        "42" // clone preserves the alias, so the write is seen on both paths.
     );
-    // Sanity: the ORIGINAL still shares the handle (this part matches real JS).
+    // ...but the clone is still independent of the ORIGINAL.
+    assert_true(
+        "const shared={n:1}; const o={a:shared,b:shared}; const c=structuredClone(o); \
+         c.a.n=7; o.a.n===1",
+    );
+    // Sanity: the ORIGINAL still shares the handle.
     assert_true("const shared={n:1}; const o={a:shared,b:shared}; o.a===o.b");
 }
 

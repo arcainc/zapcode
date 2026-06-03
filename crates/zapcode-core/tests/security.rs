@@ -930,11 +930,9 @@ fn test_setinterval_blocked() {
     assert!(result.is_err(), "VULN: setInterval available in sandbox");
 }
 
-/// Object.freeze is not yet implemented — frozen objects can still be mutated.
-/// This is a correctness gap (not a sandbox escape), since Object.freeze cannot
-/// be used to break out of the sandbox.
+/// Object.freeze is now enforcing — writes to a frozen object are silently
+/// ignored (sloppy mode), so the value stays at its frozen state.
 #[test]
-#[ignore = "Object.freeze not yet implemented"]
 fn test_object_freeze_bypass() {
     // Try to modify a frozen object
     let result = eval_ts(
