@@ -745,11 +745,19 @@ fn user_error_subclass_instanceof_self_and_name_message() {
 }
 
 #[test]
-fn divergence_user_error_subclass_not_instanceof_error() {
-    // DIVERGENCE (documented): a user `class X extends Error` does NOT establish
-    // the `instanceof Error` chain (built-in subtypes do). Pinned to actual.
+fn user_error_subclass_is_instanceof_error() {
+    // A user `class X extends Error` establishes the `instanceof Error` chain.
     assert_eq!(
         run_str("class MyErr extends Error {} let e = new MyErr('oops'); e instanceof Error"),
+        "true"
+    );
+    // It's also an instance of its own class, and not an unrelated error type.
+    assert_eq!(
+        run_str("class MyErr extends Error {} let e = new MyErr('oops'); e instanceof MyErr"),
+        "true"
+    );
+    assert_eq!(
+        run_str("class MyErr extends Error {} let e = new MyErr('oops'); e instanceof TypeError"),
         "false"
     );
 }

@@ -3,9 +3,8 @@
 //! Wide coverage of the array iteration/mutation/query surface and object
 //! construction/reflection. Results are stringified with `JSON.stringify` (or a
 //! scalar expression) so the harness's `to_js_string` output is deterministic and
-//! byte-comparable to Node. Two documented gaps are pinned to actual behavior:
-//! `Object.freeze` is non-enforcing here, and `Object.getOwnPropertyNames` is not
-//! provided (`Object.keys` covers the enumerable case).
+//! byte-comparable to Node. `Object.freeze` is enforcing and
+//! `Object.getOwnPropertyNames` is implemented.
 
 use zapcode_core::vm::VmState;
 use zapcode_core::{ResourceLimits, ZapcodeRun};
@@ -216,9 +215,7 @@ fn has_own_property() {
 }
 
 #[test]
-fn object_freeze_is_non_enforcing_documented_divergence() {
-    // DIVERGENCE (documented): `Object.freeze` returns the object but does NOT
-    // actually prevent mutation here (real JS silently ignores the write in
-    // sloppy mode, leaving `a === 1`). Asserting zapcode's actual behavior.
-    assert_eq!(run_str("const o = Object.freeze({a: 1}); o.a = 2; o.a"), "2"); // JS: 1
+fn object_freeze_is_enforcing() {
+    // `Object.freeze` silently ignores the write in sloppy mode, leaving `a === 1`.
+    assert_eq!(run_str("const o = Object.freeze({a: 1}); o.a = 2; o.a"), "1");
 }

@@ -747,6 +747,27 @@ fn call_math_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
         "sinh" => Value::Float(arg_num(args, 0).sinh()),
         "cosh" => Value::Float(arg_num(args, 0).cosh()),
         "tanh" => Value::Float(arg_num(args, 0).tanh()),
+        // Inverse hyperbolics (asinh/acosh/atanh).
+        "asinh" => Value::Float(arg_num(args, 0).asinh()),
+        "acosh" => Value::Float(arg_num(args, 0).acosh()),
+        "atanh" => Value::Float(arg_num(args, 0).atanh()),
+        // Math.clz32: count leading zeros of the ToUint32 of the argument.
+        "clz32" => {
+            let n = arg_num(args, 0);
+            let u = to_uint32(n);
+            Value::Float(u.leading_zeros() as f64)
+        }
+        // Math.fround: round to the nearest 32-bit float.
+        "fround" => {
+            let n = arg_num(args, 0);
+            Value::Float(n as f32 as f64)
+        }
+        // Math.imul: 32-bit integer multiplication (wrapping), result as i32.
+        "imul" => {
+            let a = to_int32(arg_num(args, 0));
+            let b = to_int32(arg_num(args, 1));
+            Value::Float(a.wrapping_mul(b) as f64)
+        }
         "random" => {
             // Math.random is served by the VM's seeded PRNG (see Vm::next_random)
             // so the sequence is deterministic across replay yet varied. This
@@ -1666,6 +1687,29 @@ fn call_string_method(
                 None => Value::Undefined,
             }
         }
+        "normalize" => {
+            // Unicode normalization (default NFC), per String.prototype.normalize.
+            use unicode_normalization::UnicodeNormalization;
+            let form = args
+                .first()
+                .map(|v| v.to_js_string(heap))
+                .filter(|f| !f.is_empty())
+                .unwrap_or_else(|| "NFC".to_string());
+            let normalized: String = match form.as_str() {
+                "NFC" => s.nfc().collect(),
+                "NFD" => s.nfd().collect(),
+                "NFKC" => s.nfkc().collect(),
+                "NFKD" => s.nfkd().collect(),
+                other => {
+                    // Match JS: an invalid form throws a RangeError.
+                    return Err(ZapcodeError::RangeError(format!(
+                        "The normalization form should be one of NFC, NFD, NFKC, NFKD. Received: {}",
+                        other
+                    )));
+                }
+            };
+            Value::String(Arc::from(normalized.as_str()))
+        }
         _ => return Ok(None),
     };
     Ok(Some(result))
@@ -1958,7 +2002,12 @@ fn call_object_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<O
             let keys: Vec<Value> = match &first {
                 Value::Object(h) => heap
                     .object(*h)
-                    .map(|m| m.keys().map(|k| Value::String(k.clone())).collect())
+                    .map(|m| {
+                        m.keys()
+                            .filter(|k| !k.starts_with("__"))
+                            .map(|k| Value::String(k.clone()))
+                            .collect()
+                    })
                     .unwrap_or_default(),
                 // Object.keys([...]) yields index strings.
                 Value::Array(h) => (0..heap.array(*h).len())
@@ -1972,7 +2021,12 @@ fn call_object_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<O
             let values: Vec<Value> = match &first {
                 Value::Object(h) => heap
                     .object(*h)
-                    .map(|m| m.values().cloned().collect())
+                    .map(|m| {
+                        m.iter()
+                            .filter(|(k, _)| !k.starts_with("__"))
+                            .map(|(_, v)| v.clone())
+                            .collect()
+                    })
                     .unwrap_or_default(),
                 Value::Array(h) => heap.array_vec(*h),
                 _ => Vec::new(),
@@ -1985,6 +2039,7 @@ fn call_object_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<O
                     .object(*h)
                     .map(|m| {
                         m.iter()
+                            .filter(|(k, _)| !k.starts_with("__"))
                             .map(|(k, v)| (Value::String(k.clone()), v.clone()))
                             .collect()
                     })
@@ -2058,11 +2113,129 @@ fn call_object_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<O
             }
             Ok(Some(Value::Object(heap.alloc_object(obj))))
         }
-        "freeze" | "seal" => {
-            // No-op in sandbox — return object as-is
+        "freeze" => {
+            // Mark the object (or array) frozen so subsequent property/index
+            // writes are silently ignored (sloppy mode) and Object.isFrozen
+            // reports true. Returns the same reference.
+            match &first {
+                Value::Object(h) => {
+                    if let Some(map) = heap.object_mut(*h) {
+                        map.insert(Arc::from("__frozen__"), Value::Bool(true));
+                    }
+                }
+                _ => {}
+            }
             Ok(Some(first))
         }
+        "seal" => {
+            // No-op in sandbox — return object as-is (sealing's distinction from
+            // freeze, value-mutability, is not modeled).
+            Ok(Some(first))
+        }
+        "isFrozen" => {
+            let frozen = match &first {
+                Value::Object(h) => matches!(
+                    heap.object(*h).and_then(|m| m.get("__frozen__")),
+                    Some(Value::Bool(true))
+                ),
+                // Primitives are considered frozen in JS.
+                Value::Undefined | Value::Null | Value::Bool(_) | Value::Int(_)
+                | Value::Float(_) | Value::String(_) => true,
+                _ => false,
+            };
+            Ok(Some(Value::Bool(frozen)))
+        }
+        "is" => {
+            // SameValue: like ===, but NaN is equal to NaN and +0 !== -0.
+            let a = args.first().cloned().unwrap_or(Value::Undefined);
+            let b = args.get(1).cloned().unwrap_or(Value::Undefined);
+            Ok(Some(Value::Bool(same_value(&a, &b))))
+        }
+        "create" => {
+            // Minimal: create a fresh object whose own properties come from the
+            // optional second argument's property descriptors. The prototype
+            // argument's chain is not modeled, but `Object.create(null)` /
+            // `Object.create(proto)` both yield a usable plain object.
+            let mut obj = IndexMap::new();
+            if let Some(Value::Object(props_h)) = args.get(1) {
+                let props = heap.object_map(*props_h);
+                for (k, desc) in props {
+                    // Each descriptor is `{ value: ... }` (data) — pull `value`.
+                    let val = match &desc {
+                        Value::Object(dh) => heap
+                            .object(*dh)
+                            .and_then(|m| m.get("value").cloned())
+                            .unwrap_or(Value::Undefined),
+                        other => other.clone(),
+                    };
+                    obj.insert(k, val);
+                }
+            }
+            Ok(Some(Value::Object(heap.alloc_object(obj))))
+        }
+        "getPrototypeOf" => {
+            // Prototype chains aren't modeled; for a plain object we report a
+            // stand-in empty object (so `Object.getPrototypeOf({})` is non-null
+            // and usable), and null for null/undefined.
+            match &first {
+                Value::Object(_) | Value::Array(_) => {
+                    Ok(Some(Value::Object(heap.alloc_object(IndexMap::new()))))
+                }
+                _ => Ok(Some(Value::Null)),
+            }
+        }
+        "getOwnPropertyNames" => {
+            // Like Object.keys but conceptually includes non-enumerable names;
+            // internal brand keys (prefixed `__`) are hidden from guest view.
+            let keys: Vec<Value> = match &first {
+                Value::Object(h) => heap
+                    .object(*h)
+                    .map(|m| {
+                        m.keys()
+                            .filter(|k| !k.starts_with("__"))
+                            .map(|k| Value::String(k.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                Value::Array(h) => {
+                    let mut names: Vec<Value> = (0..heap.array(*h).len())
+                        .map(|i| Value::String(Arc::from(i.to_string().as_str())))
+                        .collect();
+                    names.push(Value::String(Arc::from("length")));
+                    names
+                }
+                _ => Vec::new(),
+            };
+            Ok(Some(Value::Array(heap.alloc_array(keys))))
+        }
         _ => Ok(None),
+    }
+}
+
+/// JS `SameValue` (the algorithm behind `Object.is`): strict equality except
+/// `NaN` is the same as `NaN`, and `+0` is distinct from `-0`.
+fn same_value(a: &Value, b: &Value) -> bool {
+    let an = numeric(a);
+    let bn = numeric(b);
+    if let (Some(x), Some(y)) = (an, bn) {
+        if x.is_nan() && y.is_nan() {
+            return true;
+        }
+        if x == 0.0 && y == 0.0 {
+            // Distinguish +0 from -0 via sign bit.
+            return x.is_sign_negative() == y.is_sign_negative();
+        }
+        return x == y;
+    }
+    a.strict_eq(b)
+}
+
+/// Extract an `f64` for SameValue numeric handling, or None for non-numbers.
+fn numeric(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(n) => Some(*n as f64),
+        Value::Float(n) => Some(*n),
+        _ => None,
     }
 }
 
@@ -2409,6 +2582,27 @@ pub fn make_rejected_promise(reason: Value, heap: &mut Heap) -> Value {
 
 fn arg_num(args: &[Value], idx: usize) -> f64 {
     args.get(idx).map(|v| v.to_number()).unwrap_or(f64::NAN)
+}
+
+/// JS `ToInt32` — wrap to a signed 32-bit integer (NaN/Infinity -> 0).
+fn to_int32(n: f64) -> i32 {
+    if !n.is_finite() || n == 0.0 {
+        return 0;
+    }
+    let m = n.trunc().rem_euclid(4_294_967_296.0); // [0, 2^32)
+    if m >= 2_147_483_648.0 {
+        (m - 4_294_967_296.0) as i32
+    } else {
+        m as i32
+    }
+}
+
+/// JS `ToUint32` — wrap to an unsigned 32-bit integer (NaN/Infinity -> 0).
+fn to_uint32(n: f64) -> u32 {
+    if !n.is_finite() || n == 0.0 {
+        return 0;
+    }
+    n.trunc().rem_euclid(4_294_967_296.0) as u32
 }
 
 fn arg_int(args: &[Value], idx: usize) -> i64 {

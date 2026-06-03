@@ -583,6 +583,10 @@ fn value_to_json(value: &Value, heap: &Heap) -> serde_json::Value {
                 .object(*h)
                 .map(|obj| {
                     obj.iter()
+                        // Internal brand keys (`__error__`, `__class__`,
+                        // `__frozen__`, …) are VM bookkeeping, not guest-visible
+                        // properties — never marshal them across the boundary.
+                        .filter(|(k, _)| !k.starts_with("__"))
                         .map(|(k, v)| (k.to_string(), value_to_json(v, heap)))
                         .collect()
                 })

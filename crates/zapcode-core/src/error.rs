@@ -17,6 +17,9 @@ pub enum ZapcodeError {
     #[error("type error: {0}")]
     TypeError(String),
 
+    #[error("range error: {0}")]
+    RangeError(String),
+
     #[error("reference error: {0} is not defined")]
     ReferenceError(String),
 

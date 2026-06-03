@@ -1168,9 +1168,8 @@ await check("BUG-delete: delete operator is not supported (throws unsupported sy
   assert.deepEqual(r.output, ["a"]);
 });
 
-await check("BUG-object-freeze: Object.freeze does not prevent property mutation", async () => {
-  // Frozen objects should silently ignore mutations in non-strict mode.
-  // Zapcode ignores the freeze and allows mutation.
+await check("object-freeze: Object.freeze silently ignores property mutation", async () => {
+  // Frozen objects silently ignore mutations in non-strict mode (now enforced).
   const r = await execute(
     `
     const o = Object.freeze({ a: 1 });
@@ -1179,7 +1178,7 @@ await check("BUG-object-freeze: Object.freeze does not prevent property mutation
     `,
     {}
   );
-  // BUG: returns 99 (mutation succeeded; freeze is a no-op)
+  // The write is ignored, so the frozen value (1) is preserved.
   assert.equal(r.output, 1);
 });
 

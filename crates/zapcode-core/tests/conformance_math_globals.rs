@@ -7,18 +7,13 @@
 //!
 //! Every numeric value below was cross-checked against real `node -e`.
 //!
-//! Two deliberate categories appear here, clearly labelled:
-//!   1. FULLY-IMPLEMENTED `Math` functions/constants — asserted at the JS value.
-//!   2. DOCUMENTED RESIDUALS — methods that report `typeof === "function"` (so a
-//!      feature-detect guard passes) but throw a *catchable* `TypeError`
-//!      ("… is not a function") when actually invoked. These are asserted at
-//!      zapcode's ACTUAL behavior (the guard result and the thrown error name),
-//!      never at the JS answer, with an explicit comment. This is a real and
-//!      stable contract: the guest can `try/catch` it; it is not a host crash.
-//!      Covered: `Math.clz32` / `Math.fround` / `Math.imul` / inverse-hyperbolics
-//!      (`asinh`/`acosh`/`atanh`); `Object.is` / `Object.create` /
-//!      `Object.getPrototypeOf` / `Object.defineProperty` /
-//!      `Object.getOwnPropertyNames`; `String.prototype.normalize`.
+//! `Math.clz32` / `Math.fround` / `Math.imul`, the inverse hyperbolics
+//! (`asinh`/`acosh`/`atanh`), `Object.is` / `Object.create` /
+//! `Object.getPrototypeOf` / `Object.getOwnPropertyNames`, and
+//! `String.prototype.normalize` are now fully implemented and asserted at their
+//! real JS values. `Object.defineProperty` remains a documented residual
+//! (`typeof === "function"` so feature-detect guards pass, but invoking throws a
+//! catchable error) — out of scope for this round.
 //!
 //! Also pins the sandbox contract that `globalThis` / `global` access raises a
 //! sandbox violation (not silently `undefined`).
@@ -90,20 +85,17 @@ fn math_hyperbolic_forward() {
 }
 
 #[test]
-fn math_inverse_hyperbolics_are_documented_residuals() {
-    // DOCUMENTED RESIDUAL: typeof is "function" so a feature-detect guard passes,
-    // but invoking throws a catchable TypeError. Asserted as actual.
+fn math_inverse_hyperbolics() {
     assert_eq!(run_str("typeof Math.asinh"), "function");
     assert_eq!(run_str("typeof Math.acosh"), "function");
     assert_eq!(run_str("typeof Math.atanh"), "function");
-    assert_eq!(
-        run_str("try { Math.asinh(0) } catch (e) { e.name }"),
-        "TypeError"
-    );
-    assert_eq!(
-        run_str("try { Math.acosh(1); 'no' } catch (e) { 'threw:' + (e instanceof TypeError) }"),
-        "threw:true"
-    );
+    // asinh(0) === 0, acosh(1) === 0, atanh(0) === 0.
+    assert_eq!(run_str("Math.asinh(0)"), "0");
+    assert_eq!(run_str("Math.acosh(1)"), "0");
+    assert_eq!(run_str("Math.atanh(0)"), "0");
+    assert_eq!(run_str("Math.asinh(1).toFixed(5)"), "0.88137");
+    assert_eq!(run_str("Math.acosh(2).toFixed(5)"), "1.31696");
+    assert_eq!(run_str("Math.atanh(0.5).toFixed(5)"), "0.54931");
 }
 
 // ============================================================================
@@ -217,26 +209,21 @@ fn math_constant_relationships() {
 // ============================================================================
 
 #[test]
-fn math_clz32_fround_imul_are_documented_residuals() {
-    // Feature-detect guards pass (typeof "function") ...
+fn math_clz32_fround_imul() {
     assert_eq!(run_str("typeof Math.clz32"), "function");
     assert_eq!(run_str("typeof Math.fround"), "function");
     assert_eq!(run_str("typeof Math.imul"), "function");
-    // ... but invoking throws a catchable TypeError. Asserted as actual.
-    assert_eq!(
-        run_str("try { Math.clz32(1); 'no' } catch (e) { e.name }"),
-        "TypeError"
-    );
-    assert_eq!(
-        run_str("try { Math.imul(3, 4); 'no' } catch (e) { e instanceof TypeError ? 'te' : 'other' }"),
-        "te"
-    );
-    // The host surfaces a clean ZapcodeError (a "type error" — not a panic/abort).
-    let err = run_err("Math.fround(1.5)");
-    assert!(
-        format!("{err}").contains("is not a function"),
-        "unexpected error: {err}"
-    );
+    // clz32: leading zeros of the ToUint32 of the argument.
+    assert_eq!(run_str("Math.clz32(1)"), "31");
+    assert_eq!(run_str("Math.clz32(0)"), "32");
+    assert_eq!(run_str("Math.clz32(1000)"), "22");
+    // imul: 32-bit integer multiplication (signed, wrapping).
+    assert_eq!(run_str("Math.imul(3, 4)"), "12");
+    assert_eq!(run_str("Math.imul(-5, 12)"), "-60");
+    assert_eq!(run_str("Math.imul(0xffffffff, 5)"), "-5");
+    // fround: round to the nearest 32-bit float.
+    assert_eq!(run_str("Math.fround(1.5)"), "1.5");
+    assert_eq!(run_str("Math.fround(5.05).toFixed(5)"), "5.05000");
 }
 
 // ============================================================================
@@ -254,26 +241,24 @@ fn object_implemented_statics() {
 }
 
 #[test]
-fn object_reflection_statics_are_documented_residuals() {
-    // typeof reports "function" so guards pass ...
+fn object_reflection_statics() {
     assert_eq!(run_str("typeof Object.is"), "function");
     assert_eq!(run_str("typeof Object.create"), "function");
     assert_eq!(run_str("typeof Object.getPrototypeOf"), "function");
-    assert_eq!(run_str("typeof Object.defineProperty"), "function");
     assert_eq!(run_str("typeof Object.getOwnPropertyNames"), "function");
-    // ... but calling throws a catchable TypeError. Asserted as actual.
-    assert_eq!(
-        run_str("try { Object.is(1, 1); 'no' } catch (e) { e.name }"),
-        "TypeError"
-    );
-    assert_eq!(
-        run_str("try { Object.create(null); 'no' } catch (e) { e instanceof TypeError ? 'te' : 'o' }"),
-        "te"
-    );
-    assert_eq!(
-        run_str("try { Object.getPrototypeOf({}); 'no' } catch (e) { e.name }"),
-        "TypeError"
-    );
+    // Object.is — SameValue: NaN equals NaN; regular values compare like ===.
+    assert_eq!(run_str("String(Object.is(1, 1))"), "true");
+    assert_eq!(run_str("String(Object.is(NaN, NaN))"), "true");
+    assert_eq!(run_str("String(Object.is(1, 2))"), "false");
+    assert_eq!(run_str("String(Object.is('a', 'a'))"), "true");
+    // Object.create yields a usable plain object; the property bag's data
+    // descriptors become own properties.
+    assert_eq!(run_str("typeof Object.create(null)"), "object");
+    assert_eq!(run_str("Object.create({}, { x: { value: 42 } }).x"), "42");
+    // Object.getPrototypeOf returns an object for object/array operands.
+    assert_eq!(run_str("typeof Object.getPrototypeOf({})"), "object");
+    // Object.getOwnPropertyNames lists own (data) property names.
+    assert_eq!(run_str("Object.getOwnPropertyNames({ a: 1, b: 2 }).join(',')"), "a,b");
 }
 
 // ============================================================================
@@ -281,11 +266,19 @@ fn object_reflection_statics_are_documented_residuals() {
 // ============================================================================
 
 #[test]
-fn string_normalize_is_a_documented_residual() {
+fn string_normalize() {
     assert_eq!(run_str("typeof 'x'.normalize"), "function");
+    // Default form is NFC; an already-composed string is unchanged.
+    assert_eq!(run_str("'café'.normalize()"), "café");
+    // A decomposed "e + combining acute" normalizes (NFC) to the single é.
+    assert_eq!(run_str("'cafe\\u0301'.normalize('NFC') === 'café'"), "true");
+    assert_eq!(run_str("String('cafe\\u0301'.normalize('NFC').length)"), "4");
+    // NFD decomposes the composed é into two code units.
+    assert_eq!(run_str("String('café'.normalize('NFD').length)"), "5");
+    // An invalid form throws a RangeError (as in real JS).
     assert_eq!(
-        run_str("try { 'café'.normalize(); 'no' } catch (e) { e.name }"),
-        "TypeError"
+        run_str("try { 'x'.normalize('BOGUS'); 'no' } catch (e) { e.name }"),
+        "RangeError"
     );
 }
 

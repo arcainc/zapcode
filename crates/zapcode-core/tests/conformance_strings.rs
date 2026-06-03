@@ -13,8 +13,9 @@
 //!     value is string-coerced to "function" and inserted literally. Pinned below.
 //!   * A handful of small `replace`/`includes`/`at`/`lastIndexOf` argument-edge
 //!     divergences, each pinned to actual behavior with a `DIVERGENCE` comment.
-//!   * `String.prototype.normalize` and tagged templates (`String.raw\`…\``) are not
-//!     provided — exercised as "unsupported" so a future fix flips a known check.
+//!   * Tagged templates (`String.raw\`…\``) are not provided — exercised as
+//!     "unsupported" so a future fix flips a known check. `String.prototype.normalize`
+//!     is now implemented (NFC/NFD/NFKC/NFKD).
 
 use zapcode_core::vm::VmState;
 use zapcode_core::{ResourceLimits, ZapcodeRun};
@@ -641,13 +642,11 @@ fn template_nesting_and_escapes() {
 // ============================================================================
 
 #[test]
-fn normalize_is_unsupported_residual() {
-    // DIVERGENCE (documented): String.prototype.normalize is not provided; calling
-    // it raises a TypeError instead of returning the (already-NFC) BMP string.
-    assert!(
-        run_err("'abc'.normalize()").contains("normalize"),
-        "expected a normalize TypeError"
-    );
+fn normalize_returns_normalized_string() {
+    // String.prototype.normalize returns the (already-NFC) string unchanged.
+    assert_eq!(run_str("'abc'.normalize()"), "abc");
+    // A decomposed sequence composes under the default NFC form.
+    assert_eq!(run_str("'cafe\\u0301'.normalize('NFC') === 'café'"), "true");
 }
 
 #[test]

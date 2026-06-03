@@ -1194,6 +1194,7 @@ impl Vm {
         }
         let (name, message) = match err {
             ZapcodeError::TypeError(s) => ("TypeError", s.clone()),
+            ZapcodeError::RangeError(s) => ("RangeError", s.clone()),
             ZapcodeError::ReferenceError(s) => {
                 ("ReferenceError", format!("{} is not defined", s))
             }
@@ -3093,10 +3094,14 @@ impl Vm {
                 let value = self.pop()?;
                 match obj_val {
                     Value::Object(h) => {
-                        // Mutate the heap slot in place; the handle is shared so the
-                        // write is visible through every alias (reference semantics).
-                        if let Some(obj) = self.heap.object_mut(h) {
-                            obj.insert(Arc::from(name.as_str()), value);
+                        // A frozen object silently ignores property writes (sloppy
+                        // mode), matching Object.freeze enforcement.
+                        if !is_frozen_object(h, &self.heap) {
+                            // Mutate the heap slot in place; the handle is shared so the
+                            // write is visible through every alias (reference semantics).
+                            if let Some(obj) = self.heap.object_mut(h) {
+                                obj.insert(Arc::from(name.as_str()), value);
+                            }
                         }
                         // Push the (same) object handle back so compile_store can store it.
                         self.push(Value::Object(h))?;
@@ -3226,9 +3231,12 @@ impl Vm {
                         }
                     }
                     Value::Object(h) => {
-                        let key: Arc<str> = Arc::from(index.to_js_string(&self.heap).as_str());
-                        if let Some(map) = self.heap.object_mut(*h) {
-                            map.insert(key, value);
+                        // Frozen objects ignore index writes too.
+                        if !is_frozen_object(*h, &self.heap) {
+                            let key: Arc<str> = Arc::from(index.to_js_string(&self.heap).as_str());
+                            if let Some(map) = self.heap.object_mut(*h) {
+                                map.insert(key, value);
+                            }
                         }
                     }
                     _ => {}
@@ -3253,8 +3261,11 @@ impl Vm {
             Instruction::DeleteProperty(name) => {
                 let obj = self.pop()?;
                 if let Value::Object(h) = &obj {
-                    if let Some(map) = self.heap.object_mut(*h) {
-                        map.shift_remove(name.as_str());
+                    // Frozen objects are non-configurable: delete is a no-op.
+                    if !is_frozen_object(*h, &self.heap) {
+                        if let Some(map) = self.heap.object_mut(*h) {
+                            map.shift_remove(name.as_str());
+                        }
                     }
                 }
                 self.push(obj)?;
@@ -3264,9 +3275,11 @@ impl Vm {
                 let obj = self.pop()?;
                 match &obj {
                     Value::Object(h) => {
-                        let k = key.to_js_string(&self.heap);
-                        if let Some(map) = self.heap.object_mut(*h) {
-                            map.shift_remove(k.as_str());
+                        if !is_frozen_object(*h, &self.heap) {
+                            let k = key.to_js_string(&self.heap);
+                            if let Some(map) = self.heap.object_mut(*h) {
+                                map.shift_remove(k.as_str());
+                            }
                         }
                     }
                     Value::Array(h) => {
@@ -4533,6 +4546,10 @@ impl Vm {
                 // The inheritance chain of class names (self first), so
                 // `instanceof` matches ancestor classes too.
                 let mut chain = vec![Value::String(Arc::from(name.as_str()))];
+                // If the class (transitively) extends a built-in Error, record the
+                // error base name so instances get the `__error__` brand (making
+                // `e instanceof Error` true) and `super(message)` sets `.message`.
+                let mut error_base: Option<Arc<str>> = None;
                 if let Some(Value::Object(sc)) = &super_class {
                     let scm = self.heap.object_map(*sc);
                     match scm.get("__class_chain__") {
@@ -4541,6 +4558,18 @@ impl Vm {
                             if let Some(n) = scm.get("__class_name__") {
                                 chain.push(n.clone());
                             }
+                        }
+                    }
+                    // A built-in Error constructor as the direct super.
+                    if let Some(Value::String(ctor)) = scm.get("__builtin_constructor__") {
+                        if is_error_ctor_name(ctor) {
+                            error_base = Some(ctor.clone());
+                        }
+                    }
+                    // Or a user class that itself extends an Error.
+                    if error_base.is_none() {
+                        if let Some(Value::String(base)) = scm.get("__error_base__") {
+                            error_base = Some(base.clone());
                         }
                     }
                 }
@@ -4561,6 +4590,10 @@ impl Vm {
                 // Store super class reference for super() calls
                 if let Some(sc) = super_class {
                     class_obj.insert(Arc::from("__super__"), sc);
+                }
+                // Record the built-in Error base so instances are branded as errors.
+                if let Some(base) = error_base {
+                    class_obj.insert(Arc::from("__error_base__"), Value::String(base));
                 }
 
                 // Add static methods directly on the class object
@@ -4703,6 +4736,16 @@ impl Vm {
                         if let Some(chain) = class_obj.get("__class_chain__") {
                             instance.insert(Arc::from("__class_chain__"), chain.clone());
                         }
+                        // A subclass of a built-in Error gets the `__error__` brand so
+                        // `e instanceof Error` is true and it stringifies as an error.
+                        // The default `name` is the error base (e.g. "Error"); a
+                        // constructor that assigns `this.name` overrides it.
+                        if let Some(Value::String(base)) = class_obj.get("__error_base__") {
+                            instance.insert(Arc::from("__error__"), Value::Bool(true));
+                            instance
+                                .entry(Arc::from("name"))
+                                .or_insert_with(|| Value::String(base.clone()));
+                        }
 
                         let instance_val = Value::Object(self.heap.alloc_object(instance));
 
@@ -4803,7 +4846,37 @@ impl Vm {
                     self.push_call_frame(&closure, &args, Some(this_val))?;
                     self.last_receiver = None;
                 } else {
-                    // No super constructor found — push undefined
+                    // No user super constructor. If the chain bottoms out at a
+                    // built-in Error, `super(message)` runs the Error constructor:
+                    // set `this.message`/`this.stack` (and a default `name`) on the
+                    // instance, matching real JS. Otherwise it's a no-op.
+                    let error_base = class
+                        .as_deref()
+                        .and_then(|name| self.class_error_base_of(name));
+                    if let (Some(base), Value::Object(inst_h)) = (error_base, &this_val) {
+                        // Only set message when an argument was passed and isn't
+                        // undefined (JS leaves message as the prototype "" otherwise).
+                        let msg = match args.first() {
+                            Some(Value::Undefined) | None => None,
+                            Some(v) => Some(v.to_js_string(&self.heap)),
+                        };
+                        if let Some(map) = self.heap.object_mut(*inst_h) {
+                            let name = match map.get("name") {
+                                Some(Value::String(n)) => n.to_string(),
+                                _ => base.to_string(),
+                            };
+                            if let Some(m) = &msg {
+                                map.insert(Arc::from("message"), Value::String(Arc::from(m.as_str())));
+                            }
+                            let stack_msg = msg.as_deref().unwrap_or("");
+                            let stack = if stack_msg.is_empty() {
+                                name.clone()
+                            } else {
+                                format!("{}: {}", name, stack_msg)
+                            };
+                            map.insert(Arc::from("stack"), Value::String(Arc::from(stack.as_str())));
+                        }
+                    }
                     self.push(Value::Undefined)?;
                 }
             }
@@ -4859,6 +4932,17 @@ impl Vm {
             {
                 Some(*h)
             }
+            _ => None,
+        }
+    }
+
+    /// The built-in Error base name a class (named `name`) transitively extends,
+    /// if any — used so `super(message)` in an Error subclass runs the Error
+    /// constructor (sets `.message`/`.stack`).
+    fn class_error_base_of(&self, name: &str) -> Option<Arc<str>> {
+        let class_h = self.class_handle_by_name(name)?;
+        match self.heap.object(class_h).and_then(|m| m.get("__error_base__")) {
+            Some(Value::String(base)) => Some(base.clone()),
             _ => None,
         }
     }
@@ -5084,6 +5168,28 @@ fn extract_object_fields(
 /// JS `ToInt32`: truncate, take modulo 2^32, then interpret as a signed 32-bit
 /// integer. A plain `f64 as i32` cast in Rust *saturates* at i32::MIN/MAX, which
 /// is wrong for operands >= 2^31 (e.g. `4294967296 | 0` must be 0, not i32::MAX).
+/// True if `name` is one of the built-in Error constructor names.
+fn is_error_ctor_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Error"
+            | "TypeError"
+            | "RangeError"
+            | "SyntaxError"
+            | "ReferenceError"
+            | "AggregateError"
+    )
+}
+
+/// True if the object at `h` has been `Object.freeze`d (carries the internal
+/// `__frozen__` brand). Frozen objects reject property/index writes and deletes.
+fn is_frozen_object(h: Handle, heap: &Heap) -> bool {
+    matches!(
+        heap.object(h).and_then(|m| m.get("__frozen__")),
+        Some(Value::Bool(true))
+    )
+}
+
 fn js_to_int32(n: f64) -> i32 {
     if !n.is_finite() || n == 0.0 {
         return 0;

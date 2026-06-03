@@ -22,14 +22,13 @@
 //!   2. `get x()`/`set x()` are stored as ordinary function-valued properties,
 //!      not accessor descriptors: reading a getter yields the function itself,
 //!      and assigning through a setter just overwrites the property.
-//!   3. `Object.freeze` returns its argument but does NOT prevent mutation,
-//!      addition, or deletion (non-enforcing).
-//!   4. Object-spread of a string or array spreads no own enumerable string
+//!   3. Object-spread of a string or array spreads no own enumerable string
 //!      keys (`{...[1,2]}` and `{...'ab'}` are `{}`); `Object.keys('ab')` is
 //!      `[]`. (zapcode does not expose index keys as own-enumerable on those.)
-//! `Object.create`, `Object.defineProperty`, `Object.getPrototypeOf`,
-//! `Object.getOwnPropertyNames`, and `Object.isFrozen` are not provided and are
-//! intentionally not exercised.
+//! `Object.freeze` is now enforcing (writes/adds/deletes on a frozen object are
+//! silently ignored) and `Object.isFrozen`, `Object.create`,
+//! `Object.getPrototypeOf`, and `Object.getOwnPropertyNames` are implemented.
+//! `Object.defineProperty` is still not provided.
 
 use zapcode_core::vm::VmState;
 use zapcode_core::{ResourceLimits, ZapcodeRun};
@@ -526,8 +525,7 @@ fn has_own_after_delete() {
 }
 
 // ============================================================================
-// 11. Object.freeze (non-enforcing)
-//     DIVERGENCE: returns argument but does not block mutation.
+// 11. Object.freeze (enforcing)
 // ============================================================================
 
 #[test]
@@ -536,26 +534,35 @@ fn freeze_returns_same_object() {
 }
 
 #[test]
-fn freeze_does_not_prevent_write() {
-    // DIVERGENCE: real JS keeps a frozen value at 1; zapcode allows the write.
-    assert_eq!(run_str("const o = Object.freeze({a: 1}); o.a = 9; o.a"), "9");
+fn freeze_prevents_write() {
+    // A frozen object silently ignores property writes (sloppy mode).
+    assert_eq!(run_str("const o = Object.freeze({a: 1}); o.a = 9; o.a"), "1");
 }
 
 #[test]
-fn freeze_does_not_prevent_add_or_delete() {
-    // DIVERGENCE: real JS would ignore both mutations.
+fn freeze_prevents_add_or_delete() {
+    // Adding a new property and deleting an existing one are both ignored.
     assert_eq!(
         run_str("const o = Object.freeze({a: 1}); o.b = 2; JSON.stringify(o)"),
-        "{\"a\":1,\"b\":2}"
+        "{\"a\":1}"
     );
     assert_eq!(
         run_str("const o = Object.freeze({a: 1, b: 2}); delete o.a; JSON.stringify(o)"),
-        "{\"b\":2}"
+        "{\"a\":1,\"b\":2}"
     );
-    // freezing the outer object never affects nested objects in real JS either
+    // Freezing the outer object is shallow: nested objects stay mutable.
     assert_eq!(
         run_str("const o = Object.freeze({a: {b: 1}}); o.a.b = 9; o.a.b"),
         "9"
+    );
+}
+
+#[test]
+fn is_frozen_reports_frozen_state() {
+    assert_eq!(run_str("const o = {a: 1}; String(Object.isFrozen(o))"), "false");
+    assert_eq!(
+        run_str("const o = Object.freeze({a: 1}); String(Object.isFrozen(o))"),
+        "true"
     );
 }
 

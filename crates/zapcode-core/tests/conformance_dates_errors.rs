@@ -150,21 +150,19 @@ fn caught_runtime_error_is_real_error() {
 }
 
 // ----------------------------------------------------------------------------
-// Documented gap: user subclass of Error
+// User subclass of Error
 // ----------------------------------------------------------------------------
 
 #[test]
-fn user_error_subclass_documented_divergence() {
-    // DIVERGENCE (documented): a USER `class X extends Error` does not (a) propagate
-    // `super(message)` to `this.message`, nor (b) establish the `instanceof Error`
-    // prototype chain. Built-in error subtypes (TypeError/RangeError) do both — see
-    // `error_subtypes`. The user-defined `name` field IS set normally. Asserting
-    // actual behavior; for custom errors, set `this.message` explicitly.
+fn user_error_subclass() {
+    // A USER `class X extends Error` now (a) propagates `super(message)` to
+    // `this.message`, and (b) establishes the `instanceof Error` chain — matching
+    // built-in error subtypes (TypeError/RangeError) and real Node.
     assert_eq!(
         run_str("class MyErr extends Error { constructor(m){ super(m); this.name = 'MyErr'; } } let r; try { throw new MyErr('custom'); } catch(e){ r = e.name + ':' + String(e.message) + ':' + (e instanceof Error); } r"),
-        "MyErr:undefined:false" // JS: "MyErr:custom:true"
+        "MyErr:custom:true"
     );
-    // Explicitly assigning the message in the constructor works around the gap.
+    // Explicitly assigning the message in the constructor still works.
     assert_eq!(
         run_str("class MyErr extends Error { constructor(m){ super(m); this.message = m; this.name = 'MyErr'; } } let r; try { throw new MyErr('custom'); } catch(e){ r = e.name + ':' + e.message; } r"),
         "MyErr:custom"
