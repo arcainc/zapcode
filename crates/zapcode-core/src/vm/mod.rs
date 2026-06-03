@@ -3606,7 +3606,7 @@ impl Vm {
                     }
                 }
             }
-            Instruction::CallSuper(arg_count) => {
+            Instruction::CallSuper { arg_count, class } => {
                 let mut args = Vec::with_capacity(arg_count);
                 for _ in 0..arg_count {
                     args.push(self.pop()?);
@@ -3621,39 +3621,21 @@ impl Vm {
                     .find_map(|f| f.this_value.clone())
                     .unwrap_or(Value::Undefined);
 
-                // Find the super class constructor from the class that's being constructed.
-                // We need to look it up from the globals — the class with __super__ key.
-                // The super class info is stored on the class object.
-                // We'll look through globals for the class that has __super__.
-                let mut super_ctor = None;
-                let global_objs: Vec<Handle> = self
-                    .globals
-                    .values()
-                    .filter_map(|v| match v {
-                        Value::Object(h) => Some(*h),
-                        _ => None,
-                    })
-                    .collect();
-                for obj_h in global_objs {
-                    let super_h = self
-                        .heap
-                        .object(obj_h)
-                        .and_then(|m| m.get("__super__"))
-                        .and_then(|v| match v {
-                            Value::Object(sh) => Some(*sh),
-                            _ => None,
-                        });
-                    if let Some(super_h) = super_h {
-                        if let Some(ctor) = self
-                            .heap
-                            .object(super_h)
-                            .and_then(|m| m.get("__constructor__").cloned())
-                        {
-                            super_ctor = Some(ctor);
-                            break;
-                        }
-                    }
-                }
+                // Resolve the super-class constructor. Prefer the lexically-defining
+                // class (`class.__super__`), which is correct even when several
+                // classes share a single ancestor; fall back to the legacy global
+                // scan for any bytecode compiled before the class name was threaded.
+                let super_class_handle = class
+                    .as_deref()
+                    .and_then(|name| self.super_class_handle_of(name))
+                    .or_else(|| self.any_super_class_handle());
+
+                let super_ctor = super_class_handle.and_then(|sh| {
+                    // Walk to the nearest ancestor that actually defines a
+                    // constructor, so chained empty subclasses still forward args.
+                    let parent = self.heap.object(sh)?.clone();
+                    find_class_constructor(&parent, &self.heap)
+                });
 
                 if let Some(Value::Function(closure)) = super_ctor {
                     self.last_receiver_source = None;
@@ -3664,9 +3646,103 @@ impl Vm {
                     self.push(Value::Undefined)?;
                 }
             }
+            Instruction::LoadSuperMethod { class, method } => {
+                // `super.method(...)`: bind the current `this` and push the parent
+                // method so the following `Call` invokes it with this receiver.
+                let this_val = self
+                    .frames
+                    .iter()
+                    .rev()
+                    .find_map(|f| f.this_value.clone())
+                    .unwrap_or(Value::Undefined);
+
+                let m = self.super_prototype_member(&class, &method);
+                match m {
+                    Some(func @ Value::Function(_)) => {
+                        self.last_receiver = Some(this_val);
+                        self.last_receiver_source = None;
+                        self.push(func)?;
+                    }
+                    _ => {
+                        return Err(ZapcodeError::TypeError(format!(
+                            "(intermediate value).{} is not a function",
+                            method
+                        )));
+                    }
+                }
+            }
+            Instruction::LoadSuperProp { class, prop } => {
+                // `super.prop` read — fetch from the super prototype; absent data
+                // properties yield undefined (instance fields live on `this`).
+                let v = self
+                    .super_prototype_member(&class, &prop)
+                    .unwrap_or(Value::Undefined);
+                self.push(v)?;
+            }
         }
 
         Ok(None)
+    }
+
+    /// Resolve the class object stored in globals under `name`, returning its
+    /// heap handle if it's an actual class (has `__class_name__`). Classes are
+    /// bound to globals by their declared name, which is how `super` finds its
+    /// lexically-defining class at runtime.
+    fn class_handle_by_name(&self, name: &str) -> Option<Handle> {
+        match self.globals.get(name) {
+            Some(Value::Object(h))
+                if self
+                    .heap
+                    .object(*h)
+                    .is_some_and(|m| m.contains_key("__class_name__")) =>
+            {
+                Some(*h)
+            }
+            _ => None,
+        }
+    }
+
+    /// The `__super__` class handle of the class named `name`, if any.
+    fn super_class_handle_of(&self, name: &str) -> Option<Handle> {
+        let class_h = self.class_handle_by_name(name)?;
+        match self.heap.object(class_h).and_then(|m| m.get("__super__")) {
+            Some(Value::Object(sh)) => Some(*sh),
+            _ => None,
+        }
+    }
+
+    /// Legacy fallback: the first class in globals that declares a `__super__`.
+    /// Only used for bytecode compiled before the defining-class name was carried
+    /// on `CallSuper`; ambiguous with multiple subclasses but preserves old behavior.
+    fn any_super_class_handle(&self) -> Option<Handle> {
+        let handles: Vec<Handle> = self
+            .globals
+            .values()
+            .filter_map(|v| match v {
+                Value::Object(h) => Some(*h),
+                _ => None,
+            })
+            .collect();
+        handles.into_iter().find_map(|h| {
+            match self.heap.object(h).and_then(|m| m.get("__super__")) {
+                Some(Value::Object(sh)) => Some(*sh),
+                _ => None,
+            }
+        })
+    }
+
+    /// Look up `member` on the super prototype of the class named `class`.
+    /// The super class's `__prototype__` is itself already flattened with its own
+    /// ancestors' methods, so this resolves inherited members through the chain.
+    fn super_prototype_member(&self, class: &str, member: &str) -> Option<Value> {
+        let super_h = self.super_class_handle_of(class)?;
+        let proto_h = match self.heap.object(super_h).and_then(|m| m.get("__prototype__")) {
+            Some(Value::Object(ph)) => *ph,
+            _ => return None,
+        };
+        self.heap
+            .object(proto_h)
+            .and_then(|m| m.get(member).cloned())
     }
 
     fn get_property(&self, obj: &Value, name: &str) -> Result<Value> {

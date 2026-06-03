@@ -58,6 +58,10 @@ struct Compiler {
     /// Function-declaration indices already bound by the scope's hoist pass, so
     /// the in-source-order `FunctionDecl` statement is a no-op for them.
     hoisted_funcs: std::collections::HashSet<usize>,
+    /// The lexically-enclosing class name while compiling a class
+    /// method/constructor body. Lets `super`/`super.m()` resolve against the
+    /// defining class's `__super__` regardless of the runtime receiver's class.
+    current_class: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +89,7 @@ impl Compiler {
             top_level_bindings: HashMap::new(),
             pending_label: None,
             hoisted_funcs: std::collections::HashSet::new(),
+            current_class: None,
         }
     }
 
@@ -103,6 +108,7 @@ impl Compiler {
             top_level_bindings,
             pending_label: None,
             hoisted_funcs: std::collections::HashSet::new(),
+            current_class: None,
         }
     }
 
@@ -202,6 +208,11 @@ impl Compiler {
 
     fn compile_function_def(&mut self, func: &FunctionDef) -> Result<CompiledFunction> {
         let mut func_compiler = Compiler::new(self.external_functions.clone());
+        // Inherit the enclosing class context so `super` inside a method/constructor
+        // body (which compiles into this fresh sub-compiler) resolves to the right
+        // defining class. Nested non-method closures inside a method keep the same
+        // class context, matching JS lexical `super` scoping.
+        func_compiler.current_class = self.current_class.clone();
 
         // Set up parameters as locals
         for param in &func.params {
@@ -1538,6 +1549,22 @@ impl Compiler {
                 if expr_is_optional_chain(expr) {
                     return self.compile_optional_chain(expr);
                 }
+                // `super.prop` (not a call): read from the defining class's super
+                // prototype. Note a *bare* super-method reference (without an
+                // immediate call) loses its `this` binding here; that mirrors plain
+                // method references and is acceptable for C3.
+                if matches!(object.as_ref(), Expr::Ident(n) if n == "super") {
+                    let class = self.current_class.clone().ok_or_else(|| {
+                        ZapcodeError::CompileError(
+                            "'super' keyword unexpected here (outside a class method)".to_string(),
+                        )
+                    })?;
+                    self.emit(Instruction::LoadSuperProp {
+                        class,
+                        prop: property.clone(),
+                    });
+                    return Ok(());
+                }
                 self.compile_expr(object)?;
                 if *optional {
                     self.emit(Instruction::Dup);
@@ -1600,7 +1627,35 @@ impl Compiler {
                         for arg in args {
                             self.compile_expr(arg)?;
                         }
-                        self.emit(Instruction::CallSuper(args.len()));
+                        self.emit(Instruction::CallSuper {
+                            arg_count: args.len(),
+                            class: self.current_class.clone(),
+                        });
+                        return Ok(());
+                    }
+                }
+                // Check if this is a `super.method(...)` call: resolve the parent
+                // method against the defining class's super prototype and call it
+                // with the current `this` bound as receiver.
+                if let Expr::Member {
+                    object, property, ..
+                } = callee.as_ref()
+                {
+                    if matches!(object.as_ref(), Expr::Ident(n) if n == "super") {
+                        let class = self.current_class.clone().ok_or_else(|| {
+                            ZapcodeError::CompileError(
+                                "'super' keyword unexpected here (outside a class method)"
+                                    .to_string(),
+                            )
+                        })?;
+                        self.emit(Instruction::LoadSuperMethod {
+                            class,
+                            method: property.clone(),
+                        });
+                        for arg in args {
+                            self.compile_expr(arg)?;
+                        }
+                        self.emit(Instruction::Call(args.len()));
                         return Ok(());
                     }
                 }
@@ -1790,7 +1845,8 @@ impl Compiler {
     ) -> Result<()> {
         let class_name = name.unwrap_or("AnonymousClass").to_string();
 
-        // Push super class if present
+        // Push super class if present. Resolve the super reference under the OUTER
+        // class context (it names a sibling/ancestor binding, not this class).
         if let Some(sc) = super_class {
             if let Some(idx) = self.resolve_local(sc) {
                 self.emit(Instruction::LoadLocal(idx));
@@ -1798,6 +1854,12 @@ impl Compiler {
                 self.emit(Instruction::LoadGlobal(sc.to_string()));
             }
         }
+
+        // Method/constructor bodies are compiled with this class as the lexical
+        // `super` context; restore the previous context afterwards so nested or
+        // sibling classes don't leak it.
+        let prev_class = self.current_class.take();
+        self.current_class = Some(class_name.clone());
 
         // Push static methods: name, closure pairs
         for sm in static_methods {
@@ -1826,6 +1888,8 @@ impl Compiler {
         } else {
             self.emit(Instruction::Push(Constant::Undefined));
         }
+
+        self.current_class = prev_class;
 
         self.emit(Instruction::CreateClass {
             name: class_name,
