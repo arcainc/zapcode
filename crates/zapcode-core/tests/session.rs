@@ -657,3 +657,54 @@ fn session_array_input_rebases_over_existing_heap() {
         other => panic!("expected completion, got {other:?}"),
     }
 }
+
+#[test]
+fn session_persists_cyclic_closure_registry_without_stack_overflow() {
+    // Under reference semantics, a registry object holding arrow functions whose
+    // captured scope references the registry forms a genuine heap cycle
+    // (registry-object -> function -> captured env -> registry-object). The
+    // snapshot serializability walk must terminate on such cycles instead of
+    // recursing forever and overflowing the stack.
+    let state = session()
+        .run_chunk(
+            r#"
+            const registry = {};
+            function register(name, fn) {
+                registry[name] = fn;
+                return Object.keys(registry).length;
+            }
+            // Each registered arrow captures the enclosing scope, which includes
+            // `registry` itself — a reference cycle through the heap.
+            register("inc", (s) => s + 1);
+            register("dbl", (s) => s * 2);
+            Object.keys(registry).sort().join(",")
+            "#
+            .to_string(),
+            Vec::new(),
+        )
+        .unwrap();
+
+    let session = match state {
+        ZapcodeSessionState::Complete {
+            output, session, ..
+        } => {
+            assert_eq!(output, Value::String("dbl,inc".into()));
+            session
+        }
+        other => panic!("expected completion, got {other:?}"),
+    };
+
+    // The dump must succeed (this is where the unbounded walk used to crash).
+    let dumped = session.dump().unwrap();
+    let restored = ZapcodeSessionSnapshot::load(&dumped).unwrap();
+
+    // The persisted registry still drives its functions after a reload.
+    let state = restored
+        .run_chunk("registry.inc(4) + registry.dbl(5)".to_string(), Vec::new())
+        .unwrap();
+    match state {
+        // 5 (4+1) + 10 (5*2) == 15
+        ZapcodeSessionState::Complete { output, .. } => assert_eq!(output, Value::Int(15)),
+        other => panic!("expected completion, got {other:?}"),
+    }
+}

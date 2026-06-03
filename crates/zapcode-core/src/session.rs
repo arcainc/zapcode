@@ -613,6 +613,19 @@ fn ensure_serializable_globals(
 }
 
 fn ensure_serializable_value(value: &Value, heap: &crate::heap::Heap) -> Result<()> {
+    // Under reference semantics, array/object handles can form cycles (e.g. a
+    // closure that captures the very object holding it, as in a step registry of
+    // arrow functions). Track visited handles so the walk terminates instead of
+    // overflowing the stack.
+    let mut seen: HashSet<crate::heap::Handle> = HashSet::new();
+    ensure_serializable_value_inner(value, heap, &mut seen)
+}
+
+fn ensure_serializable_value_inner(
+    value: &Value,
+    heap: &crate::heap::Heap,
+    seen: &mut HashSet<crate::heap::Handle>,
+) -> Result<()> {
     match value {
         Value::Undefined
         | Value::Null
@@ -621,22 +634,28 @@ fn ensure_serializable_value(value: &Value, heap: &crate::heap::Heap) -> Result<
         | Value::Float(_)
         | Value::String(_) => Ok(()),
         Value::Array(h) => {
+            if !seen.insert(*h) {
+                return Ok(());
+            }
             for item in heap.array(*h) {
-                ensure_serializable_value(item, heap)?;
+                ensure_serializable_value_inner(item, heap, seen)?;
             }
             Ok(())
         }
         Value::Object(h) => {
+            if !seen.insert(*h) {
+                return Ok(());
+            }
             if let Some(map) = heap.object(*h) {
                 for value in map.values() {
-                    ensure_serializable_value(value, heap)?;
+                    ensure_serializable_value_inner(value, heap, seen)?;
                 }
             }
             Ok(())
         }
         Value::Function(closure) => {
             for (_, captured) in &closure.captured {
-                ensure_serializable_value(captured, heap)?;
+                ensure_serializable_value_inner(captured, heap, seen)?;
             }
             Ok(())
         }
