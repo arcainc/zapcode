@@ -237,6 +237,23 @@ pub struct Vm {
     /// value (string, object, …) rather than a stringified error. Transient —
     /// set by `Throw`, consumed by the catch handler; never crosses a suspension.
     pub(crate) pending_throw: Option<Value>,
+    /// Re-entrancy depth of the ToPrimitive machinery. A user `valueOf`/`toString`
+    /// hook can itself trigger another coercion (e.g. by returning/operating on
+    /// another object); this bounds that recursion so a pathological hook can't
+    /// loop forever. Transient — never serialized.
+    pub(crate) to_primitive_depth: u32,
+}
+
+/// The preferred type passed to [`Vm::to_primitive`], mirroring the JS
+/// `ToPrimitive` hint. Determines whether `valueOf` or `toString` is tried first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToPrimitiveHint {
+    /// `Number(x)`, arithmetic, relational comparisons.
+    Number,
+    /// `String(x)`, template literals.
+    String,
+    /// `+` (string-or-number) — same method order as Number per spec.
+    Default,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -305,6 +322,7 @@ impl Vm {
             pending_batch: None,
             rng_state: 0,
             pending_throw: None,
+            to_primitive_depth: 0,
         }
     }
 
@@ -389,6 +407,7 @@ impl Vm {
             pending_batch: None,
             rng_state: 0,
             pending_throw: None,
+            to_primitive_depth: 0,
         }
     }
 
@@ -1308,9 +1327,95 @@ impl Vm {
         }
     }
 
+    /// JS ToPrimitive ([Symbol.toPrimitive] / valueOf / toString) for a heap
+    /// Object that defines a callable hook. Returns the primitive a user hook
+    /// produced, or the original value unchanged when no usable hook exists (so
+    /// the caller's built-in `to_js_string` / `to_number_heap` still applies —
+    /// e.g. a plain `{}` becomes `"[object Object]"` / `NaN`).
+    ///
+    /// Only `Value::Object` carries user hooks; everything else (primitives,
+    /// arrays, functions, dates) is returned as-is so existing coercion behavior
+    /// is untouched. Per spec the method order is valueOf-then-toString for the
+    /// "number"/"default" hints and toString-then-valueOf for the "string" hint;
+    /// a method whose result is itself an object is skipped.
+    ///
+    /// Symbol.toPrimitive is not dispatched: this crate's Symbol support is a
+    /// stub (no well-known symbols, object property keys are strings), so a
+    /// `[Symbol.toPrimitive]` computed key can't be reliably matched. See
+    /// STRESS-PASS-BUGS.md.
+    fn to_primitive(&mut self, value: &Value, hint: ToPrimitiveHint) -> Result<Value> {
+        let handle = match value {
+            Value::Object(h) => *h,
+            // No user hooks on non-objects; let the built-in coercion handle it.
+            _ => return Ok(value.clone()),
+        };
+
+        // Order the method names per the requested hint.
+        let methods: [&str; 2] = match hint {
+            ToPrimitiveHint::String => ["toString", "valueOf"],
+            ToPrimitiveHint::Number | ToPrimitiveHint::Default => ["valueOf", "toString"],
+        };
+
+        // Bound the re-entrancy so a hook that itself coerces objects can't loop
+        // forever (and so a tool-call-suspending hook is caught at a shallow depth).
+        if self.to_primitive_depth >= 200 {
+            return Err(ZapcodeError::RuntimeError(
+                "ToPrimitive recursion limit exceeded (cyclic valueOf/toString?)".to_string(),
+            ));
+        }
+
+        for name in methods {
+            // Read the hook out of the object (clone-out to avoid borrowing the
+            // heap across the guest call). Only an own callable field counts.
+            let hook = match self.heap.object(handle).and_then(|m| m.get(name)) {
+                Some(Value::Function(c)) => Value::Function(c.clone()),
+                _ => continue,
+            };
+
+            self.to_primitive_depth += 1;
+            let called = self.call_method_internal(&hook, value.clone(), Vec::new());
+            self.to_primitive_depth -= 1;
+            let result = called?;
+
+            // A primitive result wins; an object/array result is ignored (try the
+            // next hook), matching OrdinaryToPrimitive.
+            if !matches!(result, Value::Object(_) | Value::Array(_)) {
+                return Ok(result);
+            }
+        }
+
+        // No hook produced a primitive: fall back to the original object so the
+        // caller's built-in coercion runs (plain object -> "[object Object]"/NaN).
+        Ok(value.clone())
+    }
+
+    /// Like [`Self::call_function_internal`] but binds `this` to `receiver`, used
+    /// when invoking a user `valueOf`/`toString` hook so the hook body can read
+    /// `this`.
+    fn call_method_internal(
+        &mut self,
+        callee: &Value,
+        receiver: Value,
+        args: Vec<Value>,
+    ) -> Result<Value> {
+        self.last_receiver_source = None;
+        self.call_closure_internal(callee, args, Some(receiver))
+    }
+
     /// Call a function value with the given arguments and run it to completion.
     /// Returns the function's return value.
     fn call_function_internal(&mut self, callee: &Value, args: Vec<Value>) -> Result<Value> {
+        self.call_closure_internal(callee, args, None)
+    }
+
+    /// Shared body for the internal-call helpers: push a frame (optionally with a
+    /// bound `this`) and run it to completion, returning the result.
+    fn call_closure_internal(
+        &mut self,
+        callee: &Value,
+        args: Vec<Value>,
+        this_value: Option<Value>,
+    ) -> Result<Value> {
         let closure = match callee {
             Value::Function(c) => c.clone(),
             other => {
@@ -1320,7 +1425,7 @@ impl Vm {
         };
 
         let target_frame_depth = self.frames.len();
-        self.push_call_frame(&closure, &args, None)?;
+        self.push_call_frame(&closure, &args, this_value)?;
 
         // Run until the new frame returns
         loop {
@@ -2155,6 +2260,10 @@ impl Vm {
             Instruction::Add => {
                 let right = self.pop()?;
                 let left = self.pop()?;
+                // ToPrimitive(default) both operands so user valueOf/toString
+                // hooks participate before the string-vs-number decision.
+                let left = self.to_primitive(&left, ToPrimitiveHint::Default)?;
+                let right = self.to_primitive(&right, ToPrimitiveHint::Default)?;
                 let result = match (&left, &right) {
                     (Value::Int(a), Value::Int(b)) => match a.checked_add(*b) {
                         Some(r) => Value::Int(r),
@@ -2206,6 +2315,8 @@ impl Vm {
             Instruction::Sub => {
                 let right = self.pop()?;
                 let left = self.pop()?;
+                let left = self.to_primitive(&left, ToPrimitiveHint::Number)?;
+                let right = self.to_primitive(&right, ToPrimitiveHint::Number)?;
                 let result = match (&left, &right) {
                     (Value::Int(a), Value::Int(b)) => match a.checked_sub(*b) {
                         Some(r) => Value::Int(r),
@@ -2220,6 +2331,8 @@ impl Vm {
             Instruction::Mul => {
                 let right = self.pop()?;
                 let left = self.pop()?;
+                let left = self.to_primitive(&left, ToPrimitiveHint::Number)?;
+                let right = self.to_primitive(&right, ToPrimitiveHint::Number)?;
                 let result = match (&left, &right) {
                     (Value::Int(a), Value::Int(b)) => match a.checked_mul(*b) {
                         Some(r) => Value::Int(r),
@@ -2234,6 +2347,8 @@ impl Vm {
             Instruction::Div => {
                 let right = self.pop()?;
                 let left = self.pop()?;
+                let left = self.to_primitive(&left, ToPrimitiveHint::Number)?;
+                let right = self.to_primitive(&right, ToPrimitiveHint::Number)?;
                 let result = Value::Float(
                     left.to_number_heap(&self.heap) / right.to_number_heap(&self.heap),
                 );
@@ -2242,6 +2357,8 @@ impl Vm {
             Instruction::Rem => {
                 let right = self.pop()?;
                 let left = self.pop()?;
+                let left = self.to_primitive(&left, ToPrimitiveHint::Number)?;
+                let right = self.to_primitive(&right, ToPrimitiveHint::Number)?;
                 let result = match (&left, &right) {
                     (Value::Int(a), Value::Int(b)) if *b != 0 => Value::Int(a % b),
                     _ => Value::Float(
@@ -2253,6 +2370,8 @@ impl Vm {
             Instruction::Pow => {
                 let right = self.pop()?;
                 let left = self.pop()?;
+                let left = self.to_primitive(&left, ToPrimitiveHint::Number)?;
+                let right = self.to_primitive(&right, ToPrimitiveHint::Number)?;
                 let result = Value::Float(
                     left.to_number_heap(&self.heap)
                         .powf(right.to_number_heap(&self.heap)),
@@ -2261,6 +2380,7 @@ impl Vm {
             }
             Instruction::Neg => {
                 let val = self.pop()?;
+                let val = self.to_primitive(&val, ToPrimitiveHint::Number)?;
                 let result = match val {
                     Value::Int(n) => Value::Int(-n),
                     _ => Value::Float(-val.to_number_heap(&self.heap)),
@@ -2340,22 +2460,30 @@ impl Vm {
             Instruction::Lt => {
                 let right = self.pop()?;
                 let left = self.pop()?;
+                let left = self.to_primitive(&left, ToPrimitiveHint::Number)?;
+                let right = self.to_primitive(&right, ToPrimitiveHint::Number)?;
                 self.push(Value::Bool(js_less_than(&left, &right, &self.heap)))?;
             }
             Instruction::Lte => {
                 let right = self.pop()?;
                 let left = self.pop()?;
+                let left = self.to_primitive(&left, ToPrimitiveHint::Number)?;
+                let right = self.to_primitive(&right, ToPrimitiveHint::Number)?;
                 // a <= b  <=>  !(b < a), but NaN must make it false either way.
                 self.push(Value::Bool(js_less_than_or_equal(&left, &right, &self.heap)))?;
             }
             Instruction::Gt => {
                 let right = self.pop()?;
                 let left = self.pop()?;
+                let left = self.to_primitive(&left, ToPrimitiveHint::Number)?;
+                let right = self.to_primitive(&right, ToPrimitiveHint::Number)?;
                 self.push(Value::Bool(js_less_than(&right, &left, &self.heap)))?;
             }
             Instruction::Gte => {
                 let right = self.pop()?;
                 let left = self.pop()?;
+                let left = self.to_primitive(&left, ToPrimitiveHint::Number)?;
+                let right = self.to_primitive(&right, ToPrimitiveHint::Number)?;
                 self.push(Value::Bool(js_less_than_or_equal(&right, &left, &self.heap)))?;
             }
 
@@ -3239,6 +3367,23 @@ impl Vm {
                             Some(Value::String(s)) => s.clone(),
                             _ => Arc::from(""),
                         };
+                        // String(x)/Number(x) run ToPrimitive on their argument so
+                        // a user valueOf/toString hook is honored (String -> string
+                        // hint, Number -> number hint).
+                        let mut args = args;
+                        match kind.as_ref() {
+                            "String" => {
+                                if let Some(first) = args.first().cloned() {
+                                    args[0] = self.to_primitive(&first, ToPrimitiveHint::String)?;
+                                }
+                            }
+                            "Number" => {
+                                if let Some(first) = args.first().cloned() {
+                                    args[0] = self.to_primitive(&first, ToPrimitiveHint::Number)?;
+                                }
+                            }
+                            _ => {}
+                        }
                         let value = builtins::call_global_fn(kind.as_ref(), &args, &mut self.heap)?;
                         self.push(value)?;
                     }
@@ -3654,7 +3799,13 @@ impl Vm {
                     parts.push(self.pop()?);
                 }
                 parts.reverse();
-                let result: String = parts.iter().map(|v| v.to_js_string(&self.heap)).collect();
+                // ToPrimitive(string) each interpolated value so a user toString
+                // hook is honored before string coercion.
+                let mut result = String::new();
+                for v in parts {
+                    let prim = self.to_primitive(&v, ToPrimitiveHint::String)?;
+                    result.push_str(&prim.to_js_string(&self.heap));
+                }
                 self.push(Value::String(Arc::from(result.as_str())))?;
             }
 
