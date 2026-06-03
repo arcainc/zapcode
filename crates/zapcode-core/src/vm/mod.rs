@@ -1980,6 +1980,399 @@ impl Vm {
         self.call_function_internal(callback, vec![item.clone(), Value::Int(index as i64)])
     }
 
+    /// `String.prototype.replace` / `replaceAll` with a FUNCTION replacer.
+    /// Invokes the callback per match with `(match, p1, p2, …, offset, string)`
+    /// (named groups appended as a final `groups` object when present) and
+    /// substitutes the callback's string-coerced return value. The pure builtin
+    /// can't reach the guest-closure call path, so this runs at the VM layer.
+    fn string_replace_with_function(
+        &mut self,
+        s: &Arc<str>,
+        method: &str,
+        args: &[Value],
+    ) -> Result<Value> {
+        let replacer = args[1].clone();
+        // Regex search: walk matches (all for /g or replaceAll, else first).
+        if let Some((pat, flags)) = args.first().and_then(|v| builtins::regexp_parts(v, &self.heap))
+        {
+            let re = builtins::compile_regex(&pat, &flags)?;
+            let global = method == "replaceAll" || flags.contains('g');
+            let has_named = re.capture_names().any(|n| n.is_some());
+            // Collect match spans + captured groups up front; the regex borrows
+            // `s`, so we can't hold it across the guest call that needs `&mut self`.
+            struct MatchInfo {
+                start: usize,
+                end: usize,
+                whole: String,
+                groups: Vec<Value>,
+                named: Vec<(String, Value)>,
+            }
+            let mut matches: Vec<MatchInfo> = Vec::new();
+            for caps in re.captures_iter(s) {
+                let m0 = caps.get(0).unwrap();
+                let mut groups = Vec::with_capacity(caps.len().saturating_sub(1));
+                for i in 1..caps.len() {
+                    groups.push(
+                        caps.get(i)
+                            .map(|g| Value::String(Arc::from(g.as_str())))
+                            .unwrap_or(Value::Undefined),
+                    );
+                }
+                let named = if has_named {
+                    re.capture_names()
+                        .flatten()
+                        .map(|name| {
+                            (
+                                name.to_string(),
+                                caps.name(name)
+                                    .map(|g| Value::String(Arc::from(g.as_str())))
+                                    .unwrap_or(Value::Undefined),
+                            )
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                matches.push(MatchInfo {
+                    start: m0.start(),
+                    end: m0.end(),
+                    whole: m0.as_str().to_string(),
+                    groups,
+                    named,
+                });
+                if !global {
+                    break;
+                }
+            }
+            let mut out = String::with_capacity(s.len());
+            let mut last = 0usize;
+            for info in matches {
+                out.push_str(&s[last..info.start]);
+                // offset is the char index of the match start (JS uses code-unit
+                // index; we align with the rest of the codebase on char count).
+                let offset = s[..info.start].chars().count() as i64;
+                let mut call_args: Vec<Value> =
+                    Vec::with_capacity(info.groups.len() + info.named.len() + 3);
+                call_args.push(Value::String(Arc::from(info.whole.as_str())));
+                call_args.extend(info.groups);
+                call_args.push(Value::Int(offset));
+                call_args.push(Value::String(s.clone()));
+                if !info.named.is_empty() {
+                    let mut g: IndexMap<Arc<str>, Value> = IndexMap::new();
+                    for (k, v) in info.named {
+                        g.insert(Arc::from(k.as_str()), v);
+                    }
+                    call_args.push(Value::Object(self.heap.alloc_object(g)));
+                }
+                let result = self.call_function_internal(&replacer, call_args)?;
+                out.push_str(&result.to_js_string(&self.heap));
+                last = info.end;
+            }
+            out.push_str(&s[last..]);
+            return Ok(Value::String(Arc::from(out.as_str())));
+        }
+
+        // String search: `replace` substitutes the first occurrence, `replaceAll`
+        // every occurrence. The callback receives (match, offset, string).
+        let search = args
+            .first()
+            .map(|v| v.to_js_string(&self.heap))
+            .unwrap_or_default();
+        let subject = s.to_string();
+        if search.is_empty() {
+            // Empty search matches at position 0 (and replaceAll between every
+            // char). Keep it simple and JS-correct for the common case: a single
+            // call at offset 0 prepending the result. JS replaceAll('') inserts at
+            // every boundary; that's an edge case we don't expect agents to hit, so
+            // handle only the first-position case to stay predictable.
+            let result =
+                self.call_function_internal(&replacer, vec![
+                    Value::String(Arc::from("")),
+                    Value::Int(0),
+                    Value::String(s.clone()),
+                ])?;
+            let ins = result.to_js_string(&self.heap);
+            return Ok(Value::String(Arc::from(format!("{}{}", ins, subject).as_str())));
+        }
+        let mut out = String::with_capacity(subject.len());
+        let mut search_from = 0usize;
+        let replace_all = method == "replaceAll";
+        loop {
+            match subject[search_from..].find(&search) {
+                Some(rel) => {
+                    let abs = search_from + rel;
+                    out.push_str(&subject[search_from..abs]);
+                    let offset = subject[..abs].chars().count() as i64;
+                    let result = self.call_function_internal(&replacer, vec![
+                        Value::String(Arc::from(search.as_str())),
+                        Value::Int(offset),
+                        Value::String(s.clone()),
+                    ])?;
+                    out.push_str(&result.to_js_string(&self.heap));
+                    search_from = abs + search.len();
+                    if !replace_all {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+        out.push_str(&subject[search_from..]);
+        Ok(Value::String(Arc::from(out.as_str())))
+    }
+
+    /// `JSON.stringify(value, replacer?, space?)`. Honors a user `toJSON()` on
+    /// plain objects and a FUNCTION replacer `(key, value)` (both need the
+    /// guest-closure call path). Array replacers / indent reuse the builtin's
+    /// formatting helpers.
+    fn json_stringify(&mut self, args: &[Value]) -> Result<Value> {
+        let value = args.first().cloned().unwrap_or(Value::Undefined);
+        let replacer_fn = match args.get(1) {
+            Some(Value::Function(_)) => args.get(1).cloned(),
+            _ => None,
+        };
+        // Array replacer (whitelist of keys) — only when not a function.
+        let whitelist: Option<Vec<String>> = if replacer_fn.is_some() {
+            None
+        } else {
+            match args.get(1) {
+                Some(Value::Array(h)) => Some(
+                    self.heap
+                        .array_vec(*h)
+                        .iter()
+                        .filter_map(|v| match v {
+                            Value::String(s) => Some(s.to_string()),
+                            Value::Int(n) => Some(n.to_string()),
+                            _ => None,
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            }
+        };
+        let indent = match args.get(2) {
+            Some(Value::Int(n)) if *n > 0 => Some(" ".repeat((*n).min(10) as usize)),
+            Some(Value::Float(n)) if *n >= 1.0 => Some(" ".repeat((*n as usize).min(10))),
+            Some(Value::String(s)) if !s.is_empty() => Some(s.to_string()),
+            _ => None,
+        };
+        // The replacer is applied at the root with key `""` and the value (JS
+        // SerializeJSONProperty applies it to a synthetic holder `{ "": value }`;
+        // we don't bind `this` since the receiver-writeback machinery would
+        // corrupt the value being serialized — replacers that read `this` are an
+        // accepted gap).
+        let transformed = if let Some(ref f) = replacer_fn {
+            self.call_function_internal(f, vec![
+                Value::String(Arc::from("")),
+                value.clone(),
+            ])?
+        } else {
+            value
+        };
+        match self.serialize_json_dynamic(
+            &transformed,
+            replacer_fn.as_ref(),
+            whitelist.as_deref(),
+            indent.as_deref(),
+            0,
+        )? {
+            Some(s) => Ok(Value::String(Arc::from(s.as_str()))),
+            None => Ok(Value::Undefined),
+        }
+    }
+
+    /// Recursive JSON serializer that honors `toJSON()` hooks and a function
+    /// replacer. Returns `None` for values JSON omits (undefined / functions) so
+    /// callers drop object props / emit `null` in arrays.
+    fn serialize_json_dynamic(
+        &mut self,
+        val: &Value,
+        replacer: Option<&Value>,
+        whitelist: Option<&[String]>,
+        indent: Option<&str>,
+        depth: usize,
+    ) -> Result<Option<String>> {
+        // Honor a `toJSON()` method on objects (plain objects and Date alike). The
+        // hook's return value is serialized in place of the object.
+        let val = if let Value::Object(h) = val {
+            let to_json = self
+                .heap
+                .object(*h)
+                .and_then(|m| m.get("toJSON"))
+                .filter(|v| matches!(v, Value::Function(_)))
+                .cloned();
+            if let Some(f) = to_json {
+                std::borrow::Cow::Owned(self.call_method_internal(&f, val.clone(), vec![])?)
+            } else {
+                std::borrow::Cow::Borrowed(val)
+            }
+        } else {
+            std::borrow::Cow::Borrowed(val)
+        };
+        let val: &Value = &val;
+        Ok(match val {
+            Value::Undefined
+            | Value::Function(_)
+            | Value::BuiltinMethod { .. }
+            | Value::Generator(_)
+            | Value::Pending(_) => None,
+            Value::Null => Some("null".to_string()),
+            Value::Bool(b) => Some(b.to_string()),
+            Value::Int(n) => Some(n.to_string()),
+            Value::Float(n) => Some(if n.is_finite() {
+                builtins::format_number(*n)
+            } else {
+                "null".to_string()
+            }),
+            Value::String(s) => Some(builtins::json_escape_string(s)),
+            Value::Array(h) => {
+                let items_src = self.heap.array_vec(*h);
+                let mut items: Vec<String> = Vec::with_capacity(items_src.len());
+                for (i, item) in items_src.iter().enumerate() {
+                    // Apply the replacer with the array index (as a string) as key.
+                    let item = if let Some(f) = replacer {
+                        self.call_function_internal(f, vec![
+                            Value::String(Arc::from(i.to_string().as_str())),
+                            item.clone(),
+                        ])?
+                    } else {
+                        item.clone()
+                    };
+                    let s = self
+                        .serialize_json_dynamic(&item, replacer, whitelist, indent, depth + 1)?
+                        .unwrap_or_else(|| "null".to_string());
+                    items.push(s);
+                }
+                Some(builtins::join_json_array(&items, indent, depth))
+            }
+            Value::Object(h) => {
+                // Clone the map out: the per-entry replacer call borrows `&mut self`,
+                // which would conflict with a live borrow into the heap.
+                let map = match self.heap.object(*h) {
+                    Some(m) => m.clone(),
+                    None => return Ok(Some("{}".to_string())),
+                };
+                // Date with no toJSON hook handled above falls here only if it had
+                // its hook stripped; emit ISO via __date_ms__ for safety.
+                if let Some(ms) = map.get("__date_ms__") {
+                    let ms = ms.to_number() as i64;
+                    return Ok(Some(builtins::json_escape_string(&unix_millis_to_iso(ms))));
+                }
+                if map.contains_key("__map__")
+                    || map.contains_key("__set__")
+                    || map.contains_key("__regexp__")
+                    || map.contains_key("__error__")
+                {
+                    return Ok(Some("{}".to_string()));
+                }
+                let mut pairs: Vec<(String, String)> = Vec::new();
+                for (k, v) in map.iter() {
+                    if k.starts_with("__") {
+                        continue;
+                    }
+                    if let Some(w) = whitelist {
+                        if !w.iter().any(|x| x == k.as_ref()) {
+                            continue;
+                        }
+                    }
+                    let v = if let Some(f) = replacer {
+                        self.call_function_internal(f, vec![
+                            Value::String(k.clone()),
+                            v.clone(),
+                        ])?
+                    } else {
+                        v.clone()
+                    };
+                    if let Some(s) =
+                        self.serialize_json_dynamic(&v, replacer, whitelist, indent, depth + 1)?
+                    {
+                        pairs.push((k.to_string(), s));
+                    }
+                }
+                Some(builtins::join_json_object(&pairs, indent, depth))
+            }
+        })
+    }
+
+    /// `JSON.parse(text, reviver)`: parse normally, then walk the result
+    /// bottom-up calling `reviver(key, value)` with `this` bound to the holder.
+    /// A reviver returning `undefined` deletes the property.
+    fn json_parse_with_reviver(&mut self, args: &[Value]) -> Result<Value> {
+        let text = match args.first() {
+            Some(Value::String(s)) => s.to_string(),
+            _ => {
+                return Err(ZapcodeError::TypeError(
+                    "JSON.parse requires a string argument".to_string(),
+                ))
+            }
+        };
+        let reviver = args[1].clone();
+        let parsed = builtins::json_to_value(&text, &mut self.heap)?;
+        // Root holder: { "": parsed }.
+        let holder = {
+            let mut m: IndexMap<Arc<str>, Value> = IndexMap::new();
+            m.insert(Arc::from(""), parsed);
+            Value::Object(self.heap.alloc_object(m))
+        };
+        self.revive_walk(&holder, "", &reviver)
+    }
+
+    /// Recursively revive a value: process children first, then call the reviver
+    /// for this `key`. Returning `undefined` from the reviver removes the entry.
+    fn revive_walk(&mut self, holder: &Value, key: &str, reviver: &Value) -> Result<Value> {
+        let value = match holder {
+            Value::Object(h) => self
+                .heap
+                .object(*h)
+                .and_then(|m| m.get(key))
+                .cloned()
+                .unwrap_or(Value::Undefined),
+            _ => Value::Undefined,
+        };
+        match &value {
+            Value::Array(h) => {
+                let len = self.heap.array_vec(*h).len();
+                for i in 0..len {
+                    let ik = i.to_string();
+                    let revived = self.revive_walk(&value, &ik, reviver)?;
+                    if let Some(arr) = self.heap.array_mut(*h) {
+                        if i < arr.len() {
+                            // Array elements are kept (set to undefined if dropped),
+                            // mirroring JS InternalizeJSONProperty for arrays.
+                            arr[i] = revived;
+                        }
+                    }
+                }
+            }
+            Value::Object(h) => {
+                let keys: Vec<Arc<str>> = self
+                    .heap
+                    .object(*h)
+                    .map(|m| m.keys().cloned().collect())
+                    .unwrap_or_default();
+                for k in keys {
+                    let revived = self.revive_walk(&value, &k, reviver)?;
+                    if matches!(revived, Value::Undefined) {
+                        if let Some(m) = self.heap.object_mut(*h) {
+                            m.shift_remove(k.as_ref());
+                        }
+                    } else if let Some(m) = self.heap.object_mut(*h) {
+                        m.insert(k, revived);
+                    }
+                }
+            }
+            _ => {}
+        }
+        // Call reviver(key, value). JS binds `this` to the holder, but the
+        // receiver-writeback machinery would corrupt the value being revived, so
+        // we leave `this` undefined — revivers that read `this` are an accepted
+        // gap (none of the supported scenarios need it).
+        self.call_function_internal(reviver, vec![
+            Value::String(Arc::from(key)),
+            value,
+        ])
+    }
+
     /// Check if a callback value is an async function that might suspend.
     fn is_async_callback(&self, callback: &Value) -> bool {
         if let Value::Function(closure) = callback {
@@ -3624,14 +4017,29 @@ impl Vm {
                             }
                             "__string__" => {
                                 if let Some(Value::String(s)) = &receiver {
-                                    builtins::call_builtin(
-                                        &Value::String(s.clone()),
-                                        &method_name,
-                                        &args,
-                                        &self.limits,
-                                        &mut self.stdout,
-                                        &mut self.heap,
-                                    )?
+                                    // replace/replaceAll with a FUNCTION replacer must
+                                    // invoke the callback per match with
+                                    // (match, ...groups, offset, string) and splice in
+                                    // its return value. The pure builtin can't reach the
+                                    // call path, so handle it here at the dispatch layer.
+                                    if matches!(method_name.as_ref(), "replace" | "replaceAll")
+                                        && matches!(args.get(1), Some(Value::Function(_)))
+                                    {
+                                        Some(self.string_replace_with_function(
+                                            &s.clone(),
+                                            &method_name,
+                                            &args,
+                                        )?)
+                                    } else {
+                                        builtins::call_builtin(
+                                            &Value::String(s.clone()),
+                                            &method_name,
+                                            &args,
+                                            &self.limits,
+                                            &mut self.stdout,
+                                            &mut self.heap,
+                                        )?
+                                    }
                                 } else {
                                     None
                                 }
@@ -3852,6 +4260,19 @@ impl Vm {
                                 }
                                 let h = self.heap.alloc_array(out);
                                 Some(Value::Array(h))
+                            }
+                            // JSON.stringify must honor a user `toJSON()` on plain
+                            // objects and a FUNCTION replacer; JSON.parse must invoke a
+                            // reviver. All three need the guest-closure call path, so
+                            // route through the VM here rather than the pure builtin.
+                            "JSON" if method_name.as_ref() == "stringify" => {
+                                Some(self.json_stringify(&args)?)
+                            }
+                            "JSON"
+                                if method_name.as_ref() == "parse"
+                                    && matches!(args.get(1), Some(Value::Function(_))) =>
+                            {
+                                Some(self.json_parse_with_reviver(&args)?)
                             }
                             global_name => builtins::call_global_method(
                                 global_name,

@@ -152,11 +152,9 @@ fn replace_with_string_replacement() {
 }
 
 #[test]
-fn replace_with_function_replacer_documented_divergence() {
-    // DIVERGENCE (documented): a FUNCTION replacer is not invoked — the function
-    // value is coerced to the string "function" and inserted literally. Only
-    // string replacements (with $-substitutions) are supported. Asserting actual.
-    assert_eq!(run_str("'a1b2'.replace(/\\d/g, m => '[' + m + ']')"), "afunctionbfunction"); // JS: a[1]b[2]
+fn replace_with_function_replacer() {
+    // A FUNCTION replacer is invoked per match; its return value is substituted.
+    assert_eq!(run_str("'a1b2'.replace(/\\d/g, m => '[' + m + ']')"), "a[1]b[2]");
 }
 
 // ----------------------------------------------------------------------------

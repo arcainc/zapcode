@@ -420,21 +420,20 @@ fn replace_dollar_edge_divergences() {
 }
 
 #[test]
-fn replace_function_replacer_documented_divergence() {
-    // DIVERGENCE (documented residual): a FUNCTION replacer is NOT invoked. The
-    // function value is string-coerced to "function" and inserted literally. Only
-    // string replacements (with $-substitutions) are honored. Asserting ACTUAL.
+fn replace_function_replacer() {
+    // A FUNCTION replacer is invoked per match with (match, ...groups, offset,
+    // string); its return value is string-coerced and substituted.
     assert_eq!(
         run_str("'a1b2'.replace(/\\d/g, m => '[' + m + ']')"),
-        "afunctionbfunction" // JS: "a[1]b[2]"
+        "a[1]b[2]"
     );
     assert_eq!(
         run_str("'hello'.replace('l', m => m.toUpperCase())"),
-        "hefunctionlo" // JS: "heLlo"
+        "heLlo"
     );
     assert_eq!(
         run_str("'abcabc'.replace(/b/g, (m, off) => off)"),
-        "afunctioncafunctionc" // JS: "a1ca4c"
+        "a1ca4c"
     );
 }
 
@@ -454,10 +453,10 @@ fn replace_all_string() {
 fn replace_all_regex_and_patterns() {
     assert_eq!(run_str("'a1b2'.replaceAll(/\\d/g, '#')"), "a#b#");
     assert_eq!(run_str("'x1x2x3'.replaceAll(/x(\\d)/g, '[$1]')"), "[1][2][3]");
-    // DIVERGENCE (documented): function replacer not invoked here either.
+    // A function replacer is invoked per match here too.
     assert_eq!(
         run_str("'a1b2'.replaceAll(/\\d/g, m => '<' + m + '>')"),
-        "afunctionbfunction" // JS: "a<1>b<2>"
+        "a<1>b<2>"
     );
 }
 

@@ -299,17 +299,16 @@ fn replace_no_match_is_unchanged() {
 }
 
 #[test]
-fn replace_function_replacer_is_documented_divergence() {
-    // DIVERGENCE asserted as actual (cluster G1): a FUNCTION replacer is not
-    // invoked — the literal token `function` is spliced in for each match instead
-    // of the callback's return value. Real JS would title-case here.
+fn replace_function_replacer() {
+    // A FUNCTION replacer is invoked per match; its return value is spliced in
+    // (cluster G1). Title-casing the first letter of each word works as in JS.
     assert_eq!(
         run_str(r#""hello world".replace(/\b\w/g, c => c.toUpperCase())"#),
-        "functionello functionorld" // JS: "Hello World"
+        "Hello World"
     );
     assert_eq!(
         run_str(r##""a1".replace(/\d/, d => "#")"##),
-        "afunction" // JS: "a#"
+        "a#"
     );
 }
 

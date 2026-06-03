@@ -449,7 +449,7 @@ fn radix_to_string(n: f64, radix: u32) -> String {
 }
 
 /// Format a number the way the VM's `to_js_string` does (no trailing `.0`).
-fn format_number(n: f64) -> String {
+pub fn format_number(n: f64) -> String {
     if n.is_nan() {
         "NaN".to_string()
     } else if n.is_infinite() {
@@ -832,7 +832,7 @@ fn call_json_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<Opt
 
 /// JSON-escape a string, including control characters (`\n`, `\t`, …) which
 /// must not appear raw in valid JSON.
-fn json_escape_string(s: &str) -> String {
+pub fn json_escape_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
@@ -916,7 +916,7 @@ fn serialize_json(
     }
 }
 
-fn join_json_array(items: &[String], indent: Option<&str>, depth: usize) -> String {
+pub fn join_json_array(items: &[String], indent: Option<&str>, depth: usize) -> String {
     if items.is_empty() {
         return "[]".to_string();
     }
@@ -935,7 +935,7 @@ fn join_json_array(items: &[String], indent: Option<&str>, depth: usize) -> Stri
     }
 }
 
-fn join_json_object(pairs: &[(String, String)], indent: Option<&str>, depth: usize) -> String {
+pub fn join_json_object(pairs: &[(String, String)], indent: Option<&str>, depth: usize) -> String {
     if pairs.is_empty() {
         return "{}".to_string();
     }
@@ -964,7 +964,7 @@ fn join_json_object(pairs: &[(String, String)], indent: Option<&str>, depth: usi
 /// Maximum nesting depth for JSON parsing to prevent stack overflow.
 const JSON_MAX_DEPTH: usize = 64;
 
-fn json_to_value(s: &str, heap: &mut Heap) -> Result<Value> {
+pub fn json_to_value(s: &str, heap: &mut Heap) -> Result<Value> {
     json_to_value_depth(s, 0, heap)
 }
 
@@ -1127,7 +1127,7 @@ pub fn regexp_parts(v: &Value, heap: &Heap) -> Option<(String, String)> {
 /// Compile a JS-ish regex with the supported flags (i, m, s). The `g` flag is
 /// handled by callers (all matches vs first). Lookaround/backreferences aren't
 /// supported by the linear-time engine and produce a clear error.
-fn compile_regex(pattern: &str, flags: &str) -> Result<regex::Regex> {
+pub fn compile_regex(pattern: &str, flags: &str) -> Result<regex::Regex> {
     regex::RegexBuilder::new(pattern)
         .case_insensitive(flags.contains('i'))
         .multi_line(flags.contains('m'))
@@ -1260,7 +1260,7 @@ pub fn call_regexp_method(
 
 /// Translate JS replacement tokens (`$&`, `$1`, `$$`) to the regex crate's
 /// `${0}`/`${1}`/`$` so group substitution works as agents expect.
-fn translate_replacement(repl: &str) -> String {
+pub fn translate_replacement(repl: &str) -> String {
     let mut out = String::new();
     let mut chars = repl.chars().peekable();
     while let Some(c) = chars.next() {

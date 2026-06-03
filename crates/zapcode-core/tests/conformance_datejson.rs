@@ -11,9 +11,6 @@
 //! never to the real-JS answer:
 //!   * `Date#toString` / `Date#toDateString` return the ISO-8601 string, not Node's
 //!     human-readable `"Thu Jan 01 1970 …"` form.
-//!   * A FUNCTION replacer (stringify) and any reviver (parse) are not invoked.
-//!   * A user-defined `toJSON()` on a PLAIN object is not honored (built-in
-//!     `Date#toJSON` IS honored).
 //!
 //! Coverage map:
 //!   Date construction         — epoch ms, ISO/space-separated/offset strings,
@@ -29,7 +26,7 @@
 //!                                array replacer, Date -> ISO, Map/Set/Error -> {}.
 //!   JSON.parse                — objects/arrays/primitives, escapes, whitespace,
 //!                                deep nesting, round-trips, parse-then-mutate.
-//!   Documented gaps           — function replacer / reviver / user toJSON.
+//!   Function replacer/reviver — invoked per entry; user `toJSON()` honored.
 
 use zapcode_core::vm::VmState;
 use zapcode_core::{ResourceLimits, ZapcodeRun};
@@ -663,28 +660,28 @@ fn json_globals_shape() {
 // ============================================================================
 
 #[test]
-fn json_function_replacer_not_invoked_documented_divergence() {
-    // DIVERGENCE (documented, I4-family): a FUNCTION replacer is not invoked — the
-    // value is serialized unmodified. (Array replacers DO work; see above.)
+fn json_function_replacer_invoked() {
+    // A FUNCTION replacer transforms each entry. (Array replacers also work; see
+    // above.)
     check(
         "JSON.stringify({a:1, b:2}, (k, v) => typeof v === 'number' ? v * 10 : v)",
-        "{\"a\":1,\"b\":2}", // JS: {"a":10,"b":20}
+        "{\"a\":10,\"b\":20}",
     );
 }
 
 #[test]
-fn json_reviver_not_invoked_documented_divergence() {
-    // DIVERGENCE (documented, I4-family): a reviver (parse 2nd arg) is not invoked.
+fn json_reviver_invoked() {
+    // A reviver (parse 2nd arg) is invoked per entry.
     check(
         "JSON.parse('{\"a\":1}', (k, v) => typeof v === 'number' ? v + 100 : v).a",
-        "1", // JS: 101
+        "101",
     );
 }
 
 #[test]
-fn json_user_to_json_on_plain_object_not_honored_documented_divergence() {
-    // DIVERGENCE (documented): a user-defined `toJSON()` on a PLAIN object is not
-    // called (Date#toJSON IS — see json_stringify_date_to_iso).
-    check("JSON.stringify({toJSON(){ return 'custom'; }})", "{}"); // JS: "custom"
-    check("JSON.stringify({x: {toJSON(){ return 5; }}})", "{\"x\":{}}"); // JS: {"x":5}
+fn json_user_to_json_on_plain_object_honored() {
+    // A user-defined `toJSON()` on a PLAIN object is called (as is Date#toJSON —
+    // see json_stringify_date_to_iso).
+    check("JSON.stringify({toJSON(){ return 'custom'; }})", "\"custom\"");
+    check("JSON.stringify({x: {toJSON(){ return 5; }}})", "{\"x\":5}");
 }
