@@ -143,6 +143,45 @@ pub(crate) enum Continuation {
         caller_frame_depth: usize,
         callback_frame_index: usize,
     },
+    /// Running a `.then()`/`.catch()`/`.finally()` callback that may itself make
+    /// an external (tool) call and therefore must be able to suspend. The main
+    /// `execute()` loop drives the callback the same way it drives array
+    /// callbacks; when the callback's frame pops, the continuation shapes the
+    /// result into the promise the chain expects and pushes it. Because the
+    /// continuation is part of the serialized VM state, a suspension mid-callback
+    /// resumes cleanly and finishes the chain.
+    PromiseCallback {
+        /// How to turn the callback's return value into the chain's result.
+        mode: PromiseCallbackMode,
+        /// The original promise (used by `finally`, which passes it through).
+        original_promise: Value,
+        caller_frame_depth: usize,
+        callback_frame_index: usize,
+    },
+}
+
+/// What a [`Continuation::PromiseCallback`] does with the callback's return value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum PromiseCallbackMode {
+    /// `.then(onFulfilled)` / `.then(_, onRejected)` / `.catch(onRejected)`:
+    /// wrap the callback's return value in a resolved promise (thenables pass
+    /// through unwrapped via `make_resolved_promise`).
+    WrapResult,
+    /// `.finally(onFinally)`: discard the callback's return value and pass the
+    /// original promise through unchanged.
+    PassThrough,
+}
+
+/// Outcome of dispatching a `.then`/`.catch`/`.finally` method. See
+/// [`Vm::execute_promise_method`].
+enum PromiseMethodOutcome {
+    /// Completed synchronously (no callback ran); the value should be pushed.
+    Value(Value),
+    /// A callback frame + [`Continuation::PromiseCallback`] were pushed; the
+    /// dispatch caller must return `Ok(None)` so the main loop drives it.
+    ContinuationStarted,
+    /// The receiver was not a promise, or the method is unknown.
+    NotAPromise,
 }
 
 /// The Zapcode VM.
@@ -1108,6 +1147,11 @@ impl Vm {
                 caller_frame_depth,
                 ..
             } => (*callback_frame_index, *caller_frame_depth),
+            Continuation::PromiseCallback {
+                callback_frame_index,
+                caller_frame_depth,
+                ..
+            } => (*callback_frame_index, *caller_frame_depth),
         };
 
         // The callback frame is still active — not done yet
@@ -1126,10 +1170,23 @@ impl Vm {
         // so an empty stack here indicates a VM bug.
         let callback_result = self.pop()?;
 
+        // `PromiseCallback` continuations re-wrap the callback's return value
+        // into the chain's next promise (see `make_resolved_promise`), so we
+        // must NOT eagerly unwrap/error on internal promises here — that is the
+        // promise-arm's job. Array continuations, by contrast, expect a plain
+        // value per element, so they unwrap a resolved promise and treat a
+        // rejected one as an unhandled rejection.
+        let is_promise_cont = matches!(
+            self.continuations.last(),
+            Some(Continuation::PromiseCallback { .. })
+        );
+
         // Unwrap internal promise values: async callbacks return
         // {__promise__: true, status: "resolved", value: X} or {status: "rejected", ...}.
         // Only unwrap objects with the __promise__ marker to avoid mangling user objects.
-        let callback_result = if let Value::Object(h) = &callback_result {
+        let callback_result = if is_promise_cont {
+            callback_result
+        } else if let Value::Object(h) = &callback_result {
             let map = self.heap.object_map(*h);
             if !matches!(map.get("__promise__"), Some(Value::Bool(true))) {
                 // Not an internal promise — leave untouched
@@ -1226,6 +1283,27 @@ impl Vm {
                     self.push(Value::Undefined)?;
                     Ok(true)
                 }
+            }
+            Continuation::PromiseCallback {
+                mode,
+                original_promise,
+                ..
+            } => {
+                // The promise callback finished (possibly after suspending for a
+                // tool call). Shape its result into the chain's next promise.
+                let chain_result = match mode {
+                    // `.then`/`.catch`: the callback's return value becomes the
+                    // resolved value of the next promise. `make_resolved_promise`
+                    // unwraps a returned promise (thenable) so chaining works.
+                    PromiseCallbackMode::WrapResult => {
+                        builtins::make_resolved_promise(callback_result, &mut self.heap)
+                    }
+                    // `.finally`: ignore the callback's return value and pass the
+                    // original promise through unchanged.
+                    PromiseCallbackMode::PassThrough => original_promise,
+                };
+                self.push(chain_result)?;
+                Ok(true)
             }
         }
     }
@@ -1613,13 +1691,28 @@ impl Vm {
     }
 
     /// Execute .then(), .catch(), or .finally() on a resolved/rejected promise.
-    /// Synchronously invokes the callback and returns a new promise wrapping the result.
+    ///
+    /// The callback is run via the continuation machinery (a
+    /// [`Continuation::PromiseCallback`]) rather than synchronously, so a tool
+    /// (external) call inside the callback can suspend the VM and resume — this
+    /// is what makes `primary().catch(() => fallbackTool())` work. The main
+    /// `execute()` loop drives the callback; when it returns, the continuation
+    /// shapes the result into the chain's next promise.
+    ///
+    /// Returns:
+    /// - `PromiseMethodOutcome::Value(v)` — completed synchronously (no callback
+    ///   to run); push `v`.
+    /// - `PromiseMethodOutcome::ContinuationStarted` — a callback frame and
+    ///   continuation were pushed; the caller must return `Ok(None)` so the
+    ///   main loop drives it.
+    /// - `PromiseMethodOutcome::NotAPromise` — the receiver was not a promise /
+    ///   the method is unknown; fall through to the normal error path.
     fn execute_promise_method(
         &mut self,
         promise: Value,
         method: &str,
         args: Vec<Value>,
-    ) -> Result<Option<Value>> {
+    ) -> Result<PromiseMethodOutcome> {
         let (status, value, reason) = if let Value::Object(h) = &promise {
             let map = self.heap.object_map(*h);
             let status = match map.get("status") {
@@ -1630,7 +1723,7 @@ impl Vm {
             let reason = map.get("reason").cloned().unwrap_or(Value::Undefined);
             (status, value, reason)
         } else {
-            return Ok(None);
+            return Ok(PromiseMethodOutcome::NotAPromise);
         };
 
         let on_fulfilled = args.first().cloned().unwrap_or(Value::Undefined);
@@ -1640,49 +1733,102 @@ impl Vm {
             "then" => {
                 if status == "resolved" {
                     if matches!(on_fulfilled, Value::Function(_)) {
-                        let result = self.call_function_internal(&on_fulfilled, vec![value])?;
-                        Ok(Some(builtins::make_resolved_promise(result, &mut self.heap)))
+                        self.start_promise_callback(
+                            on_fulfilled,
+                            vec![value],
+                            PromiseCallbackMode::WrapResult,
+                            promise,
+                        )
                     } else {
                         // No callback — pass through the promise
-                        Ok(Some(promise))
+                        Ok(PromiseMethodOutcome::Value(promise))
                     }
                 } else if status == "rejected" {
                     if matches!(on_rejected, Value::Function(_)) {
-                        let result = self.call_function_internal(&on_rejected, vec![reason])?;
-                        Ok(Some(builtins::make_resolved_promise(result, &mut self.heap)))
+                        self.start_promise_callback(
+                            on_rejected,
+                            vec![reason],
+                            PromiseCallbackMode::WrapResult,
+                            promise,
+                        )
                     } else {
                         // No onRejected — pass through the rejection
-                        Ok(Some(promise))
+                        Ok(PromiseMethodOutcome::Value(promise))
                     }
                 } else {
-                    Ok(Some(promise))
+                    Ok(PromiseMethodOutcome::Value(promise))
                 }
             }
             "catch" => {
                 if status == "rejected" {
                     let handler = args.first().cloned().unwrap_or(Value::Undefined);
                     if matches!(handler, Value::Function(_)) {
-                        let result = self.call_function_internal(&handler, vec![reason])?;
-                        Ok(Some(builtins::make_resolved_promise(result, &mut self.heap)))
+                        self.start_promise_callback(
+                            handler,
+                            vec![reason],
+                            PromiseCallbackMode::WrapResult,
+                            promise,
+                        )
                     } else {
-                        Ok(Some(promise))
+                        Ok(PromiseMethodOutcome::Value(promise))
                     }
                 } else {
                     // Resolved — pass through
-                    Ok(Some(promise))
+                    Ok(PromiseMethodOutcome::Value(promise))
                 }
             }
             "finally" => {
                 let handler = args.first().cloned().unwrap_or(Value::Undefined);
                 if matches!(handler, Value::Function(_)) {
-                    // finally callback receives no arguments
-                    self.call_function_internal(&handler, vec![])?;
+                    // finally callback receives no arguments and its return value
+                    // is discarded — the original promise passes through.
+                    self.start_promise_callback(
+                        handler,
+                        vec![],
+                        PromiseCallbackMode::PassThrough,
+                        promise,
+                    )
+                } else {
+                    // No handler — pass through the original promise
+                    Ok(PromiseMethodOutcome::Value(promise))
                 }
-                // finally always passes through the original promise
-                Ok(Some(promise))
             }
-            _ => Ok(None),
+            _ => Ok(PromiseMethodOutcome::NotAPromise),
         }
+    }
+
+    /// Push a promise-callback frame plus a [`Continuation::PromiseCallback`] so
+    /// the main `execute()` loop drives the callback. This lets a tool call
+    /// inside the callback suspend the VM (the continuation is part of the
+    /// serialized state and resumes cleanly).
+    fn start_promise_callback(
+        &mut self,
+        callback: Value,
+        args: Vec<Value>,
+        mode: PromiseCallbackMode,
+        original_promise: Value,
+    ) -> Result<PromiseMethodOutcome> {
+        let closure = match &callback {
+            Value::Function(c) => c.clone(),
+            _ => {
+                return Err(ZapcodeError::TypeError(
+                    "promise callback is not a function".to_string(),
+                ))
+            }
+        };
+
+        let caller_frame_depth = self.frames.len();
+        self.push_call_frame(&closure, &args, None)?;
+        let callback_frame_index = self.frames.len() - 1;
+
+        self.continuations.push(Continuation::PromiseCallback {
+            mode,
+            original_promise,
+            caller_frame_depth,
+            callback_frame_index,
+        });
+
+        Ok(PromiseMethodOutcome::ContinuationStarted)
     }
 
     fn alloc_generator_id(&mut self) -> u64 {
@@ -2908,7 +3054,19 @@ impl Vm {
                             }
                             "__promise__" => {
                                 if let Some(promise) = receiver {
-                                    self.execute_promise_method(promise, &method_name, args)?
+                                    match self
+                                        .execute_promise_method(promise, &method_name, args)?
+                                    {
+                                        PromiseMethodOutcome::Value(v) => Some(v),
+                                        // A continuation was started — the main
+                                        // execute() loop drives the callback (and
+                                        // suspends if it makes a tool call). Don't
+                                        // push a result here.
+                                        PromiseMethodOutcome::ContinuationStarted => {
+                                            return Ok(None);
+                                        }
+                                        PromiseMethodOutcome::NotAPromise => None,
+                                    }
                                 } else {
                                     None
                                 }
