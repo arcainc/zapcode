@@ -3081,6 +3081,135 @@ impl Vm {
         }
     }
 
+    /// Materialize an iterable into a Vec of its elements, consuming it.
+    /// Handles arrays (copied), strings (per char), built-in Set/Map (as
+    /// `[k,v]` pairs), generators (driven to completion), and plain objects
+    /// exposing a custom `[Symbol.iterator]()` method (the iterator protocol is
+    /// invoked: call `[Symbol.iterator]()`, then repeatedly call `.next()` until
+    /// a `{ done: true }` result). Used by spread and array destructuring.
+    fn drain_iterable(&mut self, val: Value) -> Result<Vec<Value>> {
+        match &val {
+            Value::Array(a) => Ok(self.heap.array_vec(*a)),
+            Value::String(s) => Ok(s
+                .chars()
+                .map(|c| Value::String(Arc::from(c.to_string().as_str())))
+                .collect()),
+            Value::Object(_) if is_set_object(&val, &self.heap) => Ok(set_items(&val, &self.heap)),
+            Value::Object(_) if is_map_object(&val, &self.heap) => {
+                Ok(map_entry_pairs(&val, &mut self.heap))
+            }
+            Value::Generator(gen_obj) => self.drain_generator(gen_obj.clone()),
+            Value::Object(_) => {
+                if let Some(items) = self.drain_custom_iterator(&val)? {
+                    Ok(items)
+                } else {
+                    Err(ZapcodeError::TypeError(format!(
+                        "{} is not iterable",
+                        val.type_name()
+                    )))
+                }
+            }
+            other => Err(ZapcodeError::TypeError(format!(
+                "{} is not iterable",
+                other.type_name()
+            ))),
+        }
+    }
+
+    /// Drive a generator to completion, collecting each yielded value.
+    fn drain_generator(&mut self, mut gen_obj: GeneratorObject) -> Result<Vec<Value>> {
+        let mut out = Vec::new();
+        loop {
+            self.tracker.track_allocation(&self.limits)?;
+            let result = self.generator_next(gen_obj.clone(), Value::Undefined)?;
+            let (value, done) = match &result {
+                Value::Object(h) => {
+                    let m = self.heap.object_map(*h);
+                    (
+                        m.get("value").cloned().unwrap_or(Value::Undefined),
+                        m.get("done").is_some_and(|v| matches!(v, Value::Bool(true))),
+                    )
+                }
+                _ => (Value::Undefined, true),
+            };
+            if done {
+                break;
+            }
+            out.push(value);
+            // Reload the (now-suspended) generator state so the next pull
+            // resumes from where this one left off.
+            let gen_key = format!("__gen_{}", gen_obj.id);
+            match self.globals.get(&gen_key) {
+                Some(Value::Generator(g)) => gen_obj = g.clone(),
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
+
+    /// If `val` is a plain object exposing a callable `[Symbol.iterator]`,
+    /// run the iterator protocol and return its elements; otherwise `None`.
+    fn drain_custom_iterator(&mut self, val: &Value) -> Result<Option<Vec<Value>>> {
+        let Value::Object(h) = val else {
+            return Ok(None);
+        };
+        // A `[Symbol.iterator]` computed key stringifies to the symbol object's
+        // debug form; we resolve the method by reading the well-known key.
+        let iter_fn = match self.heap.object(*h) {
+            Some(m) => m.get(builtins::SYMBOL_ITERATOR_KEY).cloned(),
+            None => None,
+        };
+        let Some(iter_fn) = iter_fn else {
+            return Ok(None);
+        };
+        if !matches!(iter_fn, Value::Function(_)) {
+            return Ok(None);
+        }
+        // Call obj[Symbol.iterator]() (with `this` bound to the object) to
+        // obtain the iterator object.
+        let iterator = self.call_method_internal(&iter_fn, val.clone(), vec![])?;
+        let iter_h = match &iterator {
+            Value::Object(ih) => *ih,
+            _ => {
+                return Err(ZapcodeError::TypeError(
+                    "[Symbol.iterator]() did not return an object".into(),
+                ))
+            }
+        };
+        let next_fn = match self.heap.object(iter_h) {
+            Some(m) => m.get("next").cloned(),
+            None => None,
+        };
+        let next_fn = match next_fn {
+            Some(v @ Value::Function(_)) => v,
+            _ => {
+                return Err(ZapcodeError::TypeError(
+                    "iterator has no next() method".into(),
+                ))
+            }
+        };
+        let mut out = Vec::new();
+        loop {
+            self.tracker.track_allocation(&self.limits)?;
+            let result = self.call_method_internal(&next_fn, iterator.clone(), vec![])?;
+            let (value, done) = match &result {
+                Value::Object(rh) => {
+                    let m = self.heap.object_map(*rh);
+                    (
+                        m.get("value").cloned().unwrap_or(Value::Undefined),
+                        m.get("done").is_some_and(|v| v.is_truthy()),
+                    )
+                }
+                _ => (Value::Undefined, true),
+            };
+            if done {
+                break;
+            }
+            out.push(value);
+        }
+        Ok(Some(out))
+    }
+
     fn make_iterator_result(&mut self, value: Value, done: bool) -> Value {
         let mut obj = IndexMap::new();
         obj.insert(Arc::from("value"), value);
@@ -3803,25 +3932,14 @@ impl Vm {
                         )))
                     }
                 };
-                let extra: Vec<Value> = match &iterable {
-                    Value::Array(items) => self.heap.array_vec(*items),
-                    Value::String(s) => s
-                        .chars()
-                        .map(|c| Value::String(Arc::from(c.to_string().as_str())))
-                        .collect(),
-                    Value::Object(_) if is_set_object(&iterable, &self.heap) => {
-                        set_items(&iterable, &self.heap)
+                // Generators, arrays, strings, Sets/Maps, and plain objects with a
+                // custom `[Symbol.iterator]` are all consumed via `drain_iterable`.
+                let extra: Vec<Value> = self.drain_iterable(iterable).map_err(|e| match e {
+                    ZapcodeError::TypeError(msg) => {
+                        ZapcodeError::TypeError(format!("{msg} (spread)"))
                     }
-                    Value::Object(_) if is_map_object(&iterable, &self.heap) => {
-                        map_entry_pairs(&iterable, &mut self.heap)
-                    }
-                    other => {
-                        return Err(ZapcodeError::TypeError(format!(
-                            "{} is not iterable (spread)",
-                            other.type_name()
-                        )))
-                    }
-                };
+                    other => other,
+                })?;
                 if let Some(v) = self.heap.array_mut(acc) {
                     v.extend(extra);
                 }
@@ -4598,6 +4716,23 @@ impl Vm {
                         let iter_obj = iter_from_items(pairs, &mut self.heap);
                         self.push(iter_obj)?;
                     }
+                    // A plain object exposing a custom `[Symbol.iterator]()`:
+                    // run the iterator protocol to materialize its elements, then
+                    // hand `for...of` a normal array-iterator over them.
+                    Value::Object(_) => {
+                        match self.drain_custom_iterator(&val)? {
+                            Some(items) => {
+                                let iter_obj = iter_from_items(items, &mut self.heap);
+                                self.push(iter_obj)?;
+                            }
+                            None => {
+                                return Err(ZapcodeError::TypeError(format!(
+                                    "{} is not iterable",
+                                    val.type_name()
+                                )));
+                            }
+                        }
+                    }
                     _ => {
                         return Err(ZapcodeError::TypeError(format!(
                             "{} is not iterable",
@@ -4726,6 +4861,30 @@ impl Vm {
                 } else {
                     self.push(value)?;
                     self.push(Value::Bool(true))?;
+                }
+            }
+            Instruction::IterableToArray => {
+                // Used by array destructuring (`const [a,b] = x`). Only GENERATORS
+                // and plain objects with a custom `[Symbol.iterator]` need to be
+                // materialized into an array so the positional element reads can
+                // index them. Arrays/strings/Sets/Maps and lenient non-iterables
+                // (number/null/plain object) are left UNCHANGED so the existing
+                // index-based destructure path keeps its current behavior.
+                let val = self.pop()?;
+                match &val {
+                    Value::Generator(gen_obj) => {
+                        let items = self.drain_generator(gen_obj.clone())?;
+                        let h = self.heap.alloc_array(items);
+                        self.push(Value::Array(h))?;
+                    }
+                    Value::Object(_) => match self.drain_custom_iterator(&val)? {
+                        Some(items) => {
+                            let h = self.heap.alloc_array(items);
+                            self.push(Value::Array(h))?;
+                        }
+                        None => self.push(val)?,
+                    },
+                    _ => self.push(val)?,
                 }
             }
 

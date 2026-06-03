@@ -1337,6 +1337,10 @@ impl Compiler {
                 self.compile_object_destructure(fields, kind)
             }
             ParamPattern::ArrayDestructure(elems) => {
+                // The source must be iterated, not merely indexed: a generator or
+                // an object with a custom `[Symbol.iterator]` is materialized into
+                // an array first (arrays/strings/etc. pass through unchanged).
+                self.emit(Instruction::IterableToArray);
                 for (i, elem) in elems.iter().enumerate() {
                     let Some(p) = elem else { continue };
                     if let ParamPattern::Rest(name) = p {
@@ -2130,16 +2134,49 @@ impl Compiler {
                 // form is handled by CallExternal above.
                 self.emit(Instruction::Await);
             }
-            Expr::Yield { value, delegate: _ } => {
-                // Compile the yielded value (or undefined if none)
-                match value {
-                    Some(expr) => self.compile_expr(expr)?,
-                    None => {
-                        self.emit(Instruction::Push(Constant::Undefined));
+            Expr::Yield { value, delegate } => {
+                if *delegate {
+                    // `yield* X` delegates to an iterable: iterate X and yield each
+                    // element individually (flattening), then leave the delegate's
+                    // completion value on the stack as the value of the `yield*`
+                    // expression. We reuse the iterator protocol so arrays,
+                    // strings, generators, Sets and Maps all delegate correctly.
+                    let expr = value
+                        .as_deref()
+                        .expect("yield* always carries an operand expression");
+                    self.compile_expr(expr)?;
+                    self.emit(Instruction::GetIterator);
+                    // loop:
+                    let loop_start = self.current_offset();
+                    self.emit(Instruction::IteratorNext); // -> [advanced_iter, value]
+                    self.emit(Instruction::IteratorDone); // -> [iter, value(if !done), done]
+                    let exit_jump = self.emit(Instruction::JumpIfTrue(0));
+                    // Stack: [iter, value]. Yield pops the value, suspends, and on
+                    // resume pushes the value sent into `.next(v)`. We discard that
+                    // resumed value (sent values are not threaded into the delegate).
+                    self.emit(Instruction::Yield);
+                    self.emit(Instruction::Pop);
+                    self.emit(Instruction::Jump(loop_start));
+                    // exit: stack is [iter] (IteratorDone did not push a value when done).
+                    let exit = self.current_offset();
+                    self.patch_jump(exit_jump, exit);
+                    self.emit(Instruction::Pop); // pop the exhausted iterator
+                    // Completion value of `yield* X` (the iterator's return value).
+                    // For array/string/Set/Map iterators this is `undefined`, which
+                    // matches JS. (A delegated generator's explicit return value is
+                    // not propagated here.)
+                    self.emit(Instruction::Push(Constant::Undefined));
+                } else {
+                    // Compile the yielded value (or undefined if none)
+                    match value {
+                        Some(expr) => self.compile_expr(expr)?,
+                        None => {
+                            self.emit(Instruction::Push(Constant::Undefined));
+                        }
                     }
+                    // Yield instruction: suspends the generator, pops value, pushes received value on resume
+                    self.emit(Instruction::Yield);
                 }
-                // Yield instruction: suspends the generator, pops value, pushes received value on resume
-                self.emit(Instruction::Yield);
             }
             Expr::TypeOf(operand) => {
                 self.compile_expr(operand)?;

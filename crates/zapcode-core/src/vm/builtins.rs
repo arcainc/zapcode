@@ -8,6 +8,15 @@ use crate::heap::{Handle, Heap};
 use crate::sandbox::ResourceLimits;
 use crate::value::Value;
 
+/// Stable string property key used to stand in for the well-known
+/// `Symbol.iterator`. This crate has no symbol-keyed storage, so `Symbol.iterator`
+/// resolves to this sentinel string; a computed key `{ [Symbol.iterator]() {} }`
+/// stores its method under this key, and the iteration protocol reads it back.
+/// The `__`-prefix follows the crate's internal-key convention so the synthetic
+/// key is hidden from `Object.keys`/`for-in`/`JSON.stringify`/`getOwnPropertyNames`
+/// (real `Symbol.iterator` is a non-enumerable symbol, not an own string key).
+pub const SYMBOL_ITERATOR_KEY: &str = "__@@iterator";
+
 /// Register built-in global objects and functions, allocating their backing
 /// objects in `heap`.
 pub fn register_globals(globals: &mut HashMap<String, Value>, heap: &mut Heap) {
@@ -103,6 +112,17 @@ fn builtin_constructor(name: &str, heap: &mut Heap) -> Value {
 fn global_fn(name: &str, heap: &mut Heap) -> Value {
     let mut obj = IndexMap::new();
     obj.insert(Arc::from("__global_fn__"), Value::String(Arc::from(name)));
+    if name == "Symbol" {
+        // Well-known `Symbol.iterator`. Real JS exposes a unique symbol; this
+        // crate has no symbol-keyed property storage, so the well-known iterator
+        // resolves to a stable sentinel STRING. A computed key
+        // `{ [Symbol.iterator]() {} }` then stores the method under this string
+        // key, and `for...of`/spread/destructure look it up to run the protocol.
+        obj.insert(
+            Arc::from("iterator"),
+            Value::String(Arc::from(SYMBOL_ITERATOR_KEY)),
+        );
+    }
     if name == "String" {
         for (prop, target) in [
             ("fromCharCode", "String.fromCharCode"),

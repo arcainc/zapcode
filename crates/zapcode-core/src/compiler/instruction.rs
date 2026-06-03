@@ -151,6 +151,11 @@ pub enum Instruction {
     GetIterator,
     IteratorNext,
     IteratorDone,
+    /// Pop the top value and push a freshly materialized array of its iterated
+    /// elements. Drives generators, iterates strings (by char), Sets, Maps (as
+    /// [k,v] pairs) and copies arrays. Used by spread (`[...x]`) and array
+    /// destructuring (`const [a,b] = x`) so non-array iterables are consumed.
+    IterableToArray,
 
     // Error handling
     //
