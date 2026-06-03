@@ -1575,7 +1575,13 @@ impl Vm {
 
         // Bound the re-entrancy so a hook that itself coerces objects can't loop
         // forever (and so a tool-call-suspending hook is caught at a shallow depth).
-        if self.to_primitive_depth >= 200 {
+        // Each level nests a full guest-call interpreter loop on the *native* stack,
+        // so the cap must be low enough that a cyclic hook (e.g.
+        // `toString(){ return "" + this }`) is caught with a clean RuntimeError
+        // rather than overflowing the Rust stack and aborting the host process.
+        // 8 is far above any legitimate valueOf->toString fallback nesting (which
+        // is at most a couple of levels) yet well below native-stack exhaustion.
+        if self.to_primitive_depth >= 8 {
             return Err(ZapcodeError::RuntimeError(
                 "ToPrimitive recursion limit exceeded (cyclic valueOf/toString?)".to_string(),
             ));
@@ -1696,8 +1702,17 @@ impl Vm {
                     }
                 }
                 Err(err) => {
-                    // Try to catch the error within the callback
-                    if let Some(try_info) = self.try_stack.pop() {
+                    // Try to catch the error within the callback. Only a try block
+                    // that lives *inside* this internal call (i.e. above the frame
+                    // this call started at) may catch here; an outer try belongs to
+                    // the caller and must be left for it to handle.
+                    if let Some(try_info) = self
+                        .try_stack
+                        .last()
+                        .filter(|t| t.frame_depth > target_frame_depth)
+                        .cloned()
+                    {
+                        self.try_stack.pop();
                         while self.frames.len() > try_info.frame_depth {
                             self.frames.pop();
                             self.tracker.pop_frame();
@@ -1707,6 +1722,15 @@ impl Vm {
                         self.push(error_val)?;
                         self.current_frame_mut().ip = try_info.catch_ip;
                     } else {
+                        // Unwind the frame(s) this call pushed so the frame stack is
+                        // restored to the caller's depth before propagating. Without
+                        // this, a nested internal call (e.g. a cyclic ToPrimitive
+                        // hook) that errors would leave orphaned frames and later
+                        // desync the interpreter loop (`frames.last().unwrap()`).
+                        while self.frames.len() > target_frame_depth {
+                            self.frames.pop();
+                            self.tracker.pop_frame();
+                        }
                         return Err(err);
                     }
                 }
