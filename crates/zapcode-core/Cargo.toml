@@ -27,6 +27,7 @@ thiserror.workspace = true
 [dev-dependencies]
 insta.workspace = true
 divan.workspace = true
+indexmap.workspace = true
 
 [[bench]]
 name = "execution"

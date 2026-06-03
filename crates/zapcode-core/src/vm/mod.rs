@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 
-use crate::compiler::instruction::{Constant, Instruction};
+use crate::compiler::instruction::{BatchKind, Constant, Instruction};
 use crate::compiler::CompiledProgram;
 use crate::error::{Result, ZapcodeError};
 use crate::heap::{Handle, Heap};
@@ -26,11 +26,15 @@ pub enum VmState {
         args: Vec<Value>,
         snapshot: ZapcodeSnapshot,
     },
-    /// Suspended on a batch of external calls (`Promise.all([...])`) that the
-    /// host can run in parallel. Resume with `resume_many` passing one result
-    /// per call, in order.
+    /// Suspended on a batch of external calls (`Promise.{all,race,any,
+    /// allSettled}([...])`) that the host can run in parallel. `combinator`
+    /// tells the host which `Promise.*` settle semantics to apply. Resume with
+    /// `resume_many` passing the settled values the combinator produced (for
+    /// `all`/`allSettled` one entry per call in order; for `race`/`any` a single
+    /// entry), or `resume_with_error` on rejection.
     SuspendedMany {
         calls: Vec<ExternalCall>,
+        combinator: BatchKind,
         snapshot: ZapcodeSnapshot,
     },
 }
@@ -51,14 +55,29 @@ pub(crate) struct PendingExternalCall {
     pub(crate) args: Vec<Value>,
 }
 
-/// The structure of an in-flight `Promise.all` batch, captured at the await so
-/// resume can rebuild the result array in element order.
+/// The structure of an in-flight `Promise.*` batch, captured at the await so
+/// resume can assemble the final promise value per the combinator.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PendingBatch {
+    /// Which combinator produced this batch (`all`/`race`/`any`/`allSettled`).
+    /// Defaults to `All` so snapshots written before this field existed still
+    /// load with the historical behavior.
+    #[serde(default = "batch_kind_all")]
+    pub(crate) kind: BatchKind,
     /// Original array elements (some are `Value::Pending`).
     pub(crate) items: Vec<Value>,
     /// Call ids being awaited, in the order presented to the host.
     pub(crate) call_ids: Vec<u64>,
+}
+
+fn batch_kind_all() -> BatchKind {
+    BatchKind::All
+}
+
+/// The result of classifying an already-settled batch element.
+enum SettledOutcome {
+    Fulfilled(Value),
+    Rejected(Value),
 }
 
 /// Tracks where a method receiver originated so that mutations to `this`
@@ -377,9 +396,19 @@ impl Vm {
         }
     }
 
-    /// Resume a batch suspension (`Promise.all([...])`) with one result per
-    /// pending call, in the order the calls were presented to the host. The
-    /// resolved array is pushed and execution continues after the await.
+    /// Resume a batch suspension with the values the host's combinator produced.
+    ///
+    /// The shape of `results` depends on the batch's combinator (carried in
+    /// `pending_batch.kind`):
+    /// - `all`: one resolved value per pending call, in the order the calls were
+    ///   presented. The VM rebuilds the full result array in element order
+    ///   (deferred calls substituted, plain-promise/value elements unwrapped).
+    /// - `allSettled`: one settled object (`{status,value}` / `{status,reason}`)
+    ///   per pending call, in order; merged into the element-order array.
+    /// - `race`/`any`: a single entry — the one settled value the host chose. It
+    ///   becomes the promise value directly.
+    ///
+    /// A rejection is delivered via `resume_with_error` instead.
     pub(crate) fn resume_many(&mut self, results: Vec<Value>) -> Result<VmState> {
         self.tracker.start();
         let batch = self.pending_batch.take().ok_or_else(|| {
@@ -387,24 +416,99 @@ impl Vm {
                 "resume_many called but the VM is not suspended on a batch".to_string(),
             )
         })?;
-        if results.len() != batch.call_ids.len() {
-            return Err(ZapcodeError::RuntimeError(format!(
-                "resume_many expected {} results but got {}",
-                batch.call_ids.len(),
-                results.len()
-            )));
-        }
-        for (id, value) in batch.call_ids.iter().zip(results) {
-            self.resolved.insert(*id, value);
-        }
-        // Rebuild the result array in element order, substituting resolved values.
-        let array = self.build_batch_array(batch.items)?;
-        // Drop the now-resolved pending calls.
+
+        // Drop the now-resolved pending calls regardless of combinator.
         let resolved_ids: HashSet<u64> = batch.call_ids.iter().copied().collect();
         self.pending_calls.retain(|c| !resolved_ids.contains(&c.id));
-        let h = self.heap.alloc_array(array);
-        self.push(Value::Array(h))?;
-        self.execute()
+
+        match batch.kind {
+            // race/any settle to a single value supplied by the host's real JS
+            // combinator; push it directly (no element-order reassembly).
+            BatchKind::Race | BatchKind::Any => {
+                if results.len() != 1 {
+                    return Err(ZapcodeError::RuntimeError(format!(
+                        "resume_many for {} expected 1 result but got {}",
+                        batch.kind.as_str(),
+                        results.len()
+                    )));
+                }
+                let value = results.into_iter().next().unwrap_or(Value::Undefined);
+                self.push(value)?;
+                self.execute()
+            }
+            // all/allSettled deliver one settled entry per pending call, in the
+            // order the calls were presented; reassemble in element order.
+            BatchKind::All | BatchKind::AllSettled => {
+                if results.len() != batch.call_ids.len() {
+                    return Err(ZapcodeError::RuntimeError(format!(
+                        "resume_many expected {} results but got {}",
+                        batch.call_ids.len(),
+                        results.len()
+                    )));
+                }
+                for (id, value) in batch.call_ids.iter().zip(results) {
+                    self.resolved.insert(*id, value);
+                }
+                let array = match batch.kind {
+                    BatchKind::AllSettled => self.build_settled_array(batch.items)?,
+                    _ => self.build_batch_array(batch.items)?,
+                };
+                let h = self.heap.alloc_array(array);
+                self.push(Value::Array(h))?;
+                self.execute()
+            }
+        }
+    }
+
+    /// Build a `Promise.allSettled` result array from its elements: deferred
+    /// calls are replaced by the host-supplied settled object as-is; plain
+    /// promise/value elements are coerced to `{status,value}` /
+    /// `{status,reason}` settled objects. Never throws.
+    fn build_settled_array(&mut self, items: Vec<Value>) -> Result<Vec<Value>> {
+        let mut array = Vec::with_capacity(items.len());
+        for item in items {
+            match item {
+                Value::Pending(id) => {
+                    // Host already produced the settled object for this call.
+                    let value = self.resolved.remove(&id).ok_or_else(|| {
+                        ZapcodeError::RuntimeError(format!("missing result for call {}", id))
+                    })?;
+                    array.push(value);
+                }
+                Value::Object(h) if builtins::is_promise(&item, &self.heap) => {
+                    let map = self.heap.object_map(h);
+                    let mut entry = IndexMap::new();
+                    match map.get("status") {
+                        Some(Value::String(s)) if s.as_ref() == "rejected" => {
+                            entry.insert(Arc::from("status"), Value::String(Arc::from("rejected")));
+                            entry.insert(
+                                Arc::from("reason"),
+                                map.get("reason").cloned().unwrap_or(Value::Undefined),
+                            );
+                        }
+                        _ => {
+                            entry.insert(
+                                Arc::from("status"),
+                                Value::String(Arc::from("fulfilled")),
+                            );
+                            entry.insert(
+                                Arc::from("value"),
+                                map.get("value").cloned().unwrap_or(Value::Undefined),
+                            );
+                        }
+                    }
+                    array.push(Value::Object(self.heap.alloc_object(entry)));
+                }
+                other => {
+                    // Plain value: fulfilled.
+                    let mut entry = IndexMap::new();
+                    entry.insert(Arc::from("status"), Value::String(Arc::from("fulfilled")));
+                    entry.insert(Arc::from("value"), other);
+                    array.push(Value::Object(self.heap.alloc_object(entry)));
+                }
+            }
+        }
+        Ok(array)
     }
 
     /// Build a `Promise.all` result array from its elements: deferred calls are
@@ -444,10 +548,11 @@ impl Vm {
         Ok(array)
     }
 
-    /// Await a `Promise.all` batch. If any element is an unresolved deferred
-    /// call, suspend once with the whole batch so the host can run the calls in
-    /// parallel; otherwise build and push the result array inline.
-    fn await_batch(&mut self, items: Vec<Value>) -> Result<Option<VmState>> {
+    /// Await a `Promise.{all,race,any,allSettled}` batch. If any element is an
+    /// unresolved deferred call, suspend once with the whole batch (tagged with
+    /// `kind`) so the host can run the calls in parallel and settle them with
+    /// the real JS combinator; otherwise assemble and push the value inline.
+    fn await_batch(&mut self, kind: BatchKind, items: Vec<Value>) -> Result<Option<VmState>> {
         let mut call_ids = Vec::new();
         for item in &items {
             if let Value::Pending(id) = item {
@@ -458,9 +563,8 @@ impl Vm {
         }
 
         if call_ids.is_empty() {
-            let array = self.build_batch_array(items)?;
-            let h = self.heap.alloc_array(array);
-            self.push(Value::Array(h))?;
+            // Every element already settled — assemble inline without the host.
+            self.assemble_batch_inline(kind, items)?;
             return Ok(None);
         }
 
@@ -480,9 +584,118 @@ impl Vm {
             });
         }
 
-        self.pending_batch = Some(PendingBatch { items, call_ids });
+        self.pending_batch = Some(PendingBatch { kind, items, call_ids });
         let snapshot = ZapcodeSnapshot::capture(self)?;
-        Ok(Some(VmState::SuspendedMany { calls, snapshot }))
+        Ok(Some(VmState::SuspendedMany {
+            calls,
+            combinator: kind,
+            snapshot,
+        }))
+    }
+
+    /// Assemble and push the batch value when every element is already settled
+    /// (no host round-trip needed). Mirrors the per-combinator builtin
+    /// semantics in `builtins::call_promise_method`.
+    fn assemble_batch_inline(&mut self, kind: BatchKind, items: Vec<Value>) -> Result<()> {
+        match kind {
+            BatchKind::All => {
+                let array = self.build_batch_array(items)?;
+                let h = self.heap.alloc_array(array);
+                self.push(Value::Array(h))?;
+            }
+            BatchKind::AllSettled => {
+                let array = self.build_settled_array(items)?;
+                let h = self.heap.alloc_array(array);
+                self.push(Value::Array(h))?;
+            }
+            BatchKind::Race => {
+                // First element wins (already settled). Resolve → push value;
+                // reject → propagate as an unhandled rejection.
+                match items.into_iter().next() {
+                    Some(first) => {
+                        let value = self.unwrap_settled_or_propagate(first)?;
+                        self.push(value)?;
+                    }
+                    None => {
+                        // Empty race never settles in real JS; surface undefined
+                        // rather than hang the deterministic VM.
+                        self.push(Value::Undefined)?;
+                    }
+                }
+            }
+            BatchKind::Any => {
+                // First fulfilled value wins; if all reject, reject with an
+                // AggregateError-shaped value.
+                let mut errors = Vec::new();
+                let mut chosen: Option<Value> = None;
+                for item in items {
+                    match self.settled_outcome(&item) {
+                        SettledOutcome::Fulfilled(v) => {
+                            chosen = Some(v);
+                            break;
+                        }
+                        SettledOutcome::Rejected(reason) => errors.push(reason),
+                    }
+                }
+                match chosen {
+                    Some(v) => self.push(v)?,
+                    None => {
+                        let errors_arr = Value::Array(self.heap.alloc_array(errors));
+                        let mut agg = IndexMap::new();
+                        agg.insert(
+                            Arc::from("name"),
+                            Value::String(Arc::from("AggregateError")),
+                        );
+                        agg.insert(
+                            Arc::from("message"),
+                            Value::String(Arc::from("All promises were rejected")),
+                        );
+                        agg.insert(Arc::from("errors"), errors_arr);
+                        let reason = Value::Object(self.heap.alloc_object(agg));
+                        let reason = reason.to_js_string(&self.heap);
+                        return Err(ZapcodeError::RuntimeError(format!(
+                            "Unhandled promise rejection: {}",
+                            reason
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Classify an already-settled element (plain value or promise object) as
+    /// fulfilled or rejected, cloning out the relevant payload.
+    fn settled_outcome(&self, item: &Value) -> SettledOutcome {
+        if let Value::Object(h) = item {
+            if builtins::is_promise(item, &self.heap) {
+                let map = self.heap.object_map(*h);
+                if matches!(map.get("status"), Some(Value::String(s)) if s.as_ref() == "rejected") {
+                    return SettledOutcome::Rejected(
+                        map.get("reason").cloned().unwrap_or(Value::Undefined),
+                    );
+                }
+                return SettledOutcome::Fulfilled(
+                    map.get("value").cloned().unwrap_or(Value::Undefined),
+                );
+            }
+        }
+        SettledOutcome::Fulfilled(item.clone())
+    }
+
+    /// Unwrap an already-settled element: resolved promise → its value, plain
+    /// value → itself, rejected promise → propagate as an unhandled rejection.
+    fn unwrap_settled_or_propagate(&mut self, item: Value) -> Result<Value> {
+        match self.settled_outcome(&item) {
+            SettledOutcome::Fulfilled(v) => Ok(v),
+            SettledOutcome::Rejected(reason) => {
+                let reason = reason.to_js_string(&self.heap);
+                Err(ZapcodeError::RuntimeError(format!(
+                    "Unhandled promise rejection: {}",
+                    reason
+                )))
+            }
+        }
     }
 
     fn push(&mut self, value: Value) -> Result<()> {
@@ -2943,17 +3156,19 @@ impl Vm {
                     .push(PendingExternalCall { id, name, args });
                 self.push(Value::Pending(id))?;
             }
-            Instruction::MakeBatchPromise(n) => {
+            Instruction::MakeBatchPromise(kind, n) => {
                 let mut items = Vec::with_capacity(n);
                 for _ in 0..n {
                     items.push(self.pop()?);
                 }
                 items.reverse();
-                // Mark as a pending-all batch promise; the await resolves it.
+                // Mark as a pending-batch promise tagged with the combinator;
+                // the await resolves it per `kind`.
                 let items_arr = Value::Array(self.heap.alloc_array(items));
                 let mut obj = IndexMap::new();
                 obj.insert(Arc::from("__promise__"), Value::Bool(true));
                 obj.insert(Arc::from("status"), Value::String(Arc::from("pending_all")));
+                obj.insert(Arc::from("__batch_kind__"), Value::String(Arc::from(kind.as_str())));
                 obj.insert(Arc::from("items"), items_arr);
                 let h = self.heap.alloc_object(obj);
                 self.push(Value::Object(h))?;
@@ -3302,9 +3517,18 @@ impl Vm {
                                     Some(Value::Array(a)) => self.heap.array_vec(*a),
                                     _ => Vec::new(),
                                 };
+                                let kind = match map.get("__batch_kind__") {
+                                    Some(Value::String(k)) => match k.as_ref() {
+                                        "race" => BatchKind::Race,
+                                        "any" => BatchKind::Any,
+                                        "allSettled" => BatchKind::AllSettled,
+                                        _ => BatchKind::All,
+                                    },
+                                    _ => BatchKind::All,
+                                };
                                 // Suspend on the whole batch (or resolve inline if
                                 // every element is already available).
-                                return self.await_batch(items);
+                                return self.await_batch(kind, items);
                             }
                             _ => {
                                 // Unknown status — pass through

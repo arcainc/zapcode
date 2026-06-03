@@ -94,6 +94,11 @@ pub struct ZapcodeBatchSuspension {
     pub kind: String,
     /// Whether execution completed. Always false for this type.
     pub completed: bool,
+    /// Which `Promise` combinator produced this batch: one of "all", "race",
+    /// "any", "allSettled". The host settles the calls with the matching
+    /// `Promise.*` and resumes accordingly (one result per call for
+    /// all/allSettled; a single result for race/any; resumeError on rejection).
+    pub combinator: String,
     /// The batched external calls, in order.
     pub calls: Vec<JsExternalCall>,
     /// Opaque snapshot bytes -- pass to `ZapcodeSnapshotHandle.load()` to resume.
@@ -130,14 +135,18 @@ pub struct ZapcodeSessionSuspension {
     pub session: Buffer,
 }
 
-/// Session suspended on a batch of external calls (`Promise.all([...])`).
-/// Resume with `resumeMany(results)`.
+/// Session suspended on a batch of external calls
+/// (`Promise.{all,race,any,allSettled}([...])`). Resume with
+/// `resumeMany(results)` (or `resumeError` on rejection).
 #[napi(object)]
 pub struct ZapcodeSessionBatchSuspension {
     /// Discriminant. Always "suspended_many".
     pub kind: String,
     /// Whether execution completed. Always false for this type.
     pub completed: bool,
+    /// Which `Promise` combinator produced this batch: "all", "race", "any", or
+    /// "allSettled".
+    pub combinator: String,
     /// The batched external calls, in order.
     pub calls: Vec<JsExternalCall>,
     /// Captured stdout output for this chunk/resume step.
@@ -646,13 +655,18 @@ fn run_result_to_either(
                 snapshot: Buffer::from(snap_bytes),
             }))
         }
-        VmState::SuspendedMany { calls, snapshot } => {
+        VmState::SuspendedMany {
+            calls,
+            combinator,
+            snapshot,
+        } => {
             let snap_bytes = snapshot
                 .dump()
                 .map_err(|e| napi::Error::from_reason(e.to_string()))?;
             Ok(Either3::C(ZapcodeBatchSuspension {
                 kind: "suspended_many".to_string(),
                 completed: false,
+                combinator: combinator.as_str().to_string(),
                 calls: external_calls_to_js(&calls, &heap),
                 snapshot: Buffer::from(snap_bytes),
             }))
@@ -695,13 +709,18 @@ fn run_result_to_either_with_stdout(
                 snapshot: Buffer::from(snap_bytes),
             }))
         }
-        VmState::SuspendedMany { calls, snapshot } => {
+        VmState::SuspendedMany {
+            calls,
+            combinator,
+            snapshot,
+        } => {
             let snap_bytes = snapshot
                 .dump()
                 .map_err(|e| napi::Error::from_reason(e.to_string()))?;
             Ok(Either3::C(ZapcodeBatchSuspension {
                 kind: "suspended_many".to_string(),
                 completed: false,
+                combinator: combinator.as_str().to_string(),
                 calls: external_calls_to_js(&calls, &heap),
                 snapshot: Buffer::from(snap_bytes),
             }))
@@ -763,6 +782,7 @@ fn session_state_to_either(state: ZapcodeSessionState) -> napi::Result<SessionEi
         }
         ZapcodeSessionState::SuspendedMany {
             calls,
+            combinator,
             stdout,
             session,
         } => {
@@ -772,6 +792,7 @@ fn session_state_to_either(state: ZapcodeSessionState) -> napi::Result<SessionEi
             Ok(Either3::C(ZapcodeSessionBatchSuspension {
                 kind: "suspended_many".to_string(),
                 completed: false,
+                combinator: combinator.as_str().to_string(),
                 calls: external_calls_to_js(&calls, &heap),
                 stdout,
                 session: Buffer::from(bytes),

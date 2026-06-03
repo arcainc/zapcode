@@ -26,7 +26,12 @@
  * ```
  */
 
-import { Zapcode, ZapcodeSnapshotHandle, ZapcodeSessionHandle } from "@unchartedfr/zapcode";
+import {
+  Zapcode,
+  ZapcodeSnapshotHandle,
+  ZapcodeSessionHandle,
+  type PromiseCombinator,
+} from "@unchartedfr/zapcode";
 import { jsonSchema, tool, type ToolSet } from "ai";
 
 // ---------------------------------------------------------------------------
@@ -749,19 +754,11 @@ async function executeCode(
       const snapshot = ZapcodeSnapshotHandle.load(state.snapshot);
 
       if (state.kind === "suspended_many") {
-        // Parallel batch (Promise.all). Run every call concurrently. A failing
-        // tool surfaces like a Promise.all rejection: the first failure is
-        // raised back into the guest (catchable); otherwise resume with all
-        // results. A malformed call throws and aborts the whole execution.
-        const outcomes = await Promise.all(
-          state.calls.map(call => invokeTool(call.name, call.args))
-        );
-        const firstFailure = outcomes.find((o): o is { ok: false; message: string } => !o.ok);
-        if (firstFailure) {
-          state = snapshot.resumeError(firstFailure.message);
-        } else {
-          state = snapshot.resumeMany(outcomes.map(o => (o as { ok: true; result: unknown }).result));
-        }
+        // Parallel batch (Promise.{all,race,any,allSettled}). Run every call
+        // concurrently as a real JS promise so race/any honor real settle
+        // timing, then settle with the matching combinator. A malformed call
+        // throws and aborts the whole execution.
+        state = await settleBatch(snapshot, state.combinator, state.calls, invokeTool);
         continue;
       }
 
@@ -1139,6 +1136,121 @@ async function invokeToolCall(
   }
 }
 
+/** A batched external call exposed by a `suspended_many` suspension. */
+type BatchCall = { name: string; args: unknown[] };
+
+/**
+ * The subset of a snapshot/session handle a batch resume needs. Both
+ * `ZapcodeSnapshotHandle` and `ZapcodeSessionHandle` satisfy this.
+ */
+interface BatchResumable<S> {
+  resumeMany(results: unknown[]): S;
+  resumeError(error: unknown): S;
+}
+
+/**
+ * Settle a `Promise.{all,race,any,allSettled}` batch using REAL JS promises so
+ * race/any honor real settle timing, then resume the VM per combinator:
+ *   all        -> Promise.all        -> resumeMany(values) | resumeError(first)
+ *   allSettled -> Promise.allSettled -> resumeMany(settledObjects)  (never rejects)
+ *   race       -> Promise.race       -> resumeMany([value]) | resumeError(reason)
+ *   any        -> Promise.any        -> resumeMany([value]) | resumeError(AggregateError)
+ *
+ * A *malformed* call (thrown by `invoke`) aborts the whole execution; a tool
+ * *rejection* is surfaced as a rejected JS promise so the combinator sees it.
+ */
+async function settleBatch<S>(
+  handle: BatchResumable<S>,
+  combinator: PromiseCombinator,
+  calls: BatchCall[],
+  invoke: (name: string, args: unknown[]) => Promise<ToolOutcome>
+): Promise<S> {
+  // A *malformed* call (unknown function / bad args) throws a plain error and
+  // must ABORT the whole execution — it is never catchable by the guest. Track
+  // the first such fatal error so we can re-throw it after settling.
+  let fatal: unknown;
+  let sawFatal = false;
+
+  // Each call becomes a REAL JS promise so race/any honor real settle timing.
+  // A fulfilled tool resolves with its result; a *runtime* tool failure rejects
+  // with a `BatchToolError` (catchable by the combinator). A malformed call's
+  // throw is recorded as fatal and re-surfaced as a never-settling rejection so
+  // it can't accidentally win a race/any.
+  const promises = calls.map(async call => {
+    let outcome: ToolOutcome;
+    try {
+      outcome = await invoke(call.name, call.args);
+    } catch (err) {
+      if (!sawFatal) {
+        sawFatal = true;
+        fatal = err;
+      }
+      // Fatal: surface via the shared `fatal` holder (checked below). Reject so
+      // this call never resolves to a bogus value.
+      throw new BatchToolError("__fatal__");
+    }
+    if (outcome.ok) return outcome.result;
+    throw new BatchToolError(outcome.message);
+  });
+
+  // Run the real combinator for value + timing semantics, then translate the
+  // settled outcome into a VM resume. Re-throw any fatal malformed-call error.
+  let resume: () => S;
+  try {
+    switch (combinator) {
+      case "all": {
+        const results = await Promise.all(promises);
+        resume = () => handle.resumeMany(results);
+        break;
+      }
+      case "allSettled": {
+        const settled = await Promise.allSettled(promises);
+        const objects = settled.map(s =>
+          s.status === "fulfilled"
+            ? { status: "fulfilled", value: s.value }
+            : { status: "rejected", reason: batchErrorMessage(s.reason) }
+        );
+        resume = () => handle.resumeMany(objects);
+        break;
+      }
+      case "race": {
+        const value = await Promise.race(promises);
+        resume = () => handle.resumeMany([value]);
+        break;
+      }
+      case "any": {
+        const value = await Promise.any(promises);
+        resume = () => handle.resumeMany([value]);
+        break;
+      }
+      default: {
+        // Exhaustiveness guard — an unknown combinator is a binding/version skew.
+        const never: never = combinator;
+        throw new Error(`unknown promise combinator: ${String(never)}`);
+      }
+    }
+  } catch (err) {
+    if (sawFatal) throw fatal; // malformed call — abort
+    // A catchable tool rejection (all/race) or an all-rejected any.
+    return handle.resumeError(batchErrorMessage(err));
+  }
+  if (sawFatal) throw fatal; // fatal lost the race but must still abort
+  return resume();
+}
+
+/** A tool rejection carried through a real JS promise inside {@link settleBatch}. */
+class BatchToolError extends Error {}
+
+/** Best-effort message extraction for a rejection reason or AggregateError. */
+function batchErrorMessage(err: unknown): string {
+  if (err instanceof AggregateError) {
+    const inner = err.errors?.map(e => batchErrorMessage(e)).join(", ");
+    return inner ? `AggregateError: ${inner}` : "AggregateError: all promises were rejected";
+  }
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
+
 /** Options for {@link createSession} / {@link loadSession}. */
 export interface SessionOptions {
   /** Tools available to guest code across the whole session. */
@@ -1201,13 +1313,9 @@ function makeSession(
     while (!state.completed) {
       const handle = ZapcodeSessionHandle.load(state.session);
       if (state.kind === "suspended_many") {
-        const outcomes = await Promise.all(
-          state.calls.map(call => invokeToolCall(toolDefs, toolNames, call.name, call.args, toolCalls))
+        state = await settleBatch(handle, state.combinator, state.calls, (name, args) =>
+          invokeToolCall(toolDefs, toolNames, name, args, toolCalls)
         );
-        const failure = outcomes.find((o): o is { ok: false; message: string } => !o.ok);
-        state = failure
-          ? handle.resumeError(failure.message)
-          : handle.resumeMany(outcomes.map(o => (o as { ok: true; result: unknown }).result));
       } else {
         const outcome = await invokeToolCall(toolDefs, toolNames, state.functionName, state.args, toolCalls);
         state = outcome.ok ? handle.resume(outcome.result) : handle.resumeError(outcome.message);

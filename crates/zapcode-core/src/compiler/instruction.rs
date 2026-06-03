@@ -1,5 +1,34 @@
 use serde::{Deserialize, Serialize};
 
+/// Which `Promise` combinator a deferred batch represents. Determines how the
+/// host settles the batched calls and how the VM assembles the final promise
+/// value when the batch resumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BatchKind {
+    /// `Promise.all` — array of results in call order; reject on first failure.
+    All,
+    /// `Promise.race` — the single first-settled value (resolve or reject).
+    Race,
+    /// `Promise.any` — the first fulfilled value; reject (AggregateError) only
+    /// when every call rejects.
+    Any,
+    /// `Promise.allSettled` — array of `{status, value|reason}` objects; never
+    /// rejects.
+    AllSettled,
+}
+
+impl BatchKind {
+    /// Stable lowercase tag exposed to the host bridge.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BatchKind::All => "all",
+            BatchKind::Race => "race",
+            BatchKind::Any => "any",
+            BatchKind::AllSettled => "allSettled",
+        }
+    }
+}
+
 /// Bytecode instructions for the Zapcode VM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Instruction {
@@ -91,8 +120,10 @@ pub enum Instruction {
     /// so the calls can be batched and run in parallel by the host.
     CallExternalDeferred(String, usize),
     /// Pops `n` items (some may be `Value::Pending`) and builds a batch promise
-    /// that, when awaited, suspends once with all of its pending calls.
-    MakeBatchPromise(usize),
+    /// tagged with the combinator kind. When awaited it suspends once with all
+    /// of its pending calls; the host settles them per the combinator and the
+    /// VM assembles the final value accordingly.
+    MakeBatchPromise(BatchKind, usize),
 
     // Control flow
     Jump(usize),

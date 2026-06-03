@@ -1615,10 +1615,11 @@ impl Compiler {
                 if expr_is_optional_chain(expr) {
                     return self.compile_optional_chain(expr);
                 }
-                // Check for `Promise.all([ ...direct external calls... ])` — when
-                // any element is a direct external call, compile the elements as
-                // deferred calls so the host can run them in parallel.
-                if self.try_compile_promise_all_batch(callee, args)? {
+                // Check for `Promise.{all,race,any,allSettled}([ ...direct
+                // external calls... ])` — when any element is a direct external
+                // call, compile the elements as deferred calls so the host can
+                // run them in parallel and settle them per the combinator.
+                if self.try_compile_promise_batch(callee, args)? {
                     return Ok(());
                 }
                 // Check if this is a super() call
@@ -1768,26 +1769,35 @@ impl Compiler {
         Ok(())
     }
 
-    /// If `callee(args)` is `Promise.all([...])` and at least one array element
-    /// is a direct call to an external function, compile it as a parallel batch:
-    /// each direct external-call element becomes a deferred call (no suspend),
-    /// other elements compile normally, then `MakeBatchPromise` wraps them.
+    /// If `callee(args)` is `Promise.{all,race,any,allSettled}([...])` and at
+    /// least one array element is a direct call to an external function, compile
+    /// it as a parallel batch tagged with the combinator kind: each direct
+    /// external-call element becomes a deferred call (no suspend), other
+    /// elements compile normally, then `MakeBatchPromise(kind, n)` wraps them.
     /// Returns `true` if it handled the call.
-    fn try_compile_promise_all_batch(&mut self, callee: &Expr, args: &[Expr]) -> Result<bool> {
-        // callee must be `Promise.all`
-        let is_promise_all = matches!(
-            callee,
-            Expr::Member { object, property, .. }
-                if property == "all" && matches!(object.as_ref(), Expr::Ident(n) if n == "Promise")
-        );
-        if !is_promise_all || args.len() != 1 {
+    fn try_compile_promise_batch(&mut self, callee: &Expr, args: &[Expr]) -> Result<bool> {
+        // callee must be `Promise.<combinator>`
+        let Expr::Member { object, property, .. } = callee else {
+            return Ok(false);
+        };
+        if !matches!(object.as_ref(), Expr::Ident(n) if n == "Promise") {
+            return Ok(false);
+        }
+        let kind = match property.as_str() {
+            "all" => BatchKind::All,
+            "race" => BatchKind::Race,
+            "any" => BatchKind::Any,
+            "allSettled" => BatchKind::AllSettled,
+            _ => return Ok(false),
+        };
+        if args.len() != 1 {
             return Ok(false);
         }
         let Expr::Array(elements) = &args[0] else {
             return Ok(false);
         };
         // Only take the batch path if there's at least one direct external call;
-        // otherwise fall through to the normal Promise.all builtin so existing
+        // otherwise fall through to the normal Promise.* builtin so existing
         // behavior (resolved promises, plain values, rejection) is unchanged.
         let has_external_call = elements
             .iter()
@@ -1818,7 +1828,7 @@ impl Compiler {
                 }
             }
         }
-        self.emit(Instruction::MakeBatchPromise(elements.len()));
+        self.emit(Instruction::MakeBatchPromise(kind, elements.len()));
         Ok(true)
     }
 

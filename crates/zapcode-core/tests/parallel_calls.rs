@@ -2,7 +2,7 @@
 //! suspension so the host can run them in parallel.
 
 use zapcode_core::vm::VmState;
-use zapcode_core::{ResourceLimits, Value, ZapcodeRun, ZapcodeSnapshot};
+use zapcode_core::{BatchKind, ResourceLimits, Value, ZapcodeRun, ZapcodeSnapshot};
 
 fn start(code: &str) -> VmState {
     ZapcodeRun::new(
@@ -26,7 +26,14 @@ fn promise_all_of_external_calls_suspends_once_with_all_calls() {
     );
 
     let (calls, snapshot) = match state {
-        VmState::SuspendedMany { calls, snapshot } => (calls, snapshot),
+        VmState::SuspendedMany {
+            calls,
+            combinator,
+            snapshot,
+        } => {
+            assert_eq!(combinator, BatchKind::All);
+            (calls, snapshot)
+        }
         other => panic!("expected SuspendedMany, got {other:?}"),
     };
 
@@ -79,7 +86,9 @@ fn batch_survives_a_dump_load_boundary() {
 fn promise_all_mixes_external_calls_and_plain_values() {
     let state = start(r#"const r = await Promise.all([fetch("a"), 42]); r"#);
     let snapshot = match state {
-        VmState::SuspendedMany { calls, snapshot } => {
+        VmState::SuspendedMany {
+            calls, snapshot, ..
+        } => {
             assert_eq!(calls.len(), 1, "only the external call is batched");
             snapshot
         }

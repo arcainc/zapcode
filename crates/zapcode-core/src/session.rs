@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::compiler::instruction::BatchKind;
 use crate::compiler::{compile_session_chunk, CompiledProgram, TopLevelBindingKind};
 use crate::error::{Result, ZapcodeError};
 use crate::sandbox::ResourceLimits;
@@ -67,10 +68,13 @@ pub enum ZapcodeSessionState {
         stdout: String,
         session: ZapcodeSessionSnapshot,
     },
-    /// Suspended on a batch of external calls (`Promise.all([...])`) the host
-    /// can run in parallel. Resume with `resume_many`.
+    /// Suspended on a batch of external calls (`Promise.{all,race,any,
+    /// allSettled}([...])`) the host can run in parallel. `combinator` selects
+    /// the `Promise.*` settle semantics. Resume with `resume_many` (or
+    /// `resume_with_error` on rejection).
     SuspendedMany {
         calls: Vec<ExternalCall>,
+        combinator: BatchKind,
         stdout: String,
         session: ZapcodeSessionSnapshot,
     },
@@ -408,8 +412,13 @@ fn build_session_state(
                 })),
             },
         }),
-        VmState::SuspendedMany { calls, snapshot: _ } => Ok(ZapcodeSessionState::SuspendedMany {
+        VmState::SuspendedMany {
             calls,
+            combinator,
+            snapshot: _,
+        } => Ok(ZapcodeSessionState::SuspendedMany {
+            calls,
+            combinator,
             stdout,
             session: ZapcodeSessionSnapshot {
                 data: SessionSnapshotData::Suspended(Box::new(SuspendedSessionState {
