@@ -406,17 +406,16 @@ fn replace_dollar_patterns() {
 }
 
 #[test]
-fn replace_dollar_edge_divergences() {
-    // DIVERGENCE: `$$` should yield a single literal `$` in JS; zapcode leaves it as
-    // `$$`. Asserting ACTUAL behavior.
-    assert_eq!(run_str("'ab'.replace('a', '$$')"), "$$b"); // JS: "$b"
-    // DIVERGENCE: `$1` with no corresponding capture group is left LITERAL in JS
-    // ("a$1c"); zapcode drops it. Asserting ACTUAL behavior.
-    assert_eq!(run_str("'abc'.replace(/b/, '$1')"), "ac"); // JS: "a$1c"
-    // DIVERGENCE: `` $` `` (prefix) and `$'` (suffix) substitutions are not
-    // implemented; the tokens are inserted literally. Asserting ACTUAL behavior.
-    assert_eq!(run_str("'abc'.replace('b', '$`')"), "a$`c"); // JS: "aac"
-    assert_eq!(run_str("'abc'.replace('b', \"$'\")"), "a$'c"); // JS: "acc"
+fn replace_dollar_patterns_edges() {
+    // `$$` yields a single literal `$`.
+    assert_eq!(run_str("'ab'.replace('a', '$$')"), "$b");
+    // `$1` with no corresponding capture group is left LITERAL.
+    assert_eq!(run_str("'abc'.replace(/b/, '$1')"), "a$1c");
+    // `` $` `` (prefix) and `$'` (suffix) substitutions are honored.
+    assert_eq!(run_str("'abc'.replace('b', '$`')"), "aac");
+    assert_eq!(run_str("'abc'.replace('b', \"$'\")"), "acc");
+    // `$&` is the matched substring (string-search path).
+    assert_eq!(run_str("'abc'.replace('b', '[$&]')"), "a[b]c");
 }
 
 #[test]

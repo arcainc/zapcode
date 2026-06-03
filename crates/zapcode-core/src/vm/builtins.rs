@@ -1280,9 +1280,56 @@ pub fn call_regexp_method(
     })
 }
 
+/// Expand JS string-replacement tokens for a *string-search* replace (no capture
+/// groups): `$$` -> `$`, `$&` -> the matched substring, `` $` `` -> the portion
+/// before the match, `$'` -> the portion after the match. A `$n` (digits) and any
+/// other `$x` are left literal, exactly like `String.prototype.replace` with a
+/// plain-string search value (which has no captures to reference).
+fn expand_string_replacement(repl: &str, whole: &str, match_start: usize, match_len: usize) -> String {
+    if !repl.contains('$') {
+        return repl.to_string();
+    }
+    let matched = &whole[match_start..match_start + match_len];
+    let before = &whole[..match_start];
+    let after = &whole[match_start + match_len..];
+    let mut out = String::with_capacity(repl.len());
+    let mut chars = repl.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('$') => {
+                chars.next();
+                out.push('$');
+            }
+            Some('&') => {
+                chars.next();
+                out.push_str(matched);
+            }
+            Some('`') => {
+                chars.next();
+                out.push_str(before);
+            }
+            Some('\'') => {
+                chars.next();
+                out.push_str(after);
+            }
+            // `$n` / `$<name>` and any other `$x`: literal (no captures here).
+            _ => out.push('$'),
+        }
+    }
+    out
+}
+
 /// Translate JS replacement tokens (`$&`, `$1`, `$$`) to the regex crate's
-/// `${0}`/`${1}`/`$` so group substitution works as agents expect.
-pub fn translate_replacement(repl: &str) -> String {
+/// `${0}`/`${1}`/`$` so group substitution works as agents expect. `group_count`
+/// is the number of capture groups *including* group 0 (i.e. `re.captures_len()`);
+/// a `$n` that references a group `>= group_count` is left literal, matching JS
+/// (`"abc".replace(/b/, "$1")` keeps `$1` because `/b/` has no group 1). To skip
+/// the range check (translate every `$n`), pass `usize::MAX`.
+pub fn translate_replacement(repl: &str, group_count: usize) -> String {
     let mut out = String::new();
     let mut chars = repl.chars().peekable();
     while let Some(c) = chars.next() {
@@ -1321,7 +1368,19 @@ pub fn translate_replacement(repl: &str) -> String {
                         break;
                     }
                 }
-                out.push_str(&format!("${{{}}}", num));
+                // A group reference past the pattern's groups stays literal (JS).
+                // Emit `$$` (the regex crate's literal-`$` escape) so the crate's
+                // own replacer renders a literal `$n` rather than re-interpreting it.
+                let in_range = num
+                    .parse::<usize>()
+                    .map(|n| n < group_count)
+                    .unwrap_or(false);
+                if in_range {
+                    out.push_str(&format!("${{{}}}", num));
+                } else {
+                    out.push_str("$$");
+                    out.push_str(&num);
+                }
             }
             _ => out.push('$'),
         }
@@ -1643,7 +1702,7 @@ fn call_string_method(
         "replace" => {
             if let Some((pat, flags)) = args.first().and_then(|v| regexp_parts(v, heap)) {
                 let re = compile_regex(&pat, &flags)?;
-                let repl = translate_replacement(&arg_str(args, 1, heap));
+                let repl = translate_replacement(&arg_str(args, 1, heap), re.captures_len());
                 let out = if flags.contains('g') {
                     re.replace_all(s, repl.as_str())
                 } else {
@@ -1653,18 +1712,51 @@ fn call_string_method(
             }
             let search = arg_str(args, 0, heap);
             let replacement = arg_str(args, 1, heap);
-            Value::String(Arc::from(s.replacen(&*search, &replacement, 1).as_str()))
+            // Replace the first occurrence, expanding `$`-tokens against the match.
+            match s.find(&*search) {
+                Some(byte) => {
+                    let expanded =
+                        expand_string_replacement(&replacement, s, byte, search.len());
+                    let mut out = String::with_capacity(s.len());
+                    out.push_str(&s[..byte]);
+                    out.push_str(&expanded);
+                    out.push_str(&s[byte + search.len()..]);
+                    Value::String(Arc::from(out.as_str()))
+                }
+                None => Value::String(s.clone()),
+            }
         }
         "replaceAll" => {
             if let Some((pat, flags)) = args.first().and_then(|v| regexp_parts(v, heap)) {
                 let re = compile_regex(&pat, &flags)?;
-                let repl = translate_replacement(&arg_str(args, 1, heap));
+                let repl = translate_replacement(&arg_str(args, 1, heap), re.captures_len());
                 let out = re.replace_all(s, repl.as_str());
                 return Ok(Some(Value::String(Arc::from(out.as_ref()))));
             }
             let search = arg_str(args, 0, heap);
             let replacement = arg_str(args, 1, heap);
-            Value::String(Arc::from(s.replace(&*search, &replacement).as_str()))
+            if search.is_empty() {
+                // Match JS empty-search edge: insert between every char (and ends).
+                // Fall back to the simple replace which already handles this shape.
+                Value::String(Arc::from(s.replace(&*search, &replacement).as_str()))
+            } else {
+                // Replace every non-overlapping occurrence, expanding `$`-tokens
+                // against each match.
+                let mut out = String::with_capacity(s.len());
+                let mut last = 0usize;
+                for (byte, _) in s.match_indices(&*search) {
+                    out.push_str(&s[last..byte]);
+                    out.push_str(&expand_string_replacement(
+                        &replacement,
+                        s,
+                        byte,
+                        search.len(),
+                    ));
+                    last = byte + search.len();
+                }
+                out.push_str(&s[last..]);
+                Value::String(Arc::from(out.as_str()))
+            }
         }
         "match" => {
             if let Some((pat, flags)) = args.first().and_then(|v| regexp_parts(v, heap)) {
