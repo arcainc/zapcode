@@ -74,6 +74,70 @@ await test("an uncaught tool failure aborts execution", async () => {
   );
 });
 
+// N4: a tool (external) call inside a .then/.catch/.finally callback must be
+// able to suspend and resume — the common `primary().catch(() => fallback())`
+// retry/fallback pattern. Previously the array-callback guard blocked this.
+await test(".catch callback can call a tool (fallback pattern)", async () => {
+  const result = await execute(
+    `
+    const out = await Promise.reject("primary down")
+      .catch(() => fetchData("fallback"));
+    out
+  `,
+    {
+      fetchData: {
+        description: "Fetch fallback data.",
+        parameters: { key: { type: "string" } },
+        execute: async ({ key }) => `${key}-ok`,
+      },
+    }
+  );
+  assert.equal(result.output, "fallback-ok");
+  assert.equal(result.toolCalls.length, 1);
+  assert.equal(result.toolCalls[0].result, "fallback-ok");
+});
+
+await test(".then callback can call a tool threading the resolved value", async () => {
+  const result = await execute(
+    `
+    const out = await Promise.resolve("ctx")
+      .then((v) => fetchData(v));
+    out
+  `,
+    {
+      fetchData: {
+        description: "Fetch data.",
+        parameters: { key: { type: "string" } },
+        execute: async ({ key }) => `${key}-ok`,
+      },
+    }
+  );
+  assert.equal(result.output, "ctx-ok");
+});
+
+await test(".finally callback runs a tool but passes the value through", async () => {
+  let cleaned = 0;
+  const result = await execute(
+    `
+    const out = await Promise.resolve(7)
+      .finally(() => cleanup("done"));
+    out
+  `,
+    {
+      cleanup: {
+        description: "Cleanup side effect.",
+        parameters: { what: { type: "string" } },
+        execute: async () => {
+          cleaned++;
+          return 999; // discarded by finally
+        },
+      },
+    }
+  );
+  assert.equal(result.output, 7);
+  assert.equal(cleaned, 1);
+});
+
 await test("autoFix surfaces an uncaught tool failure as a structured error", async () => {
   const result = await execute(
     `const v = await fetchData("a"); v`,

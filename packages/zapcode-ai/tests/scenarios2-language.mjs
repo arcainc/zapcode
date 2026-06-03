@@ -536,9 +536,8 @@ await check("switch fallthrough: consecutive cases without break share code", as
 // ─────────────────────────────────────────────────────────────────────────────
 // 13. try/finally return-value interaction
 // ─────────────────────────────────────────────────────────────────────────────
-// BUG: try/finally — a return inside finally should override the try return.
-// Standard JS: the finally return wins. Actual: the try return wins.
-await check("BUG — try/finally: try return wins instead of finally return", async () => {
+// try/finally — a return inside finally overrides the try return (matches Node).
+await check("try/finally: finally return overrides try return", async () => {
   const r = await execute(`
     function f() {
       try {
@@ -549,9 +548,7 @@ await check("BUG — try/finally: try return wins instead of finally return", as
     }
     f()
   `, {});
-  // Correct JS: "from-finally"
-  // Actual (bug): "from-try"
-  assert.equal(r.output, "from-try", "BUG: finally return does not override try return");
+  assert.equal(r.output, "from-finally", "finally return overrides the try return");
 });
 
 await check("try/catch/finally: finally always runs, catch return preserved when finally has no return", async () => {

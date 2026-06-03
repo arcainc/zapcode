@@ -19,9 +19,9 @@ fn start_with_externals(
 
 #[test]
 fn test_snapshot_dump_load_roundtrip() {
-    // Code that calls an external function, causing suspension.
+    // Code that awaits an external function, causing suspension.
     let code = r#"
-        const result = fetch("https://example.com");
+        const result = await fetch("https://example.com");
     "#;
 
     let state = start_with_externals(code, vec!["fetch"], Vec::new());
@@ -46,9 +46,9 @@ fn test_snapshot_dump_load_roundtrip() {
 
 #[test]
 fn test_snapshot_resume_simple() {
-    // Code: call external, use return value
+    // Code: await external, use return value
     let code = r#"
-        const data = fetch("https://example.com");
+        const data = await fetch("https://example.com");
         data
     "#;
 
@@ -67,7 +67,8 @@ fn test_snapshot_resume_simple() {
             // Resume with a return value
             let result = snapshot
                 .resume(Value::String("response body".into()))
-                .unwrap();
+                .unwrap()
+                .state;
 
             match result {
                 VmState::Complete(v) => {
@@ -84,9 +85,9 @@ fn test_snapshot_resume_simple() {
 
 #[test]
 fn test_snapshot_resume_with_computation_after() {
-    // Code: call external, then do computation with the result
+    // Code: await external, then do computation with the result
     let code = r#"
-        const x = fetch("url");
+        const x = await fetch("url");
         x + " processed"
     "#;
 
@@ -94,7 +95,7 @@ fn test_snapshot_resume_with_computation_after() {
 
     match state {
         VmState::Suspended { snapshot, .. } => {
-            let result = snapshot.resume(Value::String("data".into())).unwrap();
+            let result = snapshot.resume(Value::String("data".into())).unwrap().state;
 
             match result {
                 VmState::Complete(v) => {
@@ -111,10 +112,10 @@ fn test_snapshot_resume_with_computation_after() {
 
 #[test]
 fn test_snapshot_resume_chain() {
-    // Code that calls two external functions in sequence
+    // Code that awaits two external functions in sequence
     let code = r#"
-        const a = fetch("url1");
-        const b = db(a);
+        const a = await fetch("url1");
+        const b = await db(a);
         b
     "#;
 
@@ -134,7 +135,7 @@ fn test_snapshot_resume_chain() {
     };
 
     // Resume fetch with a value, should suspend again at db
-    let state2 = snapshot1.resume(Value::String("fetched".into())).unwrap();
+    let state2 = snapshot1.resume(Value::String("fetched".into())).unwrap().state;
 
     let snapshot2 = match state2 {
         VmState::Suspended {
@@ -151,7 +152,7 @@ fn test_snapshot_resume_chain() {
     };
 
     // Resume db with final value
-    let state3 = snapshot2.resume(Value::String("db result".into())).unwrap();
+    let state3 = snapshot2.resume(Value::String("db result".into())).unwrap().state;
 
     match state3 {
         VmState::Complete(v) => {
@@ -166,7 +167,7 @@ fn test_snapshot_preserves_locals_and_globals() {
     // Verify that local variables survive snapshot/resume
     let code = r#"
         const prefix = "hello";
-        const suffix = fetch("url");
+        const suffix = await fetch("url");
         prefix + " " + suffix
     "#;
 
@@ -174,7 +175,7 @@ fn test_snapshot_preserves_locals_and_globals() {
 
     match state {
         VmState::Suspended { snapshot, .. } => {
-            let result = snapshot.resume(Value::String("world".into())).unwrap();
+            let result = snapshot.resume(Value::String("world".into())).unwrap().state;
             match result {
                 VmState::Complete(v) => {
                     assert_eq!(v, Value::String("hello world".into()));
@@ -189,7 +190,7 @@ fn test_snapshot_preserves_locals_and_globals() {
 #[test]
 fn test_snapshot_with_inputs() {
     let code = r#"
-        const result = fetch(url);
+        const result = await fetch(url);
         result
     "#;
 
@@ -199,7 +200,7 @@ fn test_snapshot_with_inputs() {
     match state {
         VmState::Suspended { args, snapshot, .. } => {
             assert_eq!(args[0], Value::String("https://test.com".into()));
-            let result = snapshot.resume(Value::String("ok".into())).unwrap();
+            let result = snapshot.resume(Value::String("ok".into())).unwrap().state;
             match result {
                 VmState::Complete(v) => assert_eq!(v, Value::String("ok".into())),
                 _ => panic!("expected completion"),
@@ -213,9 +214,9 @@ fn test_snapshot_with_inputs() {
 fn test_snapshot_size() {
     // Verify snapshot is compact — should be well under 10KB for simple code
     let code = r#"
-        const a = fetch("url1");
-        const b = db(a);
-        const c = fetch("url2");
+        const a = await fetch("url1");
+        const b = await db(a);
+        const c = await fetch("url2");
         c
     "#;
 
@@ -244,7 +245,7 @@ fn test_snapshot_size() {
 fn test_snapshot_dump_load_resume() {
     // Full round-trip: capture → dump → load → resume
     let code = r#"
-        const data = fetch("https://example.com");
+        const data = await fetch("https://example.com");
         data + "!"
     "#;
 
@@ -262,7 +263,7 @@ fn test_snapshot_dump_load_resume() {
     let loaded = ZapcodeSnapshot::load(&bytes).unwrap();
 
     // Resume execution
-    let result = loaded.resume(Value::String("response".into())).unwrap();
+    let result = loaded.resume(Value::String("response".into())).unwrap().state;
 
     match result {
         VmState::Complete(v) => {
@@ -275,7 +276,7 @@ fn test_snapshot_dump_load_resume() {
 #[test]
 fn test_snapshot_resume_with_numeric_result() {
     let code = r#"
-        const count = getCount();
+        const count = await getCount();
         count * 2 + 1
     "#;
 
@@ -283,7 +284,7 @@ fn test_snapshot_resume_with_numeric_result() {
 
     match state {
         VmState::Suspended { snapshot, .. } => {
-            let result = snapshot.resume(Value::Int(21)).unwrap();
+            let result = snapshot.resume(Value::Int(21)).unwrap().state;
             match result {
                 VmState::Complete(v) => assert_eq!(v, Value::Int(43)),
                 _ => panic!("expected completion"),
@@ -317,7 +318,7 @@ fn test_snapshot_multi_await_with_let_and_console() {
     let state = start_with_externals(code, vec!["getWeather", "searchFlights"], Vec::new());
 
     // First suspend: getWeather("Tokyo")
-    let snap1 = match state {
+    let mut snap1 = match state {
         VmState::Suspended {
             function_name,
             snapshot,
@@ -329,18 +330,20 @@ fn test_snapshot_multi_await_with_let_and_console() {
         _ => panic!("expected first suspension"),
     };
 
-    let weather1 = Value::Object(
+    // Build the compound return value directly in the snapshot's heap so its
+    // handle is valid when resumed.
+    let weather1 = Value::Object(snap1.heap_mut().alloc_object(
         vec![
             ("condition".into(), Value::String("Clear".into())),
             ("temp".into(), Value::Int(26)),
         ]
         .into_iter()
         .collect(),
-    );
-    let state2 = snap1.resume(weather1).unwrap();
+    ));
+    let state2 = snap1.resume(weather1).unwrap().state;
 
     // Second suspend: getWeather("Paris")
-    let snap2 = match state2 {
+    let mut snap2 = match state2 {
         VmState::Suspended {
             function_name,
             snapshot,
@@ -352,18 +355,18 @@ fn test_snapshot_multi_await_with_let_and_console() {
         _ => panic!("expected second suspension"),
     };
 
-    let weather2 = Value::Object(
+    let weather2 = Value::Object(snap2.heap_mut().alloc_object(
         vec![
             ("condition".into(), Value::String("Sunny".into())),
             ("temp".into(), Value::Int(22)),
         ]
         .into_iter()
         .collect(),
-    );
-    let state3 = snap2.resume(weather2).unwrap();
+    ));
+    let state3 = snap2.resume(weather2).unwrap().state;
 
     // Third suspend: searchFlights
-    let snap3 = match state3 {
+    let mut snap3 = match state3 {
         VmState::Suspended {
             function_name,
             snapshot,
@@ -375,20 +378,22 @@ fn test_snapshot_multi_await_with_let_and_console() {
         _ => panic!("expected third suspension"),
     };
 
-    let flights = Value::Array(vec![Value::Object(
+    let flight = Value::Object(snap3.heap_mut().alloc_object(
         vec![
             ("airline".into(), Value::String("BA".into())),
             ("price".into(), Value::Int(450)),
         ]
         .into_iter()
         .collect(),
-    )]);
+    ));
+    let flights = Value::Array(snap3.heap_mut().alloc_array(vec![flight]));
     let final_state = snap3.resume(flights).unwrap();
 
-    match final_state {
+    match final_state.state {
         VmState::Complete(v) => {
             // Should have all fields
-            if let Value::Object(map) = &v {
+            if let Value::Object(h) = &v {
+                let map = final_state.heap.object_map(*h);
                 assert!(map.contains_key("tokyo"));
                 assert!(map.contains_key("paris"));
                 assert!(map.contains_key("flights"));

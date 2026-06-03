@@ -124,7 +124,7 @@ fn session_resume_then_continue_with_new_chunk() {
         .run_chunk(
             r#"
             const prefix = "hello ";
-            const data = fetch(url);
+            const data = await fetch(url);
             prefix + data
             "#
             .to_string(),
@@ -610,4 +610,101 @@ fn session_rejects_generators_and_builtin_methods_in_persisted_state() {
         )
         .unwrap_err();
     assert!(matches!(builtin_err, ZapcodeError::SnapshotError(_)));
+}
+
+/// An array input passed to a *second* chunk must rebase past the slots the
+/// first chunk left in the session's persisted heap. Exercises the host-boundary
+/// `run_chunk_with_input_heap` path that the language bindings call.
+#[test]
+fn session_array_input_rebases_over_existing_heap() {
+    use indexmap::IndexMap;
+    use std::sync::Arc;
+    use zapcode_core::heap::Heap;
+
+    let session = session();
+
+    // First chunk leaves a user-global array in the session heap.
+    let state = session
+        .run_chunk("const base = [100, 200]; base.length".to_string(), Vec::new())
+        .unwrap();
+    let session = match state {
+        ZapcodeSessionState::Complete { output, session, .. } => {
+            assert_eq!(output, Value::Int(2));
+            session
+        }
+        other => panic!("expected completion, got {other:?}"),
+    };
+
+    // Second chunk receives an object input { items: [1, 2, 3] } allocated in a
+    // standalone heap; its handles must rebase past the persisted `base` slot.
+    let mut input_heap = Heap::new();
+    let items = input_heap.alloc_array(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+    let mut fields = IndexMap::new();
+    fields.insert(Arc::from("items"), Value::Array(items));
+    let cfg = input_heap.alloc_object(fields);
+
+    let state = session
+        .run_chunk_with_input_heap(
+            "base[0] + cfg.items.reduce((a, b) => a + b, 0)".to_string(),
+            vec![("cfg".to_string(), Value::Object(cfg))],
+            input_heap,
+        )
+        .unwrap();
+
+    match state {
+        // 100 (base[0]) + 6 (1+2+3) == 106
+        ZapcodeSessionState::Complete { output, .. } => assert_eq!(output, Value::Int(106)),
+        other => panic!("expected completion, got {other:?}"),
+    }
+}
+
+#[test]
+fn session_persists_cyclic_closure_registry_without_stack_overflow() {
+    // Under reference semantics, a registry object holding arrow functions whose
+    // captured scope references the registry forms a genuine heap cycle
+    // (registry-object -> function -> captured env -> registry-object). The
+    // snapshot serializability walk must terminate on such cycles instead of
+    // recursing forever and overflowing the stack.
+    let state = session()
+        .run_chunk(
+            r#"
+            const registry = {};
+            function register(name, fn) {
+                registry[name] = fn;
+                return Object.keys(registry).length;
+            }
+            // Each registered arrow captures the enclosing scope, which includes
+            // `registry` itself — a reference cycle through the heap.
+            register("inc", (s) => s + 1);
+            register("dbl", (s) => s * 2);
+            Object.keys(registry).sort().join(",")
+            "#
+            .to_string(),
+            Vec::new(),
+        )
+        .unwrap();
+
+    let session = match state {
+        ZapcodeSessionState::Complete {
+            output, session, ..
+        } => {
+            assert_eq!(output, Value::String("dbl,inc".into()));
+            session
+        }
+        other => panic!("expected completion, got {other:?}"),
+    };
+
+    // The dump must succeed (this is where the unbounded walk used to crash).
+    let dumped = session.dump().unwrap();
+    let restored = ZapcodeSessionSnapshot::load(&dumped).unwrap();
+
+    // The persisted registry still drives its functions after a reload.
+    let state = restored
+        .run_chunk("registry.inc(4) + registry.dbl(5)".to_string(), Vec::new())
+        .unwrap();
+    match state {
+        // 5 (4+1) + 10 (5*2) == 15
+        ZapcodeSessionState::Complete { output, .. } => assert_eq!(output, Value::Int(15)),
+        other => panic!("expected completion, got {other:?}"),
+    }
 }

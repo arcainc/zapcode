@@ -8,9 +8,26 @@ use oxc_span::SourceType;
 
 use crate::error::{Result, ZapcodeError};
 
-type DestructureFieldParts = (Option<String>, Option<Vec<DestructureField>>, Option<Expr>);
+type DestructureFieldParts = (Option<String>, Option<Box<ParamPattern>>, Option<Expr>);
+
+/// Maximum bracket/brace/paren nesting depth the source may contain.
+///
+/// oxc's recursive-descent parser AND our `AstLowerer` descend one native stack
+/// frame per nesting level, and each level is *very* stack-hungry — on a 2MB
+/// thread stack (Rust's default worker/test stack) a debug build overflows below
+/// 80 levels of `[[[…]]]`, aborting the whole host process (an uncatchable
+/// `SIGSEGV`/`SIGABRT`) *before any VM resource limit is consulted*, since this
+/// is parse time. We reject deeper input up front with a clean, catchable
+/// `ParseError`. 64 matches the existing `JSON_MAX_DEPTH` parse cap, is safe on
+/// the smallest stack we run on, and is far beyond any realistic AI-generated
+/// expression (which nests literals a handful of levels at most).
+const MAX_NESTING_DEPTH: usize = 64;
 
 pub fn parse(source: &str) -> Result<Program> {
+    // Reject pathologically deep bracket nesting before it reaches oxc's
+    // recursive descent (which would overflow the native stack and abort).
+    check_nesting_depth(source)?;
+
     // Auto-wrap trailing object literals: `{ key: value }` → `({ key: value })`
     // This avoids the JS ambiguity where `{` at statement start is a block.
     let source = wrap_trailing_object(source);
@@ -31,6 +48,84 @@ pub fn parse(source: &str) -> Result<Program> {
         body: lowerer.body,
         functions: lowerer.functions,
     })
+}
+
+/// Scan the source and reject it (with a catchable `ParseError`) if the
+/// bracket/brace/paren nesting ever exceeds [`MAX_NESTING_DEPTH`]. This runs
+/// before oxc so a deeply-nested literal can never drive oxc's recursive descent
+/// to native-stack exhaustion (which aborts the host process).
+///
+/// The scanner is bracket-counting and skips the contents of string, template,
+/// and regex-ish literals and of `//` / `/* */` comments, so brackets *inside*
+/// strings/comments don't inflate the count. It does not need to be a full lexer
+/// — a conservative over-count inside an exotic construct only makes the guard
+/// fire slightly earlier, never later, which is the safe direction.
+fn check_nesting_depth(source: &str) -> Result<()> {
+    let bytes = source.as_bytes();
+    let n = bytes.len();
+    let mut i = 0usize;
+    let mut depth: usize = 0;
+    let mut max_depth: usize = 0;
+
+    while i < n {
+        let c = bytes[i];
+        match c {
+            // Line comment: skip to end of line.
+            b'/' if i + 1 < n && bytes[i + 1] == b'/' => {
+                i += 2;
+                while i < n && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            // Block comment: skip to closing */.
+            b'/' if i + 1 < n && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < n && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+            }
+            // String / template literal: skip to the matching unescaped quote.
+            // (Template `${}` interpolations may contain brackets, but counting
+            // the whole template as opaque only under-counts depth there, which
+            // is safe — a deeply-nested interpolation would still have to repeat
+            // outside any single template to reach the cap.)
+            b'"' | b'\'' | b'`' => {
+                let quote = c;
+                i += 1;
+                while i < n {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == quote {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                if depth > max_depth {
+                    max_depth = depth;
+                    if max_depth > MAX_NESTING_DEPTH {
+                        return Err(ZapcodeError::ParseError(format!(
+                            "expression nesting depth exceeds the maximum of {}",
+                            MAX_NESTING_DEPTH
+                        )));
+                    }
+                }
+                i += 1;
+            }
+            b')' | b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    Ok(())
 }
 
 /// If the source ends with a `{ ... }` block that looks like an object literal
@@ -85,7 +180,17 @@ fn wrap_trailing_object(source: &str) -> String {
         // If preceded by =, (, return, =>, etc. — it's already in expression context.
         // `)` means the `{` is a control-flow / function block (if/for/while/catch/
         // switch/function with params), never an object literal — don't wrap it.
-        if matches!(last_char, '=' | '(' | ',' | ':' | '>' | '[' | ')') {
+        //
+        // Binary / unary operator characters (`& | ? + - * / % < ! ^ ~`) likewise
+        // mean the `{` is the right-hand operand of an expression (e.g. the object
+        // literal in `"a" in {a:1}` once the `in` keyword's trailing space is
+        // trimmed away leaves no operator char, so the keyword check below handles
+        // `in`/`of`; the operator chars here cover things like `x ?? {y:1}`).
+        if matches!(
+            last_char,
+            '=' | '(' | ',' | ':' | '>' | '[' | ')' | '&' | '|' | '?' | '+' | '-' | '*' | '/'
+                | '%' | '<' | '!' | '^' | '~'
+        ) {
             return source.to_string();
         }
         // If preceded by a keyword that takes a block, don't wrap
@@ -105,6 +210,21 @@ fn wrap_trailing_object(source: &str) -> String {
                 | "class"
                 | "function"
                 | "switch"
+                // Keywords that introduce expression context: a trailing `{...}` is
+                // an object literal operand, not a statement-level block. Wrapping it
+                // with `;(` would split the expression and cause a parse error
+                // (e.g. `"a" in {a:1}`, `x instanceof {}`, `return {a:1}`).
+                | "in"
+                | "of"
+                | "instanceof"
+                | "typeof"
+                | "return"
+                | "yield"
+                | "new"
+                | "delete"
+                | "void"
+                | "await"
+                | "case"
         ) {
             return source.to_string();
         }
@@ -334,6 +454,21 @@ impl<'a> AstLowerer<'a> {
                 Some(expr) => Some(self.lower_expr(expr)?),
                 None => None,
             };
+            // JS name inference: `const f = function(){}` / `const f = () => {}`
+            // gives the (otherwise anonymous) function the binding's name.
+            if let (AssignTarget::Ident(bind_name), Some(init_expr)) = (&pattern, &init) {
+                if let Some(func_index) = match init_expr {
+                    Expr::FunctionExpr { func_index } => Some(*func_index),
+                    Expr::ArrowFunction { func_index } => Some(*func_index),
+                    _ => None,
+                } {
+                    if let Some(f) = self.functions.get_mut(func_index) {
+                        if f.name.is_none() {
+                            f.name = Some(bind_name.clone());
+                        }
+                    }
+                }
+            }
             declarations.push(VarDeclarator { pattern, init });
         }
         Ok(Statement::VariableDecl {
@@ -348,18 +483,12 @@ impl<'a> AstLowerer<'a> {
             ast::BindingPattern::BindingIdentifier(id) => {
                 Ok(AssignTarget::Ident(id.name.to_string()))
             }
-            ast::BindingPattern::ObjectPattern(obj) => Ok(AssignTarget::ObjectDestructure(
-                self.lower_object_pattern_fields(obj)?,
-            )),
-            ast::BindingPattern::ArrayPattern(arr) => {
-                let mut elements = Vec::new();
-                for elem in &arr.elements {
-                    match elem {
-                        Some(pat) => elements.push(Some(self.lower_binding_pattern(pat)?)),
-                        None => elements.push(None),
-                    }
-                }
-                Ok(AssignTarget::ArrayDestructure(elements))
+            // Object/array destructuring var-decls are lowered to the unified
+            // `ParamPattern` form, which carries element defaults and arbitrary
+            // object/array nesting. The compiler destructures it via the same
+            // recursive path used for parameters and `for…of` bindings.
+            ast::BindingPattern::ObjectPattern(_) | ast::BindingPattern::ArrayPattern(_) => {
+                Ok(AssignTarget::Pattern(self.lower_binding_pattern_to_param(pat)?))
             }
             ast::BindingPattern::AssignmentPattern(assign) => {
                 self.lower_binding_pattern(&assign.left)
@@ -374,6 +503,15 @@ impl<'a> AstLowerer<'a> {
         let mut fields = Vec::new();
         for prop in &obj.properties {
             let key = property_key_to_string(&prop.key);
+            // A computed key built from a non-literal expression (`{[k]: v}`)
+            // must be resolved at runtime. A string/number/identifier-literal
+            // key (including `{['a']: v}`) is already static and needs no
+            // runtime expression.
+            let computed_key = if prop.computed && key == "<computed>" {
+                Some(self.lower_expr(prop.key.to_expression())?)
+            } else {
+                None
+            };
             let (alias, nested, default) = self.lower_destructure_field_value(&prop.value, &key)?;
             fields.push(DestructureField {
                 key,
@@ -381,6 +519,7 @@ impl<'a> AstLowerer<'a> {
                 nested,
                 default,
                 rest: false,
+                computed_key,
             });
         }
 
@@ -393,6 +532,7 @@ impl<'a> AstLowerer<'a> {
                         nested: None,
                         default: None,
                         rest: true,
+                        computed_key: None,
                     });
                 }
                 _ => {
@@ -419,15 +559,18 @@ impl<'a> AstLowerer<'a> {
                 let alias = if name != key { Some(name) } else { None };
                 Ok((alias, None, None))
             }
-            ast::BindingPattern::ObjectPattern(obj) => {
-                Ok((None, Some(self.lower_object_pattern_fields(obj)?), None))
-            }
+            // A nested object OR array pattern bound to this field's value
+            // (`{a: {b}}`, `{a: [x, y]}`). Both lower to a `ParamPattern`.
+            ast::BindingPattern::ObjectPattern(_) | ast::BindingPattern::ArrayPattern(_) => Ok((
+                None,
+                Some(Box::new(self.lower_binding_pattern_to_param(value)?)),
+                None,
+            )),
             ast::BindingPattern::AssignmentPattern(assign) => {
                 let default = self.lower_expr(&assign.right)?;
                 let (alias, nested, _) = self.lower_destructure_field_value(&assign.left, key)?;
                 Ok((alias, nested, Some(default)))
             }
-            _ => Ok((None, None, None)),
         }
     }
 
@@ -448,6 +591,16 @@ impl<'a> AstLowerer<'a> {
                     match elem {
                         Some(p) => elems.push(Some(self.lower_binding_pattern_to_param(p)?)),
                         None => elems.push(None),
+                    }
+                }
+                if let Some(rest) = &arr.rest {
+                    if let ast::BindingPattern::BindingIdentifier(id) = &rest.argument {
+                        elems.push(Some(ParamPattern::Rest(id.name.to_string())));
+                    } else {
+                        return Err(self.unsupported(
+                            rest.span,
+                            "only identifier array rest destructuring is supported",
+                        ));
                     }
                 }
                 Ok(ParamPattern::ArrayDestructure(elems))
@@ -556,6 +709,7 @@ impl<'a> AstLowerer<'a> {
             binding,
             iterable,
             body,
+            await_each: false,
             span,
         })
     }
@@ -582,10 +736,15 @@ impl<'a> AstLowerer<'a> {
         };
         let iterable = self.lower_expr(&for_of.right)?;
         let body = self.lower_statement_as_block(&for_of.body)?;
+        // `for await (const x of it)`: oxc sets `for_of.await`. We lower the loop
+        // identically to a sync for-of but flag it so the compiler awaits each
+        // iterated value (resolving promises / suspending on pending external
+        // calls via the existing Await path) before binding it.
         Ok(Statement::ForOf {
             binding,
             iterable,
             body,
+            await_each: for_of.r#await,
             span,
         })
     }
@@ -620,9 +779,14 @@ impl<'a> AstLowerer<'a> {
     fn lower_func_decl(&mut self, func: &ast::Function<'_>) -> Result<Statement> {
         let span = self.span(func.span);
         let func_def = self.lower_function(func)?;
+        let name = func_def.name.clone();
         let func_index = self.functions.len();
         self.functions.push(func_def);
-        Ok(Statement::FunctionDecl { func_index, span })
+        Ok(Statement::FunctionDecl {
+            func_index,
+            name,
+            span,
+        })
     }
 
     fn lower_function(&mut self, func: &ast::Function<'_>) -> Result<FunctionDef> {
@@ -699,7 +863,8 @@ impl<'a> AstLowerer<'a> {
             None => None,
         };
 
-        let (constructor, methods, static_methods) = self.lower_class_body(&class.body)?;
+        let (constructor, methods, static_methods, fields, static_fields) =
+            self.lower_class_body(&class.body)?;
 
         Ok(Statement::ClassDecl {
             name,
@@ -707,6 +872,8 @@ impl<'a> AstLowerer<'a> {
             constructor,
             methods,
             static_methods,
+            fields,
+            static_fields,
             span,
         })
     }
@@ -728,7 +895,8 @@ impl<'a> AstLowerer<'a> {
             None => None,
         };
 
-        let (constructor, methods, static_methods) = self.lower_class_body(&class.body)?;
+        let (constructor, methods, static_methods, fields, static_fields) =
+            self.lower_class_body(&class.body)?;
 
         Ok(Expr::ClassExpr {
             name,
@@ -736,6 +904,8 @@ impl<'a> AstLowerer<'a> {
             constructor,
             methods,
             static_methods,
+            fields,
+            static_fields,
         })
     }
 
@@ -743,10 +913,17 @@ impl<'a> AstLowerer<'a> {
         let mut constructor = None;
         let mut methods = Vec::new();
         let mut static_methods = Vec::new();
+        let mut fields = Vec::new();
+        let mut static_fields = Vec::new();
 
         for element in &body.body {
             match element {
                 ast::ClassElement::MethodDefinition(method) => {
+                    // `#private` methods are unsupported syntax.
+                    if matches!(&method.key, ast::PropertyKey::PrivateIdentifier(_)) {
+                        return Err(self
+                            .unsupported(method.span, "private fields are not supported"));
+                    }
                     let method_name = match &method.key {
                         ast::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
                         ast::PropertyKey::StringLiteral(s) => s.value.to_string(),
@@ -770,43 +947,57 @@ impl<'a> AstLowerer<'a> {
                         span: self.span(func.span),
                     };
 
-                    match method.kind {
+                    let kind = match method.kind {
                         ast::MethodDefinitionKind::Constructor => {
                             constructor = Some(Box::new(func_def));
+                            continue;
                         }
-                        ast::MethodDefinitionKind::Method => {
-                            if method.r#static {
-                                static_methods.push(ClassMethod {
-                                    name: method_name,
-                                    func: func_def,
-                                });
-                            } else {
-                                methods.push(ClassMethod {
-                                    name: method_name,
-                                    func: func_def,
-                                });
-                            }
-                        }
-                        ast::MethodDefinitionKind::Get | ast::MethodDefinitionKind::Set => {
-                            // Getters/setters: treat as regular methods for now
-                            if method.r#static {
-                                static_methods.push(ClassMethod {
-                                    name: method_name,
-                                    func: func_def,
-                                });
-                            } else {
-                                methods.push(ClassMethod {
-                                    name: method_name,
-                                    func: func_def,
-                                });
-                            }
-                        }
+                        ast::MethodDefinitionKind::Method => ClassMethodKind::Method,
+                        ast::MethodDefinitionKind::Get => ClassMethodKind::Get,
+                        ast::MethodDefinitionKind::Set => ClassMethodKind::Set,
+                    };
+
+                    let entry = ClassMethod {
+                        name: method_name,
+                        func: func_def,
+                        kind,
+                    };
+                    if method.r#static {
+                        static_methods.push(entry);
+                    } else {
+                        methods.push(entry);
                     }
                 }
-                ast::ClassElement::PropertyDefinition(_) => {
-                    // Class property declarations (e.g., `name: string;`) are type-level
-                    // and are handled at runtime through constructor assignments.
-                    // Skip them in the IR.
+                ast::ClassElement::PropertyDefinition(prop) => {
+                    // `#private` fields are unsupported syntax.
+                    if matches!(&prop.key, ast::PropertyKey::PrivateIdentifier(_)) {
+                        return Err(self
+                            .unsupported(prop.span, "private fields are not supported"));
+                    }
+                    // Computed field names (`[k] = …`) are not supported.
+                    let field_name = match &prop.key {
+                        ast::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+                        ast::PropertyKey::StringLiteral(s) => s.value.to_string(),
+                        _ => continue,
+                    };
+                    // `declare x: T;` is a TypeScript type-only declaration with no
+                    // runtime initialization — skip it.
+                    if prop.declare {
+                        continue;
+                    }
+                    let value = match &prop.value {
+                        Some(expr) => Some(self.lower_expr(expr)?),
+                        None => None,
+                    };
+                    let entry = ClassField {
+                        name: field_name,
+                        value,
+                    };
+                    if prop.r#static {
+                        static_fields.push(entry);
+                    } else {
+                        fields.push(entry);
+                    }
                 }
                 ast::ClassElement::AccessorProperty(s) => {
                     return Err(self
@@ -821,7 +1012,7 @@ impl<'a> AstLowerer<'a> {
             }
         }
 
-        Ok((constructor, methods, static_methods))
+        Ok((constructor, methods, static_methods, fields, static_fields))
     }
 
     fn lower_switch(&mut self, switch: &ast::SwitchStatement<'_>) -> Result<Statement> {
@@ -850,8 +1041,19 @@ impl<'a> AstLowerer<'a> {
             ast::Expression::BooleanLiteral(lit) => Ok(Expr::BoolLit(lit.value)),
             ast::Expression::NullLiteral(_) => Ok(Expr::NullLit),
             ast::Expression::TemplateLiteral(tpl) => {
-                let quasis: Vec<String> =
-                    tpl.quasis.iter().map(|q| q.value.raw.to_string()).collect();
+                // Use the *cooked* value so escape sequences (\n, \t, \uXXXX, \\)
+                // are processed; `raw` is the unescaped source text.
+                let quasis: Vec<String> = tpl
+                    .quasis
+                    .iter()
+                    .map(|q| {
+                        q.value
+                            .cooked
+                            .as_ref()
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| q.value.raw.to_string())
+                    })
+                    .collect();
                 let exprs: Result<Vec<Expr>> =
                     tpl.expressions.iter().map(|e| self.lower_expr(e)).collect();
                 Ok(Expr::TemplateLit {
@@ -1044,6 +1246,20 @@ impl<'a> AstLowerer<'a> {
                 })
             }
             ast::Expression::AssignmentExpression(assign) => {
+                // Destructuring assignment (`[a, b] = …`, `({x: o.p} = …)`): the
+                // left side is an array/object target rather than a simple lvalue.
+                if matches!(
+                    &assign.left,
+                    ast::AssignmentTarget::ArrayAssignmentTarget(_)
+                        | ast::AssignmentTarget::ObjectAssignmentTarget(_)
+                ) {
+                    let pattern = self.lower_assign_pattern(&assign.left)?;
+                    let value = self.lower_expr(&assign.right)?;
+                    return Ok(Expr::DestructureAssign {
+                        pattern: Box::new(pattern),
+                        value: Box::new(value),
+                    });
+                }
                 let op = lower_assign_op(assign.operator);
                 let target = self.lower_assignment_target(&assign.left)?;
                 let value = self.lower_expr(&assign.right)?;
@@ -1253,6 +1469,104 @@ impl<'a> AstLowerer<'a> {
             _ => Err(ZapcodeError::CompileError(
                 "unsupported assignment target".to_string(),
             )),
+        }
+    }
+
+    /// Lower a destructuring-assignment target (`[a, b]`, `{x: o.p}`) into an
+    /// [`AssignPattern`], whose leaves are arbitrary assignable expressions.
+    fn lower_assign_pattern(
+        &mut self,
+        target: &ast::AssignmentTarget<'_>,
+    ) -> Result<AssignPattern> {
+        match target {
+            ast::AssignmentTarget::ArrayAssignmentTarget(arr) => {
+                let mut elements = Vec::new();
+                for elem in &arr.elements {
+                    match elem {
+                        Some(maybe_default) => {
+                            elements.push(Some(self.lower_assign_pattern_element(maybe_default)?))
+                        }
+                        None => elements.push(None),
+                    }
+                }
+                let rest = match &arr.rest {
+                    Some(rest) => Some(Box::new(self.lower_assign_pattern(&rest.target)?)),
+                    None => None,
+                };
+                Ok(AssignPattern::Array { elements, rest })
+            }
+            ast::AssignmentTarget::ObjectAssignmentTarget(obj) => {
+                let mut fields = Vec::new();
+                for prop in &obj.properties {
+                    fields.push(self.lower_assign_pattern_field(prop)?);
+                }
+                let rest = match &obj.rest {
+                    Some(rest) => Some(Box::new(self.lower_assign_pattern(&rest.target)?)),
+                    None => None,
+                };
+                Ok(AssignPattern::Object { fields, rest })
+            }
+            // A simple lvalue leaf (identifier or member expression).
+            other => Ok(AssignPattern::Target(self.lower_assignment_target(other)?)),
+        }
+    }
+
+    fn lower_assign_pattern_element(
+        &mut self,
+        elem: &ast::AssignmentTargetMaybeDefault<'_>,
+    ) -> Result<AssignPatternElement> {
+        match elem {
+            ast::AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(with_default) => {
+                let pattern = self.lower_assign_pattern(&with_default.binding)?;
+                let default = Some(self.lower_expr(&with_default.init)?);
+                Ok(AssignPatternElement { pattern, default })
+            }
+            // The non-default variants are inherited `AssignmentTarget`s.
+            other => {
+                let pattern = self.lower_assign_pattern(other.to_assignment_target())?;
+                Ok(AssignPatternElement {
+                    pattern,
+                    default: None,
+                })
+            }
+        }
+    }
+
+    fn lower_assign_pattern_field(
+        &mut self,
+        prop: &ast::AssignmentTargetProperty<'_>,
+    ) -> Result<AssignPatternField> {
+        match prop {
+            // `{ foo }` / `{ foo = default }` shorthand.
+            ast::AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(id) => {
+                let name = id.binding.name.to_string();
+                let default = match &id.init {
+                    Some(init) => Some(self.lower_expr(init)?),
+                    None => None,
+                };
+                Ok(AssignPatternField {
+                    key: name.clone(),
+                    computed_key: None,
+                    pattern: AssignPattern::Target(Expr::Ident(name)),
+                    default,
+                })
+            }
+            // `{ key: target }` / `{ [k]: target }` / `{ key: t = default }`.
+            ast::AssignmentTargetProperty::AssignmentTargetPropertyProperty(prop) => {
+                let key = property_key_to_string(&prop.name);
+                let computed_key = if prop.computed && key == "<computed>" {
+                    Some(self.lower_expr(prop.name.to_expression())?)
+                } else {
+                    None
+                };
+                let element = self.lower_assign_pattern_element(&prop.binding)?;
+                Ok(AssignPatternField {
+                    key,
+                    computed_key,
+                    pattern: element.pattern,
+                    default: element.default,
+                })
+            }
         }
     }
 

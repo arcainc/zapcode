@@ -41,7 +41,8 @@ fn error_is_catchable_in_guest_try_catch() {
 
     let resumed = snapshot(state)
         .resume_with_error(Value::String("upstream 500".into()))
-        .unwrap();
+        .unwrap()
+        .state;
 
     match resumed {
         VmState::Complete(v) => assert_eq!(v, Value::String("caught:upstream 500".into())),
@@ -83,7 +84,8 @@ fn execution_continues_normally_after_a_caught_error() {
     // First call fails...
     let after_error = snapshot(state)
         .resume_with_error(Value::String("boom".into()))
-        .unwrap();
+        .unwrap()
+        .state;
     // ...which suspends again on the retry call inside catch.
     let retry = match after_error {
         VmState::Suspended {
@@ -99,7 +101,7 @@ fn execution_continues_normally_after_a_caught_error() {
         VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),
     };
 
-    match retry.resume(Value::String("recovered".into())).unwrap() {
+    match retry.resume(Value::String("recovered".into())).unwrap().state {
         VmState::Complete(v) => assert_eq!(v, Value::String("recovered".into())),
         VmState::Suspended { .. } => panic!("expected completion"),
         VmState::SuspendedMany { .. } => panic!("unexpected batch suspension"),

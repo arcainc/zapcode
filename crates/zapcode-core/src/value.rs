@@ -1,7 +1,18 @@
-use indexmap::IndexMap;
+use crate::heap::{Handle, Heap};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
+
+/// Maximum nesting depth for the recursive value walkers (`to_js_string`,
+/// JSON serialization, deep-clone, host marshalling). Reference values can form
+/// cycles or be nested arbitrarily deep; an unbounded native recursion would
+/// exhaust the OS stack and abort the entire host process (an uncatchable
+/// `SIGSEGV`/`SIGABRT` across the napi boundary). Capping the recursion well
+/// below the native-stack budget turns "deep or cyclic value" into a bounded,
+/// catchable condition. Far above the 64-deep JSON parse cap and any realistic
+/// data shape, yet well under native-stack exhaustion (each frame here is small,
+/// unlike the interpreter-loop frames the VM's `max_stack_depth` governs).
+pub const MAX_RENDER_DEPTH: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Value {
@@ -11,8 +22,10 @@ pub enum Value {
     Int(i64),
     Float(f64),
     String(Arc<str>),
-    Array(Vec<Value>),
-    Object(IndexMap<Arc<str>, Value>),
+    /// Reference to an array slot in the [`Heap`]. Cloning shares the handle.
+    Array(Handle),
+    /// Reference to an object slot in the [`Heap`].
+    Object(Handle),
     Function(Closure),
     /// A generator object — calling function* creates one of these.
     Generator(GeneratorObject),
@@ -145,6 +158,9 @@ impl Value {
         }
     }
 
+    /// Numeric coercion for primitives. Reference values (array/object) need the
+    /// heap to inspect their contents — use [`Value::to_number_heap`] for those;
+    /// here they coerce to NaN.
     pub fn to_number(&self) -> f64 {
         match self {
             Value::Undefined => f64::NAN,
@@ -153,20 +169,70 @@ impl Value {
             Value::Bool(false) => 0.0,
             Value::Int(n) => *n as f64,
             Value::Float(n) => *n,
-            Value::String(s) => {
-                // JS: empty / whitespace-only string coerces to 0, not NaN.
-                let t = s.trim();
-                if t.is_empty() {
-                    0.0
-                } else {
-                    t.parse::<f64>().unwrap_or(f64::NAN)
-                }
-            }
+            Value::String(s) => Self::parse_number_str(s),
             _ => f64::NAN,
         }
     }
 
-    pub fn to_js_string(&self) -> String {
+    /// Full JS numeric coercion, including reference values:
+    /// `ToNumber(array)` via its `toString` ([] -> 0, [5] -> 5, [1,2] -> NaN),
+    /// and a Date to its epoch-millis (so `d2 - d1`, `+d`, `<`/`>` work).
+    pub fn to_number_heap(&self, heap: &Heap) -> f64 {
+        match self {
+            Value::Array(_) => Self::parse_number_str(&self.to_js_string(heap)),
+            Value::Object(h) => match heap.object(*h).and_then(|m| m.get("__date_ms__")) {
+                Some(Value::Int(ms)) => *ms as f64,
+                Some(Value::Float(ms)) => *ms,
+                _ => f64::NAN,
+            },
+            _ => self.to_number(),
+        }
+    }
+
+    /// JS string-to-number coercion (`Number("...")`), supporting the numeric
+    /// forms Node accepts: empty/whitespace -> 0, decimal/float, hex `0x`,
+    /// binary `0b`, octal `0o`, and `Infinity`. Anything else -> NaN.
+    fn parse_number_str(s: &str) -> f64 {
+        let t = s.trim();
+        if t.is_empty() {
+            return 0.0;
+        }
+        match t {
+            "Infinity" | "+Infinity" => return f64::INFINITY,
+            "-Infinity" => return f64::NEG_INFINITY,
+            _ => {}
+        }
+        // Radix prefixes (no sign allowed by spec for these forms).
+        let radix = if let Some(rest) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+            Some((rest, 16))
+        } else if let Some(rest) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
+            Some((rest, 2))
+        } else if let Some(rest) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
+            Some((rest, 8))
+        } else {
+            None
+        };
+        if let Some((digits, base)) = radix {
+            return match u64::from_str_radix(digits, base) {
+                Ok(n) => n as f64,
+                Err(_) => f64::NAN,
+            };
+        }
+        t.parse::<f64>().unwrap_or(f64::NAN)
+    }
+
+    pub fn to_js_string(&self, heap: &Heap) -> String {
+        self.to_js_string_depth(heap, 0)
+    }
+
+    /// Depth-bounded string coercion. Reference values (arrays/objects) can form
+    /// cycles (`const a = []; a.push(a)`) or be nested arbitrarily deep, so the
+    /// naive recursion would exhaust the native stack and abort the whole host
+    /// process. We cap the recursion at [`MAX_RENDER_DEPTH`] and render anything
+    /// past it as the placeholder `[...]`/`[Object]` rather than recursing — this
+    /// keeps `String(cyclic)` / template literals / `console.log` / `join` bounded
+    /// and abort-safe instead of crashing the embedder.
+    fn to_js_string_depth(&self, heap: &Heap, depth: usize) -> String {
         match self {
             Value::Undefined => "undefined".to_string(),
             Value::Null => "null".to_string(),
@@ -187,20 +253,60 @@ impl Value {
                 }
             }
             Value::String(s) => s.to_string(),
-            Value::Array(arr) => {
-                let items: Vec<String> = arr.iter().map(|v| v.to_js_string()).collect();
+            Value::Array(h) => {
+                if depth >= MAX_RENDER_DEPTH {
+                    // Bottomed out (deep or cyclic): stop recursing. This cannot
+                    // be reached by any legitimate finite structure short of
+                    // MAX_RENDER_DEPTH nesting, so a placeholder is acceptable and
+                    // keeps the walk abort-safe.
+                    return "[...]".to_string();
+                }
+                // JS Array.prototype.toString renders null/undefined (and holes)
+                // as the empty string, not the literal "null"/"undefined".
+                let items: Vec<String> = heap
+                    .array(*h)
+                    .iter()
+                    .map(|v| match v {
+                        Value::Null | Value::Undefined => String::new(),
+                        _ => v.to_js_string_depth(heap, depth + 1),
+                    })
+                    .collect();
                 items.join(",")
             }
-            Value::Object(map) => {
+            Value::Object(h) => {
+                if depth >= MAX_RENDER_DEPTH {
+                    return "[object Object]".to_string();
+                }
+                let Some(map) = heap.object(*h) else {
+                    return "[object Object]".to_string();
+                };
+                // A Date stringifies to its ISO form (rather than [object Object]).
+                if let Some(ms) = map.get("__date_ms__") {
+                    let ms = match ms {
+                        Value::Int(n) => *n as f64,
+                        Value::Float(n) => *n,
+                        _ => f64::NAN,
+                    };
+                    if ms.is_nan() {
+                        return "Invalid Date".to_string();
+                    }
+                    return crate::vm::unix_millis_to_iso(ms as i64);
+                }
+                // A promise object (the deferred-call / settled promise repr,
+                // tagged with `__promise__: true`) stringifies to "[object Promise]"
+                // like a real JS Promise, rather than leaking "[object Object]".
+                if matches!(map.get("__promise__"), Some(Value::Bool(true))) {
+                    return "[object Promise]".to_string();
+                }
                 // Error objects stringify as "Name: message" (like JS).
                 if matches!(map.get("__error__"), Some(Value::Bool(true))) {
                     let name = map
                         .get("name")
-                        .map(|v| v.to_js_string())
+                        .map(|v| v.to_js_string_depth(heap, depth + 1))
                         .unwrap_or_else(|| "Error".to_string());
                     let message = map
                         .get("message")
-                        .map(|v| v.to_js_string())
+                        .map(|v| v.to_js_string_depth(heap, depth + 1))
                         .unwrap_or_default();
                     if message.is_empty() {
                         name
@@ -217,7 +323,7 @@ impl Value {
         }
     }
 
-    /// Strict equality (===)
+    /// Strict equality (===). Arrays/objects compare by identity (handle).
     pub fn strict_eq(&self, other: &Value) -> bool {
         match (self, other) {
             (Value::Undefined, Value::Undefined) | (Value::Null, Value::Null) => true,
@@ -227,7 +333,9 @@ impl Value {
             (Value::Int(a), Value::Float(b)) => (*a as f64) == *b,
             (Value::Float(a), Value::Int(b)) => *a == (*b as f64),
             (Value::String(a), Value::String(b)) => a == b,
-            // Reference equality for arrays/objects
+            // Reference identity for arrays/objects (same heap slot).
+            (Value::Array(a), Value::Array(b)) => a == b,
+            (Value::Object(a), Value::Object(b)) => a == b,
             _ => false,
         }
     }
@@ -235,7 +343,7 @@ impl Value {
     /// JS abstract (loose) equality (`==`). Performs type coercion between
     /// numbers, strings, and booleans; `null`/`undefined` are loosely equal to
     /// each other and to nothing else. Object/array operands fall back to
-    /// reference equality (no `toPrimitive` coercion).
+    /// reference identity (no `toPrimitive` coercion).
     pub fn loose_eq(&self, other: &Value) -> bool {
         match (self, other) {
             // null and undefined are loosely equal to each other only.
@@ -257,15 +365,22 @@ impl Value {
             // boolean coerces to number, then compare.
             (Value::Bool(_), _) => Value::Float(self.to_number()).loose_eq(other),
             (_, Value::Bool(_)) => self.loose_eq(&Value::Float(other.to_number())),
-            // Arrays/objects: reference equality only.
+            // Arrays/objects: reference identity only.
             _ => self.strict_eq(other),
         }
     }
 }
 
 impl fmt::Display for Value {
+    /// Heap-free best-effort rendering for diagnostics. Array/object contents
+    /// aren't available without the heap; use [`Value::to_js_string`] for real
+    /// string coercion of those.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.to_js_string())
+        match self {
+            Value::Array(_) => write!(f, "[object Array]"),
+            Value::Object(_) => write!(f, "[object Object]"),
+            other => write!(f, "{}", other.to_js_string(&Heap::new())),
+        }
     }
 }
 

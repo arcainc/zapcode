@@ -268,16 +268,34 @@ await test("an infinite loop is bounded by a resource limit (doesn't hang)", asy
   );
 });
 
-await test("calling a tool inside .map gives an actionable error", async () => {
-  // A known limitation: external calls can't suspend inside array-callback
-  // methods. The error must steer the model to a for...of loop or Promise.all.
-  await assert.rejects(
-    () =>
-      execute(`[1, 2, 3].map(n => f(n))`, {
-        f: { description: "f", parameters: { n: { type: "number" } }, execute: async ({ n }) => n },
-      }),
-    /for\.\.\.of loop|Promise\.all/
+await test("a bare tool call inside .map yields deferred promises that Promise.all runs", async () => {
+  // N5: a bare (un-awaited) tool call is now a *deferred* Promise object, so
+  // `[1,2,3].map(n => f(n))` produces an array of promises instead of erroring.
+  // Mapping them through `Promise.all(...)` forces the host to run every call —
+  // the supported parallel pattern. (`for...of` with `await` is the sequential
+  // alternative; covered by other tests.)
+  const f = {
+    description: "f",
+    parameters: { n: { type: "number" } },
+    execute: async ({ n }) => n * 10,
+  };
+
+  // Bare .map without await: each element is a deferred Promise object; the
+  // tools are not run because nothing consumes the promises.
+  const deferred = await execute(
+    `[1, 2, 3].map(n => f(n)).map(p => typeof p).join(",")`,
+    { f }
   );
+  assert.equal(deferred.output, "object,object,object");
+  assert.equal(deferred.toolCalls.length, 0);
+
+  // Promise.all over the mapped deferred calls runs them all, in order.
+  const all = await execute(
+    `const out = await Promise.all([1, 2, 3].map(n => f(n))); out.join(",")`,
+    { f }
+  );
+  assert.equal(all.output, "10,20,30");
+  assert.equal(all.toolCalls.length, 3);
 });
 
 // --- Language breadth under await ----------------------------------------

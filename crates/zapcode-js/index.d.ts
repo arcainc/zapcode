@@ -31,9 +31,22 @@ export interface ExternalCall {
   args: unknown[];
 }
 
+/**
+ * Which `Promise` combinator produced a deferred batch. The host settles the
+ * batched calls with the matching `Promise.*` and resumes accordingly.
+ */
+export type PromiseCombinator = "all" | "race" | "any" | "allSettled";
+
 export interface ZapcodeBatchSuspension {
   kind: "suspended_many";
   completed: false;
+  /**
+   * Which `Promise` combinator produced this batch. Resume with:
+   * - all: resumeMany(results) | resumeError(firstFailure)
+   * - allSettled: resumeMany(settledObjects) — never rejects
+   * - race/any: resumeMany([singleValue]) | resumeError(reason)
+   */
+  combinator: PromiseCombinator;
   /** The batched external calls, in order — run them in parallel. */
   calls: ExternalCall[];
   snapshot: Buffer;
@@ -59,6 +72,8 @@ export interface ZapcodeSessionSuspension {
 export interface ZapcodeSessionBatchSuspension {
   kind: "suspended_many";
   completed: false;
+  /** Which `Promise` combinator produced this batch. */
+  combinator: PromiseCombinator;
   /** The batched external calls, in order — run them in parallel. */
   calls: ExternalCall[];
   stdout: string;

@@ -41,6 +41,7 @@
 
 pub mod compiler;
 pub mod error;
+pub mod heap;
 pub mod parser;
 pub mod sandbox;
 pub mod session;
@@ -50,6 +51,7 @@ pub mod value;
 pub mod vm;
 pub(crate) mod wire;
 
+pub use compiler::instruction::BatchKind;
 pub use error::ZapcodeError;
 pub use sandbox::ResourceLimits;
 pub use session::{ZapcodeSessionSnapshot, ZapcodeSessionState};

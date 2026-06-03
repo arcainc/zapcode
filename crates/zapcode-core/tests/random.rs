@@ -1,10 +1,13 @@
 //! Math.random is deterministic across replay (same program → same sequence)
 //! but varies call to call, and its state survives suspend/resume.
 
+use zapcode_core::heap::Heap;
 use zapcode_core::vm::VmState;
 use zapcode_core::{ResourceLimits, Value, ZapcodeRun};
 
-fn run(code: &str) -> Value {
+/// Run `code` and return the completion value together with the heap it
+/// references, so array/object handles can be resolved.
+fn run(code: &str) -> (Value, Heap) {
     let result = ZapcodeRun::new(
         code.to_string(),
         Vec::new(),
@@ -15,16 +18,16 @@ fn run(code: &str) -> Value {
     .run(Vec::new())
     .unwrap();
     match result.state {
-        VmState::Complete(v) => v,
+        VmState::Complete(v) => (v, result.heap),
         other => panic!("expected completion, got {other:?}"),
     }
 }
 
 #[test]
 fn random_is_in_range_and_varies() {
-    let out = run("[Math.random(), Math.random(), Math.random()]");
+    let (out, heap) = run("[Math.random(), Math.random(), Math.random()]");
     let arr = match out {
-        Value::Array(a) => a,
+        Value::Array(h) => heap.array_vec(h),
         other => panic!("expected array, got {other:?}"),
     };
     assert_eq!(arr.len(), 3);
@@ -38,9 +41,9 @@ fn random_is_in_range_and_varies() {
     assert!(nums.iter().all(|n| *n != 0.5));
 }
 
-fn nums(value: Value) -> Vec<f64> {
+fn nums((value, heap): (Value, Heap)) -> Vec<f64> {
     match value {
-        Value::Array(a) => a.iter().map(|v| v.to_number()).collect(),
+        Value::Array(h) => heap.array_vec(h).iter().map(|v| v.to_number()).collect(),
         other => panic!("expected array, got {other:?}"),
     }
 }
@@ -78,8 +81,9 @@ fn random_state_survives_suspend_resume() {
         VmState::Suspended { snapshot, .. } => snapshot,
         other => panic!("expected suspension, got {other:?}"),
     };
-    let out = match snapshot.resume(Value::Null).unwrap() {
-        VmState::Complete(v) => v,
+    let resumed = snapshot.resume(Value::Null).unwrap();
+    let out = match resumed.state {
+        VmState::Complete(v) => (v, resumed.heap),
         other => panic!("expected completion, got {other:?}"),
     };
     let drawn = nums(out);

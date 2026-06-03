@@ -23,10 +23,14 @@ miniz_oxide.workspace = true
 regex.workspace = true
 indexmap.workspace = true
 thiserror.workspace = true
+unicode-normalization = "0.1.25"
 
 [dev-dependencies]
 insta.workspace = true
 divan.workspace = true
+indexmap.workspace = true
+sha2.workspace = true
+miniz_oxide.workspace = true
 
 [[bench]]
 name = "execution"

@@ -15,7 +15,7 @@ fn run_str(code: &str) -> String {
     .run(Vec::new())
     .unwrap();
     match result.state {
-        VmState::Complete(v) => v.to_js_string(),
+        VmState::Complete(v) => v.to_js_string(&result.heap),
         other => panic!("expected completion, got {other:?}"),
     }
 }
@@ -87,4 +87,39 @@ fn nullish_coalescing_in_call_args() {
     // Multiple nullish args in one call.
     let code3 = "function g(a, b, c) { return [a, b, c].join(','); } g(1 ?? 9, null ?? 2, 3 ?? 9)";
     assert_eq!(run_str(code3), "1,2,3");
+}
+
+#[test]
+fn optional_member_does_not_leak_receiver_into_object_literals() {
+    assert_eq!(
+        run_str(
+            r#"
+            const owner = { ownerId: "owner_ava" };
+            const payload = { ownerId: owner?.ownerId ?? "manager_pool", ticketId: "t1" };
+            JSON.stringify(payload)
+            "#
+        ),
+        r#"{"ownerId":"owner_ava","ticketId":"t1"}"#
+    );
+    assert_eq!(
+        run_str(
+            r#"
+            const owner = null;
+            const payload = { ownerId: owner?.ownerId ?? "manager_pool", ticketId: "t1" };
+            JSON.stringify(payload)
+            "#
+        ),
+        r#"{"ownerId":"manager_pool","ticketId":"t1"}"#
+    );
+    assert_eq!(
+        run_str(
+            r#"
+            const owner = { nested: { ownerId: "owner_ava" } };
+            const key = "nested";
+            const payload = { ownerId: owner?.[key]?.ownerId ?? "manager_pool" };
+            JSON.stringify(payload)
+            "#
+        ),
+        r#"{"ownerId":"owner_ava"}"#
+    );
 }

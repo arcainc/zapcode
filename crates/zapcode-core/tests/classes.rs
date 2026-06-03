@@ -1,5 +1,24 @@
-use zapcode_core::vm::eval_ts;
-use zapcode_core::Value;
+use zapcode_core::heap::Heap;
+use zapcode_core::vm::{eval_ts, VmState};
+use zapcode_core::{ResourceLimits, Value, ZapcodeRun};
+
+/// Run `code` and return the completion value plus the heap that backs any
+/// array/object handles in it.
+fn run(code: &str) -> (Value, Heap) {
+    let result = ZapcodeRun::new(
+        code.to_string(),
+        Vec::new(),
+        Vec::new(),
+        ResourceLimits::default(),
+    )
+    .unwrap()
+    .run(Vec::new())
+    .unwrap();
+    match result.state {
+        VmState::Complete(v) => (v, result.heap),
+        other => panic!("expected completion, got {other:?}"),
+    }
+}
 
 #[test]
 fn test_basic_class_with_constructor() {
@@ -306,7 +325,7 @@ fn test_method_this_mutation_persists() {
     // Regression test: mutations to `this` properties inside method calls must
     // persist back to the original object variable. Previously, the receiver was
     // cloned and mutations were lost.
-    let result = eval_ts(
+    let (result, heap) = run(
         r#"
         class Counter {
             count: number;
@@ -321,10 +340,10 @@ fn test_method_this_mutation_persists() {
         const c = new Counter(10);
         [c.increment(), c.increment(), c.increment()]
     "#,
-    )
-    .unwrap();
+    );
     match result {
-        Value::Array(arr) => {
+        Value::Array(h) => {
+            let arr = heap.array_vec(h);
             assert_eq!(arr.len(), 3);
             assert_eq!(arr[0], Value::Int(11));
             assert_eq!(arr[1], Value::Int(12));
@@ -365,7 +384,7 @@ fn test_method_this_mutation_persists_local() {
 #[test]
 fn test_method_this_mutation_multiple_instances() {
     // Ensure mutations to one instance don't affect another.
-    let result = eval_ts(
+    let (result, heap) = run(
         r#"
         class Counter {
             count: number;
@@ -384,10 +403,10 @@ fn test_method_this_mutation_multiple_instances() {
         b.increment();
         [a.count, b.count]
     "#,
-    )
-    .unwrap();
+    );
     match result {
-        Value::Array(arr) => {
+        Value::Array(h) => {
+            let arr = heap.array_vec(h);
             assert_eq!(arr.len(), 2);
             assert_eq!(arr[0], Value::Int(2));
             assert_eq!(arr[1], Value::Int(101));
