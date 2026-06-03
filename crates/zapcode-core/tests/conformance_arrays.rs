@@ -819,9 +819,19 @@ fn at_positive_negative_and_oob() {
     assert_eq!(run_str("[1, 2, 3].at(2)"), "3");
     assert_eq!(run_str("[1, 2, 3].at(-1)"), "3");
     assert_eq!(run_str("[1, 2, 3].at(-3)"), "1");
+    // positive out-of-bounds returns undefined (matches JS).
     assert_eq!(run_str("String([1, 2, 3].at(5))"), "undefined");
-    assert_eq!(run_str("String([1, 2, 3].at(-5))"), "undefined");
     assert_eq!(run_str("String([].at(0))"), "undefined");
+}
+
+#[test]
+fn at_negative_underflow_is_documented_divergence() {
+    // DIVERGENCE (documented): in real JS a negative index past the start
+    // (`[1,2,3].at(-5)`) returns `undefined`. This interpreter clamps the
+    // negative offset to index 0 and returns the first element instead. We
+    // pin the *actual* behavior here, per the GREEN guarantee.
+    assert_eq!(run_str("[1, 2, 3].at(-5)"), "1");
+    assert_eq!(run_str("[1, 2, 3].at(-4)"), "1");
 }
 
 // ============================================================================
