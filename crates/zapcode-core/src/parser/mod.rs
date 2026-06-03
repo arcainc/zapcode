@@ -8,7 +8,7 @@ use oxc_span::SourceType;
 
 use crate::error::{Result, ZapcodeError};
 
-type DestructureFieldParts = (Option<String>, Option<Vec<DestructureField>>, Option<Expr>);
+type DestructureFieldParts = (Option<String>, Option<Box<ParamPattern>>, Option<Expr>);
 
 pub fn parse(source: &str) -> Result<Program> {
     // Auto-wrap trailing object literals: `{ key: value }` → `({ key: value })`
@@ -373,28 +373,12 @@ impl<'a> AstLowerer<'a> {
             ast::BindingPattern::BindingIdentifier(id) => {
                 Ok(AssignTarget::Ident(id.name.to_string()))
             }
-            ast::BindingPattern::ObjectPattern(obj) => Ok(AssignTarget::ObjectDestructure(
-                self.lower_object_pattern_fields(obj)?,
-            )),
-            ast::BindingPattern::ArrayPattern(arr) => {
-                let mut elements = Vec::new();
-                for elem in &arr.elements {
-                    match elem {
-                        Some(pat) => elements.push(Some(self.lower_binding_pattern(pat)?)),
-                        None => elements.push(None),
-                    }
-                }
-                if let Some(rest) = &arr.rest {
-                    if let ast::BindingPattern::BindingIdentifier(id) = &rest.argument {
-                        elements.push(Some(AssignTarget::Rest(id.name.to_string())));
-                    } else {
-                        return Err(self.unsupported(
-                            rest.span,
-                            "only identifier array rest destructuring is supported",
-                        ));
-                    }
-                }
-                Ok(AssignTarget::ArrayDestructure(elements))
+            // Object/array destructuring var-decls are lowered to the unified
+            // `ParamPattern` form, which carries element defaults and arbitrary
+            // object/array nesting. The compiler destructures it via the same
+            // recursive path used for parameters and `for…of` bindings.
+            ast::BindingPattern::ObjectPattern(_) | ast::BindingPattern::ArrayPattern(_) => {
+                Ok(AssignTarget::Pattern(self.lower_binding_pattern_to_param(pat)?))
             }
             ast::BindingPattern::AssignmentPattern(assign) => {
                 self.lower_binding_pattern(&assign.left)
@@ -409,6 +393,15 @@ impl<'a> AstLowerer<'a> {
         let mut fields = Vec::new();
         for prop in &obj.properties {
             let key = property_key_to_string(&prop.key);
+            // A computed key built from a non-literal expression (`{[k]: v}`)
+            // must be resolved at runtime. A string/number/identifier-literal
+            // key (including `{['a']: v}`) is already static and needs no
+            // runtime expression.
+            let computed_key = if prop.computed && key == "<computed>" {
+                Some(self.lower_expr(prop.key.to_expression())?)
+            } else {
+                None
+            };
             let (alias, nested, default) = self.lower_destructure_field_value(&prop.value, &key)?;
             fields.push(DestructureField {
                 key,
@@ -416,6 +409,7 @@ impl<'a> AstLowerer<'a> {
                 nested,
                 default,
                 rest: false,
+                computed_key,
             });
         }
 
@@ -428,6 +422,7 @@ impl<'a> AstLowerer<'a> {
                         nested: None,
                         default: None,
                         rest: true,
+                        computed_key: None,
                     });
                 }
                 _ => {
@@ -454,15 +449,18 @@ impl<'a> AstLowerer<'a> {
                 let alias = if name != key { Some(name) } else { None };
                 Ok((alias, None, None))
             }
-            ast::BindingPattern::ObjectPattern(obj) => {
-                Ok((None, Some(self.lower_object_pattern_fields(obj)?), None))
-            }
+            // A nested object OR array pattern bound to this field's value
+            // (`{a: {b}}`, `{a: [x, y]}`). Both lower to a `ParamPattern`.
+            ast::BindingPattern::ObjectPattern(_) | ast::BindingPattern::ArrayPattern(_) => Ok((
+                None,
+                Some(Box::new(self.lower_binding_pattern_to_param(value)?)),
+                None,
+            )),
             ast::BindingPattern::AssignmentPattern(assign) => {
                 let default = self.lower_expr(&assign.right)?;
                 let (alias, nested, _) = self.lower_destructure_field_value(&assign.left, key)?;
                 Ok((alias, nested, Some(default)))
             }
-            _ => Ok((None, None, None)),
         }
     }
 
@@ -1111,6 +1109,20 @@ impl<'a> AstLowerer<'a> {
                 })
             }
             ast::Expression::AssignmentExpression(assign) => {
+                // Destructuring assignment (`[a, b] = …`, `({x: o.p} = …)`): the
+                // left side is an array/object target rather than a simple lvalue.
+                if matches!(
+                    &assign.left,
+                    ast::AssignmentTarget::ArrayAssignmentTarget(_)
+                        | ast::AssignmentTarget::ObjectAssignmentTarget(_)
+                ) {
+                    let pattern = self.lower_assign_pattern(&assign.left)?;
+                    let value = self.lower_expr(&assign.right)?;
+                    return Ok(Expr::DestructureAssign {
+                        pattern: Box::new(pattern),
+                        value: Box::new(value),
+                    });
+                }
                 let op = lower_assign_op(assign.operator);
                 let target = self.lower_assignment_target(&assign.left)?;
                 let value = self.lower_expr(&assign.right)?;
@@ -1320,6 +1332,104 @@ impl<'a> AstLowerer<'a> {
             _ => Err(ZapcodeError::CompileError(
                 "unsupported assignment target".to_string(),
             )),
+        }
+    }
+
+    /// Lower a destructuring-assignment target (`[a, b]`, `{x: o.p}`) into an
+    /// [`AssignPattern`], whose leaves are arbitrary assignable expressions.
+    fn lower_assign_pattern(
+        &mut self,
+        target: &ast::AssignmentTarget<'_>,
+    ) -> Result<AssignPattern> {
+        match target {
+            ast::AssignmentTarget::ArrayAssignmentTarget(arr) => {
+                let mut elements = Vec::new();
+                for elem in &arr.elements {
+                    match elem {
+                        Some(maybe_default) => {
+                            elements.push(Some(self.lower_assign_pattern_element(maybe_default)?))
+                        }
+                        None => elements.push(None),
+                    }
+                }
+                let rest = match &arr.rest {
+                    Some(rest) => Some(Box::new(self.lower_assign_pattern(&rest.target)?)),
+                    None => None,
+                };
+                Ok(AssignPattern::Array { elements, rest })
+            }
+            ast::AssignmentTarget::ObjectAssignmentTarget(obj) => {
+                let mut fields = Vec::new();
+                for prop in &obj.properties {
+                    fields.push(self.lower_assign_pattern_field(prop)?);
+                }
+                let rest = match &obj.rest {
+                    Some(rest) => Some(Box::new(self.lower_assign_pattern(&rest.target)?)),
+                    None => None,
+                };
+                Ok(AssignPattern::Object { fields, rest })
+            }
+            // A simple lvalue leaf (identifier or member expression).
+            other => Ok(AssignPattern::Target(self.lower_assignment_target(other)?)),
+        }
+    }
+
+    fn lower_assign_pattern_element(
+        &mut self,
+        elem: &ast::AssignmentTargetMaybeDefault<'_>,
+    ) -> Result<AssignPatternElement> {
+        match elem {
+            ast::AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(with_default) => {
+                let pattern = self.lower_assign_pattern(&with_default.binding)?;
+                let default = Some(self.lower_expr(&with_default.init)?);
+                Ok(AssignPatternElement { pattern, default })
+            }
+            // The non-default variants are inherited `AssignmentTarget`s.
+            other => {
+                let pattern = self.lower_assign_pattern(other.to_assignment_target())?;
+                Ok(AssignPatternElement {
+                    pattern,
+                    default: None,
+                })
+            }
+        }
+    }
+
+    fn lower_assign_pattern_field(
+        &mut self,
+        prop: &ast::AssignmentTargetProperty<'_>,
+    ) -> Result<AssignPatternField> {
+        match prop {
+            // `{ foo }` / `{ foo = default }` shorthand.
+            ast::AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(id) => {
+                let name = id.binding.name.to_string();
+                let default = match &id.init {
+                    Some(init) => Some(self.lower_expr(init)?),
+                    None => None,
+                };
+                Ok(AssignPatternField {
+                    key: name.clone(),
+                    computed_key: None,
+                    pattern: AssignPattern::Target(Expr::Ident(name)),
+                    default,
+                })
+            }
+            // `{ key: target }` / `{ [k]: target }` / `{ key: t = default }`.
+            ast::AssignmentTargetProperty::AssignmentTargetPropertyProperty(prop) => {
+                let key = property_key_to_string(&prop.name);
+                let computed_key = if prop.computed && key == "<computed>" {
+                    Some(self.lower_expr(prop.name.to_expression())?)
+                } else {
+                    None
+                };
+                let element = self.lower_assign_pattern_element(&prop.binding)?;
+                Ok(AssignPatternField {
+                    key,
+                    computed_key,
+                    pattern: element.pattern,
+                    default: element.default,
+                })
+            }
         }
     }
 

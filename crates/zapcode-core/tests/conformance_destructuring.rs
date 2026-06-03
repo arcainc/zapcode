@@ -4,26 +4,21 @@
 //! destructuring (rename, nested, defaults, rest, computed-key), destructuring in
 //! function parameters and in `for…of`, and mixed/deep patterns.
 //!
-//! Where zapcode matches real Node, the real-JS answer is asserted. zapcode has a
-//! cluster of DOCUMENTED, KNOWN destructuring divergences (see STRESS-PASS-BUGS.md,
-//! cluster D / H3 and the `conformance_functions.rs` notes); those cases are pinned
-//! to zapcode's *actual* behavior with an explicit `// DIVERGENCE` comment and the
-//! real-JS answer noted, never asserted as correct. The known divergences are:
-//!   * Nested ARRAY patterns inside a var-decl (`[[a],[b]]`, `[a,[b,c]]`) bind the
-//!     inner names to `undefined` (object-nesting of objects works; an array nested
-//!     inside an object var-decl pattern also fails to bind).
-//!   * ARRAY-pattern defaults (`[a = 1] = []`) are not applied (object-pattern
-//!     defaults DO work, including in var-decls and as nested object props).
-//!   * Computed object keys built from a *variable* (`{[k]: v}`) don't bind (a
-//!     *string-literal* computed key `{['a']: v}` works, since it's static).
-//!   * Destructured-PARAMETER defaults (`function f({a = 1} = {})`) yield `NaN`
-//!     (pattern-with-default *parameters* don't apply their defaults).
+//! The real-JS answer is asserted throughout. This covers the full destructuring
+//! surface, including the cases that were previously documented divergences and are
+//! now correct:
+//!   * Nested ARRAY patterns in a var-decl (`[[a],[b]]`, `[a,[b,c]]`) and array
+//!     patterns nested inside object patterns (`{arr: [x, y]}`).
+//!   * ARRAY-pattern element defaults (`[a = 1] = []`), including later defaults
+//!     referencing earlier-bound elements.
+//!   * Computed object keys built from a *variable* (`{[k]: v}`).
+//!   * Destructured-PARAMETER defaults (`function f({a = 1} = {})`,
+//!     `function f([a, b] = [7, 8])`) — both inner and whole-pattern defaults.
 //!   * Destructuring ASSIGNMENT to pre-existing / member targets
-//!     (`[a, b] = [b, a]`, `({x: o.p} = …)`) is a CompileError (only declaration-
-//!     form destructuring is supported).
-//! Object-pattern var-decl destructuring (rename / nested-object / defaults / rest /
-//! default-expression laziness) and array rest / hole-skip are fully correct, as is
-//! all destructuring in `for…of` bindings — including nested array patterns there.
+//!     (`[a, b] = [b, a]`, `({x: o.p} = …)`, `[arr[0], y] = …`).
+//! Object-pattern var-decl destructuring (rename / nested / defaults / rest /
+//! default-expression laziness), array rest / hole-skip, and all destructuring in
+//! `for…of` bindings are likewise fully correct.
 
 use zapcode_core::vm::VmState;
 use zapcode_core::{ResourceLimits, ZapcodeRun};
@@ -338,12 +333,11 @@ fn object_computed_key_string_literal() {
 }
 
 #[test]
-fn object_computed_key_from_variable_documented_divergence() {
-    // DIVERGENCE: a computed key built from a *variable* does not bind — the value
-    // comes out `undefined`. (JS: 5.) A string-LITERAL computed key works
-    // (object_computed_key_string_literal). Pinned to zapcode's actual behavior.
-    assert_eq!(run_str("const k = 'b'; const {[k]: v} = {b: 5}; String(v)"), "undefined"); // JS: 5
-    assert_eq!(run_str("const key = 'x'; const {[key]: v} = {x: 42}; String(v)"), "undefined"); // JS: 42
+fn object_computed_key_from_variable() {
+    // A computed key built from a *variable* (`{[k]: v}`) binds the value of the
+    // property whose name is the runtime-evaluated key.
+    assert_eq!(run_str("const k = 'b'; const {[k]: v} = {b: 5}; String(v)"), "5");
+    assert_eq!(run_str("const key = 'x'; const {[key]: v} = {x: 42}; String(v)"), "42");
 }
 
 // ============================================================================
@@ -569,90 +563,75 @@ fn mixed_realistic_record_shape() {
 }
 
 // ============================================================================
-// DOCUMENTED DIVERGENCES — pinned to zapcode's actual behavior, never asserted
-// as the real-JS answer. (See STRESS-PASS-BUGS.md cluster D / H3.)
+// Previously-divergent forms (cluster D) — now fixed, asserting real-JS results:
+// nested array patterns, array-in-object patterns, array element defaults,
+// computed-key destructuring, destructured-parameter defaults, and destructuring
+// assignment to existing / member targets.
 // ============================================================================
 
 #[test]
-fn nested_array_var_decl_documented_divergence() {
-    // DIVERGENCE: nested ARRAY patterns in a var-decl bind inner names to
-    // `undefined` (the one-level array destructure works; nesting an array INTO an
-    // array pattern does not). The for…of and parameter forms DO bind nested arrays
-    // (see for_of_array_nested / mixed_param_array_of_objects), so this is specific
-    // to the var-decl lowering.
-    assert_eq!(run_str("const [[a], [b]] = [[1], [2]]; String(a) + ',' + String(b)"), "undefined,undefined"); // JS: 1,2
-    assert_eq!(run_str("const [a, [b, c]] = [1, [2, 3]]; `${a},${String(b)},${String(c)}`"), "1,undefined,undefined"); // JS: 1,2,3
+fn nested_array_var_decl() {
+    // Nested ARRAY patterns in a var-decl bind their inner names.
+    assert_eq!(run_str("const [[a], [b]] = [[1], [2]]; String(a) + ',' + String(b)"), "1,2");
+    assert_eq!(run_str("const [a, [b, c]] = [1, [2, 3]]; `${a},${String(b)},${String(c)}`"), "1,2,3");
 }
 
 #[test]
-fn array_inside_object_var_decl_documented_divergence() {
-    // DIVERGENCE: an array pattern nested inside an OBJECT pattern does not bind —
-    // the inner names come out `undefined`. (Object-in-object nesting works; see
-    // object_nested_deep.) Only a DIRECT array-in-array for…of head binds nested
-    // arrays (see for_of_array_nested).
-    assert_eq!(run_str("const {arr: [x, y]} = {arr: [1, 2]}; String(x) + ',' + String(y)"), "undefined,undefined"); // JS: 1,2
-    assert_eq!(run_str("const {p: {q: [r]}} = {p: {q: [42]}}; String(r)"), "undefined"); // JS: 42
+fn array_inside_object_var_decl() {
+    // An array pattern nested inside an OBJECT pattern binds its inner names.
+    assert_eq!(run_str("const {arr: [x, y]} = {arr: [1, 2]}; String(x) + ',' + String(y)"), "1,2");
+    assert_eq!(run_str("const {p: {q: [r]}} = {p: {q: [42]}}; String(r)"), "42");
 }
 
 #[test]
-fn array_inside_object_for_of_documented_divergence() {
-    // DIVERGENCE: an array pattern nested inside an OBJECT pattern does not bind even
-    // in a for…of head (the array-in-ARRAY for…of head DOES bind; see
-    // for_of_array_nested — this is the array-in-OBJECT form).
+fn array_inside_object_for_of() {
+    // An array pattern nested inside an OBJECT pattern binds in a for…of head.
     assert_eq!(
         run_str("const out = []; for (const {tags: [first]} of [{tags: ['a', 'b']}, {tags: ['c']}]) out.push(String(first)); out.join(',')"),
-        "undefined,undefined" // JS: a,c
+        "a,c"
     );
 }
 
 #[test]
-fn array_inside_object_param_documented_divergence() {
-    // DIVERGENCE: an array pattern nested inside an OBJECT parameter pattern does not
-    // bind (inner names come out `undefined`).
+fn array_inside_object_param() {
+    // An array pattern nested inside an OBJECT parameter pattern binds its names.
     assert_eq!(
         run_str("function f({coords: [x, y]}){ return String(x) + ',' + String(y); } f({coords: [3, 4]})"),
-        "undefined,undefined" // JS: 3,4
+        "3,4"
     );
 }
 
 #[test]
-fn object_inside_array_param_documented_divergence() {
-    // DIVERGENCE: an object pattern nested inside an ARRAY parameter pattern does not
-    // bind (inner names come out `undefined`).
-    assert_eq!(run_str("function f([{a}, {b}]){ return a + b; } f([{a: 1}, {b: 2}])"), "NaN"); // JS: 3
-    assert_eq!(run_str("const f = ([{name}]) => String(name); f([{name: 'x'}])"), "undefined"); // JS: x
+fn object_inside_array_param() {
+    // An object pattern nested inside an ARRAY parameter pattern binds its names.
+    assert_eq!(run_str("function f([{a}, {b}]){ return a + b; } f([{a: 1}, {b: 2}])"), "3");
+    assert_eq!(run_str("const f = ([{name}]) => String(name); f([{name: 'x'}])"), "x");
 }
 
 #[test]
-fn array_defaults_var_decl_documented_divergence() {
-    // DIVERGENCE: ARRAY-pattern defaults are not applied — a missing slot stays
-    // `undefined` instead of taking the default. (Object-pattern defaults DO work;
-    // see object_default_applied_when_missing.)
-    assert_eq!(run_str("const [a = 10, b = 20] = [1]; `${a},${String(b)}`"), "1,undefined"); // JS: 1,20
-    assert_eq!(run_str("const [a = 10] = []; String(a)"), "undefined"); // JS: 10
-    assert_eq!(run_str("const [a, b = a + 1] = [5]; `${a},${String(b)}`"), "5,undefined"); // JS: 5,6
+fn array_defaults_var_decl() {
+    // ARRAY-pattern element defaults apply when the slot is missing/undefined; a
+    // later default may reference an earlier-bound element.
+    assert_eq!(run_str("const [a = 10, b = 20] = [1]; `${a},${String(b)}`"), "1,20");
+    assert_eq!(run_str("const [a = 10] = []; String(a)"), "10");
+    assert_eq!(run_str("const [a, b = a + 1] = [5]; `${a},${String(b)}`"), "5,6");
 }
 
 #[test]
-fn param_pattern_defaults_documented_divergence() {
-    // DIVERGENCE: destructured-PARAMETER defaults (a default ON the pattern itself,
-    // or defaults INSIDE a parameter pattern with the whole-arg default) yield NaN —
-    // the pattern's own default and inner defaults aren't applied for the param form.
-    // (Var-decl object defaults work; this is the param-default path specifically.)
-    assert_eq!(run_str("function f({a = 1, b = 2} = {}){ return a + b; } f({a: 10})"), "NaN"); // JS: 12
-    assert_eq!(run_str("function f({a = 1, b = 2} = {}){ return a + b; } f()"), "NaN"); // JS: 3
-    assert_eq!(run_str("function f([a, b] = [7, 8]){ return a + b; } f()"), "NaN"); // JS: 15
+fn param_pattern_defaults() {
+    // Destructured-PARAMETER defaults: a default INSIDE the pattern and the
+    // whole-arg `={}` / `=[…]` default both apply.
+    assert_eq!(run_str("function f({a = 1, b = 2} = {}){ return a + b; } f({a: 10})"), "12");
+    assert_eq!(run_str("function f({a = 1, b = 2} = {}){ return a + b; } f()"), "3");
+    assert_eq!(run_str("function f([a, b] = [7, 8]){ return a + b; } f()"), "15");
 }
 
 #[test]
-fn destructuring_assignment_to_existing_targets_unsupported() {
-    // DIVERGENCE: destructuring ASSIGNMENT (to already-declared names or member
-    // expressions, i.e. without a `const`/`let`/`var`) errors with an
-    // "unsupported assignment target" CompileError (raised lazily at run time).
-    // Only the declaration form is supported. JS accepts all of these. Pinned by
-    // error rather than a brittle message.
-    assert!(errors_out("let a = 1, b = 2; [a, b] = [b, a]; a + ',' + b")); // JS swap: 2,1
-    assert!(errors_out("let a, b; ({a, b} = {a: 1, b: 2}); a + b")); // JS: 3
-    assert!(errors_out("const o = {}; ({x: o.p} = {x: 7}); o.p")); // JS: 7
-    assert!(errors_out("let arr = []; [arr[0], arr[1]] = [1, 2]; JSON.stringify(arr)")); // JS: [1,2]
+fn destructuring_assignment_to_existing_targets() {
+    // Destructuring ASSIGNMENT (to already-declared names or member expressions,
+    // i.e. without a `const`/`let`/`var`) binds the targets.
+    assert_eq!(run_str("let a = 1, b = 2; [a, b] = [b, a]; a + ',' + b"), "2,1");
+    assert_eq!(run_str("let a, b; ({a, b} = {a: 1, b: 2}); a + b"), "3");
+    assert_eq!(run_str("const o = {}; ({x: o.p} = {x: 7}); o.p"), "7");
+    assert_eq!(run_str("let arr = []; [arr[0], arr[1]] = [1, 2]; JSON.stringify(arr)"), "[1,2]");
 }

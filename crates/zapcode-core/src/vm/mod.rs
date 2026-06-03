@@ -1387,6 +1387,7 @@ impl Vm {
         params: &[ParamPattern],
         args: &[Value],
         local_count: usize,
+        needs_arguments: bool,
         heap: &mut Heap,
     ) -> Vec<Value> {
         let mut locals = Vec::with_capacity(local_count);
@@ -1399,10 +1400,21 @@ impl Vm {
                     let rest: Vec<Value> = args.get(i..).map(|s| s.to_vec()).unwrap_or_default();
                     locals.push(Value::Array(heap.alloc_array(rest)));
                 }
-                ParamPattern::DefaultValue { .. } => {
+                ParamPattern::DefaultValue { pattern, .. } => {
                     let val = args.get(i).cloned().unwrap_or(Value::Undefined);
-                    // Keep Undefined so the compiler-emitted default init can fire
-                    locals.push(val);
+                    match pattern.as_ref() {
+                        // `function f(p = …)`: one local holds the (possibly
+                        // undefined) argument; the compiler-emitted default fires.
+                        ParamPattern::Ident(_) | ParamPattern::Rest(_) => locals.push(val),
+                        // `function f({a} = …)` / `function f([a] = …)`: push the
+                        // raw argument as a hidden temp FIRST, then the extracted
+                        // leaves. The compiler re-destructures the temp's default
+                        // into the leaves when the argument is undefined.
+                        nested => {
+                            locals.push(val.clone());
+                            extract_pattern(nested, &val, &mut locals, heap);
+                        }
+                    }
                 }
                 // Destructuring params bind multiple locals in declaration order;
                 // extract the fields from the argument into those slots.
@@ -1411,6 +1423,11 @@ impl Vm {
                     extract_pattern(param, &arg, &mut locals, heap);
                 }
             }
+        }
+        // `arguments`: an array-like of ALL passed arguments, bound right after
+        // the param-derived locals (its slot was reserved by the compiler).
+        if needs_arguments {
+            locals.push(Value::Array(heap.alloc_array(args.to_vec())));
         }
         locals
     }
@@ -1435,7 +1452,8 @@ impl Vm {
         let func = self.current_function(closure.func_ref);
         let params = func.params.clone();
         let local_count = func.local_count;
-        let locals = Self::bind_params(&params, args, local_count, &mut self.heap);
+        let needs_arguments = func.needs_arguments;
+        let locals = Self::bind_params(&params, args, local_count, needs_arguments, &mut self.heap);
 
         // If this is a method call (has this_value from a receiver), transfer
         // the receiver source so we can write back mutations on return.
@@ -5055,7 +5073,7 @@ fn extract_object_fields(
         } else if let Some(nested) = &field.nested {
             consumed.push(field.key.clone());
             let child = field_of(value, &field.key, heap);
-            extract_object_fields(nested, &child, out, heap);
+            extract_pattern(nested, &child, out, heap);
         } else {
             consumed.push(field.key.clone());
             out.push(field_of(value, &field.key, heap));

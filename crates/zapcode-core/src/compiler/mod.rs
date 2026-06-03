@@ -42,6 +42,9 @@ pub struct CompiledFunction {
     pub local_names: Vec<String>,
     pub is_async: bool,
     pub is_generator: bool,
+    /// True iff the body references `arguments` and the function is non-arrow, so
+    /// the VM must bind an array-like `arguments` local right after the params.
+    pub needs_arguments: bool,
 }
 
 struct Compiler {
@@ -209,6 +212,119 @@ impl Compiler {
         Ok(())
     }
 
+    /// True iff `arguments` is referenced directly in this function body. Nested
+    /// function/arrow bodies live in the separate `Program.functions` table
+    /// (referenced here only by index), so this scan stops at the current
+    /// function boundary — exactly the lexical scope `arguments` belongs to.
+    fn body_uses_arguments(body: &[Statement]) -> bool {
+        body.iter().any(Self::stmt_uses_arguments)
+    }
+
+    fn stmt_uses_arguments(stmt: &Statement) -> bool {
+        match stmt {
+            Statement::VariableDecl { declarations, .. } => declarations
+                .iter()
+                .any(|d| d.init.as_ref().is_some_and(Self::expr_uses_arguments)),
+            Statement::Expression { expr, .. } => Self::expr_uses_arguments(expr),
+            Statement::Return { value, .. } => value.as_ref().is_some_and(Self::expr_uses_arguments),
+            Statement::Throw { value, .. } => Self::expr_uses_arguments(value),
+            Statement::If {
+                test,
+                consequent,
+                alternate,
+                ..
+            } => {
+                Self::expr_uses_arguments(test)
+                    || Self::body_uses_arguments(consequent)
+                    || alternate.as_deref().is_some_and(Self::body_uses_arguments)
+            }
+            Statement::While { test, body, .. } | Statement::DoWhile { body, test, .. } => {
+                Self::expr_uses_arguments(test) || Self::body_uses_arguments(body)
+            }
+            Statement::For {
+                init,
+                test,
+                update,
+                body,
+                ..
+            } => {
+                init.as_deref().is_some_and(Self::stmt_uses_arguments)
+                    || test.as_ref().is_some_and(Self::expr_uses_arguments)
+                    || update.as_ref().is_some_and(Self::expr_uses_arguments)
+                    || Self::body_uses_arguments(body)
+            }
+            Statement::ForOf { iterable, body, .. } => {
+                Self::expr_uses_arguments(iterable) || Self::body_uses_arguments(body)
+            }
+            Statement::Block { body, .. } => Self::body_uses_arguments(body),
+            Statement::TryCatch {
+                try_body,
+                catch_body,
+                finally_body,
+                ..
+            } => {
+                Self::body_uses_arguments(try_body)
+                    || Self::body_uses_arguments(catch_body)
+                    || finally_body.as_deref().is_some_and(Self::body_uses_arguments)
+            }
+            Statement::Labeled { body, .. } => Self::stmt_uses_arguments(body),
+            Statement::Switch {
+                discriminant,
+                cases,
+                ..
+            } => {
+                Self::expr_uses_arguments(discriminant)
+                    || cases.iter().any(|c| {
+                        c.test.as_ref().is_some_and(Self::expr_uses_arguments)
+                            || Self::body_uses_arguments(&c.consequent)
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    fn expr_uses_arguments(expr: &Expr) -> bool {
+        match expr {
+            Expr::Ident(name) => name == "arguments",
+            Expr::TemplateLit { exprs, .. } => exprs.iter().any(Self::expr_uses_arguments),
+            Expr::Array(items) => items
+                .iter()
+                .any(|e| e.as_ref().is_some_and(Self::expr_uses_arguments)),
+            Expr::Object(props) => props.iter().any(|p| Self::expr_uses_arguments(&p.value)),
+            Expr::Spread(e)
+            | Expr::Unary { operand: e, .. }
+            | Expr::Update { operand: e, .. }
+            | Expr::Await(e)
+            | Expr::TypeOf(e)
+            | Expr::Delete(e) => Self::expr_uses_arguments(e),
+            Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
+                Self::expr_uses_arguments(left) || Self::expr_uses_arguments(right)
+            }
+            Expr::Conditional {
+                test,
+                consequent,
+                alternate,
+            } => {
+                Self::expr_uses_arguments(test)
+                    || Self::expr_uses_arguments(consequent)
+                    || Self::expr_uses_arguments(alternate)
+            }
+            Expr::Assignment { target, value, .. } => {
+                Self::expr_uses_arguments(target) || Self::expr_uses_arguments(value)
+            }
+            Expr::Sequence(items) => items.iter().any(Self::expr_uses_arguments),
+            Expr::Member { object, .. } => Self::expr_uses_arguments(object),
+            Expr::ComputedMember {
+                object, property, ..
+            } => Self::expr_uses_arguments(object) || Self::expr_uses_arguments(property),
+            Expr::Call { callee, args, .. } | Expr::New { callee, args } => {
+                Self::expr_uses_arguments(callee) || args.iter().any(Self::expr_uses_arguments)
+            }
+            Expr::Yield { value, .. } => value.as_deref().is_some_and(Self::expr_uses_arguments),
+            _ => false,
+        }
+    }
+
     fn compile_function_def(&mut self, func: &FunctionDef) -> Result<CompiledFunction> {
         let mut func_compiler = Compiler::new(self.external_functions.clone());
         // Inherit the enclosing class context so `super` inside a method/constructor
@@ -217,8 +333,9 @@ impl Compiler {
         // class context, matching JS lexical `super` scoping.
         func_compiler.current_class = self.current_class.clone();
 
-        // Set up parameters as locals
-        for param in &func.params {
+        // Set up parameters as locals. The slot layout MUST match the order the
+        // VM's `bind_params` pushes values (see vm::bind_params).
+        for (i, param) in func.params.iter().enumerate() {
             match param {
                 ParamPattern::Ident(name) => {
                     func_compiler.declare_local(name);
@@ -226,43 +343,61 @@ impl Compiler {
                 ParamPattern::Rest(name) => {
                     func_compiler.declare_local(name);
                 }
-                ParamPattern::DefaultValue { pattern, .. } => {
-                    if let ParamPattern::Ident(name) = pattern.as_ref() {
+                ParamPattern::DefaultValue { pattern, .. } => match pattern.as_ref() {
+                    ParamPattern::Ident(name) | ParamPattern::Rest(name) => {
                         func_compiler.declare_local(name);
                     }
-                }
+                    // `function f({a} = {})` / `function f([a] = […])`: a hidden
+                    // temp holds the raw argument (so the whole-pattern default can
+                    // be re-destructured when it is undefined), then the inner
+                    // pattern's leaf locals, matching the VM's push order.
+                    nested => {
+                        func_compiler.declare_local(&Self::param_temp_name(i));
+                        func_compiler.declare_param_pattern_locals(nested);
+                    }
+                },
                 ParamPattern::ObjectDestructure(fields) => {
                     func_compiler.declare_destructure_locals(fields);
                 }
                 ParamPattern::ArrayDestructure(elems) => {
                     for elem in elems.iter().flatten() {
-                        if let ParamPattern::Ident(name) | ParamPattern::Rest(name) = elem {
-                            func_compiler.declare_local(name);
-                        }
+                        func_compiler.declare_param_pattern_locals(elem);
                     }
                 }
             }
         }
 
+        // `arguments`: an ordinary (non-arrow) function that references
+        // `arguments` gets an array-like bound right after the params. The VM
+        // (`bind_params`) pushes the full argument list into this slot, so it must
+        // be declared immediately after the param-derived locals. Arrows inherit
+        // the enclosing `arguments` lexically (handled by global/closure lookup),
+        // so they do NOT declare their own.
+        let needs_arguments = !func.is_arrow && Self::body_uses_arguments(&func.body);
+        if needs_arguments {
+            func_compiler.declare_local("arguments");
+        }
+
         // Apply default parameter values: `if (param === undefined) param = <default>`.
-        for param in &func.params {
+        for (i, param) in func.params.iter().enumerate() {
             match param {
                 ParamPattern::DefaultValue { pattern, default } => match pattern.as_ref() {
-                    ParamPattern::Ident(name) => {
+                    ParamPattern::Ident(name) | ParamPattern::Rest(name) => {
                         if let Some(slot) = func_compiler.resolve_local(name) {
                             func_compiler.emit_slot_default(slot, default)?;
                         }
                     }
-                    // `function f({a = 5} = {})`: a missing argument leaves the
-                    // destructured fields undefined, so the field defaults below
-                    // already cover it.
-                    ParamPattern::ObjectDestructure(fields) => {
-                        func_compiler.emit_object_param_defaults(fields)?;
+                    // `function f({a = 5} = {})` / `function f([a, b] = [7, 8])`:
+                    // when the argument is undefined, evaluate the whole-pattern
+                    // default and destructure it into the leaf slots; then apply
+                    // any inner field/element defaults.
+                    nested => {
+                        func_compiler.emit_pattern_param_default(&Self::param_temp_name(i), nested, default)?;
+                        func_compiler.emit_pattern_inner_defaults(nested)?;
                     }
-                    _ => {}
                 },
-                ParamPattern::ObjectDestructure(fields) => {
-                    func_compiler.emit_object_param_defaults(fields)?;
+                ParamPattern::ObjectDestructure(_) | ParamPattern::ArrayDestructure(_) => {
+                    func_compiler.emit_pattern_inner_defaults(param)?;
                 }
                 _ => {}
             }
@@ -286,6 +421,7 @@ impl Compiler {
             local_names: func_compiler.locals,
             is_async: func.is_async,
             is_generator: func.is_generator,
+            needs_arguments,
         })
     }
 
@@ -1067,6 +1203,18 @@ impl Compiler {
                     }
                 }
             }
+            // Object/array destructuring var-decls share the recursive pattern
+            // path used for parameters and `for…of` (handles element defaults and
+            // arbitrary object/array nesting).
+            AssignTarget::Pattern(pattern) => {
+                if let Some(expr) = &decl.init {
+                    self.compile_expr(expr)?;
+                } else {
+                    self.emit(Instruction::Push(Constant::Undefined));
+                }
+                self.compile_destructure_pattern(pattern, kind)?;
+                self.emit(Instruction::Pop); // pop source value
+            }
             AssignTarget::ObjectDestructure(fields) => {
                 if let Some(expr) = &decl.init {
                     self.compile_expr(expr)?;
@@ -1119,10 +1267,32 @@ impl Compiler {
                 let name = field.alias.as_ref().unwrap_or(&field.key);
                 self.declare_local(name);
             } else if let Some(nested) = &field.nested {
-                self.declare_destructure_locals(nested);
+                self.declare_param_pattern_locals(nested);
             } else {
                 let name = field.alias.as_ref().unwrap_or(&field.key);
                 self.declare_local(name);
+            }
+        }
+    }
+
+    /// Declare the locals a parameter pattern binds, in the exact order the VM's
+    /// `extract_pattern` pushes them (so positionally-bound destructured params
+    /// land in the matching slots).
+    fn declare_param_pattern_locals(&mut self, pattern: &ParamPattern) {
+        match pattern {
+            ParamPattern::Ident(name) | ParamPattern::Rest(name) => {
+                self.declare_local(name);
+            }
+            ParamPattern::DefaultValue { pattern, .. } => {
+                self.declare_param_pattern_locals(pattern);
+            }
+            ParamPattern::ObjectDestructure(fields) => {
+                self.declare_destructure_locals(fields);
+            }
+            ParamPattern::ArrayDestructure(elems) => {
+                for elem in elems.iter().flatten() {
+                    self.declare_param_pattern_locals(elem);
+                }
             }
         }
     }
@@ -1171,28 +1341,50 @@ impl Compiler {
                         self.store_binding(name, kind)?;
                         continue;
                     }
+                    // Read element `i` of the source array onto the stack.
                     self.emit(Instruction::Dup);
                     self.emit(Instruction::Push(Constant::Int(i as i64)));
                     self.emit(Instruction::GetIndex);
-                    match p {
-                        ParamPattern::Ident(name) => self.store_binding(name, kind)?,
-                        ParamPattern::ObjectDestructure(_) | ParamPattern::ArrayDestructure(_) => {
-                            self.compile_destructure_pattern(p, kind)?;
-                            self.emit(Instruction::Pop);
-                        }
-                        _ => {
-                            self.emit(Instruction::Pop);
-                        }
-                    }
+                    // `[a = expr]`: a missing/undefined element takes its default;
+                    // the default may reference earlier-bound names in the pattern.
+                    let inner = if let ParamPattern::DefaultValue { pattern, default } = p {
+                        self.emit_apply_default(Some(default))?;
+                        pattern.as_ref()
+                    } else {
+                        p
+                    };
+                    self.bind_element_pattern(inner, kind)?;
                 }
                 Ok(())
             }
             ParamPattern::Ident(name) => self.store_binding(name, kind),
+            ParamPattern::DefaultValue { pattern, .. } => {
+                // A whole-pattern default (`function f([a, b] = [7, 8])`) is
+                // applied by the parameter-default path before this runs; here we
+                // just destructure the (possibly defaulted) value.
+                self.compile_destructure_pattern(pattern, kind)
+            }
             _ => {
                 self.emit(Instruction::Pop);
                 Ok(())
             }
         }
+    }
+
+    /// Bind a single array-element pattern whose value is already on top of the
+    /// stack (after any default has been applied). Consumes that value.
+    fn bind_element_pattern(&mut self, p: &ParamPattern, kind: VarKind) -> Result<()> {
+        match p {
+            ParamPattern::Ident(name) => self.store_binding(name, kind)?,
+            ParamPattern::ObjectDestructure(_) | ParamPattern::ArrayDestructure(_) => {
+                self.compile_destructure_pattern(p, kind)?;
+                self.emit(Instruction::Pop);
+            }
+            _ => {
+                self.emit(Instruction::Pop);
+            }
+        }
+        Ok(())
     }
 
     fn compile_object_destructure(
@@ -1213,10 +1405,19 @@ impl Compiler {
                 let name = field.alias.as_ref().unwrap_or(&field.key);
                 self.store_binding(name, kind)?;
             } else {
-                self.emit(Instruction::GetProperty(field.key.clone()));
+                // Read the field's value: a computed key (`{[k]: v}`) evaluates
+                // the key expression at runtime; a static key uses GetProperty.
+                if let Some(key_expr) = &field.computed_key {
+                    self.compile_expr(key_expr)?;
+                    self.emit(Instruction::GetIndex);
+                } else {
+                    self.emit(Instruction::GetProperty(field.key.clone()));
+                }
                 self.emit_apply_default(field.default.as_ref())?;
                 if let Some(nested) = &field.nested {
-                    self.compile_object_destructure(nested, kind)?;
+                    // The nested pattern (object or array) destructures the
+                    // field's value, which sits on top of the stack.
+                    self.compile_destructure_pattern(nested, kind)?;
                     self.emit(Instruction::Pop);
                 } else {
                     let name = field.alias.as_ref().unwrap_or(&field.key);
@@ -1240,19 +1441,87 @@ impl Compiler {
         Ok(())
     }
 
-    /// Apply field defaults for a destructured object parameter (`function
-    /// f({a = 5})`), whose fields were bound positionally by `bind_params`.
-    fn emit_object_param_defaults(&mut self, fields: &[DestructureField]) -> Result<()> {
-        for field in fields {
-            if field.rest {
-                continue;
-            }
-            let name = field.alias.as_ref().unwrap_or(&field.key);
-            if let (Some(def), Some(slot)) = (&field.default, self.resolve_local(name)) {
-                self.emit_slot_default(slot, def)?;
-            }
-        }
+    /// A reserved, un-typable local name for the hidden temp that holds a
+    /// destructured parameter's raw argument (parameter index `i`).
+    fn param_temp_name(i: usize) -> String {
+        format!("<param${i}>")
+    }
+
+    /// `function f({a} = {})`: when the raw argument (held in `temp`) is
+    /// undefined, evaluate the whole-pattern default and destructure it into the
+    /// pattern's already-declared leaf slots.
+    fn emit_pattern_param_default(
+        &mut self,
+        temp: &str,
+        pattern: &ParamPattern,
+        default: &Expr,
+    ) -> Result<()> {
+        let Some(slot) = self.resolve_local(temp) else {
+            return Ok(());
+        };
+        self.emit(Instruction::LoadLocal(slot));
+        self.emit(Instruction::Push(Constant::Undefined));
+        self.emit(Instruction::StrictEq);
+        let skip = self.emit(Instruction::JumpIfFalse(0));
+        self.compile_expr(default)?;
+        // Store the default's destructured pieces into the leaf slots (they were
+        // declared up-front), then drop the source value.
+        self.compile_destructure_pattern(pattern, VarKind::Let)?;
+        self.emit(Instruction::Pop);
+        let after = self.current_offset();
+        self.patch_jump(skip, after);
         Ok(())
+    }
+
+    /// Apply the inner field/element defaults of a destructured parameter
+    /// pattern, whose leaves were bound positionally by `bind_params`. Walks
+    /// object fields (`{a = 5}`), array elements (`[a = 1]`), and nesting.
+    fn emit_pattern_inner_defaults(&mut self, pattern: &ParamPattern) -> Result<()> {
+        match pattern {
+            ParamPattern::DefaultValue { pattern, .. } => {
+                self.emit_pattern_inner_defaults(pattern)
+            }
+            ParamPattern::ObjectDestructure(fields) => {
+                for field in fields {
+                    if field.rest {
+                        continue;
+                    }
+                    if let Some(nested) = &field.nested {
+                        // Defaults applied directly to the field (`{a: [x] = []}`)
+                        // are handled at the destructure site; here we only descend
+                        // into the nested pattern's own leaf defaults.
+                        self.emit_pattern_inner_defaults(nested)?;
+                    } else {
+                        let name = field.alias.as_ref().unwrap_or(&field.key);
+                        if let (Some(def), Some(slot)) = (&field.default, self.resolve_local(name)) {
+                            self.emit_slot_default(slot, def)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            ParamPattern::ArrayDestructure(elems) => {
+                for elem in elems.iter().flatten() {
+                    match elem {
+                        ParamPattern::DefaultValue { pattern, default } => {
+                            if let ParamPattern::Ident(name) = pattern.as_ref() {
+                                if let Some(slot) = self.resolve_local(name) {
+                                    self.emit_slot_default(slot, default)?;
+                                }
+                            } else {
+                                self.emit_pattern_inner_defaults(pattern)?;
+                            }
+                        }
+                        ParamPattern::ObjectDestructure(_) | ParamPattern::ArrayDestructure(_) => {
+                            self.emit_pattern_inner_defaults(elem)?;
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     /// If the top-of-stack value is `undefined`, replace it with the evaluated
@@ -1645,6 +1914,9 @@ impl Compiler {
                         self.compile_store(target)?;
                     }
                 }
+            }
+            Expr::DestructureAssign { pattern, value } => {
+                self.compile_destructure_assign(pattern, value)?;
             }
             Expr::Sequence(exprs) => {
                 for (i, e) in exprs.iter().enumerate() {
@@ -2058,6 +2330,72 @@ impl Compiler {
         });
 
         Ok(())
+    }
+
+    /// Compile a destructuring ASSIGNMENT expression (`[a, b] = …`,
+    /// `({x: o.p} = …)`). The whole expression evaluates to the right-hand value
+    /// (left on the stack), matching JS.
+    fn compile_destructure_assign(
+        &mut self,
+        pattern: &AssignPattern,
+        value: &Expr,
+    ) -> Result<()> {
+        self.compile_expr(value)?;
+        // Keep one copy of the source as the expression's result; destructure a
+        // duplicate into the targets.
+        self.emit(Instruction::Dup);
+        self.compile_assign_pattern_value(pattern)?;
+        Ok(())
+    }
+
+    /// Destructure the value on top of the stack into `pattern`, consuming it.
+    fn compile_assign_pattern_value(&mut self, pattern: &AssignPattern) -> Result<()> {
+        match pattern {
+            // A leaf lvalue: store the (already-on-stack) value into it.
+            AssignPattern::Target(target) => self.compile_store(target),
+            AssignPattern::Array { elements, rest } => {
+                for (i, elem) in elements.iter().enumerate() {
+                    if let Some(elem) = elem {
+                        self.emit(Instruction::Dup);
+                        self.emit(Instruction::Push(Constant::Int(i as i64)));
+                        self.emit(Instruction::GetIndex);
+                        self.emit_apply_default(elem.default.as_ref())?;
+                        self.compile_assign_pattern_value(&elem.pattern)?;
+                    }
+                }
+                if let Some(rest) = rest {
+                    self.emit(Instruction::Dup);
+                    self.emit(Instruction::ArrayRestFrom(elements.len()));
+                    self.compile_assign_pattern_value(rest)?;
+                }
+                // Drop the source value.
+                self.emit(Instruction::Pop);
+                Ok(())
+            }
+            AssignPattern::Object { fields, rest } => {
+                let excluded: Vec<String> =
+                    fields.iter().map(|f| f.key.clone()).collect();
+                for field in fields {
+                    self.emit(Instruction::Dup);
+                    if let Some(key_expr) = &field.computed_key {
+                        self.compile_expr(key_expr)?;
+                        self.emit(Instruction::GetIndex);
+                    } else {
+                        self.emit(Instruction::GetProperty(field.key.clone()));
+                    }
+                    self.emit_apply_default(field.default.as_ref())?;
+                    self.compile_assign_pattern_value(&field.pattern)?;
+                }
+                if let Some(rest) = rest {
+                    self.emit(Instruction::Dup);
+                    self.emit(Instruction::ObjectRest(excluded));
+                    self.compile_assign_pattern_value(rest)?;
+                }
+                // Drop the source value.
+                self.emit(Instruction::Pop);
+                Ok(())
+            }
+        }
     }
 
     fn compile_store(&mut self, target: &Expr) -> Result<()> {

@@ -61,9 +61,15 @@ pub enum ParamPattern {
 pub struct DestructureField {
     pub key: String,
     pub alias: Option<String>,
-    pub nested: Option<Vec<DestructureField>>,
+    /// A nested pattern bound to this field's value. May be an object pattern
+    /// (`{a: {b}}`) or an array pattern (`{a: [x, y]}`); both nest arbitrarily.
+    pub nested: Option<Box<ParamPattern>>,
     pub default: Option<Expr>,
     pub rest: bool,
+    /// For a computed key (`{[k]: v}`), the runtime key expression to evaluate.
+    /// When set, `key` is a placeholder and the actual property name comes from
+    /// evaluating this expression and coercing to a string.
+    pub computed_key: Option<Expr>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,6 +200,40 @@ pub struct VarDeclarator {
     pub init: Option<Expr>,
 }
 
+/// A destructuring-ASSIGNMENT pattern (left-hand side of `pattern = value` with
+/// no declaration keyword). Unlike [`AssignTarget`], its leaves are arbitrary
+/// assignable expressions (`a`, `o.p`, `arr[i]`), each stored via the normal
+/// assignment path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AssignPattern {
+    /// A leaf assignment target: an identifier or member expression.
+    Target(Expr),
+    /// `[a, b, ...rest]` — elements may be `None` (elision/hole).
+    Array {
+        elements: Vec<Option<AssignPatternElement>>,
+        rest: Option<Box<AssignPattern>>,
+    },
+    /// `{a, b: x, [k]: y, ...rest}`.
+    Object {
+        fields: Vec<AssignPatternField>,
+        rest: Option<Box<AssignPattern>>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssignPatternElement {
+    pub pattern: AssignPattern,
+    pub default: Option<Expr>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssignPatternField {
+    pub key: String,
+    pub computed_key: Option<Expr>,
+    pub pattern: AssignPattern,
+    pub default: Option<Expr>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AssignTarget {
     Ident(String),
@@ -202,6 +242,11 @@ pub enum AssignTarget {
     /// Array-rest binding `...name`; only valid as the last element of an
     /// `ArrayDestructure`.
     Rest(String),
+    /// A destructuring binding lowered to the unified `ParamPattern` form, which
+    /// supports element defaults and arbitrary object/array nesting. Used for
+    /// var-decl destructuring so `const [[a],[b]] = …`, `const [a = 1] = []`, and
+    /// `const {arr: [x]} = …` all bind correctly.
+    Pattern(ParamPattern),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,6 +302,14 @@ pub enum Expr {
     Assignment {
         op: AssignOp,
         target: Box<Expr>,
+        value: Box<Expr>,
+    },
+    /// Destructuring ASSIGNMENT (no declaration keyword): `[a, b] = …`,
+    /// `({x: o.p} = …)`, `[arr[0], y] = …`. The leaves are arbitrary assignable
+    /// expressions (identifiers or member accesses), unlike a binding pattern.
+    /// Evaluates to the right-hand value.
+    DestructureAssign {
+        pattern: Box<AssignPattern>,
         value: Box<Expr>,
     },
     Sequence(Vec<Expr>),
