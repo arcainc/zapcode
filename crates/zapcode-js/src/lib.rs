@@ -437,7 +437,7 @@ impl Zapcode {
             VmState::Complete(v) => Ok(ZapcodeResult {
                 kind: "complete".to_string(),
                 completed: true,
-                output: value_to_json(&v, &heap),
+                output: value_to_json(&v, &heap)?,
                 stdout,
                 trace: trace_to_js(&trace),
             }),
@@ -559,10 +559,40 @@ fn json_to_value(json: &serde_json::Value, heap: &mut Heap) -> Value {
     }
 }
 
+/// Maximum nesting depth when marshalling a guest `Value` out across the napi
+/// boundary. Guest reference values can form cycles (`const a = []; a.push(a)`)
+/// or be nested arbitrarily deep; an unbounded native recursion here would
+/// overflow the OS stack and *abort the entire host Node process* (an
+/// uncatchable `SIGSEGV` — a panic/abort across napi kills the host). Capping
+/// the recursion turns "cyclic / very deep value handed back or passed to a
+/// tool" into a catchable `napi::Error` the host can handle. Kept in lockstep
+/// with the core's `MAX_RENDER_DEPTH`.
+const MAX_MARSHAL_DEPTH: usize = 256;
+
 /// Convert a `zapcode_core::Value` to a `serde_json::Value`, dereferencing
 /// array/object handles through `heap`.
-fn value_to_json(value: &Value, heap: &Heap) -> serde_json::Value {
-    match value {
+///
+/// Fallible: a reference cycle or an over-deep structure surfaces a catchable
+/// `napi::Error` instead of recursing to native-stack exhaustion (which would
+/// abort the host process). `seen` tracks the chain of currently-open
+/// Array/Object handles to detect cycles; `depth` is the hard backstop.
+fn value_to_json(value: &Value, heap: &Heap) -> napi::Result<serde_json::Value> {
+    let mut seen: Vec<zapcode_core::heap::Handle> = Vec::new();
+    value_to_json_inner(value, heap, &mut seen, 0)
+}
+
+fn value_to_json_inner(
+    value: &Value,
+    heap: &Heap,
+    seen: &mut Vec<zapcode_core::heap::Handle>,
+    depth: usize,
+) -> napi::Result<serde_json::Value> {
+    if depth > MAX_MARSHAL_DEPTH {
+        return Err(napi::Error::from_reason(
+            "value nesting depth exceeded while marshalling result (max 256)".to_string(),
+        ));
+    }
+    Ok(match value {
         Value::Undefined | Value::Null => serde_json::Value::Null,
         Value::Bool(b) => serde_json::Value::Bool(*b),
         Value::Int(n) => serde_json::json!(*n),
@@ -575,18 +605,34 @@ fn value_to_json(value: &Value, heap: &Heap) -> serde_json::Value {
             }
         }
         Value::String(s) => serde_json::Value::String(s.to_string()),
-        Value::Array(h) => serde_json::Value::Array(
-            heap.array(*h).iter().map(|v| value_to_json(v, heap)).collect(),
-        ),
+        Value::Array(h) => {
+            if seen.contains(h) {
+                return Err(napi::Error::from_reason(
+                    "Converting circular structure to JSON".to_string(),
+                ));
+            }
+            seen.push(*h);
+            let mut items = Vec::new();
+            for v in heap.array(*h).iter() {
+                items.push(value_to_json_inner(v, heap, seen, depth + 1)?);
+            }
+            seen.pop();
+            serde_json::Value::Array(items)
+        }
         Value::Object(h) => {
-            let map: serde_json::Map<String, serde_json::Value> = heap
-                .object(*h)
-                .map(|obj| {
-                    obj.iter()
-                        .map(|(k, v)| (k.to_string(), value_to_json(v, heap)))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let mut map = serde_json::Map::new();
+            if let Some(obj) = heap.object(*h) {
+                if seen.contains(h) {
+                    return Err(napi::Error::from_reason(
+                        "Converting circular structure to JSON".to_string(),
+                    ));
+                }
+                seen.push(*h);
+                for (k, v) in obj.iter() {
+                    map.insert(k.to_string(), value_to_json_inner(v, heap, seen, depth + 1)?);
+                }
+                seen.pop();
+            }
             serde_json::Value::Object(map)
         }
         Value::Function(_) | Value::BuiltinMethod { .. } => {
@@ -596,7 +642,7 @@ fn value_to_json(value: &Value, heap: &Heap) -> serde_json::Value {
         Value::Generator(_) => serde_json::Value::Null,
         // A deferred batch call never escapes to JS as a result value.
         Value::Pending(_) => serde_json::Value::Null,
-    }
+    })
 }
 
 fn trace_span_to_js(span: &TraceSpan) -> JsTraceSpan {
@@ -635,7 +681,7 @@ fn run_result_to_either(
         VmState::Complete(v) => Ok(Either3::A(ZapcodeResult {
             kind: "complete".to_string(),
             completed: true,
-            output: value_to_json(&v, &heap),
+            output: value_to_json(&v, &heap)?,
             stdout: String::new(),
             trace: trace_to_js(&trace),
         })),
@@ -644,6 +690,7 @@ fn run_result_to_either(
             args,
             snapshot,
         } => {
+            let js_args = values_to_json(&args, &heap)?;
             let snap_bytes = snapshot
                 .dump()
                 .map_err(|e| napi::Error::from_reason(e.to_string()))?;
@@ -651,7 +698,7 @@ fn run_result_to_either(
                 kind: "suspended".to_string(),
                 completed: false,
                 function_name,
-                args: args.iter().map(|v| value_to_json(v, &heap)).collect(),
+                args: js_args,
                 snapshot: Buffer::from(snap_bytes),
             }))
         }
@@ -660,6 +707,7 @@ fn run_result_to_either(
             combinator,
             snapshot,
         } => {
+            let js_calls = external_calls_to_js(&calls, &heap)?;
             let snap_bytes = snapshot
                 .dump()
                 .map_err(|e| napi::Error::from_reason(e.to_string()))?;
@@ -667,7 +715,7 @@ fn run_result_to_either(
                 kind: "suspended_many".to_string(),
                 completed: false,
                 combinator: combinator.as_str().to_string(),
-                calls: external_calls_to_js(&calls, &heap),
+                calls: js_calls,
                 snapshot: Buffer::from(snap_bytes),
             }))
         }
@@ -689,7 +737,7 @@ fn run_result_to_either_with_stdout(
         VmState::Complete(v) => Ok(Either3::A(ZapcodeResult {
             kind: "complete".to_string(),
             completed: true,
-            output: value_to_json(&v, &heap),
+            output: value_to_json(&v, &heap)?,
             stdout,
             trace: trace_to_js(&trace),
         })),
@@ -698,6 +746,7 @@ fn run_result_to_either_with_stdout(
             args,
             snapshot,
         } => {
+            let js_args = values_to_json(&args, &heap)?;
             let snap_bytes = snapshot
                 .dump()
                 .map_err(|e| napi::Error::from_reason(e.to_string()))?;
@@ -705,7 +754,7 @@ fn run_result_to_either_with_stdout(
                 kind: "suspended".to_string(),
                 completed: false,
                 function_name,
-                args: args.iter().map(|v| value_to_json(v, &heap)).collect(),
+                args: js_args,
                 snapshot: Buffer::from(snap_bytes),
             }))
         }
@@ -714,6 +763,7 @@ fn run_result_to_either_with_stdout(
             combinator,
             snapshot,
         } => {
+            let js_calls = external_calls_to_js(&calls, &heap)?;
             let snap_bytes = snapshot
                 .dump()
                 .map_err(|e| napi::Error::from_reason(e.to_string()))?;
@@ -721,21 +771,39 @@ fn run_result_to_either_with_stdout(
                 kind: "suspended_many".to_string(),
                 completed: false,
                 combinator: combinator.as_str().to_string(),
-                calls: external_calls_to_js(&calls, &heap),
+                calls: js_calls,
                 snapshot: Buffer::from(snap_bytes),
             }))
         }
     }
 }
 
-fn external_calls_to_js(calls: &[zapcode_core::ExternalCall], heap: &Heap) -> Vec<JsExternalCall> {
-    calls
-        .iter()
-        .map(|c| JsExternalCall {
+fn external_calls_to_js(
+    calls: &[zapcode_core::ExternalCall],
+    heap: &Heap,
+) -> napi::Result<Vec<JsExternalCall>> {
+    let mut out = Vec::with_capacity(calls.len());
+    for c in calls {
+        let mut args = Vec::with_capacity(c.args.len());
+        for v in c.args.iter() {
+            args.push(value_to_json(v, heap)?);
+        }
+        out.push(JsExternalCall {
             name: c.name.clone(),
-            args: c.args.iter().map(|v| value_to_json(v, heap)).collect(),
-        })
-        .collect()
+            args,
+        });
+    }
+    Ok(out)
+}
+
+/// Marshal a list of `Value`s to JSON, surfacing a catchable error if any
+/// contains a cycle / is too deeply nested (instead of aborting the host).
+fn values_to_json(values: &[Value], heap: &Heap) -> napi::Result<Vec<serde_json::Value>> {
+    let mut out = Vec::with_capacity(values.len());
+    for v in values {
+        out.push(value_to_json(v, heap)?);
+    }
+    Ok(out)
 }
 
 type SessionEither =
@@ -751,13 +819,14 @@ fn session_state_to_either(state: ZapcodeSessionState) -> napi::Result<SessionEi
             stdout,
             session,
         } => {
+            let js_output = value_to_json(&output, &heap)?;
             let bytes = session
                 .dump()
                 .map_err(|e| napi::Error::from_reason(e.to_string()))?;
             Ok(Either3::A(ZapcodeSessionResult {
                 kind: "complete".to_string(),
                 completed: true,
-                output: value_to_json(&output, &heap),
+                output: js_output,
                 stdout,
                 session: Buffer::from(bytes),
             }))
@@ -768,6 +837,7 @@ fn session_state_to_either(state: ZapcodeSessionState) -> napi::Result<SessionEi
             stdout,
             session,
         } => {
+            let js_args = values_to_json(&args, &heap)?;
             let bytes = session
                 .dump()
                 .map_err(|e| napi::Error::from_reason(e.to_string()))?;
@@ -775,7 +845,7 @@ fn session_state_to_either(state: ZapcodeSessionState) -> napi::Result<SessionEi
                 kind: "suspended".to_string(),
                 completed: false,
                 function_name,
-                args: args.iter().map(|v| value_to_json(v, &heap)).collect(),
+                args: js_args,
                 stdout,
                 session: Buffer::from(bytes),
             }))
@@ -786,6 +856,7 @@ fn session_state_to_either(state: ZapcodeSessionState) -> napi::Result<SessionEi
             stdout,
             session,
         } => {
+            let js_calls = external_calls_to_js(&calls, &heap)?;
             let bytes = session
                 .dump()
                 .map_err(|e| napi::Error::from_reason(e.to_string()))?;
@@ -793,7 +864,7 @@ fn session_state_to_either(state: ZapcodeSessionState) -> napi::Result<SessionEi
                 kind: "suspended_many".to_string(),
                 completed: false,
                 combinator: combinator.as_str().to_string(),
-                calls: external_calls_to_js(&calls, &heap),
+                calls: js_calls,
                 stdout,
                 session: Buffer::from(bytes),
             }))

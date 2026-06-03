@@ -10,6 +10,7 @@
 use crate::value::Value;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// An index into the [`Heap`]'s slot table identifying one array or object.
@@ -159,23 +160,68 @@ impl Heap {
 
     /// Recursively copy a value into fresh heap slots (independent of the
     /// original), for `structuredClone` and other deep-copy semantics.
-    pub fn deep_clone(&mut self, value: &Value) -> Value {
-        match value {
+    ///
+    /// Reference values can alias and form cycles (`const a = []; a.push(a)`), so
+    /// a naive recursion would loop forever / overflow the native stack and abort
+    /// the host process. `seen` maps each already-cloned *source* handle to its
+    /// freshly-allocated *clone* handle: revisiting a source handle reuses its
+    /// clone, which preserves shared structure and makes cyclic input terminate
+    /// (matching `structuredClone`, which round-trips cycles). To make a cycle
+    /// resolvable we must register the clone handle *before* descending into the
+    /// children, so a back-edge to the node currently being cloned finds it.
+    pub fn deep_clone(&mut self, value: &Value) -> crate::error::Result<Value> {
+        let mut seen: HashMap<Handle, Handle> = HashMap::new();
+        self.deep_clone_inner(value, &mut seen, 0)
+    }
+
+    fn deep_clone_inner(
+        &mut self,
+        value: &Value,
+        seen: &mut HashMap<Handle, Handle>,
+        depth: usize,
+    ) -> crate::error::Result<Value> {
+        // Defense-in-depth: even with the cycle-preserving `seen` map, a very
+        // deep *acyclic* chain would recurse to native-stack exhaustion. Cap it
+        // and surface a catchable error rather than aborting the host process.
+        if depth > crate::value::MAX_RENDER_DEPTH {
+            return Err(crate::error::ZapcodeError::RuntimeError(format!(
+                "structuredClone nesting depth exceeded (max {})",
+                crate::value::MAX_RENDER_DEPTH
+            )));
+        }
+        Ok(match value {
             Value::Array(h) => {
+                if let Some(&clone) = seen.get(h) {
+                    return Ok(Value::Array(clone));
+                }
+                // Allocate the clone slot first (empty) and record the mapping so a
+                // back-reference to this array resolves to the same clone handle.
+                let clone = self.alloc_array(Vec::new());
+                seen.insert(*h, clone);
                 let items = self.array_vec(*h);
-                let cloned: Vec<Value> = items.iter().map(|v| self.deep_clone(v)).collect();
-                Value::Array(self.alloc_array(cloned))
+                let mut cloned: Vec<Value> = Vec::with_capacity(items.len());
+                for v in items.iter() {
+                    cloned.push(self.deep_clone_inner(v, seen, depth + 1)?);
+                }
+                self.set_array(clone, cloned);
+                Value::Array(clone)
             }
             Value::Object(h) => {
+                if let Some(&clone) = seen.get(h) {
+                    return Ok(Value::Object(clone));
+                }
+                let clone = self.alloc_object(IndexMap::new());
+                seen.insert(*h, clone);
                 let map = self.object_map(*h);
-                let cloned: IndexMap<Arc<str>, Value> = map
-                    .iter()
-                    .map(|(k, v)| (k.clone(), self.deep_clone(v)))
-                    .collect();
-                Value::Object(self.alloc_object(cloned))
+                let mut cloned: IndexMap<Arc<str>, Value> = IndexMap::new();
+                for (k, v) in map.iter() {
+                    cloned.insert(k.clone(), self.deep_clone_inner(v, seen, depth + 1)?);
+                }
+                self.set_object(clone, cloned);
+                Value::Object(clone)
             }
             other => other.clone(),
-        }
+        })
     }
 }
 

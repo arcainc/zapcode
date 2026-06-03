@@ -171,9 +171,18 @@ impl ZapcodeSnapshot {
 
     /// Deserialize a snapshot from bytes produced by [`Self::dump`].
     pub fn load(bytes: &[u8]) -> Result<Self> {
-        let payload = crate::wire::decode_frame(FrameKind::Snapshot, bytes)?;
-        let snapshot: VmSnapshot = postcard::from_bytes(&payload)
+        let payload = crate::wire::decode_frame(
+            FrameKind::Snapshot,
+            bytes,
+            crate::wire::MAX_LOAD_DECOMPRESSED_BYTES,
+        )?;
+        let mut snapshot: VmSnapshot = postcard::from_bytes(&payload)
             .map_err(|e| ZapcodeError::SnapshotError(format!("load failed: {}", e)))?;
+        // Clamp untrusted, snapshot-embedded resource limits down to safe
+        // defaults so a forged/tampered blob can't raise its own limits to
+        // bypass sandbox enforcement on resume (the wire SHA is keyless — it
+        // detects corruption, not forgery).
+        snapshot.limits.clamp_to_default();
         Ok(Self {
             snapshot: Box::new(snapshot),
         })

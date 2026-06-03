@@ -54,4 +54,73 @@ await test("Date return marshals to an ISO string", async () => {
   assert.equal(r.output, "2023-11-14T22:13:20.123Z");
 });
 
+// ── Reference-cycle / deep-recursion DoS hardening (must never abort) ──
+// Each of these used to SIGSEGV the host process (exit 139) via unbounded
+// native recursion. They must now surface a catchable error or a bounded value,
+// and the host must survive — which is implicit in this script reaching the end.
+
+await test("cycle returned as result is a catchable error, not a host abort", async () => {
+  await assert.rejects(
+    () => execute(`const a = []; a.push(a); a`, {}),
+    /circular structure/i,
+  );
+});
+
+await test("JSON.stringify(cycle) throws the JS circular-structure error in-guest", async () => {
+  const r = await execute(
+    `const a=[]; a.push(a); let ok=false; try { JSON.stringify(a); } catch(e){ ok = (''+e).indexOf('circular') >= 0; } ok`,
+    {},
+  );
+  assert.equal(r.output, true);
+});
+
+await test("String()/template/join of a cycle are bounded (no abort)", async () => {
+  for (const expr of ["String(a)", "`${a}`", "a.join(',')"]) {
+    const r = await execute(`const a=[]; a.push(a); typeof (${expr}) === 'string'`, {});
+    assert.equal(r.output, true, `expected ${expr} to produce a bounded string`);
+  }
+});
+
+await test("structuredClone(cycle) round-trips, preserving the self-reference", async () => {
+  const r = await execute(`const a=[]; a.push(a); const c = structuredClone(a); (c !== a) && (c[0] === c)`, {});
+  assert.equal(r.output, true);
+});
+
+await test("a cyclic value passed to a tool is a catchable error, not a host abort", async () => {
+  await assert.rejects(
+    () => execute(`const a=[]; a.push(a); await echo(a); 1`, {
+      echo: { description: "", parameters: { x: { type: "object", optional: true } }, execute: async (args) => args.x },
+    }),
+    /circular structure/i,
+  );
+});
+
+await test("deeply nested literal is a catchable parse error, not a host abort", async () => {
+  const code = `const x = ${"[".repeat(5000)}${"]".repeat(5000)}; 1`;
+  await assert.rejects(() => execute(code, {}), /nesting depth/i);
+});
+
+await test("runtime-built deep JSON.stringify is catchable, not a host abort", async () => {
+  const code = `let a={x:1}; for(let i=0;i<9000;i++){a={n:a};} JSON.stringify(a).length`;
+  await assert.rejects(() => execute(code, {}, { memoryLimitMb: 64, timeLimitMs: 20000 }), /nesting depth/i);
+});
+
+await test("Array.from({length: huge}) hits the memory limit (no untracked OOM)", async () => {
+  await assert.rejects(
+    () => execute(`const a = Array.from({length: 50000000}); a.length`, {}, { memoryLimitMb: 8, timeLimitMs: 20000 }),
+    /memory limit|allocation limit/i,
+  );
+});
+
+await test("padStart/join past the cap hit the memory limit", async () => {
+  await assert.rejects(
+    () => execute(`'x'.padStart(200000000, 'ab').length`, {}, { memoryLimitMb: 8, timeLimitMs: 20000 }),
+    /memory limit/i,
+  );
+  await assert.rejects(
+    () => execute(`const s='x'.repeat(1000000); const a=[]; let i=0; while(i<300){a.push(s);i=i+1;} a.join('').length`, {}, { memoryLimitMb: 8, timeLimitMs: 20000 }),
+    /memory limit/i,
+  );
+});
+
 console.log(`\n${passed} marshalling checks passed.`);

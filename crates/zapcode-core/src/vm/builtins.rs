@@ -6,7 +6,7 @@ use indexmap::IndexMap;
 use crate::error::{Result, ZapcodeError};
 use crate::heap::{Handle, Heap};
 use crate::sandbox::ResourceLimits;
-use crate::value::Value;
+use crate::value::{Value, MAX_RENDER_DEPTH};
 
 /// Register built-in global objects and functions, allocating their backing
 /// objects in `heap`.
@@ -496,7 +496,7 @@ pub fn call_global_fn(kind: &str, args: &[Value], heap: &mut Heap) -> Result<Val
         "isNaN" => Value::Bool(arg.to_number_heap(heap).is_nan()),
         "isFinite" => Value::Bool(arg.to_number_heap(heap).is_finite()),
         // Deep-copy so the result is independent of the original (reference semantics).
-        "structuredClone" => heap.deep_clone(&arg),
+        "structuredClone" => heap.deep_clone(&arg)?,
         "String.fromCharCode" => {
             let s: String = args
                 .iter()
@@ -787,7 +787,8 @@ fn call_json_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<Opt
                 Some(Value::String(s)) if !s.is_empty() => Some(s.to_string()),
                 _ => None,
             };
-            match serialize_json(val, whitelist.as_deref(), indent.as_deref(), 0, heap) {
+            let mut seen: Vec<Handle> = Vec::new();
+            match serialize_json(val, whitelist.as_deref(), indent.as_deref(), 0, &mut seen, heap)? {
                 // JSON.stringify(undefined) / of a function returns the value undefined.
                 Some(s) => Ok(Some(Value::String(Arc::from(s.as_str())))),
                 None => Ok(Some(Value::Undefined)),
@@ -831,48 +832,70 @@ fn json_escape_string(s: &str) -> String {
     out
 }
 
-/// Serialize a value to JSON. Returns `None` for values JSON omits (undefined,
-/// functions) so callers can drop object properties / emit `null` in arrays.
-/// `whitelist` is the array-replacer key filter; `indent` enables pretty output.
+/// Serialize a value to JSON. Returns `Ok(None)` for values JSON omits
+/// (undefined, functions) so callers can drop object properties / emit `null` in
+/// arrays. `whitelist` is the array-replacer key filter; `indent` enables pretty
+/// output.
+///
+/// `seen` carries the chain of currently-open Array/Object handles so a reference
+/// cycle (`const a = []; a.push(a)`) is detected and reported as the JS-faithful
+/// `TypeError: Converting circular structure to JSON` — instead of recursing
+/// until the native stack overflows and aborts the host process. A hard
+/// [`MAX_RENDER_DEPTH`] cap is also enforced as defense-in-depth so a very deep
+/// (acyclic) structure surfaces a catchable error rather than crashing.
 fn serialize_json(
     val: &Value,
     whitelist: Option<&[String]>,
     indent: Option<&str>,
     depth: usize,
+    seen: &mut Vec<Handle>,
     heap: &Heap,
-) -> Option<String> {
+) -> Result<Option<String>> {
+    if depth > MAX_RENDER_DEPTH {
+        return Err(ZapcodeError::RuntimeError(format!(
+            "JSON nesting depth exceeded (max {})",
+            MAX_RENDER_DEPTH
+        )));
+    }
     match val {
         Value::Undefined
         | Value::Function(_)
         | Value::BuiltinMethod { .. }
         | Value::Generator(_)
-        | Value::Pending(_) => None,
-        Value::Null => Some("null".to_string()),
-        Value::Bool(b) => Some(b.to_string()),
-        Value::Int(n) => Some(n.to_string()),
-        Value::Float(n) => Some(if n.is_finite() {
+        | Value::Pending(_) => Ok(None),
+        Value::Null => Ok(Some("null".to_string())),
+        Value::Bool(b) => Ok(Some(b.to_string())),
+        Value::Int(n) => Ok(Some(n.to_string())),
+        Value::Float(n) => Ok(Some(if n.is_finite() {
             format_number(*n)
         } else {
             "null".to_string()
-        }),
-        Value::String(s) => Some(json_escape_string(s)),
+        })),
+        Value::String(s) => Ok(Some(json_escape_string(s))),
         Value::Array(h) => {
-            let items: Vec<String> = heap
-                .array(*h)
-                .iter()
-                .map(|v| {
-                    serialize_json(v, whitelist, indent, depth + 1, heap)
-                        .unwrap_or_else(|| "null".to_string())
-                })
-                .collect();
-            Some(join_json_array(&items, indent, depth))
+            if seen.contains(h) {
+                return Err(ZapcodeError::TypeError(
+                    "Converting circular structure to JSON".to_string(),
+                ));
+            }
+            seen.push(*h);
+            let mut items: Vec<String> = Vec::new();
+            for v in heap.array(*h).iter() {
+                let rendered = serialize_json(v, whitelist, indent, depth + 1, seen, heap)?
+                    .unwrap_or_else(|| "null".to_string());
+                items.push(rendered);
+            }
+            seen.pop();
+            Ok(Some(join_json_array(&items, indent, depth)))
         }
         Value::Object(h) => {
-            let map = heap.object(*h)?;
+            let Some(map) = heap.object(*h) else {
+                return Ok(None);
+            };
             // Date -> ISO string (matches Date.prototype.toJSON).
             if map.contains_key("__date_ms__") {
                 let ms = map.get("__date_ms__").map(|v| v.to_number() as i64).unwrap_or(0);
-                return Some(json_escape_string(&crate::vm::unix_millis_to_iso(ms)));
+                return Ok(Some(json_escape_string(&crate::vm::unix_millis_to_iso(ms))));
             }
             // Map/Set/RegExp/Error have no enumerable own data properties in JS.
             if map.contains_key("__map__")
@@ -880,17 +903,30 @@ fn serialize_json(
                 || map.contains_key("__regexp__")
                 || map.contains_key("__error__")
             {
-                return Some("{}".to_string());
+                return Ok(Some("{}".to_string()));
             }
-            let pairs: Vec<(String, String)> = map
-                .iter()
-                .filter(|(k, _)| !k.starts_with("__"))
-                .filter(|(k, _)| whitelist.map_or(true, |w| w.iter().any(|x| x == k.as_ref())))
-                .filter_map(|(k, v)| {
-                    serialize_json(v, whitelist, indent, depth + 1, heap).map(|s| (k.to_string(), s))
-                })
-                .collect();
-            Some(join_json_object(&pairs, indent, depth))
+            if seen.contains(h) {
+                return Err(ZapcodeError::TypeError(
+                    "Converting circular structure to JSON".to_string(),
+                ));
+            }
+            seen.push(*h);
+            let mut pairs: Vec<(String, String)> = Vec::new();
+            for (k, v) in map.iter() {
+                if k.starts_with("__") {
+                    continue;
+                }
+                if let Some(w) = whitelist {
+                    if !w.iter().any(|x| x == k.as_ref()) {
+                        continue;
+                    }
+                }
+                if let Some(s) = serialize_json(v, whitelist, indent, depth + 1, seen, heap)? {
+                    pairs.push((k.to_string(), s));
+                }
+            }
+            seen.pop();
+            Ok(Some(join_json_object(&pairs, indent, depth)))
         }
     }
 }
@@ -1497,6 +1533,10 @@ fn call_string_method(
             if current_len >= target_len {
                 Value::String(s.clone())
             } else {
+                // Guard the projected size before materializing, like `repeat`,
+                // so a huge `target_len` can't allocate an untracked giant string
+                // (memory-limit bypass / host OOM).
+                check_string_alloc(target_len, limits)?;
                 let pad_len = target_len - current_len;
                 let padding: String = pad.chars().cycle().take(pad_len).collect();
                 Value::String(Arc::from(format!("{}{}", padding, s).as_str()))
@@ -1513,6 +1553,7 @@ fn call_string_method(
             if current_len >= target_len {
                 Value::String(s.clone())
             } else {
+                check_string_alloc(target_len, limits)?;
                 let pad_len = target_len - current_len;
                 let padding: String = pad.chars().cycle().take(pad_len).collect();
                 Value::String(Arc::from(format!("{}{}", s, padding).as_str()))
@@ -1647,9 +1688,17 @@ fn call_string_method(
             }
         }
         "concat" => {
+            // Sum the projected size first and reject up front so a string
+            // built from many large pieces can't bypass the memory limit.
+            let mut projected = s.len();
+            let rendered: Vec<String> = args.iter().map(|a| a.to_js_string(heap)).collect();
+            for piece in &rendered {
+                projected = projected.saturating_add(piece.len());
+            }
+            check_string_alloc(projected, limits)?;
             let mut result = s.to_string();
-            for arg in args {
-                result.push_str(&arg.to_js_string(heap));
+            for piece in rendered {
+                result.push_str(&piece);
             }
             Value::String(Arc::from(result.as_str()))
         }
@@ -1669,6 +1718,20 @@ fn call_string_method(
         _ => return Ok(None),
     };
     Ok(Some(result))
+}
+
+/// Reject a string allocation whose projected byte length exceeds the memory
+/// limit before it is materialized. Mirrors the in-line guard `String.repeat`
+/// uses; shared by the other unbounded string-builders (padStart/padEnd, concat,
+/// Array.join) so a guest can't bypass `memory_limit_bytes` through them.
+fn check_string_alloc(projected_len: usize, limits: &ResourceLimits) -> Result<()> {
+    if projected_len > limits.memory_limit_bytes {
+        return Err(ZapcodeError::MemoryLimitExceeded(format!(
+            "string result of {} bytes exceeds memory limit of {} bytes",
+            projected_len, limits.memory_limit_bytes
+        )));
+    }
+    Ok(())
 }
 
 // ── Array methods ────────────────────────────────────────────────────
@@ -1713,7 +1776,7 @@ fn call_array_method(
     handle: crate::heap::Handle,
     method: &str,
     args: &[Value],
-    _limits: &ResourceLimits,
+    limits: &ResourceLimits,
     heap: &mut Heap,
 ) -> Result<Option<Value>> {
     // Snapshot the elements for read-only methods. Mutating methods
@@ -1759,6 +1822,11 @@ fn call_array_method(
                     _ => v.to_js_string(heap),
                 })
                 .collect();
+            // Reject before allocating the contiguous result so a join of many
+            // large strings can't bypass the memory limit (host OOM DoS).
+            let body: usize = joined.iter().map(|p| p.len()).sum();
+            let sep_total = sep.len().saturating_mul(joined.len().saturating_sub(1));
+            check_string_alloc(body.saturating_add(sep_total), limits)?;
             Value::String(Arc::from(joined.join(&sep).as_str()))
         }
         "slice" => {
@@ -2070,6 +2138,46 @@ fn call_object_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<O
 /// Handles arrays, strings (by char), built-in Set/Map, and `{ length: n }`
 /// array-likes. The optional mapFn is applied by the caller (it may be a
 /// guest closure that requires the VM).
+/// The number of elements `array_from_source` would produce for `val`, computed
+/// *without* materializing the (possibly enormous) Vec. Callers use this to
+/// charge the allocation against the resource limit before building it, so a
+/// `{length: 200_000_000}` array-like can't allocate untracked and OOM the host.
+pub fn array_from_source_len(val: &Value, heap: &Heap) -> usize {
+    match val {
+        Value::Array(h) => heap.array(*h).len(),
+        Value::String(s) => s.chars().count(),
+        Value::Object(h) => {
+            let Some(map) = heap.object(*h) else {
+                return 0;
+            };
+            if matches!(map.get("__set__"), Some(Value::Bool(true))) {
+                return match map.get("__items__") {
+                    Some(Value::Array(ih)) => heap.array(*ih).len(),
+                    _ => 0,
+                };
+            }
+            if matches!(map.get("__map__"), Some(Value::Bool(true))) {
+                return match map.get("__entries__") {
+                    Some(Value::Array(eh)) => heap.array(*eh).len(),
+                    _ => 0,
+                };
+            }
+            match map.get("length") {
+                Some(len_val) => {
+                    let n = len_val.to_number();
+                    if n.is_finite() && n >= 0.0 {
+                        n as usize
+                    } else {
+                        0
+                    }
+                }
+                None => 0,
+            }
+        }
+        _ => 0,
+    }
+}
+
 pub fn array_from_source(val: &Value, heap: &mut Heap) -> Vec<Value> {
     match val {
         Value::Array(h) => heap.array_vec(*h),
