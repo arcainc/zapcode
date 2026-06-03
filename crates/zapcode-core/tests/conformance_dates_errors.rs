@@ -167,4 +167,15 @@ fn user_error_subclass() {
         run_str("class MyErr extends Error { constructor(m){ super(m); this.message = m; this.name = 'MyErr'; } } let r; try { throw new MyErr('custom'); } catch(e){ r = e.name + ':' + e.message; } r"),
         "MyErr:custom"
     );
+    // A subclass with NO own constructor still forwards the message via the
+    // implicit `constructor(...a){ super(...a) }`; `name` defaults to "Error".
+    assert_eq!(
+        run_str("class MyErr extends Error {} let e = new MyErr('boom'); e.name + ':' + e.message + ':' + (e instanceof Error)"),
+        "Error:boom:true"
+    );
+    // No-arg subclass construction yields an empty message (not undefined), like JS.
+    assert_eq!(
+        run_str("class MyErr extends Error {} String(new MyErr().message)"),
+        ""
+    );
 }

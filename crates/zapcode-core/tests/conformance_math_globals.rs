@@ -251,6 +251,11 @@ fn object_reflection_statics() {
     assert_eq!(run_str("String(Object.is(NaN, NaN))"), "true");
     assert_eq!(run_str("String(Object.is(1, 2))"), "false");
     assert_eq!(run_str("String(Object.is('a', 'a'))"), "true");
+    // The SameValue impl distinguishes +0/-0 correctly for genuine Float(-0.0),
+    // BUT the `-0` literal collapses to integer 0 (negative zero is not
+    // representable — documented residual F13), so Object.is(-0, 0) is `true`
+    // here. JS: false. Pinned to zapcode's actual behavior.
+    assert_eq!(run_str("String(Object.is(-0, 0))"), "true");
     // Object.create yields a usable plain object; the property bag's data
     // descriptors become own properties.
     assert_eq!(run_str("typeof Object.create(null)"), "object");

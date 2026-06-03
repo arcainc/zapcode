@@ -5451,6 +5451,42 @@ impl Vm {
                                 self.last_receiver = None;
                             }
                             _ => {
+                                // No user constructor. A built-in Error subclass with
+                                // no own constructor still has an implicit
+                                // `constructor(...a){ super(...a) }`, so forward the
+                                // message argument (and derive the stack) like JS.
+                                if class_obj.contains_key("__error_base__") {
+                                    if let Value::Object(inst_h) = &instance_val {
+                                        let inst_h = *inst_h;
+                                        let msg = match args.first() {
+                                            Some(v) if !matches!(v, Value::Undefined) => {
+                                                v.to_js_string(&self.heap)
+                                            }
+                                            _ => String::new(),
+                                        };
+                                        let name = self
+                                            .heap
+                                            .object(inst_h)
+                                            .and_then(|m| m.get("name"))
+                                            .map(|v| v.to_js_string(&self.heap))
+                                            .unwrap_or_else(|| "Error".to_string());
+                                        let stack = if msg.is_empty() {
+                                            name
+                                        } else {
+                                            format!("{}: {}", name, msg)
+                                        };
+                                        if let Some(map) = self.heap.object_mut(inst_h) {
+                                            map.insert(
+                                                Arc::from("message"),
+                                                Value::String(Arc::from(msg.as_str())),
+                                            );
+                                            map.insert(
+                                                Arc::from("stack"),
+                                                Value::String(Arc::from(stack.as_str())),
+                                            );
+                                        }
+                                    }
+                                }
                                 self.push(instance_val)?;
                             }
                         }
