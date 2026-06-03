@@ -31,6 +31,7 @@ pub fn register_globals(globals: &mut HashMap<String, Value>, heap: &mut Heap) {
     globals.insert("Promise".to_string(), Value::Object(empty));
     globals.insert("Map".to_string(), builtin_constructor("Map", heap));
     globals.insert("Set".to_string(), builtin_constructor("Set", heap));
+    globals.insert("RegExp".to_string(), builtin_constructor("RegExp", heap));
     globals.insert("Date".to_string(), {
         let mut d = IndexMap::new();
         d.insert(
@@ -1256,14 +1257,13 @@ pub fn call_regexp_method(
                         };
                         write_last_index(heap, new_char);
                     }
-                    let items: Vec<Value> = caps
-                        .iter()
-                        .map(|c| {
-                            c.map(|m| Value::String(Arc::from(m.as_str())))
-                                .unwrap_or(Value::Undefined)
-                        })
-                        .collect();
-                    Some(Value::Array(heap.alloc_array(items)))
+                    // Return the rich match-result object (same shape as
+                    // `match()`'s non-global result): integer-string keys for the
+                    // capture groups plus `length`, `index`, `input`, and `groups`
+                    // (named captures). `m[0]`, `m[1]`, `m.index`, `m.input`, and
+                    // `m.groups.name` all resolve through object key access.
+                    let subject_arc: Arc<str> = Arc::from(subject.as_str());
+                    Some(alloc_match_result(&re, &caps, &subject_arc, heap))
                 }
                 None => {
                     // No (further) match: reset the cursor and report exhaustion.

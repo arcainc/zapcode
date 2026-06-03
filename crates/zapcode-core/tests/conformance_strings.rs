@@ -538,13 +538,18 @@ fn regex_test() {
 
 #[test]
 fn regex_exec() {
-    assert_eq!(run_str("JSON.stringify(/(\\w)(\\d)/.exec('a1').slice(0, 3))"), "[\"a1\",\"a\",\"1\"]");
+    // The `exec` result is an array-LIKE object (it carries the extra `.index` /
+    // `.input` / `.groups` props that a Vec-backed heap array can't hold — the same
+    // documented trade-off as `match()`), so read groups by index, not `.slice`.
+    assert_eq!(
+        run_str("const m=/(\\w)(\\d)/.exec('a1'); JSON.stringify([m[0], m[1], m[2]])"),
+        "[\"a1\",\"a\",\"1\"]"
+    );
     assert_eq!(run_str("String(/\\d/.exec('abc'))"), "null"); // no match -> null
     assert_eq!(run_str("/(\\d+)/.exec('xy42')[0]"), "42"); // group 0 = whole match
     assert_eq!(run_str("/(\\d+)/.exec('xy42')[1]"), "42"); // group 1
-    // DIVERGENCE: the `exec` result does not carry `.index` (only `.match()` /
-    // `.matchAll()` results expose it). Asserting ACTUAL behavior.
-    assert_eq!(run_str("String(/(\\d+)/.exec('xy42').index)"), "undefined"); // JS: 2
+    // The `exec` result carries `.index` (match start in chars), like JS.
+    assert_eq!(run_str("String(/(\\d+)/.exec('xy42').index)"), "2");
 }
 
 #[test]

@@ -456,6 +456,7 @@ impl Vm {
         "Math",
         "Promise",
         "Map",
+        "RegExp",
         "Date",
         "String",
         "Number",
@@ -1881,9 +1882,11 @@ impl Vm {
         // so the cap must be low enough that a cyclic hook (e.g.
         // `toString(){ return "" + this }`) is caught with a clean RuntimeError
         // rather than overflowing the Rust stack and aborting the host process.
-        // 8 is far above any legitimate valueOf->toString fallback nesting (which
-        // is at most a couple of levels) yet well below native-stack exhaustion.
-        if self.to_primitive_depth >= 8 {
+        // 5 is comfortably above any legitimate valueOf->toString fallback nesting
+        // (which is at most a couple of levels) yet well below native-stack
+        // exhaustion across the various interpreter frame sizes on the recursion
+        // path (a cyclic `toString(){ return "" + this }` is caught cleanly here).
+        if self.to_primitive_depth >= 5 {
             return Err(ZapcodeError::RuntimeError(
                 "ToPrimitive recursion limit exceeded (cyclic valueOf/toString?)".to_string(),
             ));
@@ -4100,6 +4103,9 @@ impl Vm {
                             "Date" => {
                                 matches!(&left, Value::Object(i) if has_key(*i, "__date_ms__", &self.heap))
                             }
+                            "RegExp" => {
+                                matches!(&left, Value::Object(i) if has_key(*i, "__regexp__", &self.heap))
+                            }
                             _ => false,
                         }
                     } else if let (Value::Object(instance), Some(class_name)) =
@@ -4542,6 +4548,17 @@ impl Vm {
                         }
                         let value = builtins::call_global_fn(kind.as_ref(), &args, &mut self.heap)?;
                         self.push(value)?;
+                    }
+                    // `RegExp(pattern, flags)` called WITHOUT `new` behaves like the
+                    // constructor (JS allows both forms).
+                    Value::Object(h)
+                        if self.heap.object(h).is_some_and(|m| {
+                            matches!(m.get("__builtin_constructor__"),
+                                Some(Value::String(s)) if s.as_ref() == "RegExp")
+                        }) =>
+                    {
+                        let r = self.construct_regexp(&args)?;
+                        self.push(r)?;
                     }
                     _ => {
                         let msg = callee.to_js_string(&self.heap);
@@ -5245,6 +5262,11 @@ impl Vm {
                                 self.push(d)?;
                                 return Ok(None);
                             }
+                            "RegExp" => {
+                                let r = self.construct_regexp(&args)?;
+                                self.push(r)?;
+                                return Ok(None);
+                            }
                             "Error" | "TypeError" | "RangeError" | "SyntaxError"
                             | "ReferenceError" => {
                                 let msg = args
@@ -5579,6 +5601,36 @@ impl Vm {
             }
             _ => None,
         }
+    }
+
+    /// Construct a regex object (the same `{__regexp__, pattern, flags, lastIndex}`
+    /// shape a regex literal compiles to) from `new RegExp(pattern, flags)` /
+    /// `RegExp(pattern, flags)`. `pattern` may be a string or an existing regex
+    /// (whose source/flags are copied; an explicit `flags` arg overrides). The
+    /// pattern is validated up front so a bad pattern throws like JS.
+    fn construct_regexp(&mut self, args: &[Value]) -> Result<Value> {
+        let (pattern, src_flags) = match args.first() {
+            Some(v) => match builtins::regexp_parts(v, &self.heap) {
+                Some((p, f)) => (p, f),
+                None => match v {
+                    Value::Undefined | Value::Null => (String::new(), String::new()),
+                    other => (other.to_js_string(&self.heap), String::new()),
+                },
+            },
+            None => (String::new(), String::new()),
+        };
+        let flags = match args.get(1) {
+            Some(Value::Undefined) | None => src_flags,
+            Some(f) => f.to_js_string(&self.heap),
+        };
+        // Validate the pattern/flags eagerly (mirrors JS throwing on a bad regex).
+        builtins::compile_regex(&pattern, &flags)?;
+        let mut obj = IndexMap::new();
+        obj.insert(Arc::from("__regexp__"), Value::Bool(true));
+        obj.insert(Arc::from("pattern"), Value::String(Arc::from(pattern.as_str())));
+        obj.insert(Arc::from("flags"), Value::String(Arc::from(flags.as_str())));
+        obj.insert(Arc::from("lastIndex"), Value::Int(0));
+        Ok(Value::Object(self.heap.alloc_object(obj)))
     }
 
     /// Resolve a static member `name` inherited from a class's `__super__` chain.
@@ -5954,10 +6006,23 @@ impl Vm {
                 if is_date_object(obj, &self.heap) && is_date_method(name) {
                     return Ok(builtin_method("__date__", name));
                 }
-                if builtins::regexp_parts(obj, &self.heap).is_some()
-                    && matches!(name, "test" | "exec")
-                {
-                    return Ok(builtin_method("__regexp__", name));
+                if let Some((pattern, flags)) = builtins::regexp_parts(obj, &self.heap) {
+                    if matches!(name, "test" | "exec") {
+                        return Ok(builtin_method("__regexp__", name));
+                    }
+                    // Read-only regex accessors derived from source/flags.
+                    match name {
+                        "source" => {
+                            let s = if pattern.is_empty() { "(?:)" } else { &pattern };
+                            return Ok(Value::String(Arc::from(s)));
+                        }
+                        "global" => return Ok(Value::Bool(flags.contains('g'))),
+                        "ignoreCase" => return Ok(Value::Bool(flags.contains('i'))),
+                        "multiline" => return Ok(Value::Bool(flags.contains('m'))),
+                        "dotAll" => return Ok(Value::Bool(flags.contains('s'))),
+                        "sticky" => return Ok(Value::Bool(flags.contains('y'))),
+                        _ => {}
+                    }
                 }
                 // Check if this is a known global object — return builtin method handle
                 if let Some(global_name) = &self.last_global_name {

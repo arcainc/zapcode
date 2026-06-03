@@ -107,12 +107,11 @@ fn exec_returns_null_on_no_match() {
 }
 
 #[test]
-fn exec_index_and_input_is_documented_divergence() {
-    // DIVERGENCE asserted as actual: the `exec` result is a bare positional array
-    // and does NOT carry `.index` / `.input` (real JS exposes both, as does this
-    // interpreter's `match()` result — see match_non_global_returns_match_result).
-    assert_eq!(run_str(r#"String(/abc/.exec("xxabc").index)"#), "undefined"); // JS: 2
-    assert_eq!(run_str(r#"String(/abc/.exec("xxabc").input)"#), "undefined"); // JS: "xxabc"
+fn exec_result_carries_index_and_input() {
+    // `exec`'s result carries `.index` (match start in chars) and `.input`
+    // (the subject), like JS (and like this interpreter's `match()` result).
+    assert_eq!(run_str(r#"String(/abc/.exec("xxabc").index)"#), "2");
+    assert_eq!(run_str(r#"String(/abc/.exec("xxabc").input)"#), "xxabc");
 }
 
 #[test]
@@ -134,11 +133,11 @@ fn exec_global_loop_terminates_and_collects() {
 }
 
 #[test]
-fn exec_groups_property_is_documented_divergence() {
-    // DIVERGENCE asserted as actual: exec's result object does NOT carry the named
-    // captures under `.groups` (match()'s result does — see match_named_groups).
-    // Real JS exposes `.groups` on both. The positional captures DO work.
-    assert_eq!(run_str(r#"const m=/(?<y>\d{4})/.exec("2020"); String(m.groups)"#), "undefined"); // JS: { y: "2020" }
+fn exec_result_carries_named_groups() {
+    // `exec`'s result carries named captures under `.groups` (like `match()`'s
+    // result and like real JS). The positional captures also work.
+    assert_eq!(run_str(r#"const m=/(?<y>\d{4})/.exec("2020"); m.groups.y"#), "2020");
+    assert_eq!(run_str(r#"const m=/(?<y>\d{4})/.exec("2020"); typeof m.groups"#), "object");
     assert_eq!(run_str(r#"/(?<y>\d{4})/.exec("2020")[1]"#), "2020"); // positional capture works
 }
 
@@ -510,19 +509,34 @@ fn combined_flags() {
 }
 
 // ============================================================================
-// RegExp constructor — documented divergence
+// RegExp constructor
 // ============================================================================
 
 #[test]
-fn regexp_constructor_is_documented_divergence() {
-    // DIVERGENCE asserted as actual (cluster G8): the RegExp constructor is not
-    // provided, so dynamically-built patterns are unsupported. `typeof` is
-    // "undefined" (not "function"), and `new RegExp(...)` throws a catchable error.
-    assert_eq!(run_str(r#"typeof RegExp"#), "undefined"); // JS: "function"
+fn regexp_constructor_builds_dynamic_patterns() {
+    // The RegExp constructor is provided (`typeof RegExp === "function"`), and
+    // `new RegExp(pattern, flags)` / `RegExp(pattern, flags)` build a usable regex.
+    assert_eq!(run_str(r#"typeof RegExp"#), "function");
+    assert_eq!(run_str(r#"const r = new RegExp("\\d+"); String(r.test("a42"))"#), "true");
+    assert_eq!(run_str(r#"new RegExp("(\\d+)", "g").exec("a42b")[0]"#), "42");
+    assert_eq!(run_str(r#"String(RegExp("x").test("xy"))"#), "true");
+}
+
+#[test]
+fn regexp_constructor_flags_source_and_instanceof() {
+    // Accessors derived from the source/flags, copy-from-regex, and instanceof.
+    assert_eq!(run_str(r#"new RegExp("abc", "gi").flags"#), "gi");
+    assert_eq!(run_str(r#"new RegExp("abc", "gi").source"#), "abc");
+    assert_eq!(run_str(r#"String(new RegExp("abc", "g").global)"#), "true");
+    assert_eq!(run_str(r#"String(new RegExp("a") instanceof RegExp)"#), "true");
+    assert_eq!(run_str(r#"String(/a/ instanceof RegExp)"#), "true");
+    // `new RegExp(existingRegex)` copies its source/flags.
     assert_eq!(
-        run_str(r#"try { new RegExp("\\d+"); "no" } catch (e) { "threw" }"#),
-        "threw"
+        run_str(r#"const base = /foo/i; const r = new RegExp(base); r.flags + "|" + r.source"#),
+        "i|foo"
     );
+    // A dynamically-built /g pattern drives a replace.
+    assert_eq!(run_str(r##""a1b2".replace(new RegExp("\\d","g"), "#")"##), "a#b#");
 }
 
 // ============================================================================

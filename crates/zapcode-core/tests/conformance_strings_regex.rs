@@ -196,7 +196,12 @@ fn regex_test_and_exec() {
     assert_eq!(run_str("/\\d/.test('abc123')"), "true");
     assert_eq!(run_str("/\\d/.test('abc')"), "false");
     assert_eq!(run_str("/^a.*z$/.test('abcz')"), "true");
-    assert_eq!(run_str("JSON.stringify(/(\\w)(\\d)/.exec('a1').slice(0, 3))"), "[\"a1\",\"a\",\"1\"]");
+    // The `exec` result is an array-LIKE object (carries `.index`/`.input`/`.groups`),
+    // so read capture groups by index rather than via array `.slice`.
+    assert_eq!(
+        run_str("const m=/(\\w)(\\d)/.exec('a1'); JSON.stringify([m[0], m[1], m[2]])"),
+        "[\"a1\",\"a\",\"1\"]"
+    );
     assert_eq!(run_str("String(/\\d/.exec('abc'))"), "null");
 }
 
