@@ -42,6 +42,7 @@
 pub mod compiler;
 pub mod error;
 pub mod heap;
+pub mod jsstring;
 pub mod parser;
 pub mod sandbox;
 pub mod session;
@@ -57,5 +58,6 @@ pub use sandbox::ResourceLimits;
 pub use session::{ZapcodeSessionSnapshot, ZapcodeSessionState};
 pub use snapshot::ZapcodeSnapshot;
 pub use trace::{ExecutionTrace, TraceSpan, TraceStatus};
+pub use jsstring::JsString;
 pub use value::Value;
 pub use vm::{ExternalCall, RunResult, VmState, ZapcodeRun};

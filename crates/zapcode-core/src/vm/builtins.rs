@@ -4,6 +4,7 @@ use std::sync::Arc;
 use indexmap::IndexMap;
 
 use crate::error::{Result, ZapcodeError};
+use crate::jsstring::JsString;
 use crate::heap::{Handle, Heap};
 use crate::sandbox::ResourceLimits;
 use crate::value::{Value, MAX_RENDER_DEPTH};
@@ -105,7 +106,7 @@ pub fn register_globals(globals: &mut HashMap<String, Value>, heap: &mut Heap) {
         let mut d = IndexMap::new();
         d.insert(
             Arc::from("__builtin_constructor__"),
-            Value::String(Arc::from("Date")),
+            Value::String(JsString::from("Date")),
         );
         // Static methods Date.now()/Date.parse()/Date.UTC() (callable globals).
         for (prop, target) in [("now", "Date.now"), ("parse", "Date.parse"), ("UTC", "Date.UTC")] {
@@ -162,7 +163,7 @@ pub fn register_globals(globals: &mut HashMap<String, Value>, heap: &mut Heap) {
 /// A `{ __global_fn__: target }` marker object (a callable static), heap-allocated.
 fn global_fn_marker(target: &str, heap: &mut Heap) -> Value {
     let mut s = IndexMap::new();
-    s.insert(Arc::from("__global_fn__"), Value::String(Arc::from(target)));
+    s.insert(Arc::from("__global_fn__"), Value::String(JsString::from(target)));
     Value::Object(heap.alloc_object(s))
 }
 
@@ -170,7 +171,7 @@ fn builtin_constructor(name: &str, heap: &mut Heap) -> Value {
     let mut obj = IndexMap::new();
     obj.insert(
         Arc::from("__builtin_constructor__"),
-        Value::String(Arc::from(name)),
+        Value::String(JsString::from(name)),
     );
     Value::Object(heap.alloc_object(obj))
 }
@@ -181,7 +182,7 @@ fn builtin_constructor(name: &str, heap: &mut Heap) -> Value {
 /// `Number.MAX_SAFE_INTEGER`).
 fn global_fn(name: &str, heap: &mut Heap) -> Value {
     let mut obj = IndexMap::new();
-    obj.insert(Arc::from("__global_fn__"), Value::String(Arc::from(name)));
+    obj.insert(Arc::from("__global_fn__"), Value::String(JsString::from(name)));
     if name == "Symbol" {
         // Well-known `Symbol.iterator`. Real JS exposes a unique symbol; this
         // crate has no symbol-keyed property storage, so the well-known iterator
@@ -190,7 +191,7 @@ fn global_fn(name: &str, heap: &mut Heap) -> Value {
         // key, and `for...of`/spread/destructure look it up to run the protocol.
         obj.insert(
             Arc::from("iterator"),
-            Value::String(Arc::from(SYMBOL_ITERATOR_KEY)),
+            Value::String(JsString::from(SYMBOL_ITERATOR_KEY)),
         );
     }
     if name == "String" {
@@ -380,13 +381,13 @@ pub fn call_number_method(n: f64, method: &str, args: &[Value]) -> Result<Option
                 Some(v) => v.to_number().clamp(0.0, 100.0) as usize,
                 None => 0,
             };
-            Value::String(Arc::from(js_to_fixed(n, digits).as_str()))
+            Value::String(JsString::from(js_to_fixed(n, digits).as_str()))
         }
         "toPrecision" => match args.first() {
-            None | Some(Value::Undefined) => Value::String(Arc::from(format_number(n).as_str())),
+            None | Some(Value::Undefined) => Value::String(JsString::from(format_number(n).as_str())),
             Some(v) => {
                 let p = (v.to_number() as usize).clamp(1, 100);
-                Value::String(Arc::from(js_to_precision(n, p).as_str()))
+                Value::String(JsString::from(js_to_precision(n, p).as_str()))
             }
         },
         "toExponential" => {
@@ -394,7 +395,7 @@ pub fn call_number_method(n: f64, method: &str, args: &[Value]) -> Result<Option
                 None | Some(Value::Undefined) => None,
                 Some(v) => Some((v.to_number() as usize).min(100)),
             };
-            Value::String(Arc::from(js_to_exponential(n, digits).as_str()))
+            Value::String(JsString::from(js_to_exponential(n, digits).as_str()))
         }
         "toString" => {
             let radix = match args.first() {
@@ -402,13 +403,13 @@ pub fn call_number_method(n: f64, method: &str, args: &[Value]) -> Result<Option
                 None => 10,
             };
             if radix == 10 || !(2..=36).contains(&radix) {
-                Value::String(Arc::from(format_number(n).as_str()))
+                Value::String(JsString::from(format_number(n).as_str()))
             } else {
-                Value::String(Arc::from(radix_to_string(n, radix).as_str()))
+                Value::String(JsString::from(radix_to_string(n, radix).as_str()))
             }
         }
         "valueOf" => finite_number(n),
-        "toLocaleString" => Value::String(Arc::from(js_to_locale_string(n).as_str())),
+        "toLocaleString" => Value::String(JsString::from(js_to_locale_string(n).as_str())),
         _ => return Ok(None),
     };
     Ok(Some(result))
@@ -669,7 +670,7 @@ fn js_number_to_string(n: f64) -> String {
 pub fn call_global_fn(kind: &str, args: &[Value], heap: &mut Heap) -> Result<Value> {
     let arg = args.first().cloned().unwrap_or(Value::Undefined);
     Ok(match kind {
-        "String" => Value::String(Arc::from(arg.to_js_string(heap).as_str())),
+        "String" => Value::String(JsString::from(arg.to_js_string(heap).as_str())),
         "Number" => finite_number(arg.to_number_heap(heap)),
         "Boolean" => Value::Bool(arg.is_truthy()),
         "parseInt" | "Number.parseInt" => {
@@ -702,14 +703,14 @@ pub fn call_global_fn(kind: &str, args: &[Value], heap: &mut Heap) -> Result<Val
                 .iter()
                 .filter_map(|v| char::from_u32(v.to_number() as u32))
                 .collect();
-            Value::String(Arc::from(s.as_str()))
+            Value::String(JsString::from(s.as_str()))
         }
         "String.fromCodePoint" => {
             let s: String = args
                 .iter()
                 .filter_map(|v| char::from_u32(v.to_number() as u32))
                 .collect();
-            Value::String(Arc::from(s.as_str()))
+            Value::String(JsString::from(s.as_str()))
         }
         // Date statics. now() is 0 — the sandbox has no wall clock (deterministic
         // replay); inject the current time via a host tool when needed.
@@ -752,7 +753,7 @@ pub fn call_global_fn(kind: &str, args: &[Value], heap: &mut Heap) -> Result<Val
             if !matches!(arg, Value::Undefined) {
                 s.insert(
                     Arc::from("description"),
-                    Value::String(Arc::from(arg.to_js_string(heap).as_str())),
+                    Value::String(JsString::from(arg.to_js_string(heap).as_str())),
                 );
             }
             Value::Object(heap.alloc_object(s))
@@ -776,7 +777,7 @@ pub fn call_builtin(
     heap: &mut Heap,
 ) -> Result<Option<Value>> {
     match object {
-        Value::String(s) => call_string_method(&s.clone(), method, args, limits, heap),
+        Value::String(s) => call_string_method(s, method, args, limits, heap),
         Value::Array(h) => call_array_method(*h, method, args, limits, heap),
         _ => Ok(None),
     }
@@ -1013,7 +1014,7 @@ fn call_json_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<Opt
             let mut seen: Vec<Handle> = Vec::new();
             match serialize_json(val, whitelist.as_deref(), indent.as_deref(), 0, &mut seen, heap)? {
                 // JSON.stringify(undefined) / of a function returns the value undefined.
-                Some(s) => Ok(Some(Value::String(Arc::from(s.as_str())))),
+                Some(s) => Ok(Some(Value::String(JsString::from(s.as_str())))),
                 None => Ok(Some(Value::Undefined)),
             }
         }
@@ -1260,7 +1261,7 @@ impl<'a> JsonParser<'a> {
             Some(b'[') => self.parse_array(depth, heap),
             Some(b'"') => {
                 let s = self.parse_string()?;
-                Ok(Value::String(Arc::from(s.as_str())))
+                Ok(Value::String(JsString::from(s.as_str())))
             }
             Some(b't') => {
                 self.expect_literal("true")?;
@@ -1903,7 +1904,7 @@ pub fn translate_replacement(repl: &str, group_count: usize) -> String {
 fn alloc_match_result(
     re: &regex::Regex,
     caps: &regex::Captures,
-    subject: &Arc<str>,
+    subject: &str,
     heap: &mut Heap,
 ) -> Value {
     let mut map: IndexMap<Arc<str>, Value> = IndexMap::new();
@@ -1912,7 +1913,7 @@ fn alloc_match_result(
     for i in 0..len {
         let v = caps
             .get(i)
-            .map(|mm| Value::String(Arc::from(mm.as_str())))
+            .map(|mm| Value::String(JsString::from(mm.as_str())))
             .unwrap_or(Value::Undefined);
         map.insert(Arc::from(i.to_string().as_str()), v);
     }
@@ -1924,7 +1925,7 @@ fn alloc_match_result(
         .map(|m| subject[..m.start()].chars().count())
         .unwrap_or(0);
     map.insert(Arc::from("index"), Value::Int(index_chars as i64));
-    map.insert(Arc::from("input"), Value::String(subject.clone()));
+    map.insert(Arc::from("input"), Value::String(subject.clone().into()));
     // Named capture groups -> `groups` object, or `undefined` if the pattern
     // declares no named groups (matching JS semantics).
     let named: Vec<&str> = re.capture_names().flatten().collect();
@@ -1935,7 +1936,7 @@ fn alloc_match_result(
         for name in named {
             let v = caps
                 .name(name)
-                .map(|mm| Value::String(Arc::from(mm.as_str())))
+                .map(|mm| Value::String(JsString::from(mm.as_str())))
                 .unwrap_or(Value::Undefined);
             g.insert(Arc::from(name), v);
         }
@@ -1946,7 +1947,7 @@ fn alloc_match_result(
 }
 
 fn call_string_method(
-    s: &Arc<str>,
+    s: &JsString,
     method: &str,
     args: &[Value],
     limits: &ResourceLimits,
@@ -1957,8 +1958,8 @@ fn call_string_method(
         "charAt" => {
             let idx = arg_int(args, 0) as usize;
             match s.chars().nth(idx) {
-                Some(c) => Value::String(Arc::from(c.to_string().as_str())),
-                None => Value::String(Arc::from("")),
+                Some(c) => Value::String(JsString::from(c.to_string().as_str())),
+                None => Value::String(JsString::from("")),
             }
         }
         "charCodeAt" => {
@@ -1990,7 +1991,7 @@ fn call_string_method(
                 _ => chars.len() - start,
             };
             let end = (start + count).min(chars.len());
-            Value::String(Arc::from(chars[start..end].iter().collect::<String>().as_str()))
+            Value::String(JsString::from(chars[start..end].iter().collect::<String>().as_str()))
         }
         "indexOf" => {
             let search = arg_str(args, 0, heap);
@@ -2079,9 +2080,9 @@ fn call_string_method(
                 chars.len()
             };
             if start >= end {
-                Value::String(Arc::from(""))
+                Value::String(JsString::from(""))
             } else {
-                Value::String(Arc::from(
+                Value::String(JsString::from(
                     chars[start..end].iter().collect::<String>().as_str(),
                 ))
             }
@@ -2102,12 +2103,12 @@ fn call_string_method(
             } else {
                 (start, end)
             };
-            Value::String(Arc::from(
+            Value::String(JsString::from(
                 chars[start..end].iter().collect::<String>().as_str(),
             ))
         }
-        "toUpperCase" => Value::String(Arc::from(s.to_uppercase().as_str())),
-        "toLowerCase" => Value::String(Arc::from(s.to_lowercase().as_str())),
+        "toUpperCase" => Value::String(JsString::from(s.to_uppercase().as_str())),
+        "toLowerCase" => Value::String(JsString::from(s.to_lowercase().as_str())),
         "localeCompare" => {
             // Codepoint ordering (no locale data); returns -1, 0, or 1.
             let other = arg_str(args, 0, heap);
@@ -2118,9 +2119,9 @@ fn call_string_method(
                 std::cmp::Ordering::Greater => 1,
             })
         }
-        "trim" => Value::String(Arc::from(s.trim())),
-        "trimStart" | "trimLeft" => Value::String(Arc::from(s.trim_start())),
-        "trimEnd" | "trimRight" => Value::String(Arc::from(s.trim_end())),
+        "trim" => Value::String(JsString::from(s.trim())),
+        "trimStart" | "trimLeft" => Value::String(JsString::from(s.trim_start())),
+        "trimEnd" | "trimRight" => Value::String(JsString::from(s.trim_end())),
         "repeat" => {
             let count = arg_int(args, 0).max(0) as usize;
             let result_len = s.len().saturating_mul(count);
@@ -2130,7 +2131,7 @@ fn call_string_method(
                     result_len, limits.memory_limit_bytes
                 )));
             }
-            Value::String(Arc::from(s.repeat(count).as_str()))
+            Value::String(JsString::from(s.repeat(count).as_str()))
         }
         "padStart" => {
             let target_len = arg_int(args, 0).max(0) as usize;
@@ -2141,7 +2142,7 @@ fn call_string_method(
             };
             let current_len = s.len();
             if current_len >= target_len {
-                Value::String(s.clone())
+                Value::String(s.clone().into())
             } else {
                 // Guard the projected size before materializing, like `repeat`,
                 // so a huge `target_len` can't allocate an untracked giant string
@@ -2149,7 +2150,7 @@ fn call_string_method(
                 check_string_alloc(target_len, limits)?;
                 let pad_len = target_len - current_len;
                 let padding: String = pad.chars().cycle().take(pad_len).collect();
-                Value::String(Arc::from(format!("{}{}", padding, s).as_str()))
+                Value::String(JsString::from(format!("{}{}", padding, s).as_str()))
             }
         }
         "padEnd" => {
@@ -2161,12 +2162,12 @@ fn call_string_method(
             };
             let current_len = s.len();
             if current_len >= target_len {
-                Value::String(s.clone())
+                Value::String(s.clone().into())
             } else {
                 check_string_alloc(target_len, limits)?;
                 let pad_len = target_len - current_len;
                 let padding: String = pad.chars().cycle().take(pad_len).collect();
-                Value::String(Arc::from(format!("{}{}", s, padding).as_str()))
+                Value::String(JsString::from(format!("{}{}", s, padding).as_str()))
             }
         }
         "split" => {
@@ -2181,7 +2182,7 @@ fn call_string_method(
             // `"abc".split()` (separator omitted/undefined) returns the whole
             // string as a single element — NOT a per-character split.
             if matches!(args.first(), None | Some(Value::Undefined)) {
-                let whole = vec![Value::String(s.clone())];
+                let whole = vec![Value::String(s.clone().into())];
                 return Ok(Some(Value::Array(heap.alloc_array(whole))));
             }
             if let Some((pat, flags)) = args.first().and_then(|v| regexp_parts(v, heap)) {
@@ -2191,28 +2192,28 @@ fn call_string_method(
                 let mut last = 0usize;
                 for caps in re.captures_iter(s) {
                     let m = caps.get(0).unwrap();
-                    out.push(Value::String(Arc::from(&s[last..m.start()])));
+                    out.push(Value::String(JsString::from(&s[last..m.start()])));
                     for i in 1..caps.len() {
                         out.push(
                             caps.get(i)
-                                .map(|g| Value::String(Arc::from(g.as_str())))
+                                .map(|g| Value::String(JsString::from(g.as_str())))
                                 .unwrap_or(Value::Undefined),
                         );
                     }
                     last = m.end();
                 }
-                out.push(Value::String(Arc::from(&s[last..])));
+                out.push(Value::String(JsString::from(&s[last..])));
                 out.truncate(limit);
                 return Ok(Some(Value::Array(heap.alloc_array(out))));
             }
             let separator = arg_str(args, 0, heap);
             let mut parts: Vec<Value> = if separator.is_empty() {
                 s.chars()
-                    .map(|c| Value::String(Arc::from(c.to_string().as_str())))
+                    .map(|c| Value::String(JsString::from(c.to_string().as_str())))
                     .collect()
             } else {
                 s.split(&*separator)
-                    .map(|p| Value::String(Arc::from(p)))
+                    .map(|p| Value::String(JsString::from(p)))
                     .collect()
             };
             parts.truncate(limit);
@@ -2227,7 +2228,7 @@ fn call_string_method(
                 } else {
                     re.replace(s, repl.as_str())
                 };
-                return Ok(Some(Value::String(Arc::from(out.as_ref()))));
+                return Ok(Some(Value::String(JsString::from(out.as_ref()))));
             }
             let search = arg_str(args, 0, heap);
             let replacement = arg_str(args, 1, heap);
@@ -2240,9 +2241,9 @@ fn call_string_method(
                     out.push_str(&s[..byte]);
                     out.push_str(&expanded);
                     out.push_str(&s[byte + search.len()..]);
-                    Value::String(Arc::from(out.as_str()))
+                    Value::String(JsString::from(out.as_str()))
                 }
-                None => Value::String(s.clone()),
+                None => Value::String(s.clone().into()),
             }
         }
         "replaceAll" => {
@@ -2250,14 +2251,14 @@ fn call_string_method(
                 let re = compile_regex(&pat, &flags)?;
                 let repl = translate_replacement(&arg_str(args, 1, heap), re.captures_len());
                 let out = re.replace_all(s, repl.as_str());
-                return Ok(Some(Value::String(Arc::from(out.as_ref()))));
+                return Ok(Some(Value::String(JsString::from(out.as_ref()))));
             }
             let search = arg_str(args, 0, heap);
             let replacement = arg_str(args, 1, heap);
             if search.is_empty() {
                 // Match JS empty-search edge: insert between every char (and ends).
                 // Fall back to the simple replace which already handles this shape.
-                Value::String(Arc::from(s.replace(&*search, &replacement).as_str()))
+                Value::String(JsString::from(s.replace(&*search, &replacement).as_str()))
             } else {
                 // Replace every non-overlapping occurrence, expanding `$`-tokens
                 // against each match.
@@ -2274,7 +2275,7 @@ fn call_string_method(
                     last = byte + search.len();
                 }
                 out.push_str(&s[last..]);
-                Value::String(Arc::from(out.as_str()))
+                Value::String(JsString::from(out.as_str()))
             }
         }
         "match" => {
@@ -2283,7 +2284,7 @@ fn call_string_method(
                 if flags.contains('g') {
                     let all: Vec<Value> = re
                         .find_iter(s)
-                        .map(|m| Value::String(Arc::from(m.as_str())))
+                        .map(|m| Value::String(JsString::from(m.as_str())))
                         .collect();
                     return Ok(Some(if all.is_empty() {
                         Value::Null
@@ -2302,7 +2303,7 @@ fn call_string_method(
             let pattern = args.first().map(|v| v.to_js_string(heap)).unwrap_or_default();
             match s.find(&pattern) {
                 Some(_) => {
-                    let items = vec![Value::String(Arc::from(pattern.as_str()))];
+                    let items = vec![Value::String(JsString::from(pattern.as_str()))];
                     Value::Array(heap.alloc_array(items))
                 }
                 None => Value::Null,
@@ -2349,7 +2350,7 @@ fn call_string_method(
             for piece in rendered {
                 result.push_str(&piece);
             }
-            Value::String(Arc::from(result.as_str()))
+            Value::String(JsString::from(result.as_str()))
         }
         "at" => {
             let idx = arg_int(args, 0);
@@ -2361,7 +2362,7 @@ fn call_string_method(
                 Value::Undefined
             } else {
                 match s.chars().nth(resolved as usize) {
-                    Some(c) => Value::String(Arc::from(c.to_string().as_str())),
+                    Some(c) => Value::String(JsString::from(c.to_string().as_str())),
                     None => Value::Undefined,
                 }
             }
@@ -2387,7 +2388,7 @@ fn call_string_method(
                     )));
                 }
             };
-            Value::String(Arc::from(normalized.as_str()))
+            Value::String(JsString::from(normalized.as_str()))
         }
         _ => return Ok(None),
     };
@@ -2518,7 +2519,7 @@ fn call_array_method(
             let body: usize = joined.iter().map(|p| p.len()).sum();
             let sep_total = sep.len().saturating_mul(joined.len().saturating_sub(1));
             check_string_alloc(body.saturating_add(sep_total), limits)?;
-            Value::String(Arc::from(joined.join(&sep).as_str()))
+            Value::String(JsString::from(joined.join(&sep).as_str()))
         }
         "toLocaleString" => {
             // Join with "," (the implementation default separator), formatting
@@ -2533,7 +2534,7 @@ fn call_array_method(
                 .collect();
             let body: usize = joined.iter().map(|p| p.len()).sum();
             check_string_alloc(body.saturating_add(joined.len()), limits)?;
-            Value::String(Arc::from(joined.join(",").as_str()))
+            Value::String(JsString::from(joined.join(",").as_str()))
         }
         "slice" => {
             let len = arr.len() as i64;
@@ -2773,13 +2774,13 @@ fn call_object_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<O
                     .map(|m| {
                         ordered_visible_keys(m)
                             .into_iter()
-                            .map(Value::String)
+                            .map(|k| Value::String(k.into()))
                             .collect()
                     })
                     .unwrap_or_default(),
                 // Object.keys([...]) yields index strings.
                 Value::Array(h) => (0..heap.array(*h).len())
-                    .map(|i| Value::String(Arc::from(i.to_string().as_str())))
+                    .map(|i| Value::String(JsString::from(i.to_string().as_str())))
                     .collect(),
                 _ => Vec::new(),
             };
@@ -2809,7 +2810,7 @@ fn call_object_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<O
                         ordered_visible_keys(m)
                             .into_iter()
                             .filter_map(|k| {
-                                m.get(&k).cloned().map(|v| (Value::String(k), v))
+                                m.get(&k).cloned().map(|v| (Value::String(k.into()), v))
                             })
                             .collect()
                     })
@@ -2820,7 +2821,7 @@ fn call_object_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<O
                     .enumerate()
                     .map(|(i, v)| {
                         (
-                            Value::String(Arc::from(i.to_string().as_str())),
+                            Value::String(JsString::from(i.to_string().as_str())),
                             v.clone(),
                         )
                     })
@@ -2874,7 +2875,7 @@ fn call_object_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<O
                         let key = kv.first().cloned().unwrap_or(Value::Undefined);
                         let val = kv.get(1).cloned().unwrap_or(Value::Undefined);
                         let key: Arc<str> = match key {
-                            Value::String(s) => s,
+                            Value::String(s) => Arc::from(s.as_str()),
                             other => Arc::from(other.to_js_string(heap).as_str()),
                         };
                         obj.insert(key, val);
@@ -2964,15 +2965,15 @@ fn call_object_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<O
                     .map(|m| {
                         m.keys()
                             .filter(|k| !is_internal_marker_key(k))
-                            .map(|k| Value::String(k.clone()))
+                            .map(|k| Value::String(k.clone().into()))
                             .collect()
                     })
                     .unwrap_or_default(),
                 Value::Array(h) => {
                     let mut names: Vec<Value> = (0..heap.array(*h).len())
-                        .map(|i| Value::String(Arc::from(i.to_string().as_str())))
+                        .map(|i| Value::String(JsString::from(i.to_string().as_str())))
                         .collect();
-                    names.push(Value::String(Arc::from("length")));
+                    names.push(Value::String(JsString::from("length")));
                     names
                 }
                 _ => Vec::new(),
@@ -3069,7 +3070,7 @@ pub fn array_from_source(val: &Value, heap: &mut Heap) -> Vec<Value> {
         Value::Array(h) => heap.array_vec(*h),
         Value::String(s) => s
             .chars()
-            .map(|c| Value::String(Arc::from(c.to_string().as_str())))
+            .map(|c| Value::String(JsString::from(c.to_string().as_str())))
             .collect(),
         Value::Object(h) => {
             let map = heap.object_map(*h);
@@ -3205,8 +3206,8 @@ fn try_lower_pending_call_batch(method: &str, args: &[Value], heap: &mut Heap) -
     let items_arr = Value::Array(heap.alloc_array(items));
     let mut obj = IndexMap::new();
     obj.insert(Arc::from("__promise__"), Value::Bool(true));
-    obj.insert(Arc::from("status"), Value::String(Arc::from("pending_all")));
-    obj.insert(Arc::from("__batch_kind__"), Value::String(Arc::from(kind)));
+    obj.insert(Arc::from("status"), Value::String(JsString::from("pending_all")));
+    obj.insert(Arc::from("__batch_kind__"), Value::String(JsString::from(kind)));
     obj.insert(Arc::from("items"), items_arr);
     Some(Value::Object(heap.alloc_object(obj)))
 }
@@ -3229,7 +3230,7 @@ fn call_promise_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<
             }
             let mut obj = IndexMap::new();
             obj.insert(Arc::from("__promise__"), Value::Bool(true));
-            obj.insert(Arc::from("status"), Value::String(Arc::from("resolved")));
+            obj.insert(Arc::from("status"), Value::String(JsString::from("resolved")));
             obj.insert(Arc::from("value"), val);
             Ok(Some(Value::Object(heap.alloc_object(obj))))
         }
@@ -3237,7 +3238,7 @@ fn call_promise_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<
             let reason = args.first().cloned().unwrap_or(Value::Undefined);
             let mut obj = IndexMap::new();
             obj.insert(Arc::from("__promise__"), Value::Bool(true));
-            obj.insert(Arc::from("status"), Value::String(Arc::from("rejected")));
+            obj.insert(Arc::from("status"), Value::String(JsString::from("rejected")));
             obj.insert(Arc::from("reason"), reason);
             Ok(Some(Value::Object(heap.alloc_object(obj))))
         }
@@ -3268,7 +3269,7 @@ fn call_promise_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<
             let value_arr = Value::Array(heap.alloc_array(results));
             let mut obj = IndexMap::new();
             obj.insert(Arc::from("__promise__"), Value::Bool(true));
-            obj.insert(Arc::from("status"), Value::String(Arc::from("resolved")));
+            obj.insert(Arc::from("status"), Value::String(JsString::from("resolved")));
             obj.insert(Arc::from("value"), value_arr);
             Ok(Some(Value::Object(heap.alloc_object(obj))))
         }
@@ -3285,7 +3286,7 @@ fn call_promise_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<
                     _ => IndexMap::new(),
                 };
                 if matches!(map.get("status"), Some(Value::String(s)) if s.as_ref() == "rejected") {
-                    entry.insert(Arc::from("status"), Value::String(Arc::from("rejected")));
+                    entry.insert(Arc::from("status"), Value::String(JsString::from("rejected")));
                     entry.insert(
                         Arc::from("reason"),
                         map.get("reason").cloned().unwrap_or(Value::Undefined),
@@ -3298,7 +3299,7 @@ fn call_promise_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<
                 } else {
                     item.clone()
                 };
-                entry.insert(Arc::from("status"), Value::String(Arc::from("fulfilled")));
+                entry.insert(Arc::from("status"), Value::String(JsString::from("fulfilled")));
                 entry.insert(Arc::from("value"), value);
                 results.push(Value::Object(heap.alloc_object(entry)));
             }
@@ -3324,7 +3325,7 @@ fn call_promise_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<
                 None => {
                     let mut obj = IndexMap::new();
                     obj.insert(Arc::from("__promise__"), Value::Bool(true));
-                    obj.insert(Arc::from("status"), Value::String(Arc::from("pending")));
+                    obj.insert(Arc::from("status"), Value::String(JsString::from("pending")));
                     Ok(Some(Value::Object(heap.alloc_object(obj))))
                 }
             }
@@ -3359,17 +3360,17 @@ fn call_promise_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<
             let mut agg = IndexMap::new();
             agg.insert(
                 Arc::from("name"),
-                Value::String(Arc::from("AggregateError")),
+                Value::String(JsString::from("AggregateError")),
             );
             agg.insert(
                 Arc::from("message"),
-                Value::String(Arc::from("All promises were rejected")),
+                Value::String(JsString::from("All promises were rejected")),
             );
             agg.insert(Arc::from("errors"), errors_arr);
             let agg_obj = Value::Object(heap.alloc_object(agg));
             let mut obj = IndexMap::new();
             obj.insert(Arc::from("__promise__"), Value::Bool(true));
-            obj.insert(Arc::from("status"), Value::String(Arc::from("rejected")));
+            obj.insert(Arc::from("status"), Value::String(JsString::from("rejected")));
             obj.insert(Arc::from("reason"), agg_obj);
             Ok(Some(Value::Object(heap.alloc_object(obj))))
         }
@@ -3397,7 +3398,7 @@ pub fn make_resolved_promise(val: Value, heap: &mut Heap) -> Value {
     }
     let mut obj = IndexMap::new();
     obj.insert(Arc::from("__promise__"), Value::Bool(true));
-    obj.insert(Arc::from("status"), Value::String(Arc::from("resolved")));
+    obj.insert(Arc::from("status"), Value::String(JsString::from("resolved")));
     obj.insert(Arc::from("value"), val);
     Value::Object(heap.alloc_object(obj))
 }
@@ -3406,7 +3407,7 @@ pub fn make_resolved_promise(val: Value, heap: &mut Heap) -> Value {
 pub fn make_rejected_promise(reason: Value, heap: &mut Heap) -> Value {
     let mut obj = IndexMap::new();
     obj.insert(Arc::from("__promise__"), Value::Bool(true));
-    obj.insert(Arc::from("status"), Value::String(Arc::from("rejected")));
+    obj.insert(Arc::from("status"), Value::String(JsString::from("rejected")));
     obj.insert(Arc::from("reason"), reason);
     Value::Object(heap.alloc_object(obj))
 }

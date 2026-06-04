@@ -30,7 +30,7 @@ fn py_to_value(obj: &Bound<'_, PyAny>, heap: &mut Heap) -> PyResult<Value> {
         Ok(Value::Float(val))
     } else if let Ok(s) = obj.downcast::<PyString>() {
         let val: String = s.extract()?;
-        Ok(Value::String(Arc::from(val.as_str())))
+        Ok(Value::String(zapcode_core::JsString::from(val.as_str())))
     } else if let Ok(list) = obj.downcast::<PyList>() {
         let mut items = Vec::with_capacity(list.len());
         for item in list.iter() {

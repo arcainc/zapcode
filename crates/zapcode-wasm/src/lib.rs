@@ -31,7 +31,7 @@ fn js_to_value(js: &JsValue, heap: &mut Heap) -> Result<Value, JsError> {
             Ok(Value::Float(n))
         }
     } else if let Some(s) = js.as_string() {
-        Ok(Value::String(Arc::from(s.as_str())))
+        Ok(Value::String(zapcode_core::JsString::from(s.as_str())))
     } else if Array::is_array(js) {
         let arr = Array::from(js);
         let mut items = Vec::with_capacity(arr.length() as usize);

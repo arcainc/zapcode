@@ -5,6 +5,7 @@ use std::sync::Arc;
 use indexmap::IndexMap;
 
 use crate::compiler::instruction::{BatchKind, Constant, Instruction};
+use crate::jsstring::JsString;
 use crate::compiler::CompiledProgram;
 use crate::error::{Result, ZapcodeError};
 use crate::heap::{Handle, Heap};
@@ -972,7 +973,7 @@ impl Vm {
                     let mut entry = IndexMap::new();
                     match map.get("status") {
                         Some(Value::String(s)) if s.as_ref() == "rejected" => {
-                            entry.insert(Arc::from("status"), Value::String(Arc::from("rejected")));
+                            entry.insert(Arc::from("status"), Value::String(JsString::from("rejected")));
                             entry.insert(
                                 Arc::from("reason"),
                                 map.get("reason").cloned().unwrap_or(Value::Undefined),
@@ -981,7 +982,7 @@ impl Vm {
                         _ => {
                             entry.insert(
                                 Arc::from("status"),
-                                Value::String(Arc::from("fulfilled")),
+                                Value::String(JsString::from("fulfilled")),
                             );
                             entry.insert(
                                 Arc::from("value"),
@@ -994,7 +995,7 @@ impl Vm {
                 other => {
                     // Plain value: fulfilled.
                     let mut entry = IndexMap::new();
-                    entry.insert(Arc::from("status"), Value::String(Arc::from("fulfilled")));
+                    entry.insert(Arc::from("status"), Value::String(JsString::from("fulfilled")));
                     entry.insert(Arc::from("value"), other);
                     array.push(Value::Object(self.heap.alloc_object(entry)));
                 }
@@ -1160,11 +1161,11 @@ impl Vm {
                         let mut agg = IndexMap::new();
                         agg.insert(
                             Arc::from("name"),
-                            Value::String(Arc::from("AggregateError")),
+                            Value::String(JsString::from("AggregateError")),
                         );
                         agg.insert(
                             Arc::from("message"),
-                            Value::String(Arc::from("All promises were rejected")),
+                            Value::String(JsString::from("All promises were rejected")),
                         );
                         agg.insert(Arc::from("errors"), errors_arr);
                         let reason = Value::Object(self.heap.alloc_object(agg));
@@ -2088,7 +2089,7 @@ impl Vm {
     /// can't reach the guest-closure call path, so this runs at the VM layer.
     fn string_replace_with_function(
         &mut self,
-        s: &Arc<str>,
+        s: &str,
         method: &str,
         args: &[Value],
     ) -> Result<Value> {
@@ -2115,7 +2116,7 @@ impl Vm {
                 for i in 1..caps.len() {
                     groups.push(
                         caps.get(i)
-                            .map(|g| Value::String(Arc::from(g.as_str())))
+                            .map(|g| Value::String(JsString::from(g.as_str())))
                             .unwrap_or(Value::Undefined),
                     );
                 }
@@ -2126,7 +2127,7 @@ impl Vm {
                             (
                                 name.to_string(),
                                 caps.name(name)
-                                    .map(|g| Value::String(Arc::from(g.as_str())))
+                                    .map(|g| Value::String(JsString::from(g.as_str())))
                                     .unwrap_or(Value::Undefined),
                             )
                         })
@@ -2154,10 +2155,10 @@ impl Vm {
                 let offset = s[..info.start].chars().count() as i64;
                 let mut call_args: Vec<Value> =
                     Vec::with_capacity(info.groups.len() + info.named.len() + 3);
-                call_args.push(Value::String(Arc::from(info.whole.as_str())));
+                call_args.push(Value::String(JsString::from(info.whole.as_str())));
                 call_args.extend(info.groups);
                 call_args.push(Value::Int(offset));
-                call_args.push(Value::String(s.clone()));
+                call_args.push(Value::String(s.clone().into()));
                 if !info.named.is_empty() {
                     let mut g: IndexMap<Arc<str>, Value> = IndexMap::new();
                     for (k, v) in info.named {
@@ -2170,7 +2171,7 @@ impl Vm {
                 last = info.end;
             }
             out.push_str(&s[last..]);
-            return Ok(Value::String(Arc::from(out.as_str())));
+            return Ok(Value::String(JsString::from(out.as_str())));
         }
 
         // String search: `replace` substitutes the first occurrence, `replaceAll`
@@ -2188,12 +2189,12 @@ impl Vm {
             // handle only the first-position case to stay predictable.
             let result =
                 self.call_function_internal(&replacer, vec![
-                    Value::String(Arc::from("")),
+                    Value::String(JsString::from("")),
                     Value::Int(0),
-                    Value::String(s.clone()),
+                    Value::String(s.clone().into()),
                 ])?;
             let ins = result.to_js_string(&self.heap);
-            return Ok(Value::String(Arc::from(format!("{}{}", ins, subject).as_str())));
+            return Ok(Value::String(JsString::from(format!("{}{}", ins, subject).as_str())));
         }
         let mut out = String::with_capacity(subject.len());
         let mut search_from = 0usize;
@@ -2205,9 +2206,9 @@ impl Vm {
                     out.push_str(&subject[search_from..abs]);
                     let offset = subject[..abs].chars().count() as i64;
                     let result = self.call_function_internal(&replacer, vec![
-                        Value::String(Arc::from(search.as_str())),
+                        Value::String(JsString::from(search.as_str())),
                         Value::Int(offset),
-                        Value::String(s.clone()),
+                        Value::String(s.clone().into()),
                     ])?;
                     out.push_str(&result.to_js_string(&self.heap));
                     search_from = abs + search.len();
@@ -2219,7 +2220,7 @@ impl Vm {
             }
         }
         out.push_str(&subject[search_from..]);
-        Ok(Value::String(Arc::from(out.as_str())))
+        Ok(Value::String(JsString::from(out.as_str())))
     }
 
     /// `JSON.stringify(value, replacer?, space?)`. Honors a user `toJSON()` on
@@ -2264,7 +2265,7 @@ impl Vm {
         // accepted gap).
         let transformed = if let Some(ref f) = replacer_fn {
             self.call_function_internal(f, vec![
-                Value::String(Arc::from("")),
+                Value::String(JsString::from("")),
                 value.clone(),
             ])?
         } else {
@@ -2279,7 +2280,7 @@ impl Vm {
             0,
             &mut seen,
         )? {
-            Some(s) => Ok(Value::String(Arc::from(s.as_str()))),
+            Some(s) => Ok(Value::String(JsString::from(s.as_str()))),
             None => Ok(Value::Undefined),
         }
     }
@@ -2353,7 +2354,7 @@ impl Vm {
                     // Apply the replacer with the array index (as a string) as key.
                     let item = if let Some(f) = replacer {
                         self.call_function_internal(f, vec![
-                            Value::String(Arc::from(i.to_string().as_str())),
+                            Value::String(JsString::from(i.to_string().as_str())),
                             item.clone(),
                         ])?
                     } else {
@@ -2411,7 +2412,7 @@ impl Vm {
                     let v = self.enumerable_value(&Value::Object(*h), &k, v.clone())?;
                     let v = if let Some(f) = replacer {
                         self.call_function_internal(f, vec![
-                            Value::String(k.clone()),
+                            Value::String(k.clone().into()),
                             v,
                         ])?
                     } else {
@@ -2506,7 +2507,7 @@ impl Vm {
         self.call_reviver(
             reviver,
             holder.clone(),
-            vec![Value::String(Arc::from(key)), value],
+            vec![Value::String(JsString::from(key)), value],
         )
     }
 
@@ -3212,7 +3213,7 @@ impl Vm {
             Value::Array(a) => Ok(self.heap.array_vec(*a)),
             Value::String(s) => Ok(s
                 .chars()
-                .map(|c| Value::String(Arc::from(c.to_string().as_str())))
+                .map(|c| Value::String(JsString::from(c.to_string().as_str())))
                 .collect()),
             Value::Object(_) if is_set_object(&val, &self.heap) => Ok(set_items(&val, &self.heap)),
             Value::Object(_) if is_map_object(&val, &self.heap) => {
@@ -3348,7 +3349,7 @@ impl Vm {
                     Constant::Bool(b) => Value::Bool(b),
                     Constant::Int(n) => Value::Int(n),
                     Constant::Float(n) => Value::Float(n),
-                    Constant::String(s) => Value::String(Arc::from(s.as_str())),
+                    Constant::String(s) => Value::String(JsString::from(s.as_str())),
                 };
                 self.push(value)?;
             }
@@ -3472,7 +3473,7 @@ impl Vm {
                         }
                         let mut s = a.to_string();
                         s.push_str(&rhs);
-                        Value::String(Arc::from(s.as_str()))
+                        Value::String(JsString::from(s.as_str()))
                     }
                     (_, Value::String(b)) => {
                         let lhs = left.to_js_string(&self.heap);
@@ -3482,7 +3483,7 @@ impl Vm {
                         }
                         let mut s = lhs;
                         s.push_str(b);
-                        Value::String(Arc::from(s.as_str()))
+                        Value::String(JsString::from(s.as_str()))
                     }
                     // JS `+`: if either operand ToPrimitives to a string (arrays,
                     // plain objects), the whole expression is string concatenation
@@ -3496,7 +3497,7 @@ impl Vm {
                         }
                         let mut s = lhs;
                         s.push_str(&rhs);
-                        Value::String(Arc::from(s.as_str()))
+                        Value::String(JsString::from(s.as_str()))
                     }
                     _ => Value::Float(
                         left.to_number_heap(&self.heap) + right.to_number_heap(&self.heap),
@@ -3723,7 +3724,7 @@ impl Vm {
                 for (key, val) in entries {
                     match key {
                         Value::String(k) => {
-                            obj.insert(k, val);
+                            obj.insert(Arc::from(k.as_str()), val);
                         }
                         _ => {
                             let k: Arc<str> = Arc::from(key.to_js_string(&self.heap).as_str());
@@ -3896,14 +3897,14 @@ impl Vm {
                         } else {
                             s.chars()
                                 .nth(*i as usize)
-                                .map(|c| Value::String(Arc::from(c.to_string().as_str())))
+                                .map(|c| Value::String(JsString::from(c.to_string().as_str())))
                                 .unwrap_or(Value::Undefined)
                         }
                     }
                     (Value::String(s), Value::Float(f)) if *f >= 0.0 && f.fract() == 0.0 => s
                         .chars()
                         .nth(*f as usize)
-                        .map(|c| Value::String(Arc::from(c.to_string().as_str())))
+                        .map(|c| Value::String(JsString::from(c.to_string().as_str())))
                         .unwrap_or(Value::Undefined),
                     // A string-typed numeric subscript (`"hello"["1"]`) reads the
                     // char at that index, like JS (property-key -> integer index).
@@ -3911,7 +3912,7 @@ impl Vm {
                         Ok(i) => s
                             .chars()
                             .nth(i)
-                            .map(|c| Value::String(Arc::from(c.to_string().as_str())))
+                            .map(|c| Value::String(JsString::from(c.to_string().as_str())))
                             .unwrap_or(Value::Undefined),
                         Err(_) if key.as_ref() == "length" => {
                             Value::Int(s.chars().count() as i64)
@@ -4125,7 +4126,7 @@ impl Vm {
                     }
                 };
                 let key: Arc<str> = match key {
-                    Value::String(k) => k,
+                    Value::String(k) => Arc::from(k.as_str()),
                     other => Arc::from(other.to_js_string(&self.heap).as_str()),
                 };
                 if let Some(map) = self.heap.object_mut(acc) {
@@ -4275,7 +4276,7 @@ impl Vm {
                             | "AggregateError" => match &left {
                                 Value::Object(i) => {
                                     self.heap.object(*i).and_then(|m| m.get("name"))
-                                        == Some(&Value::String(Arc::from(ctor.as_ref())))
+                                        == Some(&Value::String(JsString::from(ctor.as_ref())))
                                 }
                                 _ => false,
                             },
@@ -4436,13 +4437,13 @@ impl Vm {
                                         && matches!(args.get(1), Some(Value::Function(_)))
                                     {
                                         Some(self.string_replace_with_function(
-                                            &s.clone(),
+                                            &s,
                                             &method_name,
                                             &args,
                                         )?)
                                     } else {
                                         builtins::call_builtin(
-                                            &Value::String(s.clone()),
+                                            &Value::String(s.clone().into()),
                                             &method_name,
                                             &args,
                                             &self.limits,
@@ -4780,7 +4781,7 @@ impl Vm {
                                     let val = self.enumerable_value(&obj, &k, stored)?;
                                     if want_entries {
                                         let pair = self.heap.alloc_array(vec![
-                                            Value::String(k.clone()),
+                                            Value::String(k.clone().into()),
                                             val,
                                         ]);
                                         out.push(Value::Array(pair));
@@ -4864,7 +4865,7 @@ impl Vm {
                             .is_some_and(|m| m.contains_key("__global_fn__")) =>
                     {
                         let kind = match self.heap.object(h).and_then(|m| m.get("__global_fn__")) {
-                            Some(Value::String(s)) => s.clone(),
+                            Some(Value::String(s)) => Arc::<str>::from(s.as_str()),
                             _ => Arc::from(""),
                         };
                         // String(x)/Number(x) run ToPrimitive on their argument so
@@ -4997,8 +4998,8 @@ impl Vm {
                 let items_arr = Value::Array(self.heap.alloc_array(items));
                 let mut obj = IndexMap::new();
                 obj.insert(Arc::from("__promise__"), Value::Bool(true));
-                obj.insert(Arc::from("status"), Value::String(Arc::from("pending_all")));
-                obj.insert(Arc::from("__batch_kind__"), Value::String(Arc::from(kind.as_str())));
+                obj.insert(Arc::from("status"), Value::String(JsString::from("pending_all")));
+                obj.insert(Arc::from("__batch_kind__"), Value::String(JsString::from(kind.as_str())));
                 obj.insert(Arc::from("items"), items_arr);
                 let h = self.heap.alloc_object(obj);
                 self.push(Value::Object(h))?;
@@ -5019,7 +5020,7 @@ impl Vm {
                 };
                 let mut obj = IndexMap::new();
                 obj.insert(Arc::from("__promise__"), Value::Bool(true));
-                obj.insert(Arc::from("status"), Value::String(Arc::from("pending_call")));
+                obj.insert(Arc::from("status"), Value::String(JsString::from("pending_call")));
                 obj.insert(Arc::from("__call_id__"), Value::Int(id as i64));
                 let h = self.heap.alloc_object(obj);
                 self.push(Value::Object(h))?;
@@ -5082,14 +5083,14 @@ impl Vm {
                     Value::String(s) => {
                         let chars: Vec<Value> = s
                             .chars()
-                            .map(|c| Value::String(Arc::from(c.to_string().as_str())))
+                            .map(|c| Value::String(JsString::from(c.to_string().as_str())))
                             .collect();
                         let iter_obj = iter_from_items(chars, &mut self.heap);
                         self.push(iter_obj)?;
                     }
                     Value::Generator(gen_obj) => {
                         let iter_obj = Value::Array(self.heap.alloc_array(vec![
-                            Value::String(Arc::from("__gen__")),
+                            Value::String(JsString::from("__gen__")),
                             Value::Int(gen_obj.id as i64),
                             Value::Bool(false),
                         ]));
@@ -5159,7 +5160,7 @@ impl Vm {
                                 g
                             } else {
                                 let done_iter = self.heap.alloc_array(vec![
-                                    Value::String(Arc::from("__gen__")),
+                                    Value::String(JsString::from("__gen__")),
                                     Value::Int(gen_id as i64),
                                     Value::Bool(true),
                                 ]);
@@ -5175,7 +5176,7 @@ impl Vm {
                                     .is_some_and(|v| matches!(v, Value::Bool(true)));
                                 let value = obj.get("value").cloned().unwrap_or(Value::Undefined);
                                 let new_iter = self.heap.alloc_array(vec![
-                                    Value::String(Arc::from("__gen__")),
+                                    Value::String(JsString::from("__gen__")),
                                     Value::Int(gen_id as i64),
                                     Value::Bool(done),
                                 ]);
@@ -5381,7 +5382,7 @@ impl Vm {
                     }
                     other => other.type_name(),
                 };
-                self.push(Value::String(Arc::from(type_str)))?;
+                self.push(Value::String(JsString::from(type_str)))?;
             }
 
             // Void
@@ -5428,7 +5429,7 @@ impl Vm {
                     let prim = self.to_primitive(&v, ToPrimitiveHint::String)?;
                     result.push_str(&prim.to_js_string(&self.heap));
                 }
-                self.push(Value::String(Arc::from(result.as_str())))?;
+                self.push(Value::String(JsString::from(result.as_str())))?;
             }
 
             // Destructuring
@@ -5759,7 +5760,7 @@ impl Vm {
                             instance.insert(Arc::from("__error__"), Value::Bool(true));
                             instance
                                 .entry(Arc::from("name"))
-                                .or_insert_with(|| Value::String(base.clone()));
+                                .or_insert_with(|| Value::String(base.clone().into()));
                         }
                         // Carry accessor descriptors onto the instance so a later
                         // GetProperty/SetProperty invokes the getter/setter body.
@@ -5785,7 +5786,7 @@ impl Vm {
                                             let p = self.heap.array_vec(ph);
                                             match (p.first(), p.get(1)) {
                                                 (Some(Value::String(n)), Some(init)) => {
-                                                    Some((n.clone(), init.clone()))
+                                                    Some((Arc::from(n.as_str()), init.clone()))
                                                 }
                                                 _ => None,
                                             }
@@ -5849,11 +5850,11 @@ impl Vm {
                                         if let Some(map) = self.heap.object_mut(inst_h) {
                                             map.insert(
                                                 Arc::from("message"),
-                                                Value::String(Arc::from(msg.as_str())),
+                                                Value::String(JsString::from(msg.as_str())),
                                             );
                                             map.insert(
                                                 Arc::from("stack"),
-                                                Value::String(Arc::from(stack.as_str())),
+                                                Value::String(JsString::from(stack.as_str())),
                                             );
                                         }
                                     }
@@ -5963,7 +5964,7 @@ impl Vm {
                                 _ => base.to_string(),
                             };
                             if let Some(m) = &msg {
-                                map.insert(Arc::from("message"), Value::String(Arc::from(m.as_str())));
+                                map.insert(Arc::from("message"), Value::String(JsString::from(m.as_str())));
                             }
                             let stack_msg = msg.as_deref().unwrap_or("");
                             let stack = if stack_msg.is_empty() {
@@ -5971,7 +5972,7 @@ impl Vm {
                             } else {
                                 format!("{}: {}", name, stack_msg)
                             };
-                            map.insert(Arc::from("stack"), Value::String(Arc::from(stack.as_str())));
+                            map.insert(Arc::from("stack"), Value::String(JsString::from(stack.as_str())));
                         }
                     }
                     self.push(Value::Undefined)?;
@@ -6057,8 +6058,8 @@ impl Vm {
         builtins::compile_regex(&pattern, &flags)?;
         let mut obj = IndexMap::new();
         obj.insert(Arc::from("__regexp__"), Value::Bool(true));
-        obj.insert(Arc::from("pattern"), Value::String(Arc::from(pattern.as_str())));
-        obj.insert(Arc::from("flags"), Value::String(Arc::from(flags.as_str())));
+        obj.insert(Arc::from("pattern"), Value::String(JsString::from(pattern.as_str())));
+        obj.insert(Arc::from("flags"), Value::String(JsString::from(flags.as_str())));
         obj.insert(Arc::from("lastIndex"), Value::Int(0));
         Ok(Value::Object(self.heap.alloc_object(obj)))
     }
@@ -6093,7 +6094,7 @@ impl Vm {
     fn class_error_base_of(&self, name: &str) -> Option<Arc<str>> {
         let class_h = self.class_handle_by_name(name)?;
         match self.heap.object(class_h).and_then(|m| m.get("__error_base__")) {
-            Some(Value::String(base)) => Some(base.clone()),
+            Some(Value::String(base)) => Some(Arc::from(base.as_str())),
             _ => None,
         }
     }
@@ -6221,7 +6222,7 @@ impl Vm {
 
         // The inheritance chain of class names (self first), so
         // `instanceof` matches ancestor classes too.
-        let mut chain = vec![Value::String(Arc::from(name))];
+        let mut chain = vec![Value::String(JsString::from(name))];
         // If the class (transitively) extends a built-in Error, record the
         // error base name so instances get the `__error__` brand (making
         // `e instanceof Error` true) and `super(message)` sets `.message`.
@@ -6239,13 +6240,13 @@ impl Vm {
             // A built-in Error constructor as the direct super.
             if let Some(Value::String(ctor)) = scm.get("__builtin_constructor__") {
                 if is_error_ctor_name(ctor) {
-                    error_base = Some(ctor.clone());
+                    error_base = Some(Arc::from(ctor.as_str()));
                 }
             }
             // Or a user class that itself extends an Error.
             if error_base.is_none() {
                 if let Some(Value::String(base)) = scm.get("__error_base__") {
-                    error_base = Some(base.clone());
+                    error_base = Some(Arc::from(base.as_str()));
                 }
             }
         }
@@ -6255,7 +6256,7 @@ impl Vm {
 
         // Build the class object
         let mut class_obj = IndexMap::new();
-        class_obj.insert(Arc::from("__class_name__"), Value::String(Arc::from(name)));
+        class_obj.insert(Arc::from("__class_name__"), Value::String(JsString::from(name)));
         class_obj.insert(Arc::from("__class_chain__"), chain_arr);
         class_obj.insert(Arc::from("__constructor__"), constructor);
         class_obj.insert(Arc::from("__prototype__"), proto_obj);
@@ -6284,7 +6285,7 @@ impl Vm {
         if !field_inits.is_empty() {
             let mut pairs = Vec::with_capacity(field_inits.len());
             for (k, v) in field_inits {
-                let pair = vec![Value::String(k), v];
+                let pair = vec![Value::String(k.into()), v];
                 pairs.push(Value::Array(self.heap.alloc_array(pair)));
             }
             let arr = Value::Array(self.heap.alloc_array(pairs));
@@ -6297,7 +6298,7 @@ impl Vm {
         }
         // Record the built-in Error base so instances are branded as errors.
         if let Some(base) = error_base {
-            class_obj.insert(Arc::from("__error_base__"), Value::String(base));
+            class_obj.insert(Arc::from("__error_base__"), Value::String(base.into()));
         }
 
         // Add static methods directly on the class object
@@ -6337,7 +6338,7 @@ impl Vm {
         let mut out = IndexMap::new();
         for (name, closure) in popped.into_iter().rev() {
             if let Value::String(nm) = name {
-                out.insert(nm, closure);
+                out.insert(Arc::from(nm.as_str()), closure);
             }
         }
         Ok(out)
@@ -6473,7 +6474,7 @@ impl Vm {
                     match name {
                         "source" => {
                             let s = if pattern.is_empty() { "(?:)" } else { &pattern };
-                            return Ok(Value::String(Arc::from(s)));
+                            return Ok(Value::String(JsString::from(s)));
                         }
                         "global" => return Ok(Value::Bool(flags.contains('g'))),
                         "ignoreCase" => return Ok(Value::Bool(flags.contains('i'))),
@@ -6521,7 +6522,7 @@ impl Vm {
                         .name
                         .clone()
                         .unwrap_or_default();
-                    Ok(Value::String(Arc::from(n.as_str())))
+                    Ok(Value::String(JsString::from(n.as_str())))
                 }
                 _ => Ok(Value::Undefined),
             },
@@ -6739,7 +6740,7 @@ fn iterable_items(v: &Value, heap: &mut Heap) -> Vec<Value> {
         Value::Array(a) => heap.array_vec(*a),
         Value::String(s) => s
             .chars()
-            .map(|c| Value::String(Arc::from(c.to_string().as_str())))
+            .map(|c| Value::String(JsString::from(c.to_string().as_str())))
             .collect(),
         Value::Object(_) if is_array_iterator(v, heap) => {
             let Value::Object(h) = v else { return Vec::new() };
@@ -6987,11 +6988,11 @@ fn find_class_constructor(class_obj: &IndexMap<Arc<str>, Value>, heap: &Heap) ->
 fn make_error_object(name: &str, message: &str, heap: &mut Heap) -> Value {
     let mut obj = IndexMap::new();
     obj.insert(Arc::from("__error__"), Value::Bool(true));
-    obj.insert(Arc::from("name"), Value::String(Arc::from(name)));
-    obj.insert(Arc::from("message"), Value::String(Arc::from(message)));
+    obj.insert(Arc::from("name"), Value::String(JsString::from(name)));
+    obj.insert(Arc::from("message"), Value::String(JsString::from(message)));
     obj.insert(
         Arc::from("stack"),
-        Value::String(Arc::from(format!("{}: {}", name, message).as_str())),
+        Value::String(JsString::from(format!("{}: {}", name, message).as_str())),
     );
     Value::Object(heap.alloc_object(obj))
 }
@@ -7372,7 +7373,7 @@ fn execute_date_method(map: &IndexMap<Arc<str>, Value>, method: &str) -> Option<
             | "getUTCMilliseconds" | "getMilliseconds" | "getTimezoneOffset" => {
                 Value::Float(f64::NAN)
             }
-            _ => Value::String(Arc::from("Invalid Date")),
+            _ => Value::String(JsString::from("Invalid Date")),
         });
     }
     let millis = millis_f as i64;
@@ -7381,7 +7382,7 @@ fn execute_date_method(map: &IndexMap<Arc<str>, Value>, method: &str) -> Option<
         return Some(Value::Int(0));
     }
     if matches!(method, "toJSON" | "toString" | "toDateString") {
-        return Some(Value::String(Arc::from(unix_millis_to_iso(millis).as_str())));
+        return Some(Value::String(JsString::from(unix_millis_to_iso(millis).as_str())));
     }
     let seconds = millis.div_euclid(1000);
     let ms = millis.rem_euclid(1000);
@@ -7392,7 +7393,7 @@ fn execute_date_method(map: &IndexMap<Arc<str>, Value>, method: &str) -> Option<
     let dow = (days + 4).rem_euclid(7);
     match method {
         "getTime" | "valueOf" => Some(Value::Int(millis)),
-        "toISOString" => Some(Value::String(Arc::from(
+        "toISOString" => Some(Value::String(JsString::from(
             unix_millis_to_iso(millis).as_str(),
         ))),
         // No timezone in the sandbox — local getters alias the UTC ones.

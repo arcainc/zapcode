@@ -544,7 +544,7 @@ fn json_to_value(json: &serde_json::Value, heap: &mut Heap) -> Value {
                 Value::Undefined
             }
         }
-        serde_json::Value::String(s) => Value::String(Arc::from(s.as_str())),
+        serde_json::Value::String(s) => Value::String(zapcode_core::JsString::from(s.as_str())),
         serde_json::Value::Array(arr) => {
             let items: Vec<Value> = arr.iter().map(|v| json_to_value(v, heap)).collect();
             Value::Array(heap.alloc_array(items))
