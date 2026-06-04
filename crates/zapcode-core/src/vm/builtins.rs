@@ -1242,11 +1242,92 @@ pub fn regexp_parts(v: &Value, heap: &Heap) -> Option<(String, String)> {
     None
 }
 
+/// Rewrite the ASCII shorthand classes (`\d \D \w \W \b \B`) to their explicit
+/// ASCII forms. The `regex` crate is Unicode-by-default, so a bare `\d`/`\w`
+/// matches Unicode digits/word chars (e.g. Arabic-Indic digits, accented
+/// letters) — JS shorthands are ASCII-only. Without this, ID/ZIP/slug
+/// validation built from `\d`/`\w` silently accepts non-ASCII input.
+///
+/// Translation (matching real Node):
+///   - outside a char class: `\d`→`[0-9]`, `\D`→`[^0-9]`,
+///     `\w`→`[0-9A-Za-z_]`, `\W`→`[^0-9A-Za-z_]`,
+///     `\b`/`\B`→`(?-u:\b)`/`(?-u:\B)` (word-boundary on the ASCII word set);
+///   - inside a char class `[...]`: `\d`→`0-9`, `\w`→`0-9A-Za-z_` (bare members,
+///     no nested brackets), and `\D`/`\W`→nested negated classes `[^0-9]` /
+///     `[^0-9A-Za-z_]` (the crate unions class members, matching JS). Inside a
+///     class, `\b` is a backspace, so it is left untouched.
+/// All other escapes (`\s \S \n \. \\ \uXXXX` …) and the rest of the grammar are
+/// passed through verbatim.
+fn rewrite_ascii_shorthands(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+    let mut in_class = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                // Look at the escaped character without consuming non-shorthands.
+                match chars.peek().copied() {
+                    Some('d') => {
+                        chars.next();
+                        out.push_str(if in_class { "0-9" } else { "[0-9]" });
+                    }
+                    Some('w') => {
+                        chars.next();
+                        out.push_str(if in_class { "0-9A-Za-z_" } else { "[0-9A-Za-z_]" });
+                    }
+                    // `\D`/`\W` map to a negated ASCII class. Inside a class the
+                    // crate accepts a *nested* negated class (`[a[^0-9]]`) and
+                    // unions its members, matching JS `[a\D]` semantics.
+                    Some('D') => {
+                        chars.next();
+                        out.push_str("[^0-9]");
+                    }
+                    Some('W') => {
+                        chars.next();
+                        out.push_str("[^0-9A-Za-z_]");
+                    }
+                    Some('b') if !in_class => {
+                        chars.next();
+                        out.push_str("(?-u:\\b)");
+                    }
+                    Some('B') if !in_class => {
+                        chars.next();
+                        out.push_str("(?-u:\\B)");
+                    }
+                    // Any other escape (incl. `\b` inside a class, where it is a
+                    // backspace, and `\s \S \n \. \\` …) is preserved exactly,
+                    // escaped char and all, so the next iteration doesn't
+                    // re-interpret it.
+                    Some(next) => {
+                        chars.next();
+                        out.push('\\');
+                        out.push(next);
+                    }
+                    None => out.push('\\'),
+                }
+            }
+            '[' if !in_class => {
+                in_class = true;
+                out.push('[');
+            }
+            ']' if in_class => {
+                in_class = false;
+                out.push(']');
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Compile a JS-ish regex with the supported flags (i, m, s). The `g` flag is
 /// handled by callers (all matches vs first). Lookaround/backreferences aren't
-/// supported by the linear-time engine and produce a clear error.
+/// supported by the linear-time engine and produce a clear error. ASCII
+/// shorthand classes are rewritten first so they match JS (ASCII) rather than
+/// the crate's Unicode defaults — see `rewrite_ascii_shorthands`.
 pub fn compile_regex(pattern: &str, flags: &str) -> Result<regex::Regex> {
-    regex::RegexBuilder::new(pattern)
+    let rewritten = rewrite_ascii_shorthands(pattern);
+    regex::RegexBuilder::new(&rewritten)
         .case_insensitive(flags.contains('i'))
         .multi_line(flags.contains('m'))
         .dot_matches_new_line(flags.contains('s'))
@@ -1271,7 +1352,8 @@ pub fn call_regexp_method(
     let subject = arg_str(args, 0, heap);
     let re = compile_regex(pattern, flags)?;
     // /g and /y are "stateful": exec/test resume from `lastIndex` and advance it.
-    let stateful = flags.contains('g') || flags.contains('y');
+    let sticky = flags.contains('y');
+    let stateful = flags.contains('g') || sticky;
 
     // Read the current `lastIndex` (in chars) from the heap slot, if present.
     let read_last_index = |heap: &Heap| -> usize {
@@ -1303,13 +1385,17 @@ pub fn call_regexp_method(
                     write_last_index(heap, 0);
                     Some(Value::Bool(false))
                 } else {
+                    // For the sticky flag `y`, the match must START exactly at
+                    // `lastIndex` (it anchors, it does not scan forward). The
+                    // crate's `find_at` returns the leftmost match at-or-after
+                    // the offset, so we reject any match that starts later.
                     match re.find_at(&subject, start_byte) {
-                        Some(m) => {
+                        Some(m) if !sticky || m.start() == start_byte => {
                             let end_char = subject[..m.end()].chars().count();
                             write_last_index(heap, end_char);
                             Some(Value::Bool(true))
                         }
-                        None => {
+                        _ => {
                             write_last_index(heap, 0);
                             Some(Value::Bool(false))
                         }
@@ -1332,6 +1418,19 @@ pub fn call_regexp_method(
                 None
             } else {
                 re.captures_at(&subject, start_byte)
+            };
+
+            // For the sticky flag `y`, the match must START exactly at
+            // `lastIndex`; `captures_at` would otherwise scan forward. Drop a
+            // match that begins past the offset so the result matches Node.
+            let caps_opt = match caps_opt {
+                Some(caps)
+                    if sticky
+                        && caps.get(0).map(|m| m.start()) != Some(start_byte) =>
+                {
+                    None
+                }
+                other => other,
             };
 
             match caps_opt {

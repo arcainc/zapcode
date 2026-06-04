@@ -203,4 +203,27 @@ await test("date conformance edges marshal to the host like Node", async () => {
   assert.equal(r.output, true);
 });
 
+// ── ASCII regex shorthands + sticky /y marshal across the host boundary ──
+// JS shorthands (\d \w …) are ASCII-only, unlike the regex crate's Unicode
+// default, and /y must anchor at lastIndex. A non-ASCII subject (Arabic-Indic
+// digits, accented letters) must reach the host as the Node-matching boolean,
+// never crash the process (no exit 139/134).
+await test("ascii regex shorthands + sticky /y marshal to the host like Node", async () => {
+  // \d is ASCII-only: an Arabic-Indic digit string is rejected by ID/ZIP rules.
+  let r = await execute(`/^\\d{5}$/.test("١٢٣٤٥")`, {});
+  assert.equal(r.output, false);
+  r = await execute(`/^\\d{5}$/.test("12345")`, {});
+  assert.equal(r.output, true);
+  // \w does not match accented letters; a slug with "café" is rejected.
+  r = await execute(`/^[\\w-]+$/.test("café-slug")`, {});
+  assert.equal(r.output, false);
+  r = await execute(`/^[\\w-]+$/.test("my-slug-1")`, {});
+  assert.equal(r.output, true);
+  // Sticky /y anchors at lastIndex: 'a' is not at index 0 of "baa".
+  r = await execute(`const re = /a/y; re.lastIndex = 0; re.test("baa")`, {});
+  assert.equal(r.output, false);
+  r = await execute(`const re = /a/y; re.lastIndex = 1; re.test("baa")`, {});
+  assert.equal(r.output, true);
+});
+
 console.log(`\n${passed} marshalling checks passed.`);
