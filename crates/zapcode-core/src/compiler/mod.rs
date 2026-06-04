@@ -58,6 +58,12 @@ struct Compiler {
     top_level_bindings: HashMap<String, TopLevelBindingKind>,
     /// Label attached to the next loop (from a `label:` statement), if any.
     pending_label: Option<String>,
+    /// Active labeled NON-loop statements (e.g. `foo: { ... break foo; }`).
+    /// Kept separate from `loop_stack` so that an *unlabeled* `break`/`continue`
+    /// never targets a labeled block — only a labeled `break foo` falls back to
+    /// this stack. Without it, `break foo` finds no loop, leaves its jump offset
+    /// at 0, and runs away to instruction 0 (hits the allocation limit).
+    labeled_blocks: Vec<LoopInfo>,
     /// Function-declaration indices already bound by the scope's hoist pass, so
     /// the in-source-order `FunctionDecl` statement is a no-op for them.
     hoisted_funcs: std::collections::HashSet<usize>,
@@ -91,6 +97,7 @@ impl Compiler {
             mode: CompilerMode::Standard,
             top_level_bindings: HashMap::new(),
             pending_label: None,
+            labeled_blocks: Vec::new(),
             hoisted_funcs: std::collections::HashSet::new(),
             current_class: None,
         }
@@ -110,6 +117,7 @@ impl Compiler {
             mode: CompilerMode::SessionChunk,
             top_level_bindings,
             pending_label: None,
+            labeled_blocks: Vec::new(),
             hoisted_funcs: std::collections::HashSet::new(),
             current_class: None,
         }
@@ -218,6 +226,21 @@ impl Compiler {
     /// function boundary — exactly the lexical scope `arguments` belongs to.
     fn body_uses_arguments(body: &[Statement]) -> bool {
         body.iter().any(Self::stmt_uses_arguments)
+    }
+
+    /// Whether a labeled statement's body is itself a loop/switch that will
+    /// adopt the pending label into its own `LoopInfo` (so `break label` /
+    /// `continue label` resolve against it). Anything else (notably a plain
+    /// block) is a labeled non-loop and needs its own break frame.
+    fn body_consumes_label(stmt: &Statement) -> bool {
+        matches!(
+            stmt,
+            Statement::While { .. }
+                | Statement::DoWhile { .. }
+                | Statement::For { .. }
+                | Statement::ForOf { .. }
+                | Statement::Switch { .. }
+        )
     }
 
     fn stmt_uses_arguments(stmt: &Statement) -> bool {
@@ -696,11 +719,21 @@ impl Compiler {
             Statement::Break { label, .. } => {
                 let idx = self.emit(Instruction::Break(0));
                 let target = match label {
+                    // A labeled break targets the matching loop/switch, or — if
+                    // none matches — a labeled non-loop block (e.g. `foo: {...}`).
                     Some(l) => self
                         .loop_stack
                         .iter_mut()
                         .rev()
-                        .find(|li| li.label.as_deref() == Some(l.as_str())),
+                        .find(|li| li.label.as_deref() == Some(l.as_str()))
+                        .or_else(|| {
+                            self.labeled_blocks
+                                .iter_mut()
+                                .rev()
+                                .find(|li| li.label.as_deref() == Some(l.as_str()))
+                        }),
+                    // An unlabeled break targets the innermost loop/switch only,
+                    // never an enclosing labeled block.
                     None => self.loop_stack.last_mut(),
                 };
                 if let Some(loop_info) = target {
@@ -710,11 +743,21 @@ impl Compiler {
             Statement::Continue { label, .. } => {
                 let idx = self.emit(Instruction::Continue(0));
                 let target = match label {
+                    // `continue label` only legally targets a loop, but a labeled
+                    // *block* may match in malformed input; fall back to it so the
+                    // jump is still patched (to the block end) rather than left at
+                    // 0 and running away.
                     Some(l) => self
                         .loop_stack
                         .iter_mut()
                         .rev()
-                        .find(|li| li.label.as_deref() == Some(l.as_str())),
+                        .find(|li| li.label.as_deref() == Some(l.as_str()))
+                        .or_else(|| {
+                            self.labeled_blocks
+                                .iter_mut()
+                                .rev()
+                                .find(|li| li.label.as_deref() == Some(l.as_str()))
+                        }),
                     None => self.loop_stack.last_mut(),
                 };
                 if let Some(loop_info) = target {
@@ -722,11 +765,34 @@ impl Compiler {
                 }
             }
             Statement::Labeled { label, body, .. } => {
-                // The next loop/switch picks up this label; clear it afterward in
-                // case the labeled statement wasn't a loop.
-                self.pending_label = Some(label.clone());
-                self.compile_statement(body)?;
-                self.pending_label = None;
+                if Self::body_consumes_label(body) {
+                    // The loop/switch picks up this label into its own LoopInfo;
+                    // clear it afterward in case the body turned out not to.
+                    self.pending_label = Some(label.clone());
+                    self.compile_statement(body)?;
+                    self.pending_label = None;
+                } else {
+                    // Labeled non-loop statement (commonly a block). Register a
+                    // break frame so `break label` jumps past the body instead of
+                    // emitting an unpatched Break(0) that loops to instruction 0.
+                    self.labeled_blocks.push(LoopInfo {
+                        break_patches: Vec::new(),
+                        continue_patches: Vec::new(),
+                        label: Some(label.clone()),
+                    });
+                    self.compile_statement(body)?;
+                    let end = self.current_offset();
+                    let info = self.labeled_blocks.pop().unwrap();
+                    for patch in info.break_patches {
+                        self.patch_jump(patch, end);
+                    }
+                    // `continue` is invalid on a block; if one slipped through,
+                    // patch it to the end too (behaves like break) so it can't
+                    // run away.
+                    for patch in info.continue_patches {
+                        self.patch_jump(patch, end);
+                    }
+                }
             }
             Statement::FunctionDecl {
                 func_index, name, ..
@@ -1655,7 +1721,67 @@ impl Compiler {
             }
             Expr::Object(props) => {
                 let has_spread = props.iter().any(|p| matches!(p.kind, PropKind::Spread));
-                if !has_spread {
+                let has_accessor = props
+                    .iter()
+                    .any(|p| matches!(p.kind, PropKind::Get | PropKind::Set));
+                if has_accessor {
+                    // Object literal with getters/setters. Build the base object
+                    // (data + spread props) incrementally, then attach the
+                    // `__getters__`/`__setters__` accessor tables the runtime
+                    // already consults on property read/write. No new bytecode —
+                    // the tables are plain reserved-key sub-objects.
+                    self.emit(Instruction::CreateObject(0));
+                    let emit_key = |c: &mut Self, prop: &ObjProperty| -> Result<()> {
+                        match &prop.key_expr {
+                            Some(key_expr) => c.compile_expr(key_expr),
+                            None => {
+                                c.emit(Instruction::Push(Constant::String(prop.key.clone())));
+                                Ok(())
+                            }
+                        }
+                    };
+                    for prop in props {
+                        match prop.kind {
+                            PropKind::Spread => {
+                                self.compile_expr(&prop.value)?;
+                                self.emit(Instruction::ObjectSpreadAssign);
+                            }
+                            // Accessors are ALSO stored as a data prop (key -> fn)
+                            // so the key enumerates in source order for free —
+                            // Object.keys / for-in need no special-casing. The
+                            // __getters__/__setters__ tables below drive the actual
+                            // read/write; value-producing surfaces (JSON, spread,
+                            // Object.values/entries) invoke the getter rather than
+                            // serializing the stored function.
+                            _ => {
+                                emit_key(self, prop)?;
+                                self.compile_expr(&prop.value)?;
+                                self.emit(Instruction::ObjectInsert);
+                            }
+                        }
+                    }
+                    // Attach the accessor tables: `obj.__getters__ = { name: fn }`.
+                    for (table, want_get) in [("__getters__", true), ("__setters__", false)] {
+                        let accessors: Vec<&ObjProperty> = props
+                            .iter()
+                            .filter(|p| {
+                                matches!(p.kind, PropKind::Get if want_get)
+                                    || matches!(p.kind, PropKind::Set if !want_get)
+                            })
+                            .collect();
+                        if accessors.is_empty() {
+                            continue;
+                        }
+                        self.emit(Instruction::Push(Constant::String(table.to_string())));
+                        self.emit(Instruction::CreateObject(0));
+                        for acc in accessors {
+                            emit_key(self, acc)?;
+                            self.compile_expr(&acc.value)?;
+                            self.emit(Instruction::ObjectInsert);
+                        }
+                        self.emit(Instruction::ObjectInsert);
+                    }
+                } else if !has_spread {
                     let mut count = 0;
                     for prop in props {
                         match &prop.key_expr {

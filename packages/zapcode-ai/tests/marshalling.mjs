@@ -363,4 +363,74 @@ await test("negative zero keeps its sign across the host boundary like Node", as
   assert.equal(r.output, 7);
 });
 
+// ── labeled break out of a plain block does not run away ──
+// `break label` on a labeled non-loop block used to emit an unpatched jump to
+// instruction 0 → infinite loop → allocation-limit error on guest input. It
+// must now complete promptly with the JS-correct result.
+await test("labeled break on a plain block completes (no runaway) like Node", async () => {
+  let r = await execute(`(function(){ let r=''; foo:{ r+='a'; break foo; r+='b'; } return r+'c'; })()`, {});
+  assert.equal(r.output, "ac");
+
+  // An unlabeled break inside such a block, nested in a loop, breaks the loop.
+  r = await execute(`(function(){ let r=''; for(let i=0;i<3;i++){ blk:{ r+=i; break; } r+='x'; } return r; })()`, {});
+  assert.equal(r.output, "0");
+});
+
+// ── Error.cause + no phantom methods on constructed instances ──
+// `new Error(msg,{cause})` exposes `cause`; a chained read on any `new
+// Builtin()` resolves against the instance, not the global constructor.
+await test("Error cause and instance property reads marshal like Node", async () => {
+  let r = await execute(`new Error("e", { cause: "c" }).cause`, {});
+  assert.equal(r.output, "c");
+
+  r = await execute(`new Error("e").cause === undefined`, {});
+  assert.equal(r.output, true);
+
+  // No phantom function for an arbitrary key on a freshly-constructed instance.
+  r = await execute(`[typeof new Error("e").zzz, typeof new Map().zzz, typeof new Date().zzz]`, {});
+  assert.deepEqual(r.output, ["undefined", "undefined", "undefined"]);
+
+  // Real members and toString still work.
+  r = await execute(`[new Error("boom").message, String(new TypeError("x"))]`, {});
+  assert.deepEqual(r.output, ["boom", "TypeError: x"]);
+});
+
+// ── Map/Set iterators have a real .next() and stay iterable across the boundary ──
+await test("Map/Set iterators expose next() and feed for-of/spread/Array.from like Node", async () => {
+  let r = await execute(`JSON.stringify(new Map([["a", 1]]).entries().next())`, {});
+  assert.equal(r.output, JSON.stringify({ value: ["a", 1], done: false }));
+
+  r = await execute(`(function(){ let it = new Set([5,6]).values(); return [it.next().value, it.next().value, it.next().done]; })()`, {});
+  assert.deepEqual(r.output, [5, 6, true]);
+
+  r = await execute(`[...new Map([["a",1],["b",2]]).keys()]`, {});
+  assert.deepEqual(r.output, ["a", "b"]);
+
+  r = await execute(`Array.from(new Set([5,6]).values())`, {});
+  assert.deepEqual(r.output, [5, 6]);
+
+  // Map/Set built from another collection's iterator.
+  r = await execute(`(function(){ let m = new Map([["a",1]]); return new Map(m.entries()).get("a"); })()`, {});
+  assert.equal(r.output, 1);
+});
+
+// ── object-literal getters/setters work and enumerate like Node ──
+await test("object-literal accessors invoke + enumerate across the host boundary", async () => {
+  let r = await execute(`({ get x() { return 42; } }).x`, {});
+  assert.equal(r.output, 42);
+
+  r = await execute(`(function(){ let o = { _x: 0, set x(v) { this._x = v * 2; } }; o.x = 7; return o._x; })()`, {});
+  assert.equal(r.output, 14);
+
+  // Enumerable in source order; JSON invokes the getter.
+  r = await execute(`Object.keys({ a: 1, get b() { return 2; }, c: 3 })`, {});
+  assert.deepEqual(r.output, ["a", "b", "c"]);
+
+  r = await execute(`JSON.stringify({ a: 1, get b() { return 2; } })`, {});
+  assert.equal(r.output, '{"a":1,"b":2}');
+
+  r = await execute(`JSON.stringify({ ...{ a: 1, get b() { return 7; } } })`, {});
+  assert.equal(r.output, '{"a":1,"b":7}');
+});
+
 console.log(`\n${passed} marshalling checks passed.`);

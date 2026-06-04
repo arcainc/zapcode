@@ -2403,13 +2403,16 @@ impl Vm {
                             continue;
                         }
                     }
+                    // Accessor keys serialize their getter's RESULT, not the
+                    // stored function (setter-only -> undefined -> omitted).
+                    let v = self.enumerable_value(&Value::Object(*h), k, v.clone())?;
                     let v = if let Some(f) = replacer {
                         self.call_function_internal(f, vec![
                             Value::String(k.clone()),
-                            v.clone(),
+                            v,
                         ])?
                     } else {
-                        v.clone()
+                        v
                     };
                     if let Some(s) =
                         self.serialize_json_dynamic(&v, replacer, whitelist, indent, depth + 1, seen)?
@@ -3168,7 +3171,40 @@ impl Vm {
     /// exposing a custom `[Symbol.iterator]()` method (the iterator protocol is
     /// invoked: call `[Symbol.iterator]()`, then repeatedly call `.next()` until
     /// a `{ done: true }` result). Used by spread and array destructuring.
+    /// Items still to yield from a built-in array-iterator object (from its
+    /// current cursor onward), or `None` if `val` isn't such an iterator.
+    fn array_iterator_remaining(&self, val: &Value) -> Option<Vec<Value>> {
+        let Value::Object(h) = val else { return None };
+        let m = self.heap.object(*h)?;
+        if !matches!(m.get("__array_iterator__"), Some(Value::Bool(true))) {
+            return None;
+        }
+        let items_h = match m.get("__items__") {
+            Some(Value::Array(a)) => *a,
+            _ => return None,
+        };
+        let cursor = match m.get("__cursor__") {
+            Some(Value::Int(i)) => (*i).max(0) as usize,
+            _ => 0,
+        };
+        Some(self.heap.array_vec(items_h).into_iter().skip(cursor).collect())
+    }
+
     fn drain_iterable(&mut self, val: Value) -> Result<Vec<Value>> {
+        if let Some(items) = self.array_iterator_remaining(&val) {
+            // Spread/Array.from/destructuring fully consume the iterator, so
+            // advance its cursor past the end.
+            if let Value::Object(h) = &val {
+                let len = match self.heap.object(*h).and_then(|m| m.get("__items__").cloned()) {
+                    Some(Value::Array(a)) => Some(self.heap.array(a).len()),
+                    _ => None,
+                };
+                if let (Some(len), Some(m)) = (len, self.heap.object_mut(*h)) {
+                    m.insert(Arc::from("__cursor__"), Value::Int(len as i64));
+                }
+            }
+            return Ok(items);
+        }
         match &val {
             Value::Array(a) => Ok(self.heap.array_vec(*a)),
             Value::String(s) => Ok(s
@@ -4108,15 +4144,25 @@ impl Vm {
                 match source {
                     Value::Object(h) => {
                         let entries = self.heap.object_map(h);
+                        let src = Value::Object(h);
+                        // Resolve values first (an accessor key contributes its
+                        // getter's RESULT, not the stored function); invoking a
+                        // getter needs &mut self, which would conflict with the
+                        // object_mut borrow below.
+                        let mut resolved: Vec<(Arc<str>, Value)> = Vec::new();
+                        for (k, v) in entries {
+                            // Spread copies own enumerable properties. Skip
+                            // reserved internal markers (so `{...instance}`
+                            // doesn't leak `__class__`/brands), but keep real
+                            // user keys that merely start with `__`.
+                            if builtins::is_internal_marker_key(&k) {
+                                continue;
+                            }
+                            let val = self.enumerable_value(&src, &k, v)?;
+                            resolved.push((k, val));
+                        }
                         if let Some(map) = self.heap.object_mut(acc) {
-                            for (k, v) in entries {
-                                // Spread copies own enumerable properties. Skip
-                                // reserved internal markers (so `{...instance}`
-                                // doesn't leak `__class__`/brands), but keep real
-                                // user keys that merely start with `__`.
-                                if builtins::is_internal_marker_key(&k) {
-                                    continue;
-                                }
+                            for (k, v) in resolved {
                                 map.insert(k, v);
                             }
                         }
@@ -4516,6 +4562,47 @@ impl Vm {
                                     None
                                 }
                             }
+                            "__array_iterator__" => {
+                                // `.next()` on a built-in iterator: yield the item
+                                // at the cursor as { value, done } and advance it.
+                                let _ = &place;
+                                if let Some(Value::Object(it)) = receiver {
+                                    let (items_h, cursor) = match self.heap.object(it) {
+                                        Some(m) => {
+                                            let ih = match m.get("__items__") {
+                                                Some(Value::Array(a)) => Some(*a),
+                                                _ => None,
+                                            };
+                                            let c = match m.get("__cursor__") {
+                                                Some(Value::Int(i)) => (*i).max(0) as usize,
+                                                _ => 0,
+                                            };
+                                            (ih, c)
+                                        }
+                                        None => (None, 0),
+                                    };
+                                    match items_h {
+                                        Some(ih) => {
+                                            let items = self.heap.array_vec(ih);
+                                            if cursor < items.len() {
+                                                let v = items[cursor].clone();
+                                                if let Some(m) = self.heap.object_mut(it) {
+                                                    m.insert(
+                                                        Arc::from("__cursor__"),
+                                                        Value::Int((cursor + 1) as i64),
+                                                    );
+                                                }
+                                                Some(self.make_iterator_result(v, false))
+                                            } else {
+                                                Some(self.make_iterator_result(Value::Undefined, true))
+                                            }
+                                        }
+                                        None => Some(self.make_iterator_result(Value::Undefined, true)),
+                                    }
+                                } else {
+                                    None
+                                }
+                            }
                             "__map__" => {
                                 // Map is a heap handle; mutating methods edit the
                                 // backing slot in place (reference semantics), so
@@ -4664,6 +4751,79 @@ impl Vm {
                                     &mut self.stdout,
                                     &mut self.heap,
                                 )?
+                            }
+                            // Object.values/entries on an object with accessors
+                            // must invoke getters for the values; the pure builtin
+                            // can't call guest closures, so resolve here. (Without
+                            // accessors, fall through to the builtin unchanged.)
+                            "Object"
+                                if matches!(method_name.as_ref(), "values" | "entries")
+                                    && self.has_accessors(
+                                        args.first().unwrap_or(&Value::Undefined),
+                                    ) =>
+                            {
+                                let obj = args[0].clone();
+                                let Value::Object(h) = &obj else { unreachable!() };
+                                let keys: Vec<Arc<str>> = self
+                                    .heap
+                                    .object_map(*h)
+                                    .keys()
+                                    .filter(|k| !builtins::is_internal_marker_key(k))
+                                    .cloned()
+                                    .collect();
+                                let want_entries = method_name.as_ref() == "entries";
+                                let mut out = Vec::with_capacity(keys.len());
+                                for k in keys {
+                                    let stored = self
+                                        .heap
+                                        .object(*h)
+                                        .and_then(|m| m.get(k.as_ref()).cloned())
+                                        .unwrap_or(Value::Undefined);
+                                    let val = self.enumerable_value(&obj, &k, stored)?;
+                                    if want_entries {
+                                        let pair = self.heap.alloc_array(vec![
+                                            Value::String(k.clone()),
+                                            val,
+                                        ]);
+                                        out.push(Value::Array(pair));
+                                    } else {
+                                        out.push(val);
+                                    }
+                                }
+                                Some(Value::Array(self.heap.alloc_array(out)))
+                            }
+                            // Object.assign with an accessor-bearing source copies
+                            // the getter's RESULT (spread semantics), not the fn.
+                            "Object"
+                                if method_name.as_ref() == "assign"
+                                    && args.iter().skip(1).any(|s| self.has_accessors(s)) =>
+                            {
+                                let target = match args.first() {
+                                    Some(Value::Object(h)) => *h,
+                                    _ => self.heap.alloc_object(IndexMap::new()),
+                                };
+                                for src in args.iter().skip(1).cloned().collect::<Vec<_>>() {
+                                    let Value::Object(sh) = &src else { continue };
+                                    let keys: Vec<Arc<str>> = self
+                                        .heap
+                                        .object_map(*sh)
+                                        .keys()
+                                        .filter(|k| !builtins::is_internal_marker_key(k))
+                                        .cloned()
+                                        .collect();
+                                    for k in keys {
+                                        let stored = self
+                                            .heap
+                                            .object(*sh)
+                                            .and_then(|m| m.get(k.as_ref()).cloned())
+                                            .unwrap_or(Value::Undefined);
+                                        let val = self.enumerable_value(&src, &k, stored)?;
+                                        if let Some(m) = self.heap.object_mut(target) {
+                                            m.insert(k, val);
+                                        }
+                                    }
+                                }
+                                Some(Value::Object(target))
                             }
                             global_name => builtins::call_global_method(
                                 global_name,
@@ -4932,6 +5092,13 @@ impl Vm {
                     Value::Object(_) if is_map_object(&val, &self.heap) => {
                         let pairs = map_entry_pairs(&val, &mut self.heap);
                         let iter_obj = iter_from_items(pairs, &mut self.heap);
+                        self.push(iter_obj)?;
+                    }
+                    // A built-in array-iterator (Map/Set/array .keys()/.values()/
+                    // .entries()): iterate its items from the current cursor.
+                    Value::Object(_) if is_array_iterator(&val, &self.heap) => {
+                        let items = self.array_iterator_remaining(&val).unwrap_or_default();
+                        let iter_obj = iter_from_items(items, &mut self.heap);
                         self.push(iter_obj)?;
                     }
                     // A plain object exposing a custom `[Symbol.iterator]()`:
@@ -5414,6 +5581,13 @@ impl Vm {
 
                 let callee = self.pop()?;
 
+                // The result of `new X(...)` is a fresh instance, never the
+                // global `X`. Consume the builtin-global shortcut here so a
+                // chained read like `new Error("e").cause` resolves against the
+                // instance (own props / undefined) instead of mistaking it for a
+                // method on the global `Error` and returning a phantom function.
+                self.last_global_name = None;
+
                 if let Value::Object(obj_h) = &callee {
                     let builtin_ctor = self
                         .heap
@@ -5458,6 +5632,20 @@ impl Vm {
                                     .map(|v| v.to_js_string(&self.heap))
                                     .unwrap_or_default();
                                 let e = make_error_object(name.as_ref(), &msg, &mut self.heap);
+                                // ES2022 `new Error(msg, { cause })`: if the
+                                // options bag has an own `cause` (even undefined),
+                                // it becomes the error's `cause` property.
+                                let cause = match args.get(1) {
+                                    Some(Value::Object(opts)) => {
+                                        self.heap.object(*opts).and_then(|m| m.get("cause").cloned())
+                                    }
+                                    _ => None,
+                                };
+                                if let (Some(cause), Value::Object(em)) = (cause, &e) {
+                                    if let Some(map) = self.heap.object_mut(*em) {
+                                        map.insert(Arc::from("cause"), cause);
+                                    }
+                                }
                                 self.push(e)?;
                                 return Ok(None);
                             }
@@ -6149,6 +6337,30 @@ impl Vm {
     /// entry for `name`, return the accessor closure to invoke (with `this` bound
     /// to `obj`). The instance keys are ignored on a class object itself (an
     /// instance getter belongs to the prototype, not the constructor).
+    /// Whether `v` is an object carrying accessor descriptors (object-literal or
+    /// class getters/setters). Used to decide when an enumeration surface must
+    /// invoke getters rather than read stored values.
+    fn has_accessors(&self, v: &Value) -> bool {
+        matches!(v, Value::Object(h) if self.heap.object(*h).is_some_and(|m| {
+            m.contains_key("__getters__") || m.contains_key("__setters__")
+        }))
+    }
+
+    /// The value of own key `name` for *value-producing* enumeration surfaces
+    /// (JSON.stringify, spread/Object.assign, Object.values/entries): if `name`
+    /// is an accessor, invoke its getter with `this` bound to `obj`; a
+    /// setter-only accessor reads as `undefined` (like JS). Otherwise return the
+    /// already-cloned `stored` value (e.g. a plain data prop or a method fn).
+    fn enumerable_value(&mut self, obj: &Value, name: &str, stored: Value) -> Result<Value> {
+        if let Some(getter) = self.instance_accessor(obj, "__getters__", name) {
+            return self.call_method_internal(&getter, obj.clone(), Vec::new());
+        }
+        if self.instance_accessor(obj, "__setters__", name).is_some() {
+            return Ok(Value::Undefined);
+        }
+        Ok(stored)
+    }
+
     fn instance_accessor(&self, obj: &Value, kind: &str, name: &str) -> Option<Value> {
         let Value::Object(h) = obj else { return None };
         let map = self.heap.object(*h)?;
@@ -6211,6 +6423,11 @@ impl Vm {
                 // Check if this is a promise instance — expose .then/.catch/.finally
                 if builtins::is_promise(obj, &self.heap) && is_promise_method(name) {
                     return Ok(builtin_method("__promise__", name));
+                }
+                // Built-in array-iterator (.keys()/.values()/.entries()): expose
+                // `.next()`; iteration itself is handled by GetIterator.
+                if is_array_iterator(obj, &self.heap) && name == "next" {
+                    return Ok(builtin_method("__array_iterator__", name));
                 }
                 if is_map_object(obj, &self.heap) {
                     if name == "size" {
@@ -6512,6 +6729,26 @@ fn iterable_items(v: &Value, heap: &mut Heap) -> Vec<Value> {
             .chars()
             .map(|c| Value::String(Arc::from(c.to_string().as_str())))
             .collect(),
+        Value::Object(_) if is_array_iterator(v, heap) => {
+            let Value::Object(h) = v else { return Vec::new() };
+            let (items_h, cursor) = match heap.object(*h) {
+                Some(m) => (
+                    match m.get("__items__") {
+                        Some(Value::Array(a)) => Some(*a),
+                        _ => None,
+                    },
+                    match m.get("__cursor__") {
+                        Some(Value::Int(i)) => (*i).max(0) as usize,
+                        _ => 0,
+                    },
+                ),
+                None => (None, 0),
+            };
+            match items_h {
+                Some(a) => heap.array_vec(a).into_iter().skip(cursor).collect(),
+                None => Vec::new(),
+            }
+        }
         Value::Object(_) if is_set_object(v, heap) => set_items(v, heap),
         Value::Object(_) if is_map_object(v, heap) => map_entry_pairs(v, heap),
         _ => Vec::new(),
@@ -6617,7 +6854,30 @@ fn is_set_object(value: &Value, heap: &Heap) -> bool {
 fn is_set_method(name: &str) -> bool {
     matches!(
         name,
-        "add" | "has" | "delete" | "clear" | "values" | "keys" | "forEach"
+        "add" | "has" | "delete" | "clear" | "values" | "keys" | "entries" | "forEach"
+    )
+}
+
+/// Build a JS-visible iterator object over `items` (what `Map`/`Set`/array
+/// `.keys()/.values()/.entries()` return). It carries `.next()` and is consumed
+/// by `for...of` / spread via the iteration machinery. Stateful: `.next()`
+/// advances `__cursor__`.
+fn make_array_iterator(items: Vec<Value>, heap: &mut Heap) -> Value {
+    let items_arr = Value::Array(heap.alloc_array(items));
+    let mut obj = IndexMap::new();
+    obj.insert(Arc::from("__array_iterator__"), Value::Bool(true));
+    obj.insert(Arc::from("__items__"), items_arr);
+    obj.insert(Arc::from("__cursor__"), Value::Int(0));
+    Value::Object(heap.alloc_object(obj))
+}
+
+fn is_array_iterator(value: &Value, heap: &Heap) -> bool {
+    matches!(
+        value,
+        Value::Object(h) if matches!(
+            heap.object(*h).and_then(|m| m.get("__array_iterator__")),
+            Some(Value::Bool(true))
+        )
     )
 }
 
@@ -6684,7 +6944,15 @@ fn execute_set_method(
             heap.set_array(items_handle, Vec::new());
             Some(Value::Undefined)
         }
-        "values" | "keys" => Some(Value::Array(heap.alloc_array(items))),
+        "values" | "keys" => Some(make_array_iterator(items, heap)),
+        "entries" => {
+            // Set entries are [value, value] pairs (the value doubles as key).
+            let pairs: Vec<Value> = items
+                .into_iter()
+                .map(|v| Value::Array(heap.alloc_array(vec![v.clone(), v])))
+                .collect();
+            Some(make_array_iterator(pairs, heap))
+        }
         _ => None,
     }
 }
@@ -6796,7 +7064,7 @@ fn execute_map_method(
                     _ => None,
                 })
                 .collect();
-            Some(Value::Array(heap.alloc_array(keys)))
+            Some(make_array_iterator(keys, heap))
         }
         "values" => {
             let vals: Vec<Value> = entries
@@ -6806,7 +7074,7 @@ fn execute_map_method(
                     _ => None,
                 })
                 .collect();
-            Some(Value::Array(heap.alloc_array(vals)))
+            Some(make_array_iterator(vals, heap))
         }
         "entries" => {
             let pairs: Vec<(Value, Value)> = entries
@@ -6825,7 +7093,7 @@ fn execute_map_method(
                 .into_iter()
                 .map(|(k, v)| Value::Array(heap.alloc_array(vec![k, v])))
                 .collect();
-            Some(Value::Array(heap.alloc_array(out)))
+            Some(make_array_iterator(out, heap))
         }
         _ => None,
     }
