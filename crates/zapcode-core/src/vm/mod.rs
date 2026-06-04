@@ -3168,7 +3168,40 @@ impl Vm {
     /// exposing a custom `[Symbol.iterator]()` method (the iterator protocol is
     /// invoked: call `[Symbol.iterator]()`, then repeatedly call `.next()` until
     /// a `{ done: true }` result). Used by spread and array destructuring.
+    /// Items still to yield from a built-in array-iterator object (from its
+    /// current cursor onward), or `None` if `val` isn't such an iterator.
+    fn array_iterator_remaining(&self, val: &Value) -> Option<Vec<Value>> {
+        let Value::Object(h) = val else { return None };
+        let m = self.heap.object(*h)?;
+        if !matches!(m.get("__array_iterator__"), Some(Value::Bool(true))) {
+            return None;
+        }
+        let items_h = match m.get("__items__") {
+            Some(Value::Array(a)) => *a,
+            _ => return None,
+        };
+        let cursor = match m.get("__cursor__") {
+            Some(Value::Int(i)) => (*i).max(0) as usize,
+            _ => 0,
+        };
+        Some(self.heap.array_vec(items_h).into_iter().skip(cursor).collect())
+    }
+
     fn drain_iterable(&mut self, val: Value) -> Result<Vec<Value>> {
+        if let Some(items) = self.array_iterator_remaining(&val) {
+            // Spread/Array.from/destructuring fully consume the iterator, so
+            // advance its cursor past the end.
+            if let Value::Object(h) = &val {
+                let len = match self.heap.object(*h).and_then(|m| m.get("__items__").cloned()) {
+                    Some(Value::Array(a)) => Some(self.heap.array(a).len()),
+                    _ => None,
+                };
+                if let (Some(len), Some(m)) = (len, self.heap.object_mut(*h)) {
+                    m.insert(Arc::from("__cursor__"), Value::Int(len as i64));
+                }
+            }
+            return Ok(items);
+        }
         match &val {
             Value::Array(a) => Ok(self.heap.array_vec(*a)),
             Value::String(s) => Ok(s
@@ -4516,6 +4549,47 @@ impl Vm {
                                     None
                                 }
                             }
+                            "__array_iterator__" => {
+                                // `.next()` on a built-in iterator: yield the item
+                                // at the cursor as { value, done } and advance it.
+                                let _ = &place;
+                                if let Some(Value::Object(it)) = receiver {
+                                    let (items_h, cursor) = match self.heap.object(it) {
+                                        Some(m) => {
+                                            let ih = match m.get("__items__") {
+                                                Some(Value::Array(a)) => Some(*a),
+                                                _ => None,
+                                            };
+                                            let c = match m.get("__cursor__") {
+                                                Some(Value::Int(i)) => (*i).max(0) as usize,
+                                                _ => 0,
+                                            };
+                                            (ih, c)
+                                        }
+                                        None => (None, 0),
+                                    };
+                                    match items_h {
+                                        Some(ih) => {
+                                            let items = self.heap.array_vec(ih);
+                                            if cursor < items.len() {
+                                                let v = items[cursor].clone();
+                                                if let Some(m) = self.heap.object_mut(it) {
+                                                    m.insert(
+                                                        Arc::from("__cursor__"),
+                                                        Value::Int((cursor + 1) as i64),
+                                                    );
+                                                }
+                                                Some(self.make_iterator_result(v, false))
+                                            } else {
+                                                Some(self.make_iterator_result(Value::Undefined, true))
+                                            }
+                                        }
+                                        None => Some(self.make_iterator_result(Value::Undefined, true)),
+                                    }
+                                } else {
+                                    None
+                                }
+                            }
                             "__map__" => {
                                 // Map is a heap handle; mutating methods edit the
                                 // backing slot in place (reference semantics), so
@@ -4932,6 +5006,13 @@ impl Vm {
                     Value::Object(_) if is_map_object(&val, &self.heap) => {
                         let pairs = map_entry_pairs(&val, &mut self.heap);
                         let iter_obj = iter_from_items(pairs, &mut self.heap);
+                        self.push(iter_obj)?;
+                    }
+                    // A built-in array-iterator (Map/Set/array .keys()/.values()/
+                    // .entries()): iterate its items from the current cursor.
+                    Value::Object(_) if is_array_iterator(&val, &self.heap) => {
+                        let items = self.array_iterator_remaining(&val).unwrap_or_default();
+                        let iter_obj = iter_from_items(items, &mut self.heap);
                         self.push(iter_obj)?;
                     }
                     // A plain object exposing a custom `[Symbol.iterator]()`:
@@ -6233,6 +6314,11 @@ impl Vm {
                 if builtins::is_promise(obj, &self.heap) && is_promise_method(name) {
                     return Ok(builtin_method("__promise__", name));
                 }
+                // Built-in array-iterator (.keys()/.values()/.entries()): expose
+                // `.next()`; iteration itself is handled by GetIterator.
+                if is_array_iterator(obj, &self.heap) && name == "next" {
+                    return Ok(builtin_method("__array_iterator__", name));
+                }
                 if is_map_object(obj, &self.heap) {
                     if name == "size" {
                         let n = match map.get("__entries__") {
@@ -6533,6 +6619,26 @@ fn iterable_items(v: &Value, heap: &mut Heap) -> Vec<Value> {
             .chars()
             .map(|c| Value::String(Arc::from(c.to_string().as_str())))
             .collect(),
+        Value::Object(_) if is_array_iterator(v, heap) => {
+            let Value::Object(h) = v else { return Vec::new() };
+            let (items_h, cursor) = match heap.object(*h) {
+                Some(m) => (
+                    match m.get("__items__") {
+                        Some(Value::Array(a)) => Some(*a),
+                        _ => None,
+                    },
+                    match m.get("__cursor__") {
+                        Some(Value::Int(i)) => (*i).max(0) as usize,
+                        _ => 0,
+                    },
+                ),
+                None => (None, 0),
+            };
+            match items_h {
+                Some(a) => heap.array_vec(a).into_iter().skip(cursor).collect(),
+                None => Vec::new(),
+            }
+        }
         Value::Object(_) if is_set_object(v, heap) => set_items(v, heap),
         Value::Object(_) if is_map_object(v, heap) => map_entry_pairs(v, heap),
         _ => Vec::new(),
@@ -6638,7 +6744,30 @@ fn is_set_object(value: &Value, heap: &Heap) -> bool {
 fn is_set_method(name: &str) -> bool {
     matches!(
         name,
-        "add" | "has" | "delete" | "clear" | "values" | "keys" | "forEach"
+        "add" | "has" | "delete" | "clear" | "values" | "keys" | "entries" | "forEach"
+    )
+}
+
+/// Build a JS-visible iterator object over `items` (what `Map`/`Set`/array
+/// `.keys()/.values()/.entries()` return). It carries `.next()` and is consumed
+/// by `for...of` / spread via the iteration machinery. Stateful: `.next()`
+/// advances `__cursor__`.
+fn make_array_iterator(items: Vec<Value>, heap: &mut Heap) -> Value {
+    let items_arr = Value::Array(heap.alloc_array(items));
+    let mut obj = IndexMap::new();
+    obj.insert(Arc::from("__array_iterator__"), Value::Bool(true));
+    obj.insert(Arc::from("__items__"), items_arr);
+    obj.insert(Arc::from("__cursor__"), Value::Int(0));
+    Value::Object(heap.alloc_object(obj))
+}
+
+fn is_array_iterator(value: &Value, heap: &Heap) -> bool {
+    matches!(
+        value,
+        Value::Object(h) if matches!(
+            heap.object(*h).and_then(|m| m.get("__array_iterator__")),
+            Some(Value::Bool(true))
+        )
     )
 }
 
@@ -6705,7 +6834,15 @@ fn execute_set_method(
             heap.set_array(items_handle, Vec::new());
             Some(Value::Undefined)
         }
-        "values" | "keys" => Some(Value::Array(heap.alloc_array(items))),
+        "values" | "keys" => Some(make_array_iterator(items, heap)),
+        "entries" => {
+            // Set entries are [value, value] pairs (the value doubles as key).
+            let pairs: Vec<Value> = items
+                .into_iter()
+                .map(|v| Value::Array(heap.alloc_array(vec![v.clone(), v])))
+                .collect();
+            Some(make_array_iterator(pairs, heap))
+        }
         _ => None,
     }
 }
@@ -6817,7 +6954,7 @@ fn execute_map_method(
                     _ => None,
                 })
                 .collect();
-            Some(Value::Array(heap.alloc_array(keys)))
+            Some(make_array_iterator(keys, heap))
         }
         "values" => {
             let vals: Vec<Value> = entries
@@ -6827,7 +6964,7 @@ fn execute_map_method(
                     _ => None,
                 })
                 .collect();
-            Some(Value::Array(heap.alloc_array(vals)))
+            Some(make_array_iterator(vals, heap))
         }
         "entries" => {
             let pairs: Vec<(Value, Value)> = entries
@@ -6846,7 +6983,7 @@ fn execute_map_method(
                 .into_iter()
                 .map(|(k, v)| Value::Array(heap.alloc_array(vec![k, v])))
                 .collect();
-            Some(Value::Array(heap.alloc_array(out)))
+            Some(make_array_iterator(out, heap))
         }
         _ => None,
     }

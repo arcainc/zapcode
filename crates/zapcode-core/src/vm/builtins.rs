@@ -60,6 +60,9 @@ const INTERNAL_MARKER_KEYS: &[&str] = &[
     "__regexp__",
     "__items__",
     "__entries__",
+    // Built-in array/Map/Set iterator object (`.keys()/.values()/.entries()`).
+    "__array_iterator__",
+    "__cursor__",
     // Promise / deferred-batch plumbing.
     "__promise__",
     "__call_id__",
@@ -2925,6 +2928,16 @@ pub fn array_from_source_len(val: &Value, heap: &Heap) -> usize {
             let Some(map) = heap.object(*h) else {
                 return 0;
             };
+            if matches!(map.get("__array_iterator__"), Some(Value::Bool(true))) {
+                let cursor = match map.get("__cursor__") {
+                    Some(Value::Int(i)) => (*i).max(0) as usize,
+                    _ => 0,
+                };
+                return match map.get("__items__") {
+                    Some(Value::Array(ih)) => heap.array(*ih).len().saturating_sub(cursor),
+                    _ => 0,
+                };
+            }
             if matches!(map.get("__set__"), Some(Value::Bool(true))) {
                 return match map.get("__items__") {
                     Some(Value::Array(ih)) => heap.array(*ih).len(),
@@ -2962,6 +2975,18 @@ pub fn array_from_source(val: &Value, heap: &mut Heap) -> Vec<Value> {
             .collect(),
         Value::Object(h) => {
             let map = heap.object_map(*h);
+            if matches!(map.get("__array_iterator__"), Some(Value::Bool(true))) {
+                let cursor = match map.get("__cursor__") {
+                    Some(Value::Int(i)) => (*i).max(0) as usize,
+                    _ => 0,
+                };
+                return match map.get("__items__") {
+                    Some(Value::Array(ih)) => {
+                        heap.array_vec(*ih).into_iter().skip(cursor).collect()
+                    }
+                    _ => Vec::new(),
+                };
+            }
             if matches!(map.get("__set__"), Some(Value::Bool(true))) {
                 return match map.get("__items__") {
                     Some(Value::Array(ih)) => heap.array_vec(*ih),

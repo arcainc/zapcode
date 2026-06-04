@@ -395,4 +395,23 @@ await test("Error cause and instance property reads marshal like Node", async ()
   assert.deepEqual(r.output, ["boom", "TypeError: x"]);
 });
 
+// ── Map/Set iterators have a real .next() and stay iterable across the boundary ──
+await test("Map/Set iterators expose next() and feed for-of/spread/Array.from like Node", async () => {
+  let r = await execute(`JSON.stringify(new Map([["a", 1]]).entries().next())`, {});
+  assert.equal(r.output, JSON.stringify({ value: ["a", 1], done: false }));
+
+  r = await execute(`(function(){ let it = new Set([5,6]).values(); return [it.next().value, it.next().value, it.next().done]; })()`, {});
+  assert.deepEqual(r.output, [5, 6, true]);
+
+  r = await execute(`[...new Map([["a",1],["b",2]]).keys()]`, {});
+  assert.deepEqual(r.output, ["a", "b"]);
+
+  r = await execute(`Array.from(new Set([5,6]).values())`, {});
+  assert.deepEqual(r.output, [5, 6]);
+
+  // Map/Set built from another collection's iterator.
+  r = await execute(`(function(){ let m = new Map([["a",1]]); return new Map(m.entries()).get("a"); })()`, {});
+  assert.equal(r.output, 1);
+});
+
 console.log(`\n${passed} marshalling checks passed.`);

@@ -61,7 +61,9 @@ fn map_iterable_ctor_size_and_iteration() {
         "x1,y2"
     );
     assert_eq!(
-        run_str("const m = new Map([[\"a\",1],[\"b\",2]]); m.keys().join(\",\") + \"|\" + m.values().join(\",\")"),
+        // keys()/values() return iterators (no .join), so spread them first —
+        // matches JS, where `m.keys().join` would throw.
+        run_str("const m = new Map([[\"a\",1],[\"b\",2]]); [...m.keys()].join(\",\") + \"|\" + [...m.values()].join(\",\")"),
         "a,b|1,2"
     );
     assert_eq!(
