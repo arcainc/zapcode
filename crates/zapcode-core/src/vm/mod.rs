@@ -3465,25 +3465,30 @@ impl Vm {
                     (Value::Float(a), Value::Float(b)) => Value::Float(a + b),
                     (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 + b),
                     (Value::Float(a), Value::Int(b)) => Value::Float(a + *b as f64),
+                    // Concatenate by UTF-16 code units so a trailing lone high
+                    // surrogate and a leading lone low surrogate RE-PAIR into the
+                    // astral char (e.g. `"\uD83D" + "\uDE00"` === "😀"), matching JS.
                     (Value::String(a), _) => {
-                        let rhs = right.to_js_string(&self.heap);
-                        let new_len = a.len().saturating_add(rhs.len());
-                        if new_len > 10_000_000 {
+                        let mut units = a.units().into_owned();
+                        let rhs: Vec<u16> = match &right {
+                            Value::String(b) => b.units().into_owned(),
+                            _ => right.to_js_string(&self.heap).encode_utf16().collect(),
+                        };
+                        if units.len().saturating_add(rhs.len()) > 10_000_000 {
                             return Err(ZapcodeError::AllocationLimitExceeded);
                         }
-                        let mut s = a.to_string();
-                        s.push_str(&rhs);
-                        Value::String(JsString::from(s.as_str()))
+                        units.extend_from_slice(&rhs);
+                        Value::String(JsString::from_units(&units))
                     }
                     (_, Value::String(b)) => {
-                        let lhs = left.to_js_string(&self.heap);
-                        let new_len = lhs.len().saturating_add(b.len());
-                        if new_len > 10_000_000 {
+                        let mut units: Vec<u16> =
+                            left.to_js_string(&self.heap).encode_utf16().collect();
+                        let rhs = b.units();
+                        if units.len().saturating_add(rhs.len()) > 10_000_000 {
                             return Err(ZapcodeError::AllocationLimitExceeded);
                         }
-                        let mut s = lhs;
-                        s.push_str(b);
-                        Value::String(JsString::from(s.as_str()))
+                        units.extend_from_slice(&rhs);
+                        Value::String(JsString::from_units(&units))
                     }
                     // JS `+`: if either operand ToPrimitives to a string (arrays,
                     // plain objects), the whole expression is string concatenation
@@ -3891,32 +3896,23 @@ impl Vm {
                             .and_then(|m| m.get(key.as_ref()).cloned())
                             .unwrap_or(Value::Undefined)
                     }
+                    // String index access reads the UTF-16 code unit at the index
+                    // (an astral char is two units; a split yields a lone surrogate).
                     (Value::String(s), Value::Int(i)) => {
                         if *i < 0 {
                             Value::Undefined
                         } else {
-                            s.chars()
-                                .nth(*i as usize)
-                                .map(|c| Value::String(JsString::from(c.to_string().as_str())))
-                                .unwrap_or(Value::Undefined)
+                            unit_at(s, *i as usize)
                         }
                     }
-                    (Value::String(s), Value::Float(f)) if *f >= 0.0 && f.fract() == 0.0 => s
-                        .chars()
-                        .nth(*f as usize)
-                        .map(|c| Value::String(JsString::from(c.to_string().as_str())))
-                        .unwrap_or(Value::Undefined),
+                    (Value::String(s), Value::Float(f)) if *f >= 0.0 && f.fract() == 0.0 => {
+                        unit_at(s, *f as usize)
+                    }
                     // A string-typed numeric subscript (`"hello"["1"]`) reads the
-                    // char at that index, like JS (property-key -> integer index).
+                    // unit at that index, like JS (property-key -> integer index).
                     (Value::String(s), Value::String(key)) => match key.parse::<usize>() {
-                        Ok(i) => s
-                            .chars()
-                            .nth(i)
-                            .map(|c| Value::String(JsString::from(c.to_string().as_str())))
-                            .unwrap_or(Value::Undefined),
-                        Err(_) if key.as_ref() == "length" => {
-                            Value::Int(s.chars().count() as i64)
-                        }
+                        Ok(i) => unit_at(s, i),
+                        Err(_) if key.as_ref() == "length" => Value::Int(s.len_utf16() as i64),
                         Err(_) => Value::Undefined,
                     },
                     _ => Value::Undefined,
@@ -6508,7 +6504,7 @@ impl Vm {
                 }
             },
             Value::String(s) => match name {
-                "length" => Ok(Value::Int(s.chars().count() as i64)),
+                "length" => Ok(Value::Int(s.len_utf16() as i64)),
                 _ if is_string_method(name) => Ok(builtin_method("__string__", name)),
                 _ => Ok(Value::Undefined),
             },
@@ -7433,6 +7429,15 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
     let month = mp + if mp < 10 { 3 } else { -9 };
     let year = y + if month <= 2 { 1 } else { 0 };
     (year, month as u32, day as u32)
+}
+
+/// The UTF-16 code unit at index `i` of `s` as a single-unit JS string (a lone
+/// surrogate becomes a `Wtf` string), or `undefined` if out of range.
+fn unit_at(s: &JsString, i: usize) -> Value {
+    s.units()
+        .get(i)
+        .map(|u| Value::String(JsString::from_units(&[*u])))
+        .unwrap_or(Value::Undefined)
 }
 
 fn is_array_method(name: &str) -> bool {

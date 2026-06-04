@@ -494,4 +494,23 @@ await test("toLocaleString and private class fields match Node across the bounda
   assert.deepEqual(r.output, [42, '{"pub":1}']);
 });
 
+// ── UTF-16 string semantics across the host boundary ──
+// Strings are UTF-16-indexed: an astral char is 2 code units, charCodeAt yields
+// surrogate halves, and a high+low surrogate re-pair on concatenation.
+await test("strings are UTF-16-indexed (astral chars) like Node", async () => {
+  let r = await execute(`["😀".length, "a😀b".length, "a😀b".indexOf("b")]`, {});
+  assert.deepEqual(r.output, [2, 4, 3]);
+
+  r = await execute(`["😀".charCodeAt(0), "😀".charCodeAt(1), "😀".codePointAt(0)]`, {});
+  assert.deepEqual(r.output, [55357, 56832, 128512]);
+
+  // Re-pairing: charAt(0)+charAt(1) reconstructs the astral char.
+  r = await execute(`(function(){ const s = "😀"; return (s.charAt(0) + s.charAt(1)) === s; })()`, {});
+  assert.equal(r.output, true);
+
+  // A re-paired astral string marshals back to the host correctly.
+  r = await execute(`String.fromCharCode(55357, 56832)`, {});
+  assert.equal(r.output, "😀");
+});
+
 console.log(`\n${passed} marshalling checks passed.`);

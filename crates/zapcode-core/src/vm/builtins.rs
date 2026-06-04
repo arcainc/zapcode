@@ -699,18 +699,26 @@ pub fn call_global_fn(kind: &str, args: &[Value], heap: &mut Heap) -> Result<Val
         // Deep-copy so the result is independent of the original (reference semantics).
         "structuredClone" => heap.deep_clone(&arg)?,
         "String.fromCharCode" => {
-            let s: String = args
-                .iter()
-                .filter_map(|v| char::from_u32(v.to_number() as u32))
-                .collect();
-            Value::String(JsString::from(s.as_str()))
+            // Each argument is a UTF-16 code unit (truncated to 16 bits);
+            // adjacent surrogates combine into astral chars, and a lone
+            // surrogate is preserved (-> a Wtf JsString).
+            let units: Vec<u16> = args.iter().map(|v| v.to_number() as u32 as u16).collect();
+            Value::String(JsString::from_units(&units))
         }
         "String.fromCodePoint" => {
-            let s: String = args
-                .iter()
-                .filter_map(|v| char::from_u32(v.to_number() as u32))
-                .collect();
-            Value::String(JsString::from(s.as_str()))
+            // Each argument is a Unicode code point; encode it to UTF-16 units.
+            let mut units: Vec<u16> = Vec::new();
+            for v in args {
+                let cp = v.to_number() as u32;
+                match char::from_u32(cp) {
+                    Some(c) => {
+                        let mut buf = [0u16; 2];
+                        units.extend_from_slice(c.encode_utf16(&mut buf));
+                    }
+                    None => units.push(cp as u16),
+                }
+            }
+            Value::String(JsString::from_units(&units))
         }
         // Date statics. now() is 0 — the sandbox has no wall clock (deterministic
         // replay); inject the current time via a host tool when needed.
@@ -1681,9 +1689,18 @@ pub fn call_regexp_method(
             }
         }
     };
-    // Map a char index into a byte offset within `subject`.
-    let char_to_byte = |s: &str, char_idx: usize| -> usize {
-        s.char_indices().nth(char_idx).map_or(s.len(), |(b, _)| b)
+    // Map a UTF-16 code-unit index (JS `lastIndex` is in code units) into a byte
+    // offset within `subject`. For BMP text a unit index equals a char index; an
+    // index landing inside an astral char's surrogate pair maps to that char.
+    let char_to_byte = |s: &str, unit_idx: usize| -> usize {
+        let mut units = 0usize;
+        for (b, c) in s.char_indices() {
+            if units >= unit_idx {
+                return b;
+            }
+            units += c.len_utf16();
+        }
+        s.len()
     };
 
     Ok(match method {
@@ -1701,7 +1718,7 @@ pub fn call_regexp_method(
                     // the offset, so we reject any match that starts later.
                     match re.find_at(&subject, start_byte) {
                         Some(m) if !sticky || m.start() == start_byte => {
-                            let end_char = subject[..m.end()].chars().count();
+                            let end_char = subject[..m.end()].encode_utf16().count();
                             write_last_index(heap, end_char);
                             Some(Value::Bool(true))
                         }
@@ -1752,7 +1769,7 @@ pub fn call_regexp_method(
                         let new_char = match full {
                             Some(m) => {
                                 let end = m.end();
-                                let end_char = subject[..end].chars().count();
+                                let end_char = subject[..end].encode_utf16().count();
                                 if m.start() == end {
                                     end_char + 1
                                 } else {
@@ -1922,7 +1939,7 @@ fn alloc_match_result(
     // not bytes). Convert the regex crate's byte offset.
     let index_chars = caps
         .get(0)
-        .map(|m| subject[..m.start()].chars().count())
+        .map(|m| subject[..m.start()].encode_utf16().count())
         .unwrap_or(0);
     map.insert(Arc::from("index"), Value::Int(index_chars as i64));
     map.insert(Arc::from("input"), Value::String(subject.clone().into()));
@@ -1946,6 +1963,34 @@ fn alloc_match_result(
     Value::Object(heap.alloc_object(map))
 }
 
+/// First index `>= from` at which `needle` occurs in `haystack` (UTF-16 code
+/// units). An empty needle matches at `from` (clamped), like JS `indexOf`.
+fn find_units(haystack: &[u16], needle: &[u16], from: usize) -> Option<usize> {
+    let from = from.min(haystack.len());
+    if needle.is_empty() {
+        return Some(from);
+    }
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    haystack[from..]
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|p| p + from)
+}
+
+/// Last index `<= max_start` at which `needle` occurs in `haystack` (UTF-16).
+fn rfind_units(haystack: &[u16], needle: &[u16], max_start: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(max_start.min(haystack.len()));
+    }
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    let limit = max_start.min(haystack.len() - needle.len());
+    (0..=limit).rev().find(|&i| &haystack[i..i + needle.len()] == needle)
+}
+
 fn call_string_method(
     s: &JsString,
     method: &str,
@@ -1954,32 +1999,53 @@ fn call_string_method(
     heap: &mut Heap,
 ) -> Result<Option<Value>> {
     let result = match method {
-        "length" => Value::Int(s.len() as i64),
+        // All position/index string operations are indexed by UTF-16 code unit
+        // (JS semantics): a non-BMP char (e.g. an emoji) is two units, and
+        // `charAt`/`slice` can produce a lone surrogate (-> a `Wtf` JsString).
+        "length" => Value::Int(s.len_utf16() as i64),
         "charAt" => {
-            let idx = arg_int(args, 0) as usize;
-            match s.chars().nth(idx) {
-                Some(c) => Value::String(JsString::from(c.to_string().as_str())),
-                None => Value::String(JsString::from("")),
+            let idx = arg_int(args, 0);
+            let units = s.units();
+            if idx < 0 || idx as usize >= units.len() {
+                Value::String(JsString::from(""))
+            } else {
+                let i = idx as usize;
+                Value::String(JsString::from_units(&units[i..i + 1]))
             }
         }
         "charCodeAt" => {
-            let idx = arg_int(args, 0) as usize;
-            match s.chars().nth(idx) {
-                Some(c) => Value::Int(c as i64),
-                None => Value::Float(f64::NAN),
+            let idx = arg_int(args, 0);
+            let units = s.units();
+            if idx < 0 || idx as usize >= units.len() {
+                Value::Float(f64::NAN)
+            } else {
+                Value::Int(units[idx as usize] as i64)
             }
         }
         "codePointAt" => {
-            let idx = arg_int(args, 0).max(0) as usize;
-            match s.chars().nth(idx) {
-                Some(c) => Value::Int(c as i64),
-                None => Value::Undefined,
+            let idx = arg_int(args, 0);
+            let units = s.units();
+            if idx < 0 || idx as usize >= units.len() {
+                Value::Undefined
+            } else {
+                let i = idx as usize;
+                let u = units[i];
+                // Combine a high+low surrogate pair into the astral code point.
+                let cp = if (0xD800..=0xDBFF).contains(&u)
+                    && i + 1 < units.len()
+                    && (0xDC00..=0xDFFF).contains(&units[i + 1])
+                {
+                    0x10000 + (((u as u32 - 0xD800) << 10) | (units[i + 1] as u32 - 0xDC00))
+                } else {
+                    u as u32
+                };
+                Value::Int(cp as i64)
             }
         }
         "substr" => {
             // substr(start, length); negative start counts from the end.
-            let chars: Vec<char> = s.chars().collect();
-            let len = chars.len() as i64;
+            let units = s.units();
+            let len = units.len() as i64;
             let raw_start = arg_int(args, 0);
             let start = if raw_start < 0 {
                 (len + raw_start).max(0)
@@ -1988,124 +2054,89 @@ fn call_string_method(
             } as usize;
             let count = match args.get(1) {
                 Some(v) if !matches!(v, Value::Undefined) => v.to_number().max(0.0) as usize,
-                _ => chars.len() - start,
+                _ => units.len() - start,
             };
-            let end = (start + count).min(chars.len());
-            Value::String(JsString::from(chars[start..end].iter().collect::<String>().as_str()))
+            let end = (start + count).min(units.len());
+            Value::String(JsString::from_units(&units[start..end]))
         }
         "indexOf" => {
-            let search = arg_str(args, 0, heap);
-            // Optional fromIndex (in chars). Search the remainder, then map the
-            // byte position back to a char index.
+            let needle: Vec<u16> = arg_str(args, 0, heap).encode_utf16().collect();
+            let units = s.units();
             let from = match args.get(1) {
-                Some(v) => (v.to_number().max(0.0)) as usize,
+                Some(v) => v.to_number().max(0.0) as usize,
                 None => 0,
             };
-            let byte_start = s.char_indices().nth(from).map_or(s.len(), |(i, _)| i);
-            match s[byte_start..].find(&*search) {
-                Some(rel) => Value::Int(s[..byte_start + rel].chars().count() as i64),
-                None => Value::Int(-1),
-            }
+            Value::Int(find_units(&units, &needle, from).map_or(-1, |p| p as i64))
         }
         "lastIndexOf" => {
-            let search = arg_str(args, 0, heap);
-            // Optional fromIndex (in chars): the match must START at or before it.
-            // Default is +Infinity (search the whole string).
-            let total_chars = s.chars().count();
-            let from_char = match args.get(1) {
+            let needle: Vec<u16> = arg_str(args, 0, heap).encode_utf16().collect();
+            let units = s.units();
+            let max_start = match args.get(1) {
                 Some(v) if !matches!(v, Value::Undefined) => {
                     let n = v.to_number();
                     if n.is_nan() {
-                        total_chars
+                        units.len()
                     } else {
-                        (n.max(0.0) as usize).min(total_chars)
+                        (n.max(0.0) as usize).min(units.len())
                     }
                 }
-                _ => total_chars,
+                _ => units.len(),
             };
-            // Last byte at which a match may begin: the byte offset of char
-            // `from_char` (or end of string).
-            let max_start_byte = s
-                .char_indices()
-                .nth(from_char)
-                .map_or(s.len(), |(i, _)| i);
-            // Find the last match whose start byte is <= max_start_byte.
-            let result = s
-                .match_indices(&*search)
-                .filter(|(byte, _)| *byte <= max_start_byte)
-                .last()
-                .map(|(byte, _)| s[..byte].chars().count() as i64)
-                .unwrap_or(-1);
-            Value::Int(result)
+            Value::Int(rfind_units(&units, &needle, max_start).map_or(-1, |p| p as i64))
         }
         "includes" => {
-            let search = arg_str(args, 0, heap);
-            // Optional position (in chars): search begins there.
+            let needle: Vec<u16> = arg_str(args, 0, heap).encode_utf16().collect();
+            let units = s.units();
             let from = match args.get(1) {
                 Some(v) if !matches!(v, Value::Undefined) => v.to_number().max(0.0) as usize,
                 _ => 0,
             };
-            let byte_start = s.char_indices().nth(from).map_or(s.len(), |(i, _)| i);
-            Value::Bool(s[byte_start..].contains(&*search))
+            Value::Bool(find_units(&units, &needle, from).is_some())
         }
         "startsWith" => {
-            let search = arg_str(args, 0, heap);
+            let needle: Vec<u16> = arg_str(args, 0, heap).encode_utf16().collect();
+            let units = s.units();
             let pos = args.get(1).map(|v| v.to_number().max(0.0) as usize).unwrap_or(0);
-            let byte_start = s.char_indices().nth(pos).map_or(s.len(), |(i, _)| i);
-            Value::Bool(s[byte_start..].starts_with(&*search))
+            Value::Bool(pos <= units.len() && units[pos..].starts_with(&needle))
         }
         "endsWith" => {
-            let search = arg_str(args, 0, heap);
-            // The optional end position treats the string as if it were that many
-            // characters long.
-            let byte_end = match args.get(1) {
+            let needle: Vec<u16> = arg_str(args, 0, heap).encode_utf16().collect();
+            let units = s.units();
+            // The optional end position treats the string as that many units long.
+            let end = match args.get(1) {
                 Some(v) if !matches!(v, Value::Undefined) => {
-                    let c = v.to_number().max(0.0) as usize;
-                    s.char_indices().nth(c).map_or(s.len(), |(i, _)| i)
+                    (v.to_number().max(0.0) as usize).min(units.len())
                 }
-                _ => s.len(),
+                _ => units.len(),
             };
-            Value::Bool(s[..byte_end].ends_with(&*search))
+            Value::Bool(units[..end].ends_with(&needle))
         }
         "slice" => {
-            // Index by CHARACTER position (consistent with charAt/substr/indexOf),
-            // not raw bytes — slicing `&s[byte..byte]` on a char-derived index would
-            // land mid-codepoint on multibyte input and panic (host SIGABRT).
-            let chars: Vec<char> = s.chars().collect();
-            let len = chars.len() as i64;
-            let start = normalize_index(arg_int(args, 0), len).min(chars.len());
+            let units = s.units();
+            let len = units.len() as i64;
+            let start = normalize_index(arg_int(args, 0), len).min(units.len());
             let end = if args.len() > 1 {
-                normalize_index(arg_int(args, 1), len).min(chars.len())
+                normalize_index(arg_int(args, 1), len).min(units.len())
             } else {
-                chars.len()
+                units.len()
             };
             if start >= end {
                 Value::String(JsString::from(""))
             } else {
-                Value::String(JsString::from(
-                    chars[start..end].iter().collect::<String>().as_str(),
-                ))
+                Value::String(JsString::from_units(&units[start..end]))
             }
         }
         "substring" => {
-            // Character-indexed (see `slice`): byte-indexing here panics on
-            // multibyte input (e.g. `"ééé".substring(1,2)`).
-            let chars: Vec<char> = s.chars().collect();
-            let len = chars.len();
+            let units = s.units();
+            let len = units.len();
             let start = (arg_int(args, 0).max(0) as usize).min(len);
             let end = if args.len() > 1 {
                 (arg_int(args, 1).max(0) as usize).min(len)
             } else {
                 len
             };
-            let (start, end) = if start > end {
-                (end, start)
-            } else {
-                (start, end)
-            };
-            Value::String(JsString::from(
-                chars[start..end].iter().collect::<String>().as_str(),
-            ))
+            let (start, end) = if start > end { (end, start) } else { (start, end) };
+            Value::String(JsString::from_units(&units[start..end]))
         }
         "toUpperCase" => Value::String(JsString::from(s.to_uppercase().as_str())),
         "toLowerCase" => Value::String(JsString::from(s.to_lowercase().as_str())),
@@ -2140,7 +2171,7 @@ fn call_string_method(
             } else {
                 " ".to_string()
             };
-            let current_len = s.len();
+            let current_len = s.len_utf16();
             if current_len >= target_len {
                 Value::String(s.clone().into())
             } else {
@@ -2160,7 +2191,7 @@ fn call_string_method(
             } else {
                 " ".to_string()
             };
-            let current_len = s.len();
+            let current_len = s.len_utf16();
             if current_len >= target_len {
                 Value::String(s.clone().into())
             } else {
@@ -2208,8 +2239,11 @@ fn call_string_method(
             }
             let separator = arg_str(args, 0, heap);
             let mut parts: Vec<Value> = if separator.is_empty() {
-                s.chars()
-                    .map(|c| Value::String(JsString::from(c.to_string().as_str())))
+                // Empty separator splits into individual UTF-16 code units
+                // (an astral char becomes its two lone surrogates), like JS.
+                s.units()
+                    .iter()
+                    .map(|u| Value::String(JsString::from_units(&[*u])))
                     .collect()
             } else {
                 s.split(&*separator)
@@ -2354,17 +2388,16 @@ fn call_string_method(
         }
         "at" => {
             let idx = arg_int(args, 0);
-            let len = s.chars().count() as i64;
+            let units = s.units();
+            let len = units.len() as i64;
             // A negative index counts from the end; an index out of range (either
             // direction, including too-negative) yields `undefined` — no clamping.
             let resolved = if idx < 0 { len + idx } else { idx };
             if resolved < 0 || resolved >= len {
                 Value::Undefined
             } else {
-                match s.chars().nth(resolved as usize) {
-                    Some(c) => Value::String(JsString::from(c.to_string().as_str())),
-                    None => Value::Undefined,
-                }
+                let i = resolved as usize;
+                Value::String(JsString::from_units(&units[i..i + 1]))
             }
         }
         "normalize" => {
