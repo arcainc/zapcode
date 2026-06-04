@@ -876,3 +876,48 @@ fn computed_method_names_unsupported() {
         r#"TypeError("undefined is not a function")"#
     );
 }
+
+#[test]
+fn class_declared_inside_function_constructs_and_runs() {
+    // A class declared inside a function body must compile its constructor/
+    // methods/fields into the GLOBAL function table. Previously these used the
+    // per-function sub-compiler's local indices (which were dropped), so the
+    // member closures dangled into the wrong functions and instantiating one
+    // recursed until the stack-depth guard fired.
+    assert_eq!(
+        run_str("function make(){ class C { constructor(){ this.v = 5; } } return new C().v; } make()"),
+        "5"
+    );
+    assert_eq!(
+        run_str("(function(){ class C { m(){ return 9; } } return new C().m(); })()"),
+        "9"
+    );
+    assert_eq!(
+        run_str("(function(){ class C { v = 5; } return new C().v; })()"),
+        "5"
+    );
+    assert_eq!(
+        run_str("(function(){ class C { get x(){ return 42; } } return new C().x; })()"),
+        "42"
+    );
+    // Class expression assigned to a local inside a function.
+    assert_eq!(
+        run_str("(function(){ const C = class { m(){ return 6; } }; return new C().m(); })()"),
+        "6"
+    );
+    // Class nested inside a method body of an outer class (sub-sub-compiler).
+    assert_eq!(
+        run_str("(function(){ class Outer { make(){ class Inner { go(){ return 7; } } return new Inner().go(); } } return new Outer().make(); })()"),
+        "7"
+    );
+    // extends + super across classes defined inside a function.
+    assert_eq!(
+        run_str("(function(){ class A { greet(){ return 'a'; } } class B extends A { greet(){ return super.greet() + 'b'; } } return new B().greet(); })()"),
+        "ab"
+    );
+    // Factory pattern: a closure returning fresh instances with per-instance state.
+    assert_eq!(
+        run_str("function mk(){ class K { constructor(){ this.n = 0; } inc(){ return ++this.n; } } return new K(); } const c = mk(); `${c.inc()},${c.inc()}`"),
+        "1,2"
+    );
+}

@@ -459,4 +459,19 @@ await test("property enumeration order matches Node across the boundary", async 
   assert.equal(r.output, "123");
 });
 
+// ── class declared inside a function constructs (no runaway recursion) ──
+// Class members compiled inside a function body used to dangle into the wrong
+// global function slots, so instantiating recursed to the stack-depth limit.
+await test("class declared inside a function works across the host boundary", async () => {
+  let r = await execute(`function make(){ class C { constructor(){ this.v = 5; } } return new C().v; } make()`, {});
+  assert.equal(r.output, 5);
+
+  r = await execute(`(function(){ class C { m(){ return 9; } } return new C().m(); })()`, {});
+  assert.equal(r.output, 9);
+
+  // Factory pattern with per-instance state.
+  r = await execute(`(function(){ function mk(){ class K { constructor(){ this.n = 0; } inc(){ return ++this.n; } } return new K(); } const c = mk(); return c.inc() + c.inc(); })()`, {});
+  assert.equal(r.output, 3);
+});
+
 console.log(`\n${passed} marshalling checks passed.`);
