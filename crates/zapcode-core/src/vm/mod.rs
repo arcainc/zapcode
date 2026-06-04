@@ -6707,6 +6707,16 @@ fn execute_map_method(
     }
 }
 
+/// Maximum absolute time value (in ms) of a valid JS Date: ±8.64e15. Anything
+/// beyond this is an Invalid Date (ECMA-262 "time clip").
+const MAX_TIME_MS: u64 = 8_640_000_000_000_000;
+
+/// A year whose magnitude exceeds this can never yield an in-range time value
+/// (the valid window is roughly ±271821..=275760). Reject earlier years before
+/// the `days_from_civil` arithmetic so a huge bare-integer string can't overflow
+/// the i64 math (which would panic in debug builds); they all map to NaN anyway.
+const MAX_TIME_YEAR: i64 = 300_000;
+
 fn make_date_object(millis: i64, heap: &mut Heap) -> Value {
     let mut obj = IndexMap::new();
     obj.insert(Arc::from("__date_ms__"), Value::Int(millis));
@@ -6735,52 +6745,80 @@ fn construct_date(args: &[Value], heap: &mut Heap) -> Value {
             },
             other => {
                 let n = other.to_number();
-                if n.is_finite() {
+                // ECMA-262 time-clip: only finite |t| <= 8.64e15 is a valid Date.
+                if n.is_finite() && (n as i64).unsigned_abs() <= MAX_TIME_MS {
                     make_date_object(n as i64, heap)
                 } else {
                     make_invalid_date(heap)
                 }
             }
         },
-        _ => {
-            let part = |i: usize, default: i64| -> i64 {
-                args.get(i).map(|v| v.to_number() as i64).unwrap_or(default)
-            };
-            let year = part(0, 1970);
-            let month = part(1, 0); // 0-indexed
-            let day = part(2, 1);
-            let hours = part(3, 0);
-            let minutes = part(4, 0);
-            let seconds = part(5, 0);
-            let ms = part(6, 0);
-            let days = days_from_civil(year, month + 1, day);
-            let millis = days * 86_400_000
-                + hours * 3_600_000
-                + minutes * 60_000
-                + seconds * 1_000
-                + ms;
-            make_date_object(millis, heap)
-        }
+        _ => match date_from_components(args) {
+            Some(millis) => make_date_object(millis, heap),
+            None => make_invalid_date(heap),
+        },
     }
 }
 
-/// `Date.UTC(year, monthIndex, day, ...)` -> epoch millis (UTC).
+/// `Date.UTC(year, monthIndex, day, ...)` -> epoch millis (UTC), or NaN for any
+/// non-finite component / out-of-range time value (matches Node).
 pub(crate) fn date_utc_millis(args: &[Value]) -> f64 {
-    let part = |i: usize, default: i64| -> i64 {
-        args.get(i).map(|v| v.to_number() as i64).unwrap_or(default)
+    date_from_components(args).map_or(f64::NAN, |ms| ms as f64)
+}
+
+/// Shared `(year, monthIndex, day, hours, minutes, seconds, ms)` -> epoch millis
+/// used by `Date.UTC` and the multi-arg `Date` constructor. Returns None (→ NaN /
+/// Invalid Date) if any supplied component is non-finite or the resulting time
+/// value falls outside ±8.64e15. Applies ECMA-262 MakeFullYear: a year in 0..=99
+/// maps to 1900+year.
+fn date_from_components(args: &[Value]) -> Option<i64> {
+    // ToNumber each supplied component; short-circuit to NaN on any non-finite.
+    let part = |i: usize, default: i64| -> Option<i64> {
+        match args.get(i) {
+            Some(v) => {
+                let n = v.to_number();
+                if n.is_finite() {
+                    Some(n as i64)
+                } else {
+                    None
+                }
+            }
+            None => Some(default),
+        }
     };
-    let year = part(0, 1970);
-    let month = part(1, 0);
-    let day = part(2, 1);
-    let hours = part(3, 0);
-    let minutes = part(4, 0);
-    let seconds = part(5, 0);
-    let ms = part(6, 0);
-    (days_from_civil(year, month + 1, day) * 86_400_000
-        + hours * 3_600_000
-        + minutes * 60_000
-        + seconds * 1_000
-        + ms) as f64
+    let year = part(0, 1970)?;
+    let month = part(1, 0)?; // 0-indexed
+    let day = part(2, 1)?;
+    let hours = part(3, 0)?;
+    let minutes = part(4, 0)?;
+    let seconds = part(5, 0)?;
+    let ms = part(6, 0)?;
+    // MakeFullYear: a two-digit year (0..=99) is offset into the 1900s.
+    let mut year = year as i128;
+    if (0..=99).contains(&year) {
+        year += 1900;
+    }
+    // Normalize a (possibly out-of-0..11) month into the year so `days_from_civil`
+    // only ever sees a bounded month. Done in i128 so huge components never panic.
+    year += (month as i128).div_euclid(12);
+    let month0 = (month as i128).rem_euclid(12); // 0..=11
+    // Reject years outside the representable window before the i64 math (which
+    // would otherwise overflow / panic in debug builds); they are NaN anyway.
+    if year.unsigned_abs() > MAX_TIME_YEAR as u128 {
+        return None;
+    }
+    // First-of-month day count uses bounded inputs; the arbitrary `day` is folded
+    // in afterward in i128 to stay overflow-free.
+    let days = days_from_civil(year as i64, (month0 as i64) + 1, 1) as i128 + (day as i128 - 1);
+    let millis = days * 86_400_000
+        + hours as i128 * 3_600_000
+        + minutes as i128 * 60_000
+        + seconds as i128 * 1_000
+        + ms as i128;
+    if millis.unsigned_abs() > MAX_TIME_MS as u128 {
+        return None;
+    }
+    Some(millis as i64)
 }
 
 /// Days since the Unix epoch for a civil (year, month 1-12, day) date (UTC).
@@ -6817,6 +6855,11 @@ pub(crate) fn parse_date_string(s: &str) -> Option<i64> {
     if dp.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
+    // A year beyond the representable Date window (e.g. a bare far-future integer
+    // string like "1234567890123") is Invalid Date; bail before the i64 math.
+    if year.unsigned_abs() > MAX_TIME_YEAR as u64 {
+        return None;
+    }
     let mut millis = days_from_civil(year, month, day) * 86_400_000;
 
     if let Some(time) = time_part {
@@ -6850,8 +6893,26 @@ pub(crate) fn parse_date_string(s: &str) -> Option<i64> {
             },
             None => (0, 0),
         };
+        // Range-check the clock like Node: minutes/seconds 0..=59 and hours
+        // 0..=24, with 24:00:00.000 the only value allowed at hour 24 (any
+        // non-zero minute/second/ms makes it Invalid Date, not a rollover).
+        if !(0..=59).contains(&minutes) || !(0..=59).contains(&seconds) {
+            return None;
+        }
+        if hours == 24 {
+            if minutes != 0 || seconds != 0 || frac_ms != 0 {
+                return None;
+            }
+        } else if !(0..=23).contains(&hours) {
+            return None;
+        }
         millis += hours * 3_600_000 + minutes * 60_000 + seconds * 1_000 + frac_ms;
         millis -= tz_offset_min * 60_000;
+    }
+    // A time value outside ±8.64e15 ms is an Invalid Date (so a bare far-future
+    // year string like "1234567890123" yields NaN rather than a garbage date).
+    if millis.unsigned_abs() > MAX_TIME_MS {
+        return None;
     }
     Some(millis)
 }

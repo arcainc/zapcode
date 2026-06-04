@@ -176,4 +176,31 @@ await test("user __-keys round-trip through a tool argument and back", async () 
   assert.equal(r.output, "7:hi");
 });
 
+// ── Date edge-correctness marshals across the host boundary (no abort) ──
+// Out-of-range ISO clock fields, far-future bare-integer strings, non-finite
+// Date.UTC components, two-digit-year MakeFullYear, and the ±8.64e15 time clip
+// must each reach the host as the Node-matching value, never crash the process.
+await test("date conformance edges marshal to the host like Node", async () => {
+  // ISO hour > 24 is Invalid Date (NaN time value), not a rollover.
+  let r = await execute(`isNaN(new Date("2020-01-01T25:00:00Z").getTime())`, {});
+  assert.equal(r.output, true);
+  // Hour 24 (only as 24:00:00.000) is the one allowed over-23 value.
+  r = await execute(`new Date("2020-01-01T24:00:00Z").toISOString()`, {});
+  assert.equal(r.output, "2020-01-02T00:00:00.000Z");
+  // A bare far-future integer string overflows the Date window -> NaN.
+  r = await execute(`isNaN(new Date("1234567890123").getTime())`, {});
+  assert.equal(r.output, true);
+  // A non-finite Date.UTC component yields NaN, not a silent 0.
+  r = await execute(`isNaN(Date.UTC(2020, NaN, 1))`, {});
+  assert.equal(r.output, true);
+  // Two-digit year maps to 1900+yy (MakeFullYear) through Date.UTC.
+  r = await execute(`new Date(Date.UTC(99, 0, 1)).getUTCFullYear()`, {});
+  assert.equal(r.output, 1999);
+  // ±8.64e15 ms is the valid boundary; one past it clips to Invalid Date.
+  r = await execute(`new Date(8640000000000000).getTime()`, {});
+  assert.equal(r.output, 8640000000000000);
+  r = await execute(`isNaN(new Date(8640000000000001).getTime())`, {});
+  assert.equal(r.output, true);
+});
+
 console.log(`\n${passed} marshalling checks passed.`);
