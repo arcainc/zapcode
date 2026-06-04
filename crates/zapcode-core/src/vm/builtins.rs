@@ -2670,6 +2670,44 @@ fn call_array_method(
 
 // ── Object static methods ────────────────────────────────────────────
 
+/// If `s` is a canonical array-index key (per ECMA-262: `ToString(ToUint32(s))
+/// === s` and the value is not 2^32-1), return that integer. Such keys sort
+/// *ascending and before* string keys in property enumeration order.
+pub fn array_index_key(s: &str) -> Option<u32> {
+    // parse::<u32> already rejects "+1", " 1", "-1", "1.0", "" and overflow; the
+    // round-trip check additionally rejects non-canonical forms like "01".
+    let n: u32 = s.parse().ok()?;
+    if n == u32::MAX {
+        return None;
+    }
+    (n.to_string() == s).then_some(n)
+}
+
+/// Own enumerable property keys of `map` in ECMA-262 OrdinaryOwnPropertyKeys
+/// order: integer-index keys ascending, then the remaining string keys in
+/// insertion order. Reserved internal markers are filtered out. This is the
+/// single ordering used by Object.keys/values/entries, for-in (which desugars
+/// to Object.keys), and JSON.stringify so they all agree.
+pub fn ordered_visible_keys(map: &IndexMap<Arc<str>, Value>) -> Vec<Arc<str>> {
+    let mut indices: Vec<(u32, Arc<str>)> = Vec::new();
+    let mut strings: Vec<Arc<str>> = Vec::new();
+    for k in map.keys() {
+        if is_internal_marker_key(k) {
+            continue;
+        }
+        match array_index_key(k) {
+            Some(n) => indices.push((n, k.clone())),
+            None => strings.push(k.clone()),
+        }
+    }
+    indices.sort_by_key(|(n, _)| *n);
+    indices
+        .into_iter()
+        .map(|(_, k)| k)
+        .chain(strings)
+        .collect()
+}
+
 fn call_object_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<Option<Value>> {
     let first = args.first().cloned().unwrap_or(Value::Undefined);
     match method {
@@ -2678,9 +2716,9 @@ fn call_object_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<O
                 Value::Object(h) => heap
                     .object(*h)
                     .map(|m| {
-                        m.keys()
-                            .filter(|k| !is_internal_marker_key(k))
-                            .map(|k| Value::String(k.clone()))
+                        ordered_visible_keys(m)
+                            .into_iter()
+                            .map(Value::String)
                             .collect()
                     })
                     .unwrap_or_default(),
@@ -2697,9 +2735,9 @@ fn call_object_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<O
                 Value::Object(h) => heap
                     .object(*h)
                     .map(|m| {
-                        m.iter()
-                            .filter(|(k, _)| !is_internal_marker_key(k))
-                            .map(|(_, v)| v.clone())
+                        ordered_visible_keys(m)
+                            .into_iter()
+                            .filter_map(|k| m.get(&k).cloned())
                             .collect()
                     })
                     .unwrap_or_default(),
@@ -2713,9 +2751,11 @@ fn call_object_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<O
                 Value::Object(h) => heap
                     .object(*h)
                     .map(|m| {
-                        m.iter()
-                            .filter(|(k, _)| !is_internal_marker_key(k))
-                            .map(|(k, v)| (Value::String(k.clone()), v.clone()))
+                        ordered_visible_keys(m)
+                            .into_iter()
+                            .filter_map(|k| {
+                                m.get(&k).cloned().map(|v| (Value::String(k), v))
+                            })
                             .collect()
                     })
                     .unwrap_or_default(),

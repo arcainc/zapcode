@@ -2394,10 +2394,13 @@ impl Vm {
                 }
                 seen.push(*h);
                 let mut pairs: Vec<(String, String)> = Vec::new();
-                for (k, v) in map.iter() {
-                    if builtins::is_internal_marker_key(k) {
-                        continue;
-                    }
+                // ECMA-262 key order: integer-index keys ascending, then string
+                // keys in insertion order (same order as Object.keys / for-in).
+                for k in builtins::ordered_visible_keys(&map) {
+                    let v = match map.get(&k) {
+                        Some(v) => v,
+                        None => continue,
+                    };
                     if let Some(w) = whitelist {
                         if !w.iter().any(|x| x == k.as_ref()) {
                             continue;
@@ -2405,7 +2408,7 @@ impl Vm {
                     }
                     // Accessor keys serialize their getter's RESULT, not the
                     // stored function (setter-only -> undefined -> omitted).
-                    let v = self.enumerable_value(&Value::Object(*h), k, v.clone())?;
+                    let v = self.enumerable_value(&Value::Object(*h), &k, v.clone())?;
                     let v = if let Some(f) = replacer {
                         self.call_function_internal(f, vec![
                             Value::String(k.clone()),
@@ -4764,13 +4767,8 @@ impl Vm {
                             {
                                 let obj = args[0].clone();
                                 let Value::Object(h) = &obj else { unreachable!() };
-                                let keys: Vec<Arc<str>> = self
-                                    .heap
-                                    .object_map(*h)
-                                    .keys()
-                                    .filter(|k| !builtins::is_internal_marker_key(k))
-                                    .cloned()
-                                    .collect();
+                                let keys =
+                                    builtins::ordered_visible_keys(&self.heap.object_map(*h));
                                 let want_entries = method_name.as_ref() == "entries";
                                 let mut out = Vec::with_capacity(keys.len());
                                 for k in keys {
@@ -4804,13 +4802,8 @@ impl Vm {
                                 };
                                 for src in args.iter().skip(1).cloned().collect::<Vec<_>>() {
                                     let Value::Object(sh) = &src else { continue };
-                                    let keys: Vec<Arc<str>> = self
-                                        .heap
-                                        .object_map(*sh)
-                                        .keys()
-                                        .filter(|k| !builtins::is_internal_marker_key(k))
-                                        .cloned()
-                                        .collect();
+                                    let keys =
+                                        builtins::ordered_visible_keys(&self.heap.object_map(*sh));
                                     for k in keys {
                                         let stored = self
                                             .heap
