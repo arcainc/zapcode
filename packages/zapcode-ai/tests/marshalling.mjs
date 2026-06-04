@@ -297,4 +297,30 @@ await test("strict JSON.parse + escapes + reviver this marshal to the host like 
   assert.equal(r.output, '{"a":1}');
 });
 
+// ── i64 arithmetic degrades to f64 past 2^53 (host-boundary numeric parity) ──
+// Past Number.MAX_SAFE_INTEGER an Int result must round like a JS double, and
+// the value must marshal across the napi boundary as a plain JS number matching
+// Node's own arithmetic (it used to stay an exact i64 → the wrong value).
+await test("large-integer arithmetic + parseInt overflow marshal to the host like Node", async () => {
+  let r = await execute(`9007199254740991 + 2`, {});
+  assert.equal(typeof r.output, "number");
+  assert.equal(r.output, 9007199254740991 + 2); // 9007199254740992 in JS
+  assert.equal(r.output, 9007199254740992);
+
+  r = await execute(`9007199254740992 + 1 === 9007199254740992`, {});
+  assert.equal(r.output, true);
+
+  r = await execute(`(function(){let x=9007199254740992; return x+1===x})()`, {});
+  assert.equal(r.output, true);
+
+  // parseInt past i64 range returns the f64, not NaN.
+  r = await execute(`parseInt("9999999999999999999")`, {});
+  assert.equal(typeof r.output, "number");
+  assert.equal(r.output, parseInt("9999999999999999999")); // 1e19
+  assert.equal(r.output, 1e19);
+
+  r = await execute(`String(parseInt("9999999999999999999"))`, {});
+  assert.equal(r.output, "10000000000000000000");
+});
+
 console.log(`\n${passed} marshalling checks passed.`);

@@ -258,16 +258,29 @@ fn js_parse_int(s: &str, radix: u32) -> f64 {
     if digits.is_empty() {
         return f64::NAN;
     }
-    match i64::from_str_radix(&digits, radix) {
-        Ok(n) => {
-            let n = n as f64;
-            if neg {
-                -n
-            } else {
-                n
-            }
+    // JS `parseInt` has no integer range limit: it returns an f64, so a value
+    // wider than i64 must not become NaN. On i64 overflow, recover the f64 value
+    // (matching the rounding a double parse produces in Node, e.g.
+    // `parseInt("9999999999999999999")` -> 1e19, not NaN).
+    let n = match i64::from_str_radix(&digits, radix) {
+        Ok(n) => n as f64,
+        // Base 10 has an exact, correctly-rounded f64 string parser; use it so the
+        // result matches Node's mathematical-value-to-double conversion bit for bit.
+        Err(_) if radix == 10 => digits.parse::<f64>().unwrap_or(f64::NAN),
+        // Other radixes have no string->f64 parser; accumulate digit by digit.
+        // (Overflowing a non-decimal radix in `parseInt` is exceedingly rare.)
+        Err(_) => {
+            let radix_f = radix as f64;
+            digits.chars().fold(0.0_f64, |acc, c| {
+                // `digits` only contains characters that passed `is_digit(radix)`.
+                acc * radix_f + c.to_digit(radix).unwrap_or(0) as f64
+            })
         }
-        Err(_) => f64::NAN,
+    };
+    if neg {
+        -n
+    } else {
+        n
     }
 }
 

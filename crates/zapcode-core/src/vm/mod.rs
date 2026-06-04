@@ -3416,7 +3416,7 @@ impl Vm {
                 let right = self.to_primitive(&right, ToPrimitiveHint::Default)?;
                 let result = match (&left, &right) {
                     (Value::Int(a), Value::Int(b)) => match a.checked_add(*b) {
-                        Some(r) => Value::Int(r),
+                        Some(r) => int_arith_result(r),
                         None => Value::Float(*a as f64 + *b as f64),
                     },
                     (Value::Float(a), Value::Float(b)) => Value::Float(a + b),
@@ -3469,7 +3469,7 @@ impl Vm {
                 let right = self.to_primitive(&right, ToPrimitiveHint::Number)?;
                 let result = match (&left, &right) {
                     (Value::Int(a), Value::Int(b)) => match a.checked_sub(*b) {
-                        Some(r) => Value::Int(r),
+                        Some(r) => int_arith_result(r),
                         None => Value::Float(*a as f64 - *b as f64),
                     },
                     _ => Value::Float(
@@ -3485,7 +3485,7 @@ impl Vm {
                 let right = self.to_primitive(&right, ToPrimitiveHint::Number)?;
                 let result = match (&left, &right) {
                     (Value::Int(a), Value::Int(b)) => match a.checked_mul(*b) {
-                        Some(r) => Value::Int(r),
+                        Some(r) => int_arith_result(r),
                         None => Value::Float(*a as f64 * *b as f64),
                     },
                     _ => Value::Float(
@@ -5200,7 +5200,10 @@ impl Vm {
             Instruction::Increment => {
                 let val = self.pop()?;
                 let result = match val {
-                    Value::Int(n) => Value::Int(n + 1),
+                    Value::Int(n) => match n.checked_add(1) {
+                        Some(r) => int_arith_result(r),
+                        None => Value::Float(n as f64 + 1.0),
+                    },
                     _ => Value::Float(val.to_number_heap(&self.heap) + 1.0),
                 };
                 self.push(result)?;
@@ -5208,7 +5211,10 @@ impl Vm {
             Instruction::Decrement => {
                 let val = self.pop()?;
                 let result = match val {
-                    Value::Int(n) => Value::Int(n - 1),
+                    Value::Int(n) => match n.checked_sub(1) {
+                        Some(r) => int_arith_result(r),
+                        None => Value::Float(n as f64 - 1.0),
+                    },
                     _ => Value::Float(val.to_number_heap(&self.heap) - 1.0),
                 };
                 self.push(result)?;
@@ -6394,6 +6400,29 @@ fn is_frozen_object(h: Handle, heap: &Heap) -> bool {
         heap.object(h).and_then(|m| m.get("__frozen__")),
         Some(Value::Bool(true))
     )
+}
+
+/// JS `Number.MAX_SAFE_INTEGER` (`2^53 - 1`). Integer results outside
+/// `[-MAX_SAFE_INTEGER, MAX_SAFE_INTEGER]` cannot be represented exactly by an
+/// f64, so for parity with JS double arithmetic we must stop tracking them as a
+/// precise i64 and let the value round like a double would.
+const MAX_SAFE_INTEGER_I64: i64 = 9_007_199_254_740_991;
+
+/// Build the [`Value`] for an i64 arithmetic result while matching JS double
+/// semantics past the safe-integer boundary.
+///
+/// JS has no integer type: every number is an f64. zapcode keeps small integers
+/// as `Value::Int` for speed/precision, but the result of `a (+|-|*) b` must
+/// behave like a double once its magnitude exceeds `MAX_SAFE_INTEGER`, where
+/// doubles can no longer represent consecutive integers (e.g. `2^53 + 1`
+/// rounds to `2^53`). Keeping the exact i64 there would diverge from Node, so
+/// we fall back to f64 and let it round.
+fn int_arith_result(r: i64) -> Value {
+    if r.unsigned_abs() <= MAX_SAFE_INTEGER_I64 as u64 {
+        Value::Int(r)
+    } else {
+        Value::Float(r as f64)
+    }
 }
 
 fn js_to_int32(n: f64) -> i32 {

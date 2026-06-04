@@ -25,8 +25,6 @@
 //!     plain decimal here (e.g. `1e21` → `1000000000000000000000`).
 //!   - `Number.MAX_VALUE` / `MIN_VALUE` / `EPSILON` stringify as long decimals (no
 //!     `e` form); their *numeric* relationships are asserted instead.
-//!   - `Number.MAX_SAFE_INTEGER + 2` stays exact (`...993`) because constant is an
-//!     integer and `+2` is i128 arithmetic (JS loses precision → `...992`).
 //!   - `Math.min(1, NaN)` → `1` and `Math.max(1, NaN)` → `1` are NaN-poisoning
 //!     differences when NaN is not the first arg (asserted as zapcode's actual).
 //!   - `Math.trunc(-0.5)` / `Math.hypot()` → `-0` (JS String() → `0`): negative-zero
@@ -513,6 +511,28 @@ fn parse_int_number_namespace() {
     assert_eq!(run_str("Number.parseInt('ff', 16)"), "255");
 }
 
+#[test]
+fn parse_int_overflows_to_f64() {
+    // A string wider than i64 range returns the f64 value in JS, not NaN.
+    // (Node: parseInt("9999999999999999999") === 1e19.)  Previously zapcode's
+    // i64::from_str_radix overflowed and yielded NaN.
+    assert_eq!(
+        run_str("String(parseInt('9999999999999999999'))"),
+        "10000000000000000000"
+    );
+    assert_eq!(
+        run_str("String(parseInt('-9999999999999999999'))"),
+        "-10000000000000000000"
+    );
+    // It stays a finite number, not NaN.
+    assert_eq!(run_str("Number.isNaN(parseInt('9999999999999999999'))"), "false");
+    // Even-wider input keeps round-tripping as a double (matches Node's 1e32).
+    assert_eq!(
+        run_str("parseInt('99999999999999999999999999999999') === 1e32"),
+        "true"
+    );
+}
+
 // ============================================================================
 // parseFloat
 // ============================================================================
@@ -935,6 +955,30 @@ fn precision_loss_at_safe_integer_boundary() {
     assert_eq!(run_str("2 ** 53"), "9007199254740992");
     assert_eq!(run_str("9007199254740993"), "9007199254740992");
     assert_eq!(run_str("2 ** 53 === 2 ** 53 + 1"), "true"); // both round to the same f64
+
+    // Integer-literal arithmetic must also round once the result leaves the safe
+    // range: JS has no i64, so `a (+|-|*) b` behaves like a double past 2^53-1.
+    // Previously zapcode kept these as exact i64s (`...993`), diverging from Node.
+    assert_eq!(run_str("String(9007199254740991 + 2)"), "9007199254740992");
+    assert_eq!(run_str("9007199254740992 + 1 === 9007199254740992"), "true");
+    assert_eq!(
+        run_str("(function(){let x=9007199254740992; return x+1===x})()"),
+        "true"
+    );
+    // Subtraction toward larger magnitude and multiplication round the same way.
+    assert_eq!(run_str("9007199254740992 - (-1)"), "9007199254740992");
+    assert_eq!(run_str("4503599627370496 * 2 + 1"), "9007199254740992");
+    // ++ / -- share the path: incrementing past the boundary rounds, not panics.
+    assert_eq!(
+        run_str("(function(){let x=9007199254740991; x++; return x})()"),
+        "9007199254740992"
+    );
+    assert_eq!(
+        run_str("(function(){let x=9007199254740992; x++; return x===9007199254740992})()"),
+        "true"
+    );
+    // The result is still a JS number, not some other type.
+    assert_eq!(run_str("typeof (9007199254740991 + 2)"), "number");
 }
 
 // ============================================================================
