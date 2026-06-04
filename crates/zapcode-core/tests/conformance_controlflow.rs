@@ -658,6 +658,34 @@ fn labeled_break_across_nested_for_of() {
 }
 
 #[test]
+fn labeled_break_on_plain_block() {
+    // `break label` out of a labeled NON-loop block jumps past the block. This
+    // used to emit an unpatched Break(0) that ran to instruction 0 and hit the
+    // allocation limit (guest-triggerable runaway).
+    assert_eq!(run_str("let r=''; foo:{ r+='a'; break foo; r+='b'; } r+'c'"), "ac");
+    // No break: the whole block runs.
+    assert_eq!(run_str("let r=''; foo:{ r+='a'; r+='b'; } r+'c'"), "abc");
+    // Nested labeled blocks: break the outer vs the inner.
+    assert_eq!(run_str("let r=''; a:{ b:{ r+='1'; break a; r+='2'; } r+='3'; } r+'4'"), "14");
+    assert_eq!(run_str("let r=''; a:{ b:{ r+='1'; break b; r+='2'; } r+='3'; } r+'4'"), "134");
+}
+
+#[test]
+fn unlabeled_break_skips_enclosing_labeled_block() {
+    // An UNLABELED break inside a labeled block that sits in a loop must break
+    // the loop, not the block (the labeled block must be invisible to it).
+    assert_eq!(
+        run_str("let r=''; for(let i=0;i<3;i++){ blk:{ r+=i; break; } r+='x'; } r"),
+        "0"
+    );
+    // A labeled break of the outer loop still works from inside such a block.
+    assert_eq!(
+        run_str("let r=''; outer: for(let i=0;i<3;i++){ blk:{ r+=i; if(i===1) break outer; } } r"),
+        "01"
+    );
+}
+
+#[test]
 fn labeled_continue_across_nested_for_of_documented_divergence() {
     // DIVERGENCE (documented, control-flow residual): a labeled `continue` that
     // targets an OUTER `for...of` does not resume the remaining outer iterations

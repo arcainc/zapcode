@@ -10,19 +10,15 @@
 //!   - `Array.prototype.keys()/values()/entries()` consumed by spread, `for…of`,
 //!     and `Array.from`, including `[i, v]` destructuring of `entries()`;
 //!   - `Map.prototype.keys()/values()/entries()` and `[...map]` direct spread;
-//!   - `Set.prototype.values()/keys()` and `[...set]`;
+//!   - `Set.prototype.values()/keys()/entries()` and `[...set]`;
+//!   - built-in Map/Set iterators support the manual `.next()` step (yielding
+//!     `{ value, done }`) and feed `Array.from` / `new Map`/`new Set`;
 //!   - `String` iteration via spread / `for…of` / `Array.from`;
 //!   - `Array.from(iterable, mapFn)`;
 //!   - generator objects as full step iterators (`it.next().value` / `.done`).
 //!
 //! DOCUMENTED DIVERGENCES (asserted at zapcode's ACTUAL behavior, with a comment,
 //! never the JS answer — verified against Node):
-//!   - built-in *collection* iterators (e.g. `arr.values()`) are spreadable /
-//!     for-of-able but do NOT support a manual `.next()` step — only generator
-//!     objects do. Calling `.next()` on a collection iterator throws a catchable
-//!     TypeError.
-//!   - `Set.prototype.entries()` does not iterate (throws) — unlike Map's, which
-//!     yields `[value, value]` pairs in JS.
 //!   - `Object.fromEntries(map)` / `Object.fromEntries(set)` return `{}` — only
 //!     `Object.fromEntries(arrayOfPairs)` is consumed (JS consumes any iterable).
 
@@ -136,16 +132,16 @@ fn set_direct_spread_and_for_of() {
 }
 
 #[test]
-fn set_entries_does_not_iterate_documented_divergence() {
-    // DIVERGENCE asserted as actual: JS yields [v, v] pairs; here Set.entries()
-    // is not iterable and throws a catchable TypeError when consumed.
+fn set_entries_yields_value_value_pairs() {
+    // Set.prototype.entries() yields [value, value] pairs (the value doubles as
+    // the key), matching JS.
     assert_eq!(
-        run_str("try { [...new Set([1, 2]).entries()]; 'no' } catch (e) { e.name }"),
-        "TypeError"
+        run_str("JSON.stringify([...new Set([1, 2]).entries()])"),
+        "[[1,1],[2,2]]"
     );
     assert_eq!(
-        run_str("try { for (const x of new Set([1]).entries()) {} 'no' } catch (e) { e instanceof TypeError ? 'te' : 'o' }"),
-        "te"
+        run_str("let r=''; for (const [k, v] of new Set(['a']).entries()) r += k + v; r"),
+        "aa"
     );
 }
 
@@ -288,4 +284,39 @@ fn dedup_and_sort_via_set_spread() {
         run_str("[...new Set([3, 1, 2, 3, 1])].sort((a, b) => a - b).join(',')"),
         "1,2,3"
     );
+}
+
+#[test]
+fn map_set_iterators_have_next_and_are_iterable() {
+    // .entries()/.keys()/.values() return real iterators: stateful .next()
+    // yielding { value, done }, also consumable by for-of / spread / Array.from.
+    assert_eq!(
+        run_str("let it=new Map([['a',1]]).entries(); JSON.stringify(it.next())"),
+        "{\"value\":[\"a\",1],\"done\":false}"
+    );
+    assert_eq!(
+        run_str("let it=new Map([['a',1]]).entries(); it.next(); JSON.stringify(it.next())"),
+        "{\"done\":true}"
+    );
+    assert_eq!(
+        run_str("let it=new Set([5,6]).values(); JSON.stringify([it.next().value, it.next().value, it.next().done])"),
+        "[5,6,true]"
+    );
+    // Still iterable via spread / for-of.
+    assert_eq!(run_str("JSON.stringify([...new Map([['a',1],['b',2]]).keys()])"), "[\"a\",\"b\"]");
+    assert_eq!(run_str("let r=0; for (const v of new Map([['a',1],['b',2]]).values()) r+=v; r"), "3");
+    // A partially-consumed iterator resumes from its cursor.
+    assert_eq!(
+        run_str("let it=new Map([['a',1],['b',2]]).keys(); it.next(); [...it].join(',')"),
+        "b"
+    );
+}
+
+#[test]
+fn iterators_feed_array_from_and_collection_ctors() {
+    assert_eq!(run_str("Array.from(new Set([5,6]).values()).join(',')"), "5,6");
+    assert_eq!(run_str("Array.from(new Map([['a',1]]).keys()).join(',')"), "a");
+    // Map/Set built from another collection's iterator.
+    assert_eq!(run_str("let m=new Map([['a',1]]); new Map(m.entries()).get('a')"), "1");
+    assert_eq!(run_str("let s=new Set([1,2,2,3]); new Set(s.values()).size"), "3");
 }

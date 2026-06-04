@@ -846,3 +846,35 @@ fn finally_then_value_completion() {
         "111"
     );
 }
+
+#[test]
+fn error_cause_option() {
+    // ES2022: `new Error(msg, { cause })` exposes an own `cause` property.
+    assert_eq!(run_str("new Error('e', { cause: 'c' }).cause"), "c");
+    assert_eq!(run_str("new TypeError('t', { cause: 42 }).cause"), "42");
+    assert_eq!(
+        run_str("JSON.stringify(new Error('e', { cause: { code: 5 } }).cause)"),
+        "{\"code\":5}"
+    );
+    // No options / no `cause` key -> cause is undefined.
+    assert_eq!(run_str("new Error('e').cause === undefined"), "true");
+    assert_eq!(run_str("new Error('e', {}).cause === undefined"), "true");
+    // The message/toString/JSON behavior is unchanged.
+    assert_eq!(run_str("new Error('boom', { cause: 'x' }).message"), "boom");
+    assert_eq!(run_str("JSON.stringify(new Error('x', { cause: 'y' }))"), "{}");
+}
+
+#[test]
+fn constructed_instance_has_no_phantom_global_methods() {
+    // A chained read on `new Builtin(...)` must resolve against the instance
+    // (own prop / undefined), not be mistaken for a method on the global
+    // constructor. Regression: `new Error('e').zzz` used to return a function
+    // because the builtin-global shortcut leaked from the `new` into the read.
+    assert_eq!(run_str("typeof new Error('e').zzz"), "undefined");
+    assert_eq!(run_str("typeof new Map().zzz"), "undefined");
+    assert_eq!(run_str("typeof new Date().zzz"), "undefined");
+    assert_eq!(run_str("typeof new RegExp('a').zzz"), "undefined");
+    // Real members still resolve.
+    assert_eq!(run_str("typeof new Map().set"), "function");
+    assert_eq!(run_str("new Error('e').message"), "e");
+}
