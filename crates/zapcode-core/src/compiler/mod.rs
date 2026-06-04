@@ -1721,7 +1721,67 @@ impl Compiler {
             }
             Expr::Object(props) => {
                 let has_spread = props.iter().any(|p| matches!(p.kind, PropKind::Spread));
-                if !has_spread {
+                let has_accessor = props
+                    .iter()
+                    .any(|p| matches!(p.kind, PropKind::Get | PropKind::Set));
+                if has_accessor {
+                    // Object literal with getters/setters. Build the base object
+                    // (data + spread props) incrementally, then attach the
+                    // `__getters__`/`__setters__` accessor tables the runtime
+                    // already consults on property read/write. No new bytecode —
+                    // the tables are plain reserved-key sub-objects.
+                    self.emit(Instruction::CreateObject(0));
+                    let emit_key = |c: &mut Self, prop: &ObjProperty| -> Result<()> {
+                        match &prop.key_expr {
+                            Some(key_expr) => c.compile_expr(key_expr),
+                            None => {
+                                c.emit(Instruction::Push(Constant::String(prop.key.clone())));
+                                Ok(())
+                            }
+                        }
+                    };
+                    for prop in props {
+                        match prop.kind {
+                            PropKind::Spread => {
+                                self.compile_expr(&prop.value)?;
+                                self.emit(Instruction::ObjectSpreadAssign);
+                            }
+                            // Accessors are ALSO stored as a data prop (key -> fn)
+                            // so the key enumerates in source order for free —
+                            // Object.keys / for-in need no special-casing. The
+                            // __getters__/__setters__ tables below drive the actual
+                            // read/write; value-producing surfaces (JSON, spread,
+                            // Object.values/entries) invoke the getter rather than
+                            // serializing the stored function.
+                            _ => {
+                                emit_key(self, prop)?;
+                                self.compile_expr(&prop.value)?;
+                                self.emit(Instruction::ObjectInsert);
+                            }
+                        }
+                    }
+                    // Attach the accessor tables: `obj.__getters__ = { name: fn }`.
+                    for (table, want_get) in [("__getters__", true), ("__setters__", false)] {
+                        let accessors: Vec<&ObjProperty> = props
+                            .iter()
+                            .filter(|p| {
+                                matches!(p.kind, PropKind::Get if want_get)
+                                    || matches!(p.kind, PropKind::Set if !want_get)
+                            })
+                            .collect();
+                        if accessors.is_empty() {
+                            continue;
+                        }
+                        self.emit(Instruction::Push(Constant::String(table.to_string())));
+                        self.emit(Instruction::CreateObject(0));
+                        for acc in accessors {
+                            emit_key(self, acc)?;
+                            self.compile_expr(&acc.value)?;
+                            self.emit(Instruction::ObjectInsert);
+                        }
+                        self.emit(Instruction::ObjectInsert);
+                    }
+                } else if !has_spread {
                     let mut count = 0;
                     for prop in props {
                         match &prop.key_expr {

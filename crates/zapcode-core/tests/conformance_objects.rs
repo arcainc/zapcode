@@ -138,44 +138,61 @@ fn literal_duplicate_keys_last_wins() {
 }
 
 // ============================================================================
-// 2. Getters / setters
-//    DIVERGENCE: stored as plain function-valued properties, not accessors.
+// 2. Getters / setters — real accessor properties (invoked on read/write,
+//    enumerable in source order, getters invoked by JSON/spread/Object.*).
 // ============================================================================
 
 #[test]
-fn getter_stored_as_function_property() {
-    // DIVERGENCE: a `get x()` is a function-valued data prop; reading returns
-    // the function (typeof "function"), not the computed value (real JS: 42).
-    assert_eq!(run_str("const o = { get x() { return 42; } }; typeof o.x"), "function");
-    // It is callable as a function and returns the body's value.
-    assert_eq!(run_str("const o = { get x() { return 42; } }; o.x()"), "42");
+fn object_literal_getter_is_invoked_on_read() {
+    // Reading invokes the getter and yields the computed value (not the fn).
+    assert_eq!(run_str("const o = { get x() { return 42; } }; o.x"), "42");
+    assert_eq!(run_str("const o = { get x() { return 42; } }; typeof o.x"), "number");
+    // `this` inside the getter is the object.
+    assert_eq!(run_str("const o = { base: 10, get total() { return this.base + 5; } }; o.total"), "15");
 }
 
 #[test]
-fn setter_stored_as_function_property() {
-    // DIVERGENCE: a `set x()` is a function-valued data prop; assigning to `o.x`
-    // overwrites the property rather than invoking the setter.
-    assert_eq!(run_str("const o = { set f(v) {} }; typeof o.f"), "function");
+fn object_literal_setter_is_invoked_on_write() {
     assert_eq!(
-        run_str("const o = { _x: 0, set x(v) { this._x = v; } }; o.x = 7; o._x"),
-        "0" // real JS: 7
+        run_str("const o = { _x: 0, set x(v) { this._x = v * 2; } }; o.x = 7; o._x"),
+        "14"
     );
-    // assignment replaces the setter function with the assigned value
+    // A get/set pair on the same key round-trips through the accessor.
     assert_eq!(
-        run_str("const o = { _x: 0, set x(v) { this._x = v; } }; o.x = 7; o.x"),
-        "7"
+        run_str("const o = { _n: 1, get n() { return this._n; }, set n(v) { this._n = v + 10; } }; o.n = 5; o.n"),
+        "15"
     );
 }
 
 #[test]
-fn getter_excluded_from_object_literal_json() {
-    // Function-valued props are dropped by JSON.stringify, so a literal with a
-    // lone getter stringifies as {} (consistent with how functions serialize).
-    assert_eq!(run_str("JSON.stringify({ get x() { return 5; } })"), "{}");
-    // a data prop alongside it survives
+fn accessor_properties_are_enumerable_in_source_order() {
+    // The accessor key enumerates in source order, like a data property.
+    assert_eq!(run_str("Object.keys({ a: 1, get b() { return 2; }, c: 3 }).join(',')"), "a,b,c");
     assert_eq!(
-        run_str("JSON.stringify({ get x() { return 5; }, y: 2 })"),
-        "{\"y\":2}"
+        run_str("let o = { a: 1, get b() { return 2; } }; let r = []; for (const k in o) r.push(k); r.join(',')"),
+        "a,b"
+    );
+    // A setter-only property is enumerable too.
+    assert_eq!(run_str("Object.keys({ a: 1, set x(v) {} }).join(',')"), "a,x");
+}
+
+#[test]
+fn getter_invoked_by_json_spread_and_object_helpers() {
+    // JSON.stringify invokes the getter and serializes its result.
+    assert_eq!(run_str("JSON.stringify({ a: 1, get b() { return 2; } })"), "{\"a\":1,\"b\":2}");
+    assert_eq!(run_str("JSON.stringify({ get x() { return 5; } })"), "{\"x\":5}");
+    // A setter-only property reads as undefined -> omitted from JSON.
+    assert_eq!(run_str("JSON.stringify({ a: 1, set x(v) {} })"), "{\"a\":1}");
+    // Spread / Object.values / Object.entries / Object.assign invoke the getter.
+    assert_eq!(run_str("JSON.stringify({ ...{ a: 1, get b() { return 7; } } })"), "{\"a\":1,\"b\":7}");
+    assert_eq!(run_str("JSON.stringify(Object.values({ a: 1, get b() { return 9; } }))"), "[1,9]");
+    assert_eq!(
+        run_str("JSON.stringify(Object.entries({ a: 1, get b() { return 9; } }))"),
+        "[[\"a\",1],[\"b\",9]]"
+    );
+    assert_eq!(
+        run_str("JSON.stringify(Object.assign({}, { a: 1, get b() { return 8; } }))"),
+        "{\"a\":1,\"b\":8}"
     );
 }
 

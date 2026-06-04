@@ -2403,13 +2403,16 @@ impl Vm {
                             continue;
                         }
                     }
+                    // Accessor keys serialize their getter's RESULT, not the
+                    // stored function (setter-only -> undefined -> omitted).
+                    let v = self.enumerable_value(&Value::Object(*h), k, v.clone())?;
                     let v = if let Some(f) = replacer {
                         self.call_function_internal(f, vec![
                             Value::String(k.clone()),
-                            v.clone(),
+                            v,
                         ])?
                     } else {
-                        v.clone()
+                        v
                     };
                     if let Some(s) =
                         self.serialize_json_dynamic(&v, replacer, whitelist, indent, depth + 1, seen)?
@@ -4141,15 +4144,25 @@ impl Vm {
                 match source {
                     Value::Object(h) => {
                         let entries = self.heap.object_map(h);
+                        let src = Value::Object(h);
+                        // Resolve values first (an accessor key contributes its
+                        // getter's RESULT, not the stored function); invoking a
+                        // getter needs &mut self, which would conflict with the
+                        // object_mut borrow below.
+                        let mut resolved: Vec<(Arc<str>, Value)> = Vec::new();
+                        for (k, v) in entries {
+                            // Spread copies own enumerable properties. Skip
+                            // reserved internal markers (so `{...instance}`
+                            // doesn't leak `__class__`/brands), but keep real
+                            // user keys that merely start with `__`.
+                            if builtins::is_internal_marker_key(&k) {
+                                continue;
+                            }
+                            let val = self.enumerable_value(&src, &k, v)?;
+                            resolved.push((k, val));
+                        }
                         if let Some(map) = self.heap.object_mut(acc) {
-                            for (k, v) in entries {
-                                // Spread copies own enumerable properties. Skip
-                                // reserved internal markers (so `{...instance}`
-                                // doesn't leak `__class__`/brands), but keep real
-                                // user keys that merely start with `__`.
-                                if builtins::is_internal_marker_key(&k) {
-                                    continue;
-                                }
+                            for (k, v) in resolved {
                                 map.insert(k, v);
                             }
                         }
@@ -4738,6 +4751,79 @@ impl Vm {
                                     &mut self.stdout,
                                     &mut self.heap,
                                 )?
+                            }
+                            // Object.values/entries on an object with accessors
+                            // must invoke getters for the values; the pure builtin
+                            // can't call guest closures, so resolve here. (Without
+                            // accessors, fall through to the builtin unchanged.)
+                            "Object"
+                                if matches!(method_name.as_ref(), "values" | "entries")
+                                    && self.has_accessors(
+                                        args.first().unwrap_or(&Value::Undefined),
+                                    ) =>
+                            {
+                                let obj = args[0].clone();
+                                let Value::Object(h) = &obj else { unreachable!() };
+                                let keys: Vec<Arc<str>> = self
+                                    .heap
+                                    .object_map(*h)
+                                    .keys()
+                                    .filter(|k| !builtins::is_internal_marker_key(k))
+                                    .cloned()
+                                    .collect();
+                                let want_entries = method_name.as_ref() == "entries";
+                                let mut out = Vec::with_capacity(keys.len());
+                                for k in keys {
+                                    let stored = self
+                                        .heap
+                                        .object(*h)
+                                        .and_then(|m| m.get(k.as_ref()).cloned())
+                                        .unwrap_or(Value::Undefined);
+                                    let val = self.enumerable_value(&obj, &k, stored)?;
+                                    if want_entries {
+                                        let pair = self.heap.alloc_array(vec![
+                                            Value::String(k.clone()),
+                                            val,
+                                        ]);
+                                        out.push(Value::Array(pair));
+                                    } else {
+                                        out.push(val);
+                                    }
+                                }
+                                Some(Value::Array(self.heap.alloc_array(out)))
+                            }
+                            // Object.assign with an accessor-bearing source copies
+                            // the getter's RESULT (spread semantics), not the fn.
+                            "Object"
+                                if method_name.as_ref() == "assign"
+                                    && args.iter().skip(1).any(|s| self.has_accessors(s)) =>
+                            {
+                                let target = match args.first() {
+                                    Some(Value::Object(h)) => *h,
+                                    _ => self.heap.alloc_object(IndexMap::new()),
+                                };
+                                for src in args.iter().skip(1).cloned().collect::<Vec<_>>() {
+                                    let Value::Object(sh) = &src else { continue };
+                                    let keys: Vec<Arc<str>> = self
+                                        .heap
+                                        .object_map(*sh)
+                                        .keys()
+                                        .filter(|k| !builtins::is_internal_marker_key(k))
+                                        .cloned()
+                                        .collect();
+                                    for k in keys {
+                                        let stored = self
+                                            .heap
+                                            .object(*sh)
+                                            .and_then(|m| m.get(k.as_ref()).cloned())
+                                            .unwrap_or(Value::Undefined);
+                                        let val = self.enumerable_value(&src, &k, stored)?;
+                                        if let Some(m) = self.heap.object_mut(target) {
+                                            m.insert(k, val);
+                                        }
+                                    }
+                                }
+                                Some(Value::Object(target))
                             }
                             global_name => builtins::call_global_method(
                                 global_name,
@@ -6251,6 +6337,30 @@ impl Vm {
     /// entry for `name`, return the accessor closure to invoke (with `this` bound
     /// to `obj`). The instance keys are ignored on a class object itself (an
     /// instance getter belongs to the prototype, not the constructor).
+    /// Whether `v` is an object carrying accessor descriptors (object-literal or
+    /// class getters/setters). Used to decide when an enumeration surface must
+    /// invoke getters rather than read stored values.
+    fn has_accessors(&self, v: &Value) -> bool {
+        matches!(v, Value::Object(h) if self.heap.object(*h).is_some_and(|m| {
+            m.contains_key("__getters__") || m.contains_key("__setters__")
+        }))
+    }
+
+    /// The value of own key `name` for *value-producing* enumeration surfaces
+    /// (JSON.stringify, spread/Object.assign, Object.values/entries): if `name`
+    /// is an accessor, invoke its getter with `this` bound to `obj`; a
+    /// setter-only accessor reads as `undefined` (like JS). Otherwise return the
+    /// already-cloned `stored` value (e.g. a plain data prop or a method fn).
+    fn enumerable_value(&mut self, obj: &Value, name: &str, stored: Value) -> Result<Value> {
+        if let Some(getter) = self.instance_accessor(obj, "__getters__", name) {
+            return self.call_method_internal(&getter, obj.clone(), Vec::new());
+        }
+        if self.instance_accessor(obj, "__setters__", name).is_some() {
+            return Ok(Value::Undefined);
+        }
+        Ok(stored)
+    }
+
     fn instance_accessor(&self, obj: &Value, kind: &str, name: &str) -> Option<Value> {
         let Value::Object(h) = obj else { return None };
         let map = self.heap.object(*h)?;

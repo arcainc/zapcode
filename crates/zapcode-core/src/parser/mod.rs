@@ -1135,6 +1135,26 @@ impl<'a> AstLowerer<'a> {
                                     computed: false,
                                     key_expr: None,
                                 });
+                            } else if matches!(p.kind, ast::PropertyKind::Get) {
+                                // `{ get x() { ... } }` — accessor getter.
+                                let value = self.lower_expr(&p.value)?;
+                                props.push(ObjProperty {
+                                    kind: PropKind::Get,
+                                    key,
+                                    value,
+                                    computed,
+                                    key_expr,
+                                });
+                            } else if matches!(p.kind, ast::PropertyKind::Set) {
+                                // `{ set x(v) { ... } }` — accessor setter.
+                                let value = self.lower_expr(&p.value)?;
+                                props.push(ObjProperty {
+                                    kind: PropKind::Set,
+                                    key,
+                                    value,
+                                    computed,
+                                    key_expr,
+                                });
                             } else if p.method {
                                 let value = self.lower_expr(&p.value)?;
                                 props.push(ObjProperty {

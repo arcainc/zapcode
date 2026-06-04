@@ -414,4 +414,23 @@ await test("Map/Set iterators expose next() and feed for-of/spread/Array.from li
   assert.equal(r.output, 1);
 });
 
+// ── object-literal getters/setters work and enumerate like Node ──
+await test("object-literal accessors invoke + enumerate across the host boundary", async () => {
+  let r = await execute(`({ get x() { return 42; } }).x`, {});
+  assert.equal(r.output, 42);
+
+  r = await execute(`(function(){ let o = { _x: 0, set x(v) { this._x = v * 2; } }; o.x = 7; return o._x; })()`, {});
+  assert.equal(r.output, 14);
+
+  // Enumerable in source order; JSON invokes the getter.
+  r = await execute(`Object.keys({ a: 1, get b() { return 2; }, c: 3 })`, {});
+  assert.deepEqual(r.output, ["a", "b", "c"]);
+
+  r = await execute(`JSON.stringify({ a: 1, get b() { return 2; } })`, {});
+  assert.equal(r.output, '{"a":1,"b":2}');
+
+  r = await execute(`JSON.stringify({ ...{ a: 1, get b() { return 7; } } })`, {});
+  assert.equal(r.output, '{"a":1,"b":7}');
+});
+
 console.log(`\n${passed} marshalling checks passed.`);
