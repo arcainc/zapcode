@@ -52,6 +52,11 @@ const INTERNAL_MARKER_KEYS: &[&str] = &[
     "__field_inits__",
     // Object.freeze brand.
     "__frozen__",
+    // Object.defineProperty property-attribute tables: key-name lists of
+    // non-enumerable / non-writable / non-configurable own properties.
+    "__non_enum__",
+    "__non_writable__",
+    "__non_config__",
     // Date backing value.
     "__date_ms__",
     // Map / Set / RegExp brands and their backing stores.
@@ -2744,10 +2749,11 @@ pub fn array_index_key(s: &str) -> Option<u32> {
 /// single ordering used by Object.keys/values/entries, for-in (which desugars
 /// to Object.keys), and JSON.stringify so they all agree.
 pub fn ordered_visible_keys(map: &IndexMap<Arc<str>, Value>) -> Vec<Arc<str>> {
+    let non_enum = marker_list(map, "__non_enum__");
     let mut indices: Vec<(u32, Arc<str>)> = Vec::new();
     let mut strings: Vec<Arc<str>> = Vec::new();
     for k in map.keys() {
-        if is_internal_marker_key(k) {
+        if is_internal_marker_key(k) || non_enum.iter().any(|n| n == k.as_ref()) {
             continue;
         }
         match array_index_key(k) {
@@ -2761,6 +2767,131 @@ pub fn ordered_visible_keys(map: &IndexMap<Arc<str>, Value>) -> Vec<Arc<str>> {
         .map(|(_, k)| k)
         .chain(strings)
         .collect()
+}
+
+/// Read a property-attribute marker list (`__non_enum__` / `__non_writable__` /
+/// `__non_config__`) off an object map. Stored as a single NUL-joined string
+/// value (NOT a heap array) so it is readable from the map alone — `ordered_
+/// visible_keys` and the spread path have the map but not the heap. Real
+/// property keys never contain a NUL, so it is an unambiguous separator.
+pub fn marker_list(map: &IndexMap<Arc<str>, Value>, marker: &str) -> Vec<String> {
+    match map.get(marker) {
+        Some(Value::String(s)) if !s.is_empty() => {
+            s.split('\u{0}').map(|x| x.to_string()).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// True iff `key` is listed in the object's `marker` attribute list.
+pub fn marker_contains(map: &IndexMap<Arc<str>, Value>, marker: &str, key: &str) -> bool {
+    match map.get(marker) {
+        Some(Value::String(s)) => s.split('\u{0}').any(|x| x == key),
+        _ => false,
+    }
+}
+
+/// Add `key` to an object's `marker` attribute list (NUL-joined string),
+/// creating it if absent and avoiding duplicates.
+fn marker_add(map: &mut IndexMap<Arc<str>, Value>, marker: &str, key: &str) {
+    let mut list: Vec<String> = match map.get(marker) {
+        Some(Value::String(s)) if !s.is_empty() => {
+            s.split('\u{0}').map(|x| x.to_string()).collect()
+        }
+        _ => Vec::new(),
+    };
+    if !list.iter().any(|x| x == key) {
+        list.push(key.to_string());
+    }
+    map.insert(Arc::from(marker), Value::String(Arc::from(list.join("\u{0}").as_str())));
+}
+
+/// Remove `key` from an object's `marker` attribute list.
+fn marker_remove(map: &mut IndexMap<Arc<str>, Value>, marker: &str, key: &str) {
+    if let Some(Value::String(s)) = map.get(marker) {
+        let kept: Vec<&str> = s.split('\u{0}').filter(|x| *x != key).collect();
+        map.insert(Arc::from(marker), Value::String(Arc::from(kept.join("\u{0}").as_str())));
+    }
+}
+
+/// Apply one ECMA property descriptor (`{value|get|set, writable, enumerable,
+/// configurable}`) to `obj_h[key]`. Attributes default to `false`/absent per
+/// the spec. Accessor descriptors install into the object's
+/// `__getters__`/`__setters__` tables (the same the runtime consults on
+/// read/write); the enumerable/writable/configurable flags are recorded in the
+/// object's `__non_*__` marker lists, which the enumeration and write paths
+/// honor. `configurable: false` is recorded for getOwnPropertyDescriptor but
+/// its redefine/delete restriction is not enforced.
+fn apply_descriptor(obj_h: Handle, key: &str, desc: &Value, heap: &mut Heap) -> Result<()> {
+    let desc_map = match desc {
+        Value::Object(dh) => heap.object_map(*dh),
+        _ => {
+            return Err(ZapcodeError::TypeError(
+                "Property description must be an object".to_string(),
+            ))
+        }
+    };
+    let truthy = |k: &str| desc_map.get(k).map(|v| v.is_truthy()).unwrap_or(false);
+    let getf = |k: &str| desc_map.get(k).cloned();
+    let is_accessor = desc_map.contains_key("get") || desc_map.contains_key("set");
+    let enumerable = truthy("enumerable");
+    let writable = truthy("writable");
+    let configurable = truthy("configurable");
+
+    if is_accessor {
+        for (table, field) in [("__getters__", "get"), ("__setters__", "set")] {
+            if let Some(f @ Value::Function(_)) = getf(field) {
+                let table_h = match heap.object(obj_h).and_then(|m| m.get(table)) {
+                    Some(Value::Object(th)) => *th,
+                    _ => {
+                        let th = heap.alloc_object(IndexMap::new());
+                        if let Some(m) = heap.object_mut(obj_h) {
+                            m.insert(Arc::from(table), Value::Object(th));
+                        }
+                        th
+                    }
+                };
+                if let Some(tm) = heap.object_mut(table_h) {
+                    tm.insert(Arc::from(key), f);
+                }
+            }
+        }
+        // An enumerable accessor needs a data placeholder so the key enumerates
+        // (matching the object-literal accessor model); non-enumerable accessors
+        // (defineProperty's default) get no data key, so they stay hidden.
+        if enumerable {
+            let placeholder = getf("get").or_else(|| getf("set")).unwrap_or(Value::Undefined);
+            if let Some(m) = heap.object_mut(obj_h) {
+                m.insert(Arc::from(key), placeholder);
+            }
+        }
+    } else {
+        let value = getf("value").unwrap_or(Value::Undefined);
+        if let Some(m) = heap.object_mut(obj_h) {
+            m.insert(Arc::from(key), value);
+        }
+    }
+
+    if let Some(m) = heap.object_mut(obj_h) {
+        if enumerable {
+            marker_remove(m, "__non_enum__", key);
+        } else {
+            marker_add(m, "__non_enum__", key);
+        }
+        if !is_accessor {
+            if writable {
+                marker_remove(m, "__non_writable__", key);
+            } else {
+                marker_add(m, "__non_writable__", key);
+            }
+        }
+        if configurable {
+            marker_remove(m, "__non_config__", key);
+        } else {
+            marker_add(m, "__non_config__", key);
+        }
+    }
+    Ok(())
 }
 
 fn call_object_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<Option<Value>> {
@@ -2978,6 +3109,68 @@ fn call_object_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<O
                 _ => Vec::new(),
             };
             Ok(Some(Value::Array(heap.alloc_array(keys))))
+        }
+        "defineProperty" => {
+            if let Value::Object(h) = &first {
+                let key = arg_str(args, 1, heap);
+                let desc = args.get(2).cloned().unwrap_or(Value::Undefined);
+                apply_descriptor(*h, &key, &desc, heap)?;
+            }
+            Ok(Some(first))
+        }
+        "defineProperties" => {
+            if let (Value::Object(h), Some(Value::Object(props_h))) = (&first, args.get(1)) {
+                for (k, desc) in heap.object_map(*props_h) {
+                    if is_internal_marker_key(&k) {
+                        continue;
+                    }
+                    apply_descriptor(*h, &k, &desc, heap)?;
+                }
+            }
+            Ok(Some(first))
+        }
+        "getOwnPropertyDescriptor" => {
+            let key = arg_str(args, 1, heap);
+            let Value::Object(h) = &first else {
+                return Ok(Some(Value::Undefined));
+            };
+            let m = heap.object_map(*h);
+            let getter = match m.get("__getters__") {
+                Some(Value::Object(gh)) => {
+                    heap.object(*gh).and_then(|gm| gm.get(key.as_str()).cloned())
+                }
+                _ => None,
+            };
+            let setter = match m.get("__setters__") {
+                Some(Value::Object(sh)) => {
+                    heap.object(*sh).and_then(|sm| sm.get(key.as_str()).cloned())
+                }
+                _ => None,
+            };
+            let is_accessor = getter.is_some() || setter.is_some();
+            // Absent own property -> undefined (private/internal keys are hidden).
+            if !is_accessor && (!m.contains_key(key.as_str()) || is_internal_marker_key(&key)) {
+                return Ok(Some(Value::Undefined));
+            }
+            let enumerable = !marker_contains(&m, "__non_enum__", &key);
+            let configurable = !marker_contains(&m, "__non_config__", &key);
+            let mut desc: IndexMap<Arc<str>, Value> = IndexMap::new();
+            if is_accessor {
+                desc.insert(Arc::from("get"), getter.unwrap_or(Value::Undefined));
+                desc.insert(Arc::from("set"), setter.unwrap_or(Value::Undefined));
+            } else {
+                desc.insert(
+                    Arc::from("value"),
+                    m.get(key.as_str()).cloned().unwrap_or(Value::Undefined),
+                );
+                desc.insert(
+                    Arc::from("writable"),
+                    Value::Bool(!marker_contains(&m, "__non_writable__", &key)),
+                );
+            }
+            desc.insert(Arc::from("enumerable"), Value::Bool(enumerable));
+            desc.insert(Arc::from("configurable"), Value::Bool(configurable));
+            Ok(Some(Value::Object(heap.alloc_object(desc))))
         }
         _ => Ok(None),
     }

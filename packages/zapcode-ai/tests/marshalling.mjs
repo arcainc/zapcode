@@ -494,4 +494,23 @@ await test("toLocaleString and private class fields match Node across the bounda
   assert.deepEqual(r.output, [42, '{"pub":1}']);
 });
 
+// ── Object.defineProperty (data/accessor descriptors + enumerable/writable) ──
+await test("Object.defineProperty matches Node across the host boundary", async () => {
+  // Non-enumerable data prop: readable, but hidden from keys/JSON.
+  let r = await execute(`(function(){ const o = {a:1}; Object.defineProperty(o,'x',{value:5}); return [o.x, Object.keys(o), JSON.stringify(o)]; })()`, {});
+  assert.deepEqual(r.output, [5, ["a"], '{"a":1}']);
+
+  // Non-writable: assignment ignored.
+  r = await execute(`(function(){ const o={}; Object.defineProperty(o,'x',{value:5,writable:false}); o.x=9; return o.x; })()`, {});
+  assert.equal(r.output, 5);
+
+  // Accessor descriptor invoked on read/write.
+  r = await execute(`(function(){ const o={}; let v=0; Object.defineProperty(o,'x',{get(){return 9},set(n){v=n}}); const a=o.x; o.x=3; return [a,v]; })()`, {});
+  assert.deepEqual(r.output, [9, 3]);
+
+  // getOwnPropertyDescriptor of a plain prop.
+  r = await execute(`Object.getOwnPropertyDescriptor({x:1},'x')`, {});
+  assert.deepEqual(r.output, { value: 1, writable: true, enumerable: true, configurable: true });
+});
+
 console.log(`\n${passed} marshalling checks passed.`);

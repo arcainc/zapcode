@@ -3826,9 +3826,14 @@ impl Vm {
                 }
                 match obj_val {
                     Value::Object(h) => {
-                        // A frozen object silently ignores property writes (sloppy
-                        // mode), matching Object.freeze enforcement.
-                        if !is_frozen_object(h, &self.heap) {
+                        // A frozen object, or a non-writable own property defined
+                        // via Object.defineProperty({writable:false}), silently
+                        // ignores the write (sloppy mode).
+                        let non_writable = self
+                            .heap
+                            .object(h)
+                            .is_some_and(|m| builtins::marker_contains(m, "__non_writable__", &name));
+                        if !is_frozen_object(h, &self.heap) && !non_writable {
                             // Mutate the heap slot in place; the handle is shared so the
                             // write is visible through every alias (reference semantics).
                             if let Some(obj) = self.heap.object_mut(h) {
@@ -4148,6 +4153,9 @@ impl Vm {
                     Value::Object(h) => {
                         let entries = self.heap.object_map(h);
                         let src = Value::Object(h);
+                        // Non-enumerable own properties (Object.defineProperty with
+                        // enumerable:false) are not spread.
+                        let non_enum = builtins::marker_list(&entries, "__non_enum__");
                         // Resolve values first (an accessor key contributes its
                         // getter's RESULT, not the stored function); invoking a
                         // getter needs &mut self, which would conflict with the
@@ -4158,7 +4166,9 @@ impl Vm {
                             // reserved internal markers (so `{...instance}`
                             // doesn't leak `__class__`/brands), but keep real
                             // user keys that merely start with `__`.
-                            if builtins::is_internal_marker_key(&k) {
+                            if builtins::is_internal_marker_key(&k)
+                                || non_enum.iter().any(|n| n == k.as_ref())
+                            {
                                 continue;
                             }
                             let val = self.enumerable_value(&src, &k, v)?;
