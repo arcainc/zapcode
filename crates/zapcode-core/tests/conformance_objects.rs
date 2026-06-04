@@ -25,7 +25,10 @@
 //!     `[]`. (zapcode does not expose index keys as own-enumerable on those.)
 //! `Object.freeze` is enforcing; `Object.isFrozen`, `Object.create`,
 //! `Object.getPrototypeOf`, and `Object.getOwnPropertyNames` are implemented.
-//! `Object.defineProperty` is still not provided.
+//! `Object.defineProperty`/`defineProperties`/`getOwnPropertyDescriptor` are
+//! implemented (data + accessor descriptors; enumerable/writable honored via
+//! per-object `__non_*__` marker lists). `configurable:false` is recorded and
+//! reported but its redefine/delete restriction is not enforced.
 
 use zapcode_core::vm::VmState;
 use zapcode_core::{ResourceLimits, ZapcodeRun};
@@ -778,4 +781,52 @@ fn property_enumeration_order_matches_ecma() {
     // Spread / assign results reorder when read, too.
     assert_eq!(run_str("Object.keys({...{2:'a',1:'b'}}).join(',')"), "1,2");
     assert_eq!(run_str("JSON.stringify(Object.assign({}, {3:'c'}, {1:'a'}))"), "{\"1\":\"a\",\"3\":\"c\"}");
+}
+
+#[test]
+fn define_property_data_accessor_and_descriptors() {
+    // Data descriptor: value installed; enumerable defaults to false (hidden
+    // from keys/JSON), writable defaults to false (assignment ignored).
+    assert_eq!(run_str("const o = {}; Object.defineProperty(o, 'x', { value: 5 }); o.x"), "5");
+    assert_eq!(run_str("const o = {a:1}; Object.defineProperty(o, 'x', { value: 5 }); Object.keys(o).join(',')"), "a");
+    assert_eq!(run_str("const o = {}; Object.defineProperty(o, 'x', { value: 5 }); JSON.stringify(o)"), "{}");
+    assert_eq!(run_str("const o = {}; Object.defineProperty(o, 'x', { value: 5, writable: false }); o.x = 9; o.x"), "5");
+    assert_eq!(run_str("const o = {}; Object.defineProperty(o, 'x', { value: 5, enumerable: true }); Object.keys(o).join(',')"), "x");
+    // Accessor descriptor: get/set installed and invoked.
+    assert_eq!(
+        run_str("const o = {}; let v = 0; Object.defineProperty(o, 'x', { get(){ return 9; }, set(n){ v = n; } }); const r = o.x; o.x = 3; `${r},${v}`"),
+        "9,3"
+    );
+    // Non-enumerable property is not spread or for-in'd; getOwnPropertyNames includes it.
+    assert_eq!(run_str("const o = {a:1}; Object.defineProperty(o, 'h', { value: 2 }); JSON.stringify({...o})"), "{\"a\":1}");
+    assert_eq!(run_str("const o = {a:1}; Object.defineProperty(o, 'h', { value: 2 }); Object.getOwnPropertyNames(o).sort().join(',')"), "a,h");
+    // defineProperties applies several at once; returns the object.
+    assert_eq!(
+        run_str("const o = {}; Object.defineProperties(o, { a: { value: 1, enumerable: true }, b: { value: 2 } }); `${Object.keys(o).join(',')}|${o.b}`"),
+        "a|2"
+    );
+}
+
+#[test]
+fn get_own_property_descriptor() {
+    // A plain data property reports all-true attributes.
+    assert_eq!(
+        run_str("JSON.stringify(Object.getOwnPropertyDescriptor({x:1}, 'x'))"),
+        "{\"value\":1,\"writable\":true,\"enumerable\":true,\"configurable\":true}"
+    );
+    // A defined non-enumerable, non-writable data prop reports its flags.
+    assert_eq!(
+        run_str("const o={}; Object.defineProperty(o,'x',{value:5}); JSON.stringify(Object.getOwnPropertyDescriptor(o,'x'))"),
+        "{\"value\":5,\"writable\":false,\"enumerable\":false,\"configurable\":false}"
+    );
+    // An accessor descriptor reports get/set (not value/writable).
+    assert_eq!(
+        run_str("const o={}; Object.defineProperty(o,'x',{get(){return 5},enumerable:true}); const d=Object.getOwnPropertyDescriptor(o,'x'); `${typeof d.get},${d.enumerable},${'value' in d}`"),
+        "function,true,false"
+    );
+    // A missing property -> undefined.
+    assert_eq!(run_str("Object.getOwnPropertyDescriptor({a:1}, 'zzz') === undefined"), "true");
+    // RESIDUAL: configurable:false is recorded/reported but its redefine-throws
+    // restriction is NOT enforced (a second defineProperty succeeds here; JS
+    // throws "Cannot redefine property").
 }
