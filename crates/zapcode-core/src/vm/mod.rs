@@ -1957,6 +1957,22 @@ impl Vm {
         r
     }
 
+    /// Run a `JSON.parse` reviver with `this` bound to the holder object, per the
+    /// ES `InternalizeJSONProperty` spec. Reuses the field-initializer frame flag
+    /// so the reviver's return value is preserved verbatim — crucially, a reviver
+    /// returning `undefined` (to delete a property) must NOT trigger the
+    /// constructor-style "rewrite undefined-return to `this`" path, which would
+    /// otherwise splice the holder back into the result and create a cycle.
+    fn call_reviver(&mut self, callee: &Value, holder: Value, args: Vec<Value>) -> Result<Value> {
+        self.last_receiver_source = None;
+        self.next_frame_is_field_init = true;
+        let r = self.call_closure_internal(callee, args, Some(holder));
+        // Cleared in push_call_frame on success; reset here defensively in case
+        // the callee wasn't a function and no frame was pushed.
+        self.next_frame_is_field_init = false;
+        r
+    }
+
     /// Shared body for the internal-call helpers: push a frame (optionally with a
     /// bound `this`) and run it to completion, returning the result.
     fn call_closure_internal(
@@ -2473,14 +2489,16 @@ impl Vm {
             }
             _ => {}
         }
-        // Call reviver(key, value). JS binds `this` to the holder, but the
-        // receiver-writeback machinery would corrupt the value being revived, so
-        // we leave `this` undefined — revivers that read `this` are an accepted
-        // gap (none of the supported scenarios need it).
-        self.call_function_internal(reviver, vec![
-            Value::String(Arc::from(key)),
-            value,
-        ])
+        // Call reviver(key, value) with `this` bound to the HOLDER object, per
+        // the ES `InternalizeJSONProperty` spec, so a reviver that reads
+        // `this[otherKey]` sees its sibling values. `call_reviver` preserves the
+        // return value verbatim (an `undefined` return deletes the property and
+        // must NOT be rewritten to the holder).
+        self.call_reviver(
+            reviver,
+            holder.clone(),
+            vec![Value::String(Arc::from(key)), value],
+        )
     }
 
     /// Check if a callback value is an async function that might suspend.

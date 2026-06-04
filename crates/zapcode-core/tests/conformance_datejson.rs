@@ -664,11 +664,19 @@ fn json_parse_objects_and_arrays() {
 
 #[test]
 fn json_parse_string_escapes() {
-    // Escapes inside parsed strings are decoded.
-    check("JSON.parse('\"a\\nb\"')", "a\nb"); // \n decoded to a real newline
-    check("JSON.parse('\"tab\\tend\"')", "tab\tend");
-    check("JSON.parse('\"\\u0041\\u0042\"')", "AB"); // \u escapes
-    check("JSON.parse('\"quote\\\"in\"')", "quote\"in");
+    // Escapes inside parsed strings are decoded by a single left-to-right scan.
+    // The guest source must carry a JSON escape (backslash-n), so the Rust
+    // literal needs `\\n` — `\n` would be a real newline, which JSON rejects as
+    // a control character (matching Node's "Bad control character" SyntaxError).
+    check("JSON.parse('\"a\\\\nb\"')", "a\nb"); // backslash-n -> real newline
+    check("JSON.parse('\"tab\\\\tend\"')", "tab\tend");
+    // A doubled backslash followed by `n` is a literal backslash then `n`, NOT a
+    // newline (the old order-dependent .replace chain got this wrong).
+    check("JSON.parse('\"a\\\\\\\\nb\"')", "a\\nb");
+    check("JSON.parse('\"\\\\u0041\\\\u0042\"')", "AB"); // \uXXXX escapes -> "AB"
+    check("JSON.parse('\"\\\\u0041\"').length", "1"); // single A is one char
+    check("JSON.parse('\"\\\\/\\\\b\\\\f\\\\r\"')", "/\u{0008}\u{000C}\r"); // \/ \b \f \r
+    check("JSON.parse('\"quote\\\\\"in\"')", "quote\"in"); // escaped quote
 }
 
 #[test]

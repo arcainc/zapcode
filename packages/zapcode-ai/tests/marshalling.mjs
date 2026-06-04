@@ -255,4 +255,46 @@ await test("Function global + in/instanceof guards marshal to the host like Node
   assert.equal(r.output, true);
 });
 
+// ── Strict JSON.parse grammar + escapes + reviver `this` marshal to host ──
+// JSON.parse must reject the inputs Node rejects (Infinity/NaN, unquoted keys,
+// trailing commas, …) as CATCHABLE errors, decode \uXXXX / short escapes via a
+// single left-to-right scan, and bind the reviver's `this` to the holder — all
+// without aborting the process (no exit 139/134).
+await test("strict JSON.parse + escapes + reviver this marshal to the host like Node", async () => {
+  // Each malformed input is a catchable error, and the program completes.
+  for (const bad of [
+    "Infinity", "NaN", "+1", "01", "1.", ".5", "0x1F",
+    "[1,2,]", "[1,,2]", '{"a":1,}', "{a:1}", "'abc'", "[[1,],2]", "",
+  ]) {
+    const src = `let ok=false; try{ JSON.parse(${JSON.stringify(bad)}) }catch(e){ ok=true } ok`;
+    const r = await execute(src, {});
+    assert.equal(r.output, true, `expected JSON.parse(${JSON.stringify(bad)}) to throw`);
+  }
+  // Valid numbers parse (no spurious rejection).
+  let r = await execute(`JSON.parse("1e3")`, {});
+  assert.equal(r.output, 1000);
+  // \uXXXX decodes to its code point (length 1), not left literal.
+  r = await execute(`JSON.parse('"\\u0041"')`, {});
+  assert.equal(r.output, "A");
+  r = await execute(`JSON.parse('"\\u0041"').length`, {});
+  assert.equal(r.output, 1);
+  r = await execute(`JSON.parse('"\\u0041\\u0042"')`, {});
+  assert.equal(r.output, "AB");
+  // A doubled backslash then `n` is a literal backslash + n (NOT a newline).
+  r = await execute(`JSON.stringify(JSON.parse('"a\\\\nb"'))`, {});
+  assert.equal(r.output, '"a\\nb"');
+  // Reviver `this` is the holder, so a reviver can read its sibling keys.
+  r = await execute(
+    `JSON.stringify(JSON.parse('{"a":1,"b":2}', function(k,v){ return k==='a' ? this.b : v; }))`,
+    {},
+  );
+  assert.equal(r.output, '{"a":2,"b":2}');
+  // A reviver returning undefined deletes the property (no cyclic holder splice).
+  r = await execute(
+    `JSON.stringify(JSON.parse('{"a":1,"b":2}', (k, v) => k === 'b' ? undefined : v))`,
+    {},
+  );
+  assert.equal(r.output, '{"a":1}');
+});
+
 console.log(`\n${passed} marshalling checks passed.`);

@@ -1087,143 +1087,332 @@ pub fn join_json_object(pairs: &[(String, String)], indent: Option<&str>, depth:
 /// Maximum nesting depth for JSON parsing to prevent stack overflow.
 const JSON_MAX_DEPTH: usize = 64;
 
+/// Strict recursive-descent JSON parser matching the ECMA-404 / ES `JSON.parse`
+/// grammar. Unlike a lenient `s.parse::<f64>()` fallthrough, this REJECTS the
+/// inputs Node rejects — `Infinity`/`NaN`, leading-`+`, leading zeros (`01`), a
+/// bare `1.`/`.5`, single-quoted strings, unquoted object keys, and trailing or
+/// empty array/object segments — and decodes string escapes with a single
+/// left-to-right scan so `"a\\nb"` stays a literal backslash-n (not a newline)
+/// and `\uXXXX` is decoded to its code point. Every malformed input returns a
+/// catchable `RuntimeError`.
+fn json_err(msg: impl Into<String>) -> ZapcodeError {
+    ZapcodeError::RuntimeError(format!("Unexpected token in JSON: {}", msg.into()))
+}
+
+struct JsonParser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
 pub fn json_to_value(s: &str, heap: &mut Heap) -> Result<Value> {
-    json_to_value_depth(s, 0, heap)
+    let mut p = JsonParser {
+        bytes: s.as_bytes(),
+        pos: 0,
+    };
+    p.skip_ws();
+    let value = p.parse_value(0, heap)?;
+    p.skip_ws();
+    if p.pos != p.bytes.len() {
+        return Err(json_err("trailing characters after JSON value"));
+    }
+    Ok(value)
 }
 
-fn json_to_value_depth(s: &str, depth: usize, heap: &mut Heap) -> Result<Value> {
-    if depth > JSON_MAX_DEPTH {
-        return Err(ZapcodeError::RuntimeError(
-            "JSON nesting depth exceeded (max 64)".to_string(),
-        ));
+impl<'a> JsonParser<'a> {
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
     }
-    let s = s.trim();
-    if s == "null" {
-        return Ok(Value::Null);
-    }
-    if s == "true" {
-        return Ok(Value::Bool(true));
-    }
-    if s == "false" {
-        return Ok(Value::Bool(false));
-    }
-    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
-        let inner = &s[1..s.len() - 1];
-        let unescaped = inner
-            .replace("\\\"", "\"")
-            .replace("\\\\", "\\")
-            .replace("\\n", "\n")
-            .replace("\\t", "\t");
-        return Ok(Value::String(Arc::from(unescaped.as_str())));
-    }
-    if let Ok(n) = s.parse::<i64>() {
-        return Ok(Value::Int(n));
-    }
-    if let Ok(n) = s.parse::<f64>() {
-        return Ok(Value::Float(n));
-    }
-    if s.starts_with('[') {
-        return parse_json_array(s, depth, heap);
-    }
-    if s.starts_with('{') {
-        return parse_json_object(s, depth, heap);
-    }
-    Err(ZapcodeError::RuntimeError(format!("Invalid JSON: {}", s)))
-}
 
-fn parse_json_array(s: &str, depth: usize, heap: &mut Heap) -> Result<Value> {
-    let inner = &s[1..s.len() - 1].trim();
-    if inner.is_empty() {
-        return Ok(Value::Array(heap.alloc_array(Vec::new())));
-    }
-    let mut items = Vec::new();
-    for part in split_json_top_level(inner) {
-        items.push(json_to_value_depth(part.trim(), depth + 1, heap)?);
-    }
-    Ok(Value::Array(heap.alloc_array(items)))
-}
-
-fn parse_json_object(s: &str, depth: usize, heap: &mut Heap) -> Result<Value> {
-    let inner = &s[1..s.len() - 1].trim();
-    if inner.is_empty() {
-        return Ok(Value::Object(heap.alloc_object(IndexMap::new())));
-    }
-    let mut map = IndexMap::new();
-    for part in split_json_top_level(inner) {
-        let part = part.trim();
-        if let Some(colon_pos) = find_json_colon(part) {
-            let key = part[..colon_pos].trim();
-            let val = part[colon_pos + 1..].trim();
-            let key = if key.starts_with('"') && key.ends_with('"') {
-                &key[1..key.len() - 1]
+    /// JSON insignificant whitespace: space, tab, LF, CR only.
+    fn skip_ws(&mut self) {
+        while let Some(b) = self.peek() {
+            if matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
+                self.pos += 1;
             } else {
-                key
-            };
-            map.insert(Arc::from(key), json_to_value_depth(val, depth + 1, heap)?);
-        }
-    }
-    Ok(Value::Object(heap.alloc_object(map)))
-}
-
-/// Count consecutive backslashes preceding position `i` in `bytes`.
-/// A quote is escaped only if preceded by an odd number of backslashes.
-fn count_preceding_backslashes(bytes: &[u8], i: usize) -> usize {
-    let mut count = 0;
-    let mut pos = i;
-    while pos > 0 {
-        pos -= 1;
-        if bytes[pos] == b'\\' {
-            count += 1;
-        } else {
-            break;
-        }
-    }
-    count
-}
-
-/// Returns true if the quote at position `i` is NOT escaped.
-fn is_unescaped_quote(bytes: &[u8], i: usize) -> bool {
-    count_preceding_backslashes(bytes, i).is_multiple_of(2)
-}
-
-fn split_json_top_level(s: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut depth = 0;
-    let mut in_string = false;
-    let mut start = 0;
-    let bytes = s.as_bytes();
-
-    for i in 0..bytes.len() {
-        match bytes[i] {
-            b'"' if !in_string => in_string = true,
-            b'"' if in_string && is_unescaped_quote(bytes, i) => in_string = false,
-            b'[' | b'{' if !in_string => depth += 1,
-            b']' | b'}' if !in_string => depth -= 1,
-            b',' if !in_string && depth == 0 => {
-                parts.push(&s[start..i]);
-                start = i + 1;
+                break;
             }
-            _ => {}
         }
     }
-    if start < s.len() {
-        parts.push(&s[start..]);
-    }
-    parts
-}
 
-fn find_json_colon(s: &str) -> Option<usize> {
-    let mut in_string = false;
-    let bytes = s.as_bytes();
-    for i in 0..bytes.len() {
-        match bytes[i] {
-            b'"' if !in_string => in_string = true,
-            b'"' if in_string && is_unescaped_quote(bytes, i) => in_string = false,
-            b':' if !in_string => return Some(i),
-            _ => {}
+    fn parse_value(&mut self, depth: usize, heap: &mut Heap) -> Result<Value> {
+        if depth > JSON_MAX_DEPTH {
+            return Err(ZapcodeError::RuntimeError(
+                "JSON nesting depth exceeded (max 64)".to_string(),
+            ));
+        }
+        match self.peek() {
+            Some(b'{') => self.parse_object(depth, heap),
+            Some(b'[') => self.parse_array(depth, heap),
+            Some(b'"') => {
+                let s = self.parse_string()?;
+                Ok(Value::String(Arc::from(s.as_str())))
+            }
+            Some(b't') => {
+                self.expect_literal("true")?;
+                Ok(Value::Bool(true))
+            }
+            Some(b'f') => {
+                self.expect_literal("false")?;
+                Ok(Value::Bool(false))
+            }
+            Some(b'n') => {
+                self.expect_literal("null")?;
+                Ok(Value::Null)
+            }
+            Some(b'-') | Some(b'0'..=b'9') => self.parse_number(),
+            Some(c) => Err(json_err(format!("unexpected character `{}`", c as char))),
+            None => Err(json_err("unexpected end of input")),
         }
     }
-    None
+
+    fn expect_literal(&mut self, lit: &str) -> Result<()> {
+        let lb = lit.as_bytes();
+        if self.bytes[self.pos..].starts_with(lb) {
+            self.pos += lb.len();
+            Ok(())
+        } else {
+            Err(json_err(format!("expected `{}`", lit)))
+        }
+    }
+
+    /// Strict JSON number grammar: optional `-`, an int part that is either `0`
+    /// or a nonzero digit followed by digits (no leading zeros, no leading `+`),
+    /// an optional `.` followed by at least one digit, and an optional exponent
+    /// `[eE][+-]?` followed by at least one digit. `Infinity`/`NaN`/`1.`/`.5`
+    /// are all rejected by construction.
+    fn parse_number(&mut self) -> Result<Value> {
+        let start = self.pos;
+        if self.peek() == Some(b'-') {
+            self.pos += 1;
+        }
+        match self.peek() {
+            Some(b'0') => {
+                self.pos += 1;
+            }
+            Some(b'1'..=b'9') => {
+                self.pos += 1;
+                while matches!(self.peek(), Some(b'0'..=b'9')) {
+                    self.pos += 1;
+                }
+            }
+            _ => return Err(json_err("invalid number")),
+        }
+        let mut is_float = false;
+        if self.peek() == Some(b'.') {
+            is_float = true;
+            self.pos += 1;
+            if !matches!(self.peek(), Some(b'0'..=b'9')) {
+                return Err(json_err("invalid number: digit expected after `.`"));
+            }
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+        }
+        if matches!(self.peek(), Some(b'e') | Some(b'E')) {
+            is_float = true;
+            self.pos += 1;
+            if matches!(self.peek(), Some(b'+') | Some(b'-')) {
+                self.pos += 1;
+            }
+            if !matches!(self.peek(), Some(b'0'..=b'9')) {
+                return Err(json_err("invalid number: digit expected in exponent"));
+            }
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+        }
+        // The slice is pure ASCII digits/`-`/`.`/`eE+-`, so it is valid UTF-8.
+        let text = std::str::from_utf8(&self.bytes[start..self.pos]).unwrap();
+        if !is_float {
+            if let Ok(n) = text.parse::<i64>() {
+                return Ok(Value::Int(n));
+            }
+        }
+        match text.parse::<f64>() {
+            Ok(n) => Ok(Value::Float(n)),
+            Err(_) => Err(json_err("invalid number")),
+        }
+    }
+
+    /// Parse a double-quoted JSON string, decoding escapes left-to-right.
+    /// Assumes the cursor is on the opening `"`.
+    fn parse_string(&mut self) -> Result<String> {
+        debug_assert_eq!(self.peek(), Some(b'"'));
+        self.pos += 1; // opening quote
+        let mut out = String::new();
+        loop {
+            match self.peek() {
+                None => return Err(json_err("unterminated string")),
+                Some(b'"') => {
+                    self.pos += 1;
+                    return Ok(out);
+                }
+                Some(b'\\') => {
+                    self.pos += 1;
+                    match self.peek() {
+                        Some(b'"') => {
+                            out.push('"');
+                            self.pos += 1;
+                        }
+                        Some(b'\\') => {
+                            out.push('\\');
+                            self.pos += 1;
+                        }
+                        Some(b'/') => {
+                            out.push('/');
+                            self.pos += 1;
+                        }
+                        Some(b'n') => {
+                            out.push('\n');
+                            self.pos += 1;
+                        }
+                        Some(b'r') => {
+                            out.push('\r');
+                            self.pos += 1;
+                        }
+                        Some(b't') => {
+                            out.push('\t');
+                            self.pos += 1;
+                        }
+                        Some(b'b') => {
+                            out.push('\u{0008}');
+                            self.pos += 1;
+                        }
+                        Some(b'f') => {
+                            out.push('\u{000C}');
+                            self.pos += 1;
+                        }
+                        Some(b'u') => {
+                            self.pos += 1;
+                            let cp = self.parse_hex4()?;
+                            // Combine a high surrogate with a following low
+                            // surrogate into a single code point (matching JS).
+                            if (0xD800..=0xDBFF).contains(&cp)
+                                && self.bytes[self.pos..].starts_with(b"\\u")
+                            {
+                                let save = self.pos;
+                                self.pos += 2;
+                                let lo = self.parse_hex4()?;
+                                if (0xDC00..=0xDFFF).contains(&lo) {
+                                    let c = 0x10000
+                                        + ((cp - 0xD800) << 10)
+                                        + (lo - 0xDC00);
+                                    out.push(char::from_u32(c).unwrap_or('\u{FFFD}'));
+                                } else {
+                                    // Not a low surrogate: emit replacement for the
+                                    // lone high surrogate and rewind to reparse `lo`.
+                                    out.push('\u{FFFD}');
+                                    self.pos = save;
+                                }
+                            } else {
+                                out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                            }
+                        }
+                        _ => return Err(json_err("invalid escape sequence")),
+                    }
+                }
+                Some(b) if b < 0x20 => {
+                    return Err(json_err("unescaped control character in string"));
+                }
+                Some(_) => {
+                    // Copy one full UTF-8 scalar verbatim.
+                    let rest = &self.bytes[self.pos..];
+                    let s = std::str::from_utf8(rest)
+                        .map_err(|_| json_err("invalid UTF-8 in string"))?;
+                    let ch = s.chars().next().unwrap();
+                    out.push(ch);
+                    self.pos += ch.len_utf8();
+                }
+            }
+        }
+    }
+
+    fn parse_hex4(&mut self) -> Result<u32> {
+        if self.pos + 4 > self.bytes.len() {
+            return Err(json_err("incomplete \\u escape"));
+        }
+        let mut cp = 0u32;
+        for _ in 0..4 {
+            let d = (self.bytes[self.pos] as char)
+                .to_digit(16)
+                .ok_or_else(|| json_err("invalid \\u hex digit"))?;
+            cp = cp * 16 + d;
+            self.pos += 1;
+        }
+        Ok(cp)
+    }
+
+    fn parse_array(&mut self, depth: usize, heap: &mut Heap) -> Result<Value> {
+        self.pos += 1; // `[`
+        self.skip_ws();
+        let mut items = Vec::new();
+        if self.peek() == Some(b']') {
+            self.pos += 1;
+            return Ok(Value::Array(heap.alloc_array(items)));
+        }
+        loop {
+            self.skip_ws();
+            items.push(self.parse_value(depth + 1, heap)?);
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                    // A trailing comma (`,]`) is rejected: the next parse_value
+                    // would fail, but check explicitly for a clearer error.
+                    self.skip_ws();
+                    if self.peek() == Some(b']') {
+                        return Err(json_err("trailing comma in array"));
+                    }
+                }
+                Some(b']') => {
+                    self.pos += 1;
+                    return Ok(Value::Array(heap.alloc_array(items)));
+                }
+                _ => return Err(json_err("expected `,` or `]` in array")),
+            }
+        }
+    }
+
+    fn parse_object(&mut self, depth: usize, heap: &mut Heap) -> Result<Value> {
+        self.pos += 1; // `{`
+        self.skip_ws();
+        let mut map: IndexMap<Arc<str>, Value> = IndexMap::new();
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            return Ok(Value::Object(heap.alloc_object(map)));
+        }
+        loop {
+            self.skip_ws();
+            // Keys MUST be double-quoted strings.
+            if self.peek() != Some(b'"') {
+                return Err(json_err("expected double-quoted property name"));
+            }
+            let key = self.parse_string()?;
+            self.skip_ws();
+            if self.peek() != Some(b':') {
+                return Err(json_err("expected `:` after property name"));
+            }
+            self.pos += 1;
+            self.skip_ws();
+            let value = self.parse_value(depth + 1, heap)?;
+            map.insert(Arc::from(key.as_str()), value);
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                    self.skip_ws();
+                    if self.peek() == Some(b'}') {
+                        return Err(json_err("trailing comma in object"));
+                    }
+                }
+                Some(b'}') => {
+                    self.pos += 1;
+                    return Ok(Value::Object(heap.alloc_object(map)));
+                }
+                _ => return Err(json_err("expected `,` or `}` in object")),
+            }
+        }
+    }
 }
 
 // ── String methods ───────────────────────────────────────────────────
