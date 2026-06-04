@@ -376,4 +376,23 @@ await test("labeled break on a plain block completes (no runaway) like Node", as
   assert.equal(r.output, "0");
 });
 
+// ── Error.cause + no phantom methods on constructed instances ──
+// `new Error(msg,{cause})` exposes `cause`; a chained read on any `new
+// Builtin()` resolves against the instance, not the global constructor.
+await test("Error cause and instance property reads marshal like Node", async () => {
+  let r = await execute(`new Error("e", { cause: "c" }).cause`, {});
+  assert.equal(r.output, "c");
+
+  r = await execute(`new Error("e").cause === undefined`, {});
+  assert.equal(r.output, true);
+
+  // No phantom function for an arbitrary key on a freshly-constructed instance.
+  r = await execute(`[typeof new Error("e").zzz, typeof new Map().zzz, typeof new Date().zzz]`, {});
+  assert.deepEqual(r.output, ["undefined", "undefined", "undefined"]);
+
+  // Real members and toString still work.
+  r = await execute(`[new Error("boom").message, String(new TypeError("x"))]`, {});
+  assert.deepEqual(r.output, ["boom", "TypeError: x"]);
+});
+
 console.log(`\n${passed} marshalling checks passed.`);

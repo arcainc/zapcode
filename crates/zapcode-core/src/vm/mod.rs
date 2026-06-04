@@ -5414,6 +5414,13 @@ impl Vm {
 
                 let callee = self.pop()?;
 
+                // The result of `new X(...)` is a fresh instance, never the
+                // global `X`. Consume the builtin-global shortcut here so a
+                // chained read like `new Error("e").cause` resolves against the
+                // instance (own props / undefined) instead of mistaking it for a
+                // method on the global `Error` and returning a phantom function.
+                self.last_global_name = None;
+
                 if let Value::Object(obj_h) = &callee {
                     let builtin_ctor = self
                         .heap
@@ -5458,6 +5465,20 @@ impl Vm {
                                     .map(|v| v.to_js_string(&self.heap))
                                     .unwrap_or_default();
                                 let e = make_error_object(name.as_ref(), &msg, &mut self.heap);
+                                // ES2022 `new Error(msg, { cause })`: if the
+                                // options bag has an own `cause` (even undefined),
+                                // it becomes the error's `cause` property.
+                                let cause = match args.get(1) {
+                                    Some(Value::Object(opts)) => {
+                                        self.heap.object(*opts).and_then(|m| m.get("cause").cloned())
+                                    }
+                                    _ => None,
+                                };
+                                if let (Some(cause), Value::Object(em)) = (cause, &e) {
+                                    if let Some(map) = self.heap.object_mut(*em) {
+                                        map.insert(Arc::from("cause"), cause);
+                                    }
+                                }
                                 self.push(e)?;
                                 return Ok(None);
                             }
