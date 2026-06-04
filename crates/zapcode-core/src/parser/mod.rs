@@ -1375,7 +1375,40 @@ impl<'a> AstLowerer<'a> {
             ast::Expression::ParenthesizedExpression(paren) => self.lower_expr(&paren.expression),
             ast::Expression::ChainExpression(chain) => self.lower_chain_expr(&chain.expression),
             ast::Expression::TaggedTemplateExpression(s) => {
-                Err(self.unsupported(s.span, "tagged template expressions are not supported"))
+                // Desugar `tag`a${x}b`` into the call `tag(["a", "b"], x)`:
+                // a strings array (cooked quasis) followed by the interpolated
+                // values, matching the JS tagged-template call shape. A member
+                // tag (`obj.tag`...`` / `String.raw`...``) keeps its `this`
+                // binding through the normal Call machinery.
+                //
+                // The strings array is a plain Array (so custom tags can use
+                // `strings[i]` / `.join` / `.map` / `.reduce`). Its `.raw`
+                // companion property is NOT provided yet — `String.raw` and tags
+                // that read `strings.raw` are a documented residual.
+                let tag = self.lower_expr(&s.tag)?;
+                let cooked: Vec<Option<Expr>> = s
+                    .quasi
+                    .quasis
+                    .iter()
+                    .map(|q| {
+                        let text = q
+                            .value
+                            .cooked
+                            .as_ref()
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| q.value.raw.to_string());
+                        Some(Expr::StringLit(text))
+                    })
+                    .collect();
+                let mut args: Vec<Expr> = vec![Expr::Array(cooked)];
+                for e in &s.quasi.expressions {
+                    args.push(self.lower_expr(e)?);
+                }
+                Ok(Expr::Call {
+                    callee: Box::new(tag),
+                    args,
+                    optional: false,
+                })
             }
             ast::Expression::ThisExpression(_) => Ok(Expr::Ident("this".to_string())),
             ast::Expression::Super(_) => Ok(Expr::Ident("super".to_string())),

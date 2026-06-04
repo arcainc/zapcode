@@ -13,9 +13,10 @@
 //!     value is string-coerced to "function" and inserted literally. Pinned below.
 //!   * A handful of small `replace`/`includes`/`at`/`lastIndexOf` argument-edge
 //!     divergences, each pinned to actual behavior with a `DIVERGENCE` comment.
-//!   * Tagged templates (`String.raw\`…\``) are not provided — exercised as
-//!     "unsupported" so a future fix flips a known check. `String.prototype.normalize`
-//!     is now implemented (NFC/NFD/NFKC/NFKD).
+//!   * Tagged templates call the tag with a cooked strings array + the
+//!     interpolated values (custom tags fully supported). The strings array's
+//!     `.raw` companion is not provided, so `String.raw\`…\`` is still a
+//!     residual. `String.prototype.normalize` is implemented (NFC/NFD/NFKC/NFKD).
 
 use zapcode_core::vm::VmState;
 use zapcode_core::{ResourceLimits, ZapcodeRun};
@@ -653,13 +654,32 @@ fn normalize_returns_normalized_string() {
 }
 
 #[test]
-fn tagged_template_is_unsupported_residual() {
-    // DIVERGENCE: tagged template expressions (incl. String.raw`…`) are not
-    // supported and surface as UnsupportedSyntax at compile time.
-    assert!(
-        run_err("String.raw`a\\nb`").contains("tagged template"),
-        "expected an unsupported-tagged-template error"
+fn tagged_template_calls_tag_with_strings_and_values() {
+    // `tag`a${x}b`` desugars to `tag(["a","b"], x)`: the cooked strings array
+    // first, then the interpolated values.
+    assert_eq!(
+        run_str("function t(s, ...v) { return s.join('|') + '#' + v.join(','); } t`a${1}b${2}c`"),
+        "a|b|c#1,2"
     );
+    // The strings array is a real array (length, index, reduce all work).
+    assert_eq!(
+        run_str("function t(s, ...v) { return s.length + '/' + v.length; } t`a${1}b${2}c${3}d`"),
+        "4/3"
+    );
+    // SQL/template-builder pattern via reduce.
+    assert_eq!(
+        run_str("function sql(s, ...v) { return s.reduce((a, c, i) => a + c + (i < v.length ? '[' + v[i] + ']' : ''), ''); } const id = 5; sql`id=${id} x=${id + 1}`"),
+        "id=[5] x=[6]"
+    );
+    // No substitutions: a single-element strings array.
+    assert_eq!(run_str("function t(s) { return s[0]; } t`hello`"), "hello");
+    // A member tag keeps its `this` binding.
+    assert_eq!(
+        run_str("const o = { p: '!', f(s, ...v) { return s[0] + this.p; } }; o.f`hi${1}`"),
+        "hi!"
+    );
+    // NOTE: the strings array's `.raw` companion is not provided, so
+    // `String.raw`…`` and tags reading `strings.raw` remain a residual.
 }
 
 // ============================================================================

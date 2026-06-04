@@ -474,4 +474,14 @@ await test("class declared inside a function works across the host boundary", as
   assert.equal(r.output, 3);
 });
 
+// ── tagged templates call the tag with (strings, ...values) ──
+await test("tagged templates work across the host boundary like Node", async () => {
+  let r = await execute(`(function(){ function t(s, ...v){ return s.join("|") + "#" + v.join(","); } return t\`a\${1}b\${2}c\`; })()`, {});
+  assert.equal(r.output, "a|b|c#1,2");
+
+  // SQL-builder pattern.
+  r = await execute(`(function(){ function sql(s, ...v){ return s.reduce((a,c,i)=>a+c+(i<v.length?"["+v[i]+"]":""),""); } let id=5; return sql\`id=\${id} x=\${id+1}\`; })()`, {});
+  assert.equal(r.output, "id=[5] x=[6]");
+});
+
 console.log(`\n${passed} marshalling checks passed.`);
