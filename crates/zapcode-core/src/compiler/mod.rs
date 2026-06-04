@@ -1,6 +1,8 @@
 pub mod instruction;
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use crate::error::{Result, ZapcodeError};
 use crate::parser::ir::*;
@@ -47,11 +49,37 @@ pub struct CompiledFunction {
     pub needs_arguments: bool,
 }
 
+impl CompiledFunction {
+    /// An empty stand-in used to reserve a slot in the shared function table
+    /// before the real compiled function is written back by index (see
+    /// `compile_program`). Never executed.
+    fn placeholder() -> Self {
+        CompiledFunction {
+            name: None,
+            params: Vec::new(),
+            instructions: Vec::new(),
+            local_count: 0,
+            local_names: Vec::new(),
+            is_async: false,
+            is_generator: false,
+            needs_arguments: false,
+        }
+    }
+}
+
 struct Compiler {
     instructions: Vec<Instruction>,
     locals: Vec<String>,
     local_indices: HashMap<String, usize>,
-    functions: Vec<CompiledFunction>,
+    /// The program's flat function table, SHARED across the top-level compiler
+    /// and every per-function sub-compiler (`compile_function_def`). Parser-
+    /// assigned function indices occupy slots `0..program.functions.len()`;
+    /// class member functions (constructors/methods/field-inits), which have no
+    /// parser index, are appended beyond that. Sharing is essential: a class
+    /// declared inside a function compiles in a sub-compiler, and its members
+    /// must land in this one global table (else their CreateClosure indices
+    /// dangle into the wrong functions and instantiating recurses forever).
+    functions: Rc<RefCell<Vec<CompiledFunction>>>,
     loop_stack: Vec<LoopInfo>,
     external_functions: HashSet<String>,
     mode: CompilerMode,
@@ -91,7 +119,7 @@ impl Compiler {
             instructions: Vec::new(),
             locals: Vec::new(),
             local_indices: HashMap::new(),
-            functions: Vec::new(),
+            functions: Rc::new(RefCell::new(Vec::new())),
             loop_stack: Vec::new(),
             external_functions,
             mode: CompilerMode::Standard,
@@ -111,7 +139,7 @@ impl Compiler {
             instructions: Vec::new(),
             locals: Vec::new(),
             local_indices: HashMap::new(),
-            functions: Vec::new(),
+            functions: Rc::new(RefCell::new(Vec::new())),
             loop_stack: Vec::new(),
             external_functions,
             mode: CompilerMode::SessionChunk,
@@ -194,10 +222,18 @@ impl Compiler {
     }
 
     fn compile_program(&mut self, program: &Program) -> Result<()> {
-        // First pass: compile all function definitions
-        for func_def in &program.functions {
+        // First pass: compile all parser-indexed function definitions. Reserve
+        // their slots up front and assign by index, because compiling a function
+        // whose body declares a class appends that class's member functions to
+        // the shared table mid-pass — reserving keeps parser indices stable
+        // (regular functions own 0..N; class members land at N and beyond).
+        let n = program.functions.len();
+        self.functions
+            .borrow_mut()
+            .resize_with(n, CompiledFunction::placeholder);
+        for (i, func_def) in program.functions.iter().enumerate() {
             let compiled = self.compile_function_def(func_def)?;
-            self.functions.push(compiled);
+            self.functions.borrow_mut()[i] = compiled;
         }
 
         // Second pass: compile body. Hoist top-level function declarations first
@@ -350,6 +386,9 @@ impl Compiler {
 
     fn compile_function_def(&mut self, func: &FunctionDef) -> Result<CompiledFunction> {
         let mut func_compiler = Compiler::new(self.external_functions.clone());
+        // Share the one global function table so class members declared in this
+        // body register globally (see the `functions` field doc).
+        func_compiler.functions = Rc::clone(&self.functions);
         // Inherit the enclosing class context so `super` inside a method/constructor
         // body (which compiles into this fresh sub-compiler) resolves to the right
         // defining class. Nested non-method closures inside a method keep the same
@@ -2492,8 +2531,8 @@ impl Compiler {
         // Push constructor closure (or undefined if none)
         if let Some(ctor) = constructor {
             let compiled = self.compile_function_def(ctor)?;
-            let func_idx = self.functions.len();
-            self.functions.push(compiled);
+            let func_idx = self.functions.borrow().len();
+            self.functions.borrow_mut().push(compiled);
             self.emit(Instruction::CreateClosure(func_idx));
         } else {
             self.emit(Instruction::Push(Constant::Undefined));
@@ -2522,8 +2561,8 @@ impl Compiler {
         for m in ms {
             self.emit(Instruction::Push(Constant::String(m.name.clone())));
             let compiled = self.compile_function_def(&m.func)?;
-            let func_idx = self.functions.len();
-            self.functions.push(compiled);
+            let func_idx = self.functions.borrow().len();
+            self.functions.borrow_mut().push(compiled);
             self.emit(Instruction::CreateClosure(func_idx));
         }
         Ok(())
@@ -2549,8 +2588,8 @@ impl Compiler {
                 span: Span { start: 0, end: 0 },
             };
             let compiled = self.compile_function_def(&init)?;
-            let func_idx = self.functions.len();
-            self.functions.push(compiled);
+            let func_idx = self.functions.borrow().len();
+            self.functions.borrow_mut().push(compiled);
             self.emit(Instruction::CreateClosure(func_idx));
         }
         Ok(())
@@ -2698,9 +2737,10 @@ pub fn compile_with_externals(
     let mut compiler = Compiler::new(external_functions);
     compiler.compile_program(program)?;
 
+    let functions = compiler.functions.borrow().clone();
     Ok(CompiledProgram {
         instructions: compiler.instructions,
-        functions: compiler.functions,
+        functions,
         local_names: compiler.locals,
     })
 }
@@ -2713,10 +2753,11 @@ pub fn compile_session_chunk(
     let mut compiler = Compiler::new_session_chunk(external_functions, existing_bindings);
     compiler.compile_program(program)?;
 
+    let functions = compiler.functions.borrow().clone();
     Ok((
         CompiledProgram {
             instructions: compiler.instructions,
-            functions: compiler.functions,
+            functions,
             local_names: compiler.locals,
         },
         compiler.top_level_bindings,
