@@ -1074,9 +1074,11 @@ impl<'a> AstLowerer<'a> {
                     "eval" => Err(ZapcodeError::SandboxViolation(
                         "eval is forbidden in the sandbox".to_string(),
                     )),
-                    "Function" => Err(ZapcodeError::SandboxViolation(
-                        "Function constructor is forbidden in the sandbox".to_string(),
-                    )),
+                    // `Function` resolves to a non-constructible global VALUE (see
+                    // `register_globals`), so `typeof Function === "function"` and
+                    // `f instanceof Function` work like Node. The sandbox violation
+                    // is raised at runtime when it is actually CALLED/constructed,
+                    // where it is catchable, instead of aborting at parse time.
                     "process" => Err(ZapcodeError::SandboxViolation(
                         "process is forbidden in the sandbox".to_string(),
                     )),

@@ -458,6 +458,7 @@ impl Vm {
         "JSON",
         "Object",
         "Array",
+        "Function",
         "Math",
         "Promise",
         "Map",
@@ -4122,7 +4123,16 @@ impl Vm {
                             }
                         }
                     }
-                    _ => false,
+                    // Functions are objects in JS; `"x" in fn` is valid (no
+                    // inspectable own data keys in this subset, so `false`).
+                    Value::Function(_) => false,
+                    // The RHS of `in` must be an object. Node throws a catchable
+                    // TypeError for primitives — e.g. `"length" in "abc"`.
+                    _ => {
+                        return Err(ZapcodeError::TypeError(
+                            "Cannot use 'in' operator to search in a non-object".to_string(),
+                        ));
+                    }
                 };
                 self.push(Value::Bool(result))?;
             }
@@ -4133,6 +4143,36 @@ impl Vm {
                 let has_key = |h: Handle, k: &str, heap: &Heap| -> bool {
                     heap.object(h).is_some_and(|m| m.contains_key(k))
                 };
+                // The RHS of `instanceof` must be callable (a constructor). Node
+                // throws a catchable TypeError otherwise — e.g. `x instanceof 5`
+                // or `x instanceof ({})`. Callable values here are user functions,
+                // builtin constructors (`__builtin_constructor__`), user classes
+                // (`__class_name__`), and bare global fns (`__global_fn__`).
+                let rhs_callable = match &right {
+                    Value::Function(_) => true,
+                    Value::Object(h) => self.heap.object(*h).is_some_and(|m| {
+                        m.contains_key("__builtin_constructor__")
+                            || m.contains_key("__class_name__")
+                            || m.contains_key("__global_fn__")
+                    }),
+                    _ => false,
+                };
+                if !rhs_callable {
+                    return Err(ZapcodeError::TypeError(
+                        "Right-hand side of 'instanceof' is not callable".to_string(),
+                    ));
+                }
+                // A user function value is an instance of the `Function` builtin
+                // (and of `Object`). Handle it before the object-map inspection
+                // below, which only covers `Value::Object` left operands.
+                if let Value::Function(_) = &left {
+                    let matches_fn = matches!(&right, Value::Object(h)
+                        if self.heap.object(*h).is_some_and(|m| matches!(
+                            m.get("__builtin_constructor__"),
+                            Some(Value::String(s)) if matches!(s.as_ref(), "Function" | "Object"))));
+                    self.push(Value::Bool(matches_fn))?;
+                    return Ok(None);
+                }
                 // Check if left's __class__ matches right's __class_name__
                 let result = if let Value::Object(class_h) = &right {
                     let class_obj = self.heap.object_map(*class_h);
@@ -4652,6 +4692,18 @@ impl Vm {
                     {
                         let r = self.construct_regexp(&args)?;
                         self.push(r)?;
+                    }
+                    // `Function(...)` called WITHOUT `new` is equally forbidden;
+                    // the rejection is a catchable runtime sandbox violation.
+                    Value::Object(h)
+                        if self.heap.object(h).is_some_and(|m| {
+                            matches!(m.get("__builtin_constructor__"),
+                                Some(Value::String(s)) if s.as_ref() == "Function")
+                        }) =>
+                    {
+                        return Err(ZapcodeError::SandboxViolation(
+                            "Function constructor is forbidden in the sandbox".to_string(),
+                        ));
                     }
                     _ => {
                         let msg = callee.to_js_string(&self.heap);
@@ -5422,6 +5474,16 @@ impl Vm {
                                     }
                                 }
                                 return Ok(None);
+                            }
+                            // `new Function(...)` is forbidden — but the rejection is
+                            // a (catchable) runtime sandbox violation, not a fatal
+                            // parse-time abort. The `Function` global itself exists so
+                            // `typeof`/`instanceof` work.
+                            "Function" => {
+                                return Err(ZapcodeError::SandboxViolation(
+                                    "Function constructor is forbidden in the sandbox"
+                                        .to_string(),
+                                ));
                             }
                             _ => {}
                         }

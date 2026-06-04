@@ -375,6 +375,75 @@ fn instanceof_basic() {
     );
 }
 
+// `in` on a non-object RHS is a catchable TypeError in Node (not a silent
+// `false`). `"length" in "abc"`, `"x" in 5`, etc. all throw.
+#[test]
+fn in_operator_non_object_rhs_throws_typeerror() {
+    assert_eq!(
+        run_str(r#"let ok=false; try{"length" in "abc"}catch(e){ok=(e instanceof TypeError)} ok"#),
+        "true"
+    );
+    assert_eq!(
+        run_str(r#"let ok=false; try{"x" in 5}catch(e){ok=(e instanceof TypeError)} ok"#),
+        "true"
+    );
+    assert_eq!(
+        run_str(r#"let ok=false; try{"x" in true}catch(e){ok=(e instanceof TypeError)} ok"#),
+        "true"
+    );
+    assert_eq!(
+        run_str(r#"let ok=false; try{"x" in null}catch(e){ok=(e instanceof TypeError)} ok"#),
+        "true"
+    );
+    // Functions are objects: `"x" in fn` does not throw (returns false here as
+    // there are no inspectable own data keys in this subset).
+    assert_eq!(
+        run_str(r#"let ok=false; try{("x" in (function(){})); ok=true}catch(e){ok=false} ok"#),
+        "true"
+    );
+}
+
+// `instanceof` with a non-callable RHS is a catchable TypeError in Node
+// (not a silent `false`).
+#[test]
+fn instanceof_non_callable_rhs_throws_typeerror() {
+    assert_eq!(
+        run_str("let ok=false; try{({}) instanceof 5}catch(e){ok=(e instanceof TypeError)} ok"),
+        "true"
+    );
+    assert_eq!(
+        run_str("let ok=false; try{5 instanceof 5}catch(e){ok=(e instanceof TypeError)} ok"),
+        "true"
+    );
+    assert_eq!(
+        run_str(
+            "let ok=false; try{(function f(){}) instanceof ({})}catch(e){ok=(e instanceof TypeError)} ok"
+        ),
+        "true"
+    );
+    assert_eq!(
+        run_str("let ok=false; try{[] instanceof null}catch(e){ok=(e instanceof TypeError)} ok"),
+        "true"
+    );
+}
+
+// `Function` is a non-constructible global VALUE: `typeof Function === "function"`
+// and a function literal `instanceof Function`/`Object` is true, matching Node.
+// (Actually CALLING `Function`/`new Function` is still a sandbox violation —
+// see the sandbox suite.)
+#[test]
+fn function_global_is_a_non_constructible_value() {
+    assert_eq!(run_str("typeof Function"), "function");
+    assert_eq!(run_str("(function f(){}) instanceof Function"), "true");
+    assert_eq!(run_str("(() => 1) instanceof Function"), "true");
+    assert_eq!(run_str("(function f(){}) instanceof Object"), "true");
+    // A plain object is not an instance of Function.
+    assert_eq!(run_str("({}) instanceof Function"), "false");
+    // Referencing `Function` no longer aborts the whole program: it can be
+    // named without being called.
+    assert_eq!(run_str("const F = Function; typeof F"), "function");
+}
+
 // ----------------------------------------------------------------------------
 // Operator precedence & grouping
 // ----------------------------------------------------------------------------

@@ -226,4 +226,33 @@ await test("ascii regex shorthands + sticky /y marshal to the host like Node", a
   assert.equal(r.output, true);
 });
 
+// ── Non-constructible Function global + in/instanceof guards (no abort) ──
+// Referencing `Function` (typeof / instanceof) used to raise an UNCATCHABLE
+// sandbox violation that killed the whole guest program at parse time. It must
+// now resolve to a non-constructible value: typeof === "function", a function
+// literal is `instanceof Function`, and a forbidden CALL is a catchable error.
+// `in`/`instanceof` with a bad RHS must throw a catchable TypeError, not abort.
+await test("Function global + in/instanceof guards marshal to the host like Node", async () => {
+  // `typeof Function` is "function"; referencing it no longer aborts.
+  let r = await execute(`typeof Function`, {});
+  assert.equal(r.output, "function");
+  // A function literal is an instance of Function (and Object).
+  r = await execute(`(function f(){}) instanceof Function`, {});
+  assert.equal(r.output, true);
+  r = await execute(`(() => 1) instanceof Object`, {});
+  assert.equal(r.output, true);
+  // `instanceof` with a non-callable RHS is a catchable TypeError.
+  r = await execute(`let ok=false; try{({}) instanceof 5}catch(e){ok=(e instanceof TypeError)} ok`, {});
+  assert.equal(r.output, true);
+  // `in` on a primitive RHS is a catchable TypeError (not silent false).
+  r = await execute(`let ok=false; try{"length" in "abc"}catch(e){ok=(e instanceof TypeError)} ok`, {});
+  assert.equal(r.output, true);
+  // Actually calling Function is still forbidden, but the violation is now
+  // catchable in-guest and the program runs to completion (no exit 139/134).
+  r = await execute(`let ok=false; try{ Function("return 1") }catch(e){ ok=true } ok`, {});
+  assert.equal(r.output, true);
+  r = await execute(`let ok=false; try{ new Function("return 1") }catch(e){ ok=true } ok`, {});
+  assert.equal(r.output, true);
+});
+
 console.log(`\n${passed} marshalling checks passed.`);

@@ -91,6 +91,11 @@ pub fn register_globals(globals: &mut HashMap<String, Value>, heap: &mut Heap) {
     globals.insert("Map".to_string(), builtin_constructor("Map", heap));
     globals.insert("Set".to_string(), builtin_constructor("Set", heap));
     globals.insert("RegExp".to_string(), builtin_constructor("RegExp", heap));
+    // `Function` is registered as a non-constructible builtin VALUE so that
+    // `typeof Function === "function"` and `f instanceof Function` match Node.
+    // Actually CALLING `Function(...)` or `new Function(...)` is still rejected
+    // (with a catchable sandbox violation) by the VM's Call/Construct handlers.
+    globals.insert("Function".to_string(), builtin_constructor("Function", heap));
     globals.insert("Date".to_string(), {
         let mut d = IndexMap::new();
         d.insert(
