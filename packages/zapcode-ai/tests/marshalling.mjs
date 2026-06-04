@@ -323,4 +323,22 @@ await test("large-integer arithmetic + parseInt overflow marshal to the host lik
   assert.equal(r.output, "10000000000000000000");
 });
 
+// ── ECMA-262 Number::toString: exponential notation crosses the host boundary ──
+// The shared formatter drives String()/template/join/JSON.stringify inside the
+// VM. Guest stdout (console.log) and JSON output must match Node's String()
+// exactly — previously large/small magnitudes printed full positional decimals.
+await test("number stringification uses JS exponential notation like Node", async () => {
+  let r = await execute(`console.log(String(1e21), String(1e-7), String(2 ** 70))`, {});
+  assert.equal(r.stdout.trim(), "1e+21 1e-7 1.1805916207174113e+21");
+
+  // JSON.stringify (runs in-VM) must serialize numbers the same way.
+  r = await execute(`JSON.stringify({ big: 1e21, small: 1e-7, mid: 123.456 })`, {});
+  assert.equal(r.output, JSON.stringify({ big: 1e21, small: 1e-7, mid: 123.456 }));
+  assert.equal(r.output, '{"big":1e+21,"small":1e-7,"mid":123.456}');
+
+  // Array.join routes through the same formatter.
+  r = await execute(`[1e21, 1e-7, 12345678].join(",")`, {});
+  assert.equal(r.output, [1e21, 1e-7, 12345678].join(","));
+});
+
 console.log(`\n${passed} marshalling checks passed.`);

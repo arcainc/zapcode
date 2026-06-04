@@ -563,14 +563,13 @@ fn unary_plus_minus_coercion_table() {
     assert_eq!(run_str("-'5'"), "-5");
     assert_eq!(run_str("-true"), "-1");
     assert_eq!(run_str("-[7]"), "-7");
-    // DIVERGENCE (negative-zero stringification, same family as the documented
-    // `1/-0` case): negating a value that ToNumbers to 0 yields the IEEE -0, which
-    // zapcode renders as "-0" whereas Node's String(-0) is "0". Asserting zapcode's
-    // actual output here rather than the Node answer.
-    assert_eq!(run_str("-false"), "-0");
-    assert_eq!(run_str("-null"), "-0");
-    assert_eq!(run_str("-''"), "-0");
-    assert_eq!(run_str("-[]"), "-0");
+    // Negating a value that ToNumbers to 0 yields the IEEE -0, but JS
+    // String(-0) === "0" (the sign is preserved in the value, dropped by
+    // ToString). The shared formatter now matches Node here.
+    assert_eq!(run_str("-false"), "0");
+    assert_eq!(run_str("-null"), "0");
+    assert_eq!(run_str("-''"), "0");
+    assert_eq!(run_str("-[]"), "0");
     assert_eq!(run_str("-'abc'"), "NaN");
     assert_eq!(run_str("+'  42  '"), "42");
     assert_eq!(run_str("+'\\t\\n7\\n'"), "7"); // whitespace trimmed both sides

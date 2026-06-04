@@ -238,20 +238,11 @@ impl Value {
             Value::Null => "null".to_string(),
             Value::Bool(b) => b.to_string(),
             Value::Int(n) => n.to_string(),
-            Value::Float(n) => {
-                if n.is_infinite() {
-                    if *n > 0.0 {
-                        "Infinity".to_string()
-                    } else {
-                        "-Infinity".to_string()
-                    }
-                } else if n.is_nan() {
-                    "NaN".to_string()
-                } else {
-                    // Remove trailing ".0" for whole numbers
-                    n.to_string()
-                }
-            }
+            // Route every float through the shared ECMA-262 Number::toString
+            // formatter so String()/templates/console.log/join agree with
+            // JSON.stringify and Number.prototype.toString (exponential at
+            // magnitude >= 1e21 or < 1e-6, shortest round-tripping decimal).
+            Value::Float(n) => crate::vm::format_number(*n),
             Value::String(s) => s.to_string(),
             Value::Array(h) => {
                 if depth >= MAX_RENDER_DEPTH {

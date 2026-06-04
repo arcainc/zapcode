@@ -21,10 +21,6 @@
 //! arithmetic, which differ here). These are skipped, or the *actual* zapcode value
 //! is asserted with an explicit comment:
 //!   - `1 / -0` → `Infinity` (JS `-Infinity`): negative-zero sign in division.
-//!   - magnitudes JS renders exponential (`|x| >= 1e21` or `|x| < 1e-6`) print in
-//!     plain decimal here (e.g. `1e21` → `1000000000000000000000`).
-//!   - `Number.MAX_VALUE` / `MIN_VALUE` / `EPSILON` stringify as long decimals (no
-//!     `e` form); their *numeric* relationships are asserted instead.
 //!   - `Math.min(1, NaN)` → `1` and `Math.max(1, NaN)` → `1` are NaN-poisoning
 //!     differences when NaN is not the first arg (asserted as zapcode's actual).
 //!   - `Math.trunc(-0.5)` / `Math.hypot()` → `-0` (JS String() → `0`): negative-zero
@@ -384,6 +380,51 @@ fn to_precision_zero_and_one() {
     assert_eq!(run_str("(0).toPrecision(1)"), "0");
     assert_eq!(run_str("(1).toPrecision(3)"), "1.00");
     assert_eq!(run_str("(-0).toPrecision(2)"), "0.0");
+}
+
+// ============================================================================
+// Shared ECMA-262 Number::toString formatter (default toString / String() /
+// templates / Array.join / JSON.stringify all route through one path)
+// ============================================================================
+
+#[test]
+fn number_to_string_switches_to_exponential() {
+    // >= 1e21 and 0 < |x| < 1e-6 use exponential; everything between is fixed.
+    // All values ground-truthed against Node's String().
+    assert_eq!(run_str("String(1e21)"), "1e+21");
+    assert_eq!(run_str("String(1e20)"), "100000000000000000000"); // boundary stays fixed
+    assert_eq!(run_str("String(2 ** 70)"), "1.1805916207174113e+21");
+    assert_eq!(run_str("String(1.5e300)"), "1.5e+300");
+    assert_eq!(run_str("String(6.022e23)"), "6.022e+23");
+    assert_eq!(run_str("String(1e-6)"), "0.000001"); // boundary stays fixed
+    assert_eq!(run_str("String(1e-7)"), "1e-7");
+    assert_eq!(run_str("String(9.999e-7)"), "9.999e-7");
+    assert_eq!(run_str("String(-3.14e-8)"), "-3.14e-8");
+    assert_eq!(run_str("String(Number.MAX_VALUE)"), "1.7976931348623157e+308");
+    // NB: use literals here, not Number.MIN_VALUE — that named constant is
+    // currently mis-defined as the smallest *normal* double (a separate bug);
+    // these exercise the formatter on the smallest subnormal and EPSILON.
+    assert_eq!(run_str("String(5e-324)"), "5e-324");
+    assert_eq!(run_str("String(2.220446049250313e-16)"), "2.220446049250313e-16");
+    // Mid-range values keep their plain decimal form.
+    assert_eq!(run_str("String(123.456)"), "123.456");
+    assert_eq!(run_str("String(0.5)"), "0.5");
+    assert_eq!(run_str("String(123456789012345680000)"), "123456789012345680000");
+}
+
+#[test]
+fn number_to_string_is_shared_across_coercion_paths() {
+    // The same formatter must drive templates, Array.join and JSON.stringify,
+    // not just String() — they previously emitted full positional decimals.
+    assert_eq!(run_str("`${1e21}`"), "1e+21");
+    assert_eq!(run_str("[1e21, 1e-7, 12345678].join(',')"), "1e+21,1e-7,12345678");
+    assert_eq!(
+        run_str("JSON.stringify({big: 1e21, small: 1e-7})"),
+        "{\"big\":1e+21,\"small\":1e-7}"
+    );
+    // Number.prototype.toString(10) and the >=1e21 toFixed fallthrough agree too.
+    assert_eq!(run_str("(1e21).toString()"), "1e+21");
+    assert_eq!(run_str("(1e21).toFixed(2)"), "1e+21");
 }
 
 // ============================================================================

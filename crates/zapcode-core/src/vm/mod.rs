@@ -21,6 +21,9 @@ mod builtins;
 /// Re-exported so the napi binding can apply the SAME exact reserved-marker
 /// filter when marshalling guest objects across the host boundary.
 pub use builtins::is_internal_marker_key;
+/// Shared ECMA-262 `Number::toString` formatter, used both by VM string
+/// coercion (`value.rs`) and the builtin number methods so every path agrees.
+pub(crate) use builtins::format_number;
 
 /// The result of VM execution.
 #[derive(Debug)]

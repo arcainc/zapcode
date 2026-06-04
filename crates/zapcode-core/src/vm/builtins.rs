@@ -556,10 +556,63 @@ pub fn format_number(n: f64) -> String {
         } else {
             "-Infinity".to_string()
         }
+    } else if n == 0.0 {
+        // Covers both +0 and -0: JS ToString(-0) === "0".
+        "0".to_string()
     } else if n.fract() == 0.0 && n.abs() < 1e15 {
+        // Fast path: small exact integers cast cleanly to i64.
         (n as i64).to_string()
     } else {
-        n.to_string()
+        js_number_to_string(n)
+    }
+}
+
+/// ECMA-262 `Number::toString` for a finite, nonzero `n`.
+///
+/// Rust's default `f64::to_string`/`Display` round-trips but never uses
+/// exponential notation, so it diverges from JS for very large or very small
+/// magnitudes (`String(1e21)` must be `"1e+21"`, `String(1e-7)` must be
+/// `"1e-7"`). This produces the shortest decimal that round-trips (via Rust's
+/// `LowerExp`, whose digit choice matches V8's) and then applies the JS
+/// notation rules: fixed-point in `(1e-6, 1e21)`, exponential outside it.
+fn js_number_to_string(n: f64) -> String {
+    let negative = n < 0.0;
+    // `{:e}` yields the shortest round-tripping mantissa, e.g. "1.2345e20",
+    // "1e-7". Split into the digit string and the base-10 exponent of the
+    // leading digit.
+    let exp_form = format!("{:e}", n.abs());
+    let (mantissa, exp_part) = exp_form.split_once('e').expect("LowerExp always has 'e'");
+    let big_e: i32 = exp_part.parse().expect("LowerExp exponent is a valid integer");
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let k = digits.len() as i32;
+    // ECMA point position `n`: value == digits * 10^(point - k).
+    let point = big_e + 1;
+
+    let body = if k <= point && point <= 21 {
+        // Integer, possibly with trailing zeros: "12300".
+        format!("{}{}", digits, "0".repeat((point - k) as usize))
+    } else if 0 < point && point <= 21 {
+        // Decimal point inside the digit run: "12.34".
+        format!("{}.{}", &digits[..point as usize], &digits[point as usize..])
+    } else if -6 < point && point <= 0 {
+        // Small magnitude, leading zeros: "0.00123".
+        format!("0.{}{}", "0".repeat((-point) as usize), digits)
+    } else {
+        // Exponential notation: "1.23e+45" / "1e-7".
+        let exp = point - 1;
+        let sign = if exp >= 0 { "+" } else { "-" };
+        let mant = if k == 1 {
+            digits
+        } else {
+            format!("{}.{}", &digits[..1], &digits[1..])
+        };
+        format!("{}e{}{}", mant, sign, exp.abs())
+    };
+
+    if negative {
+        format!("-{}", body)
+    } else {
+        body
     }
 }
 

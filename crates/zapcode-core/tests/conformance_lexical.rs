@@ -160,12 +160,11 @@ fn exponent_literals() {
     assert_eq!(run_str("1.5e2"), "150");
     assert_eq!(run_str("2.5e-1"), "0.25");
     assert_eq!(run_str("1e+3"), "1000"); // explicit + sign
-    // Number-to-string here always emits full decimal (never exponential); V8
-    // would print "6.022e+23" / "1e+21" / "1e-7". Asserted as actual (documented
-    // number-stringification residual).
-    assert_eq!(run_str("6.022e23"), "602200000000000000000000");
-    assert_eq!(run_str("1e21"), "1000000000000000000000");
-    assert_eq!(run_str("1e-7"), "0.0000001");
+    // Number-to-string switches to exponential at magnitude >= 1e21 and for
+    // 0 < magnitude < 1e-6, matching V8 / ECMA-262 Number::toString.
+    assert_eq!(run_str("6.022e23"), "6.022e+23");
+    assert_eq!(run_str("1e21"), "1e+21");
+    assert_eq!(run_str("1e-7"), "1e-7");
     assert_eq!(run_str(".5e1"), "5");
 }
 
