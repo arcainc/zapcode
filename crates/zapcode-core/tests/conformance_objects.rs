@@ -678,3 +678,70 @@ fn delete_all_keys_leaves_empty() {
         "{}"
     );
 }
+
+// ============================================================================
+// User-defined keys that merely start with `__` are ORDINARY own properties.
+// The interpreter must only hide its EXACT reserved internal markers, never a
+// blanket `__`-prefix; otherwise it silently eats user keys like `__id__`,
+// `__typename`, `__v`. Each assertion below matches real Node.
+// ============================================================================
+
+#[test]
+fn double_underscore_user_keys_are_enumerable() {
+    // Object.keys / values / entries keep user `__`-keys (Node-verified).
+    assert_eq!(run_str("const o={__id__:5,a:1}; Object.keys(o).join(',')"), "__id__,a");
+    assert_eq!(
+        run_str("Object.values({__typename:'X',a:1}).join(',')"),
+        "X,1"
+    );
+    assert_eq!(run_str("Object.entries({__t__:9}).length"), "1");
+    // getOwnPropertyNames likewise keeps them.
+    assert_eq!(
+        run_str("Object.getOwnPropertyNames({__id__:1,b:2}).join(',')"),
+        "__id__,b"
+    );
+    // for-in (lowers to Object.keys) enumerates them too.
+    assert_eq!(
+        run_str("let ks=[]; for (const k in {__id__:1,b:2}) { ks.push(k); } ks.join(',')"),
+        "__id__,b"
+    );
+}
+
+#[test]
+fn double_underscore_user_keys_survive_spread() {
+    // `{...o}` copies user `__`-keys (Node: `({...{__x__:1}}).__x__` === 1).
+    assert_eq!(run_str("String(({...{__x__:1}}).__x__)"), "1");
+    assert_eq!(
+        run_str("const s={__id__:1,a:2}; String(({...s, c:3}).__id__)"),
+        "1"
+    );
+    assert_eq!(
+        run_str("JSON.stringify({...{__id__:7,a:1}})"),
+        "{\"__id__\":7,\"a\":1}"
+    );
+}
+
+#[test]
+fn double_underscore_user_keys_reflection_self_consistent() {
+    // Object.hasOwn / `in` / get-property all already expose user `__`-keys;
+    // keys/values/entries/stringify now agree.
+    assert_eq!(run_str("String(Object.hasOwn({__id__:1}, '__id__'))"), "true");
+    assert_eq!(run_str("String('__id__' in {__id__:1})"), "true");
+    assert_eq!(run_str("String(({__id__:7}).__id__)"), "7");
+}
+
+#[test]
+fn class_instance_internal_markers_stay_hidden_on_spread() {
+    // Spreading a class instance must NOT leak internal brand keys
+    // (`__class__`, `__class_chain__`, …) — only real own data props copy.
+    assert_eq!(
+        run_str(
+            "class C { constructor(){ this.a=1; this.b=2; } } JSON.stringify({...new C()})"
+        ),
+        "{\"a\":1,\"b\":2}"
+    );
+    assert_eq!(
+        run_str("class C { a = 1; b = 2; } Object.keys({...new C()}).join(',')"),
+        "a,b"
+    );
+}

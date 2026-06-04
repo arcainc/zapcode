@@ -148,4 +148,32 @@ await test("padStart/join past the cap hit the memory limit", async () => {
   );
 });
 
+// ── User `__`-prefixed keys must survive the host boundary ──
+// value_to_json hides only the EXACT reserved internal markers, never a blanket
+// `__`-prefix, so real user keys like `__id__`/`__typename`/`__v` marshal out
+// while VM brands (e.g. a class instance's `__class__`) never leak.
+await test("user __-keys survive marshalling to the host", async () => {
+  const r = await execute(`({__id__: 42, name: "x", __typename: "User", __v: 1})`, {});
+  assert.deepEqual(r.output, { __id__: 42, name: "x", __typename: "User", __v: 1 });
+});
+
+await test("class instance brands do NOT leak across the host boundary", async () => {
+  const r = await execute(`class C { constructor(){ this.a = 1; this.b = 2; } } new C()`, {});
+  assert.deepEqual(r.output, { a: 1, b: 2 });
+});
+
+await test("user __-keys round-trip through a tool argument and back", async () => {
+  const r = await execute(
+    `const x = await echo({payload: {__id__: 7, q: "hi"}}); x.__id__ + ":" + x.q`,
+    {
+      echo: {
+        description: "",
+        parameters: { payload: { type: "object" } },
+        execute: async (args) => args.payload,
+      },
+    },
+  );
+  assert.equal(r.output, "7:hi");
+});
+
 console.log(`\n${passed} marshalling checks passed.`);

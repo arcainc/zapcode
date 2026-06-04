@@ -174,3 +174,24 @@ fn user_to_json_on_plain_object_honored() {
     assert_eq!(run_str("JSON.stringify({toJSON(){ return 'custom'; }})"), "\"custom\"");
     assert_eq!(run_str("JSON.stringify({x: {toJSON(){ return 5; }}})"), "{\"x\":5}");
 }
+
+#[test]
+fn stringify_keeps_user_double_underscore_keys() {
+    // JSON.stringify must NOT drop user keys that merely start with `__` — only
+    // the interpreter's exact reserved internal markers are hidden. Node:
+    // JSON.stringify({__v:1,a:2}) === '{"__v":1,"a":2}'.
+    assert_eq!(run_str("JSON.stringify({__v:1,a:2})"), "{\"__v\":1,\"a\":2}");
+    assert_eq!(
+        run_str("JSON.stringify({a:{__id__:3},__meta__:1})"),
+        "{\"a\":{\"__id__\":3},\"__meta__\":1}"
+    );
+    assert_eq!(
+        run_str("JSON.stringify({__proto_like__:'kept',normal:1})"),
+        "{\"__proto_like__\":\"kept\",\"normal\":1}"
+    );
+    // A class instance still hides its internal brand keys.
+    assert_eq!(
+        run_str("class C { a = 1; b = 2; } JSON.stringify(new C())"),
+        "{\"a\":1,\"b\":2}"
+    );
+}

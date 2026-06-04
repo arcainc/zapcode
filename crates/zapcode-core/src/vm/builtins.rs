@@ -17,6 +17,65 @@ use crate::value::{Value, MAX_RENDER_DEPTH};
 /// (real `Symbol.iterator` is a non-enumerable symbol, not an own string key).
 pub const SYMBOL_ITERATOR_KEY: &str = "__@@iterator";
 
+/// EXACT allowlist of reserved internal marker keys. These are VM bookkeeping
+/// properties (brands, class metadata, accessor tables, collection backing
+/// stores, promise/batch plumbing) that live in the same heap object map as
+/// guest data but must never be exposed to the guest as own properties.
+///
+/// IMPORTANT: this is an exact-match set, NOT a `starts_with("__")` prefix
+/// filter. A blanket prefix check silently eats real user keys like `__id__`,
+/// `__typename`, or `__v`, which Node treats as ordinary enumerable own
+/// properties. Reflection that already exposes `__`-keys (hasOwnProperty,
+/// `in`, get-property) stays self-consistent with `Object.keys`/`values`/
+/// `entries`, object spread, `getOwnPropertyNames`, and `JSON.stringify`
+/// because all of them filter ONLY the keys in this list.
+const INTERNAL_MARKER_KEYS: &[&str] = &[
+    // Symbol brand and the synthetic `Symbol.iterator` key.
+    "__symbol__",
+    SYMBOL_ITERATOR_KEY,
+    // Error brands.
+    "__error__",
+    "__error_base__",
+    // Class / instance metadata.
+    "__class__",
+    "__class_name__",
+    "__class_chain__",
+    "__constructor__",
+    "__prototype__",
+    "__super__",
+    "__builtin_constructor__",
+    // Accessor descriptor tables and field initializers.
+    "__getters__",
+    "__setters__",
+    "__static_getters__",
+    "__static_setters__",
+    "__field_inits__",
+    // Object.freeze brand.
+    "__frozen__",
+    // Date backing value.
+    "__date_ms__",
+    // Map / Set / RegExp brands and their backing stores.
+    "__map__",
+    "__set__",
+    "__regexp__",
+    "__items__",
+    "__entries__",
+    // Promise / deferred-batch plumbing.
+    "__promise__",
+    "__call_id__",
+    "__batch_kind__",
+    // Global-function thunk marker.
+    "__global_fn__",
+];
+
+/// True iff `key` is one of the reserved internal marker keys that must be
+/// hidden from guest reflection (see [`INTERNAL_MARKER_KEYS`]). Any other key —
+/// including user keys that merely start with `__` such as `__id__` — is a
+/// real, guest-visible own property.
+pub fn is_internal_marker_key(key: &str) -> bool {
+    INTERNAL_MARKER_KEYS.contains(&key)
+}
+
 /// Register built-in global objects and functions, allocating their backing
 /// objects in `heap`.
 pub fn register_globals(globals: &mut HashMap<String, Value>, heap: &mut Heap) {
@@ -957,7 +1016,7 @@ fn serialize_json(
             seen.push(*h);
             let mut pairs: Vec<(String, String)> = Vec::new();
             for (k, v) in map.iter() {
-                if k.starts_with("__") {
+                if is_internal_marker_key(k) {
                     continue;
                 }
                 if let Some(w) = whitelist {
@@ -2252,7 +2311,7 @@ fn call_object_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<O
                     .object(*h)
                     .map(|m| {
                         m.keys()
-                            .filter(|k| !k.starts_with("__"))
+                            .filter(|k| !is_internal_marker_key(k))
                             .map(|k| Value::String(k.clone()))
                             .collect()
                     })
@@ -2271,7 +2330,7 @@ fn call_object_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<O
                     .object(*h)
                     .map(|m| {
                         m.iter()
-                            .filter(|(k, _)| !k.starts_with("__"))
+                            .filter(|(k, _)| !is_internal_marker_key(k))
                             .map(|(_, v)| v.clone())
                             .collect()
                     })
@@ -2287,7 +2346,7 @@ fn call_object_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<O
                     .object(*h)
                     .map(|m| {
                         m.iter()
-                            .filter(|(k, _)| !k.starts_with("__"))
+                            .filter(|(k, _)| !is_internal_marker_key(k))
                             .map(|(k, v)| (Value::String(k.clone()), v.clone()))
                             .collect()
                     })
@@ -2434,13 +2493,14 @@ fn call_object_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<O
         }
         "getOwnPropertyNames" => {
             // Like Object.keys but conceptually includes non-enumerable names;
-            // internal brand keys (prefixed `__`) are hidden from guest view.
+            // reserved internal brand keys are hidden from guest view (but real
+            // user keys that merely start with `__` are kept).
             let keys: Vec<Value> = match &first {
                 Value::Object(h) => heap
                     .object(*h)
                     .map(|m| {
                         m.keys()
-                            .filter(|k| !k.starts_with("__"))
+                            .filter(|k| !is_internal_marker_key(k))
                             .map(|k| Value::String(k.clone()))
                             .collect()
                     })

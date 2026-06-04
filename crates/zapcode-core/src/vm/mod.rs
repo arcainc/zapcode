@@ -18,6 +18,10 @@ use crate::value::{
 
 mod builtins;
 
+/// Re-exported so the napi binding can apply the SAME exact reserved-marker
+/// filter when marshalling guest objects across the host boundary.
+pub use builtins::is_internal_marker_key;
+
 /// The result of VM execution.
 #[derive(Debug)]
 pub enum VmState {
@@ -2371,7 +2375,7 @@ impl Vm {
                 seen.push(*h);
                 let mut pairs: Vec<(String, String)> = Vec::new();
                 for (k, v) in map.iter() {
-                    if k.starts_with("__") {
+                    if builtins::is_internal_marker_key(k) {
                         continue;
                     }
                     if let Some(w) = whitelist {
@@ -4072,6 +4076,13 @@ impl Vm {
                         let entries = self.heap.object_map(h);
                         if let Some(map) = self.heap.object_mut(acc) {
                             for (k, v) in entries {
+                                // Spread copies own enumerable properties. Skip
+                                // reserved internal markers (so `{...instance}`
+                                // doesn't leak `__class__`/brands), but keep real
+                                // user keys that merely start with `__`.
+                                if builtins::is_internal_marker_key(&k) {
+                                    continue;
+                                }
                                 map.insert(k, v);
                             }
                         }
