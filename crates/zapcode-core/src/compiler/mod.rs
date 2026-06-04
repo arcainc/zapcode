@@ -58,6 +58,12 @@ struct Compiler {
     top_level_bindings: HashMap<String, TopLevelBindingKind>,
     /// Label attached to the next loop (from a `label:` statement), if any.
     pending_label: Option<String>,
+    /// Active labeled NON-loop statements (e.g. `foo: { ... break foo; }`).
+    /// Kept separate from `loop_stack` so that an *unlabeled* `break`/`continue`
+    /// never targets a labeled block — only a labeled `break foo` falls back to
+    /// this stack. Without it, `break foo` finds no loop, leaves its jump offset
+    /// at 0, and runs away to instruction 0 (hits the allocation limit).
+    labeled_blocks: Vec<LoopInfo>,
     /// Function-declaration indices already bound by the scope's hoist pass, so
     /// the in-source-order `FunctionDecl` statement is a no-op for them.
     hoisted_funcs: std::collections::HashSet<usize>,
@@ -91,6 +97,7 @@ impl Compiler {
             mode: CompilerMode::Standard,
             top_level_bindings: HashMap::new(),
             pending_label: None,
+            labeled_blocks: Vec::new(),
             hoisted_funcs: std::collections::HashSet::new(),
             current_class: None,
         }
@@ -110,6 +117,7 @@ impl Compiler {
             mode: CompilerMode::SessionChunk,
             top_level_bindings,
             pending_label: None,
+            labeled_blocks: Vec::new(),
             hoisted_funcs: std::collections::HashSet::new(),
             current_class: None,
         }
@@ -218,6 +226,21 @@ impl Compiler {
     /// function boundary — exactly the lexical scope `arguments` belongs to.
     fn body_uses_arguments(body: &[Statement]) -> bool {
         body.iter().any(Self::stmt_uses_arguments)
+    }
+
+    /// Whether a labeled statement's body is itself a loop/switch that will
+    /// adopt the pending label into its own `LoopInfo` (so `break label` /
+    /// `continue label` resolve against it). Anything else (notably a plain
+    /// block) is a labeled non-loop and needs its own break frame.
+    fn body_consumes_label(stmt: &Statement) -> bool {
+        matches!(
+            stmt,
+            Statement::While { .. }
+                | Statement::DoWhile { .. }
+                | Statement::For { .. }
+                | Statement::ForOf { .. }
+                | Statement::Switch { .. }
+        )
     }
 
     fn stmt_uses_arguments(stmt: &Statement) -> bool {
@@ -696,11 +719,21 @@ impl Compiler {
             Statement::Break { label, .. } => {
                 let idx = self.emit(Instruction::Break(0));
                 let target = match label {
+                    // A labeled break targets the matching loop/switch, or — if
+                    // none matches — a labeled non-loop block (e.g. `foo: {...}`).
                     Some(l) => self
                         .loop_stack
                         .iter_mut()
                         .rev()
-                        .find(|li| li.label.as_deref() == Some(l.as_str())),
+                        .find(|li| li.label.as_deref() == Some(l.as_str()))
+                        .or_else(|| {
+                            self.labeled_blocks
+                                .iter_mut()
+                                .rev()
+                                .find(|li| li.label.as_deref() == Some(l.as_str()))
+                        }),
+                    // An unlabeled break targets the innermost loop/switch only,
+                    // never an enclosing labeled block.
                     None => self.loop_stack.last_mut(),
                 };
                 if let Some(loop_info) = target {
@@ -710,11 +743,21 @@ impl Compiler {
             Statement::Continue { label, .. } => {
                 let idx = self.emit(Instruction::Continue(0));
                 let target = match label {
+                    // `continue label` only legally targets a loop, but a labeled
+                    // *block* may match in malformed input; fall back to it so the
+                    // jump is still patched (to the block end) rather than left at
+                    // 0 and running away.
                     Some(l) => self
                         .loop_stack
                         .iter_mut()
                         .rev()
-                        .find(|li| li.label.as_deref() == Some(l.as_str())),
+                        .find(|li| li.label.as_deref() == Some(l.as_str()))
+                        .or_else(|| {
+                            self.labeled_blocks
+                                .iter_mut()
+                                .rev()
+                                .find(|li| li.label.as_deref() == Some(l.as_str()))
+                        }),
                     None => self.loop_stack.last_mut(),
                 };
                 if let Some(loop_info) = target {
@@ -722,11 +765,34 @@ impl Compiler {
                 }
             }
             Statement::Labeled { label, body, .. } => {
-                // The next loop/switch picks up this label; clear it afterward in
-                // case the labeled statement wasn't a loop.
-                self.pending_label = Some(label.clone());
-                self.compile_statement(body)?;
-                self.pending_label = None;
+                if Self::body_consumes_label(body) {
+                    // The loop/switch picks up this label into its own LoopInfo;
+                    // clear it afterward in case the body turned out not to.
+                    self.pending_label = Some(label.clone());
+                    self.compile_statement(body)?;
+                    self.pending_label = None;
+                } else {
+                    // Labeled non-loop statement (commonly a block). Register a
+                    // break frame so `break label` jumps past the body instead of
+                    // emitting an unpatched Break(0) that loops to instruction 0.
+                    self.labeled_blocks.push(LoopInfo {
+                        break_patches: Vec::new(),
+                        continue_patches: Vec::new(),
+                        label: Some(label.clone()),
+                    });
+                    self.compile_statement(body)?;
+                    let end = self.current_offset();
+                    let info = self.labeled_blocks.pop().unwrap();
+                    for patch in info.break_patches {
+                        self.patch_jump(patch, end);
+                    }
+                    // `continue` is invalid on a block; if one slipped through,
+                    // patch it to the end too (behaves like break) so it can't
+                    // run away.
+                    for patch in info.continue_patches {
+                        self.patch_jump(patch, end);
+                    }
+                }
             }
             Statement::FunctionDecl {
                 func_index, name, ..

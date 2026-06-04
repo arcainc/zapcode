@@ -363,4 +363,17 @@ await test("negative zero keeps its sign across the host boundary like Node", as
   assert.equal(r.output, 7);
 });
 
+// ── labeled break out of a plain block does not run away ──
+// `break label` on a labeled non-loop block used to emit an unpatched jump to
+// instruction 0 → infinite loop → allocation-limit error on guest input. It
+// must now complete promptly with the JS-correct result.
+await test("labeled break on a plain block completes (no runaway) like Node", async () => {
+  let r = await execute(`(function(){ let r=''; foo:{ r+='a'; break foo; r+='b'; } return r+'c'; })()`, {});
+  assert.equal(r.output, "ac");
+
+  // An unlabeled break inside such a block, nested in a loop, breaks the loop.
+  r = await execute(`(function(){ let r=''; for(let i=0;i<3;i++){ blk:{ r+=i; break; } r+='x'; } return r; })()`, {});
+  assert.equal(r.output, "0");
+});
+
 console.log(`\n${passed} marshalling checks passed.`);
