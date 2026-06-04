@@ -694,3 +694,32 @@ fn realistic_string_processing() {
         "Hello"
     );
 }
+
+// ----------------------------------------------------------------------------
+// Regression: `slice`/`substring` index by CHARACTER position (consistent with
+// charAt/substr/indexOf). Previously they byte-indexed `&s[start..end]`, so a
+// char-derived index on multibyte input landed mid-codepoint and PANICKED the
+// host (SIGABRT). These cases used to abort the process; they must now return the
+// correct BMP slice. (Astral/UTF-16-unit semantics remain a documented G9 gap.)
+// ----------------------------------------------------------------------------
+
+#[test]
+fn multibyte_slice_substring_no_host_abort() {
+    // C2: substring across a multibyte boundary.
+    assert_eq!(run_str("\"ééé\".substring(1, 2)"), "é");
+    assert_eq!(run_str("\"ééé\".substring(0, 2)"), "éé");
+    // C3: indexOf returns a CHAR index; slice must consume it as a char index too.
+    assert_eq!(run_str("const u = \"é://host\"; u.slice(0, u.indexOf(\":\"))"), "é");
+    // Negative indices over multibyte text.
+    assert_eq!(run_str("\"café\".slice(-2)"), "fé");
+    assert_eq!(run_str("\"café\".slice(2)"), "fé");
+    // Split + per-piece slice round-trips consistently over multibyte keys.
+    assert_eq!(
+        run_str("\"ä=1;ö=2\".split(\";\").map(p => p.slice(0, p.indexOf(\"=\"))).join(\",\")"),
+        "ä,ö"
+    );
+    // ASCII behavior is unchanged.
+    assert_eq!(run_str("\"hello\".slice(1, 3)"), "el");
+    assert_eq!(run_str("\"hello\".substring(1, 3)"), "el");
+    assert_eq!(run_str("\"hello\".substring(3, 1)"), "el"); // swapped args
+}
