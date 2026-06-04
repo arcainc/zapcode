@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::compiler::instruction::BatchKind;
+use crate::jsstring::JsString;
 use crate::compiler::{compile_session_chunk, CompiledProgram, TopLevelBindingKind};
 use crate::error::{Result, ZapcodeError};
 use crate::sandbox::ResourceLimits;

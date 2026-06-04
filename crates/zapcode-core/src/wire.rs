@@ -38,7 +38,9 @@ const MAGIC: &[u8; 4] = b"ZPC1";
 /// `CompiledProgram`, the VM frame/continuation types, or the snapshot structs.
 /// v2: `Value::Array`/`Value::Object` now carry a `Handle` into the heap, and
 /// the snapshot carries the heap itself — incompatible with v1 byte layouts.
-pub(crate) const FORMAT_VERSION: u16 = 2;
+/// v3: `Value::String` changed from a bare `Arc<str>` to the enum-tagged,
+/// UTF-16-aware `JsString` (see `jsstring`) — incompatible with v2 string bytes.
+pub(crate) const FORMAT_VERSION: u16 = 3;
 
 const HEADER_LEN: usize = 4 + 2 + 1 + 1 + 32;
 

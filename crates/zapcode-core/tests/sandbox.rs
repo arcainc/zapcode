@@ -62,7 +62,7 @@ fn test_function_global_is_typeof_function() {
     let result = eval_ts("typeof Function");
     assert_eq!(
         result.unwrap(),
-        zapcode_core::Value::String(std::sync::Arc::from("function"))
+        zapcode_core::Value::String(zapcode_core::JsString::from("function"))
     );
 }
 

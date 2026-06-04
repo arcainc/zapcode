@@ -6,9 +6,12 @@
 //! explicit `DIVERGENCE` comment so the suite stays green and the gap stays visible.
 //!
 //! Documented residuals exercised here (see STRESS-PASS-BUGS.md):
-//!   * G9 — strings are indexed by Unicode *code point*, not UTF-16 code unit. To
-//!     stay clear of it every input is BMP/ASCII, so `length`/index/`charCodeAt`/
-//!     `slice`/`match.index` all agree with JS for the text used here.
+//!   * Strings are now UTF-16-indexed (length/charAt/charCodeAt/slice/indexOf/
+//!     split('') operate on code units; an astral char is two units and ops can
+//!     produce lone surrogates that re-pair on concatenation — see
+//!     `astral_strings_are_utf16_indexed`). The one residual is the HOST bridge:
+//!     a bare lone surrogate returned directly to the host marshals lossily
+//!     (the bridge goes through a Rust String, which cannot hold one).
 //!   * Function replacers for `replace`/`replaceAll` are NOT invoked — the function
 //!     value is string-coerced to "function" and inserted literally. Pinned below.
 //!   * A handful of small `replace`/`includes`/`at`/`lastIndexOf` argument-edge
@@ -744,4 +747,40 @@ fn multibyte_slice_substring_no_host_abort() {
     assert_eq!(run_str("\"hello\".slice(1, 3)"), "el");
     assert_eq!(run_str("\"hello\".substring(1, 3)"), "el");
     assert_eq!(run_str("\"hello\".substring(3, 1)"), "el"); // swapped args
+}
+
+#[test]
+fn astral_strings_are_utf16_indexed() {
+    // length and indexing count UTF-16 code units: a non-BMP char is 2 units.
+    assert_eq!(run_str("'😀'.length"), "2");
+    assert_eq!(run_str("'a😀b'.length"), "4");
+    assert_eq!(run_str("'😀'.charCodeAt(0)"), "55357"); // high surrogate
+    assert_eq!(run_str("'😀'.charCodeAt(1)"), "56832"); // low surrogate
+    assert_eq!(run_str("'😀'.codePointAt(0)"), "128512"); // combined code point
+    assert_eq!(run_str("'a😀b'.indexOf('b')"), "3");
+    assert_eq!(run_str("'a😀b'.lastIndexOf('a')"), "0");
+    assert_eq!(run_str("'a😀b'.slice(3)"), "b");
+    assert_eq!(run_str("'a😀b'.substring(0, 1)"), "a");
+    assert_eq!(run_str("'a😀b'.split('').length"), "4");
+    // for-of / spread iterate by CODE POINT (an astral char is one element).
+    assert_eq!(run_str("[...'a😀b'].length"), "3");
+    assert_eq!(run_str("(() => { let n = 0; for (const c of '😀😀') n++; return n; })()"), "2");
+}
+
+#[test]
+fn lone_surrogates_round_trip_through_units() {
+    // charAt at a surrogate boundary yields a single code unit (a lone
+    // surrogate); its charCodeAt is the surrogate value and its length is 1.
+    assert_eq!(run_str("'😀'.charAt(0).length"), "1");
+    assert_eq!(run_str("'😀'.charAt(0).charCodeAt(0)"), "55357");
+    assert_eq!(run_str("'😀'.slice(0, 1).charCodeAt(0)"), "55357");
+    // Concatenating a high + low lone surrogate RE-PAIRS them into the astral
+    // char (UTF-16 string semantics).
+    assert_eq!(run_str("(() => { const s = '😀'; return (s.charAt(0) + s.charAt(1)) === s; })()"), "true");
+    assert_eq!(run_str("(String.fromCharCode(55357) + String.fromCharCode(56832)).codePointAt(0)"), "128512");
+    // String.fromCharCode takes UTF-16 units (surrogate pair -> astral char);
+    // String.fromCodePoint takes code points.
+    assert_eq!(run_str("String.fromCharCode(55357, 56832).codePointAt(0)"), "128512");
+    assert_eq!(run_str("String.fromCodePoint(128512).length"), "2");
+    assert_eq!(run_str("String.fromCodePoint(128512) === '😀'"), "true");
 }

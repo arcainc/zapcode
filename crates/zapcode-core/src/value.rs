@@ -1,4 +1,5 @@
 use crate::heap::{Handle, Heap};
+use crate::jsstring::JsString;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
@@ -21,7 +22,7 @@ pub enum Value {
     Bool(bool),
     Int(i64),
     Float(f64),
-    String(Arc<str>),
+    String(JsString),
     /// Reference to an array slot in the [`Heap`]. Cloning shares the handle.
     Array(Handle),
     /// Reference to an object slot in the [`Heap`].
