@@ -7445,6 +7445,7 @@ fn is_array_method(name: &str) -> bool {
             | "slice"
             | "concat"
             | "join"
+            | "toLocaleString"
             | "reverse"
             | "sort"
             | "indexOf"

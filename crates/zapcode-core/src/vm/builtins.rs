@@ -71,12 +71,14 @@ const INTERNAL_MARKER_KEYS: &[&str] = &[
     "__global_fn__",
 ];
 
-/// True iff `key` is one of the reserved internal marker keys that must be
-/// hidden from guest reflection (see [`INTERNAL_MARKER_KEYS`]). Any other key —
-/// including user keys that merely start with `__` such as `__id__` — is a
-/// real, guest-visible own property.
+/// True iff `key` must be hidden from guest reflection: either a reserved
+/// internal marker (see [`INTERNAL_MARKER_KEYS`]) or a class private field /
+/// method, which the parser mangles to a `#`-prefixed key. Private members are
+/// excluded from Object.keys/values/entries, for-in, JSON.stringify, and
+/// spread, like real JS. Any other key — including user keys that merely start
+/// with `__` such as `__id__` — is a real, guest-visible own property.
 pub fn is_internal_marker_key(key: &str) -> bool {
-    INTERNAL_MARKER_KEYS.contains(&key)
+    key.starts_with('#') || INTERNAL_MARKER_KEYS.contains(&key)
 }
 
 /// Register built-in global objects and functions, allocating their backing
@@ -329,8 +331,45 @@ fn finite_number(n: f64) -> Value {
 pub fn is_number_method(name: &str) -> bool {
     matches!(
         name,
-        "toFixed" | "toString" | "toPrecision" | "toExponential" | "valueOf"
+        "toFixed" | "toString" | "toPrecision" | "toExponential" | "valueOf" | "toLocaleString"
     )
+}
+
+/// `Number.prototype.toLocaleString()` with the default (en-US-style) locale:
+/// thousands-grouped integer part and up to 3 fractional digits (Intl's default
+/// maximumFractionDigits), trailing zeros stripped. The sandbox has no ICU /
+/// locale data, so locale/options arguments are ignored and this fixed,
+/// deterministic default is used.
+fn js_to_locale_string(n: f64) -> String {
+    if n.is_nan() {
+        return "NaN".to_string();
+    }
+    if n.is_infinite() {
+        return if n > 0.0 { "∞" } else { "-∞" }.to_string();
+    }
+    // Round half-away-from-zero to 3 fractional digits, like Intl's default.
+    let fixed = js_to_fixed(n, 3);
+    let (sign, body) = match fixed.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", fixed.as_str()),
+    };
+    let (int_part, frac_part) = body.split_once('.').unwrap_or((body, ""));
+    let frac = frac_part.trim_end_matches('0');
+    // Group the integer part in threes from the right: "1234567" -> "1,234,567".
+    let bytes = int_part.as_bytes();
+    let len = bytes.len();
+    let mut out = String::from(sign);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    if !frac.is_empty() {
+        out.push('.');
+        out.push_str(frac);
+    }
+    out
 }
 
 /// Methods on number primitives: `(3.14159).toFixed(2)`, `(255).toString(16)`, …
@@ -369,6 +408,7 @@ pub fn call_number_method(n: f64, method: &str, args: &[Value]) -> Result<Option
             }
         }
         "valueOf" => finite_number(n),
+        "toLocaleString" => Value::String(Arc::from(js_to_locale_string(n).as_str())),
         _ => return Ok(None),
     };
     Ok(Some(result))
@@ -2479,6 +2519,21 @@ fn call_array_method(
             let sep_total = sep.len().saturating_mul(joined.len().saturating_sub(1));
             check_string_alloc(body.saturating_add(sep_total), limits)?;
             Value::String(Arc::from(joined.join(&sep).as_str()))
+        }
+        "toLocaleString" => {
+            // Join with "," (the implementation default separator), formatting
+            // each element via its own toLocaleString (numbers get grouping).
+            let joined: Vec<String> = arr
+                .iter()
+                .map(|v| match v {
+                    Value::Null | Value::Undefined => String::new(),
+                    Value::Int(_) | Value::Float(_) => js_to_locale_string(v.to_number()),
+                    _ => v.to_js_string(heap),
+                })
+                .collect();
+            let body: usize = joined.iter().map(|p| p.len()).sum();
+            check_string_alloc(body.saturating_add(joined.len()), limits)?;
+            Value::String(Arc::from(joined.join(",").as_str()))
         }
         "slice" => {
             let len = arr.len() as i64;

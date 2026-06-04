@@ -919,14 +919,12 @@ impl<'a> AstLowerer<'a> {
         for element in &body.body {
             match element {
                 ast::ClassElement::MethodDefinition(method) => {
-                    // `#private` methods are unsupported syntax.
-                    if matches!(&method.key, ast::PropertyKey::PrivateIdentifier(_)) {
-                        return Err(self
-                            .unsupported(method.span, "private fields are not supported"));
-                    }
                     let method_name = match &method.key {
                         ast::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
                         ast::PropertyKey::StringLiteral(s) => s.value.to_string(),
+                        // `#method` -> stored under a "#"-prefixed key (hidden
+                        // from reflection); `this.#method()` reads the same key.
+                        ast::PropertyKey::PrivateIdentifier(id) => format!("#{}", id.name),
                         _ => continue, // skip computed method names
                     };
 
@@ -969,15 +967,12 @@ impl<'a> AstLowerer<'a> {
                     }
                 }
                 ast::ClassElement::PropertyDefinition(prop) => {
-                    // `#private` fields are unsupported syntax.
-                    if matches!(&prop.key, ast::PropertyKey::PrivateIdentifier(_)) {
-                        return Err(self
-                            .unsupported(prop.span, "private fields are not supported"));
-                    }
                     // Computed field names (`[k] = …`) are not supported.
                     let field_name = match &prop.key {
                         ast::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
                         ast::PropertyKey::StringLiteral(s) => s.value.to_string(),
+                        // `#field` -> "#"-prefixed (hidden) key.
+                        ast::PropertyKey::PrivateIdentifier(id) => format!("#{}", id.name),
                         _ => continue,
                     };
                     // `declare x: T;` is a TypeScript type-only declaration with no
@@ -1332,7 +1327,13 @@ impl<'a> AstLowerer<'a> {
                 })
             }
             ast::Expression::PrivateFieldExpression(s) => {
-                Err(self.unsupported(s.span, "private fields are not supported"))
+                // `obj.#field` reads the "#"-prefixed (hidden) key.
+                let object = self.lower_expr(&s.object)?;
+                Ok(Expr::Member {
+                    object: Box::new(object),
+                    property: format!("#{}", s.field.name),
+                    optional: false,
+                })
             }
             ast::Expression::ArrowFunctionExpression(arrow) => {
                 let params = self.lower_formal_params(&arrow.params)?;
@@ -1471,7 +1472,12 @@ impl<'a> AstLowerer<'a> {
                 })
             }
             ast::ChainElement::PrivateFieldExpression(s) => {
-                Err(self.unsupported(s.span, "private fields are not supported"))
+                let object = self.lower_expr(&s.object)?;
+                Ok(Expr::Member {
+                    object: Box::new(object),
+                    property: format!("#{}", s.field.name),
+                    optional: s.optional,
+                })
             }
             ast::ChainElement::TSNonNullExpression(ts) => self.lower_expr(&ts.expression),
         }
@@ -1518,6 +1524,15 @@ impl<'a> AstLowerer<'a> {
                 Ok(Expr::ComputedMember {
                     object: Box::new(object),
                     property: Box::new(property),
+                    optional: false,
+                })
+            }
+            // `this.#field = v` assigns the "#"-prefixed (hidden) key.
+            ast::AssignmentTarget::PrivateFieldExpression(s) => {
+                let object = self.lower_expr(&s.object)?;
+                Ok(Expr::Member {
+                    object: Box::new(object),
+                    property: format!("#{}", s.field.name),
                     optional: false,
                 })
             }
@@ -1647,6 +1662,15 @@ impl<'a> AstLowerer<'a> {
                 Ok(Expr::ComputedMember {
                     object: Box::new(object),
                     property: Box::new(property),
+                    optional: false,
+                })
+            }
+            // `++obj.#field` / `obj.#field--`: update on a private member.
+            ast::SimpleAssignmentTarget::PrivateFieldExpression(s) => {
+                let object = self.lower_expr(&s.object)?;
+                Ok(Expr::Member {
+                    object: Box::new(object),
+                    property: format!("#{}", s.field.name),
                     optional: false,
                 })
             }
