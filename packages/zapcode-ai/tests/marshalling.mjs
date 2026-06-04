@@ -484,4 +484,14 @@ await test("tagged templates work across the host boundary like Node", async () 
   assert.equal(r.output, "id=[5] x=[6]");
 });
 
+// ── Number.toLocaleString grouping + private class fields ──
+await test("toLocaleString and private class fields match Node across the boundary", async () => {
+  let r = await execute(`(1234567).toLocaleString()`, {});
+  assert.equal(r.output, "1,234,567");
+
+  // Private fields work and are hidden from reflection.
+  r = await execute(`(function(){ class C { #x = 42; pub = 1; getX(){ return this.#x; } } const c = new C(); return [c.getX(), JSON.stringify(c)]; })()`, {});
+  assert.deepEqual(r.output, [42, '{"pub":1}']);
+});
+
 console.log(`\n${passed} marshalling checks passed.`);

@@ -861,10 +861,23 @@ fn setter_is_invoked_on_assignment() {
 }
 
 #[test]
-fn private_fields_are_unsupported_syntax() {
-    // DIVERGENCE (documented): `#private` fields are unsupported syntax.
-    let e = run_err("class C { #x = 5; getX(){ return this.#x; } } new C().getX()");
-    assert!(e.contains("private fields are not supported"), "got: {e}"); // JS: 5
+fn private_fields_and_methods() {
+    // `#private` fields and methods work and are hidden from reflection
+    // (mangled to a "#"-prefixed key the guest can't enumerate).
+    assert_eq!(run_str("class C { #x = 42; getX(){ return this.#x; } } new C().getX()"), "42");
+    // private method, called through `this`.
+    assert_eq!(run_str("class C { #h(){ return 7; } run(){ return this.#h(); } } new C().run()"), "7");
+    // private accessor pair.
+    assert_eq!(
+        run_str("class C { #x = 1; get v(){ return this.#x; } set v(n){ this.#x = n; } } const c = new C(); c.v = 5; c.v"),
+        "5"
+    );
+    // compound-assign and update on a private field; static private via the class.
+    assert_eq!(run_str("class C { #n = 0; inc(){ this.#n += 1; return this.#n; } } const c = new C(); `${c.inc()},${c.inc()}`"), "1,2");
+    assert_eq!(run_str("class C { static #count = 0; static inc(){ return ++C.#count; } } `${C.inc()},${C.inc()}`"), "1,2");
+    // Private members are NOT enumerable / serialized (only `pub` shows).
+    assert_eq!(run_str("class C { #secret = 1; pub = 2; } JSON.stringify(Object.keys(new C()))"), "[\"pub\"]");
+    assert_eq!(run_str("class C { #secret = 1; pub = 2; } JSON.stringify(new C())"), "{\"pub\":2}");
 }
 
 #[test]

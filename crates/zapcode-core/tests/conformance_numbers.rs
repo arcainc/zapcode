@@ -1068,3 +1068,18 @@ fn numeric_literal_forms() {
     assert_eq!(run_str("1e2"), "100");
     assert_eq!(run_str("2.5e-1"), "0.25");
 }
+
+#[test]
+fn to_locale_string_default_grouping() {
+    // Default (en-US-style) locale: thousands-grouped integer part, up to 3
+    // fractional digits, trailing zeros stripped. Locale/options args ignored.
+    assert_eq!(run_str("(1234567).toLocaleString()"), "1,234,567");
+    assert_eq!(run_str("(12).toLocaleString()"), "12");
+    assert_eq!(run_str("(1234.5).toLocaleString()"), "1,234.5");
+    assert_eq!(run_str("(-1234).toLocaleString()"), "-1,234");
+    assert_eq!(run_str("(1234.5678).toLocaleString()"), "1,234.568");
+    assert_eq!(run_str("(0).toLocaleString()"), "0");
+    assert_eq!(run_str("(1000000).toLocaleString()"), "1,000,000");
+    // Array.prototype.toLocaleString formats each element and joins with ",".
+    assert_eq!(run_str("[1000, 2000, 3].toLocaleString()"), "1,000,2,000,3");
+}
