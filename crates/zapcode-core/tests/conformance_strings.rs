@@ -589,9 +589,11 @@ fn string_of_numbers() {
     assert_eq!(run_str("String(NaN)"), "NaN");
     assert_eq!(run_str("String(Infinity)"), "Infinity");
     assert_eq!(run_str("String(-Infinity)"), "-Infinity");
-    // DIVERGENCE: very large integers are printed in full positional notation; JS
-    // switches to exponential at 1e21 (String(1e21) === "1e+21"). Asserting ACTUAL.
-    assert_eq!(run_str("String(1e21)"), "1000000000000000000000"); // JS: "1e+21"
+    // JS switches to exponential at magnitude >= 1e21 and for 0 < |x| < 1e-6.
+    assert_eq!(run_str("String(1e21)"), "1e+21");
+    assert_eq!(run_str("String(1e-7)"), "1e-7");
+    assert_eq!(run_str("String(2 ** 70)"), "1.1805916207174113e+21");
+    assert_eq!(run_str("String(1e20)"), "100000000000000000000"); // still positional
 }
 
 #[test]

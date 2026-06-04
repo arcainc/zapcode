@@ -2,10 +2,8 @@
 //!
 //! Broad, test262-style coverage of the interpreter's operator surface, asserting
 //! the *real-Node* answer (verified against Node) at every point where zapcode is
-//! known to agree. Documented divergences are deliberately avoided here:
-//!   - `1 / -0` (zapcode renders `Infinity`, JS `-Infinity`) — numeric edge, skipped.
-//!   - very large/small magnitudes that JS renders in exponential form (`1e21`,
-//!     `1e-7`) — number-stringification divergence, skipped.
+//! known to agree (this now includes the negative-zero sign through division
+//! and exponential number formatting, both formerly divergent).
 //!   - UTF-16 vs code-point string indexing (G9) — covered/avoided in string suites.
 //! Everything asserted below produces byte-identical `to_js_string` output to Node's
 //! `String(...)` of the same expression.
@@ -375,6 +373,75 @@ fn instanceof_basic() {
     );
 }
 
+// `in` on a non-object RHS is a catchable TypeError in Node (not a silent
+// `false`). `"length" in "abc"`, `"x" in 5`, etc. all throw.
+#[test]
+fn in_operator_non_object_rhs_throws_typeerror() {
+    assert_eq!(
+        run_str(r#"let ok=false; try{"length" in "abc"}catch(e){ok=(e instanceof TypeError)} ok"#),
+        "true"
+    );
+    assert_eq!(
+        run_str(r#"let ok=false; try{"x" in 5}catch(e){ok=(e instanceof TypeError)} ok"#),
+        "true"
+    );
+    assert_eq!(
+        run_str(r#"let ok=false; try{"x" in true}catch(e){ok=(e instanceof TypeError)} ok"#),
+        "true"
+    );
+    assert_eq!(
+        run_str(r#"let ok=false; try{"x" in null}catch(e){ok=(e instanceof TypeError)} ok"#),
+        "true"
+    );
+    // Functions are objects: `"x" in fn` does not throw (returns false here as
+    // there are no inspectable own data keys in this subset).
+    assert_eq!(
+        run_str(r#"let ok=false; try{("x" in (function(){})); ok=true}catch(e){ok=false} ok"#),
+        "true"
+    );
+}
+
+// `instanceof` with a non-callable RHS is a catchable TypeError in Node
+// (not a silent `false`).
+#[test]
+fn instanceof_non_callable_rhs_throws_typeerror() {
+    assert_eq!(
+        run_str("let ok=false; try{({}) instanceof 5}catch(e){ok=(e instanceof TypeError)} ok"),
+        "true"
+    );
+    assert_eq!(
+        run_str("let ok=false; try{5 instanceof 5}catch(e){ok=(e instanceof TypeError)} ok"),
+        "true"
+    );
+    assert_eq!(
+        run_str(
+            "let ok=false; try{(function f(){}) instanceof ({})}catch(e){ok=(e instanceof TypeError)} ok"
+        ),
+        "true"
+    );
+    assert_eq!(
+        run_str("let ok=false; try{[] instanceof null}catch(e){ok=(e instanceof TypeError)} ok"),
+        "true"
+    );
+}
+
+// `Function` is a non-constructible global VALUE: `typeof Function === "function"`
+// and a function literal `instanceof Function`/`Object` is true, matching Node.
+// (Actually CALLING `Function`/`new Function` is still a sandbox violation —
+// see the sandbox suite.)
+#[test]
+fn function_global_is_a_non_constructible_value() {
+    assert_eq!(run_str("typeof Function"), "function");
+    assert_eq!(run_str("(function f(){}) instanceof Function"), "true");
+    assert_eq!(run_str("(() => 1) instanceof Function"), "true");
+    assert_eq!(run_str("(function f(){}) instanceof Object"), "true");
+    // A plain object is not an instance of Function.
+    assert_eq!(run_str("({}) instanceof Function"), "false");
+    // Referencing `Function` no longer aborts the whole program: it can be
+    // named without being called.
+    assert_eq!(run_str("const F = Function; typeof F"), "function");
+}
+
 // ----------------------------------------------------------------------------
 // Operator precedence & grouping
 // ----------------------------------------------------------------------------
@@ -494,14 +561,13 @@ fn unary_plus_minus_coercion_table() {
     assert_eq!(run_str("-'5'"), "-5");
     assert_eq!(run_str("-true"), "-1");
     assert_eq!(run_str("-[7]"), "-7");
-    // DIVERGENCE (negative-zero stringification, same family as the documented
-    // `1/-0` case): negating a value that ToNumbers to 0 yields the IEEE -0, which
-    // zapcode renders as "-0" whereas Node's String(-0) is "0". Asserting zapcode's
-    // actual output here rather than the Node answer.
-    assert_eq!(run_str("-false"), "-0");
-    assert_eq!(run_str("-null"), "-0");
-    assert_eq!(run_str("-''"), "-0");
-    assert_eq!(run_str("-[]"), "-0");
+    // Negating a value that ToNumbers to 0 yields the IEEE -0, but JS
+    // String(-0) === "0" (the sign is preserved in the value, dropped by
+    // ToString). The shared formatter now matches Node here.
+    assert_eq!(run_str("-false"), "0");
+    assert_eq!(run_str("-null"), "0");
+    assert_eq!(run_str("-''"), "0");
+    assert_eq!(run_str("-[]"), "0");
     assert_eq!(run_str("-'abc'"), "NaN");
     assert_eq!(run_str("+'  42  '"), "42");
     assert_eq!(run_str("+'\\t\\n7\\n'"), "7"); // whitespace trimmed both sides

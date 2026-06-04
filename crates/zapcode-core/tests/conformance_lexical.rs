@@ -21,8 +21,6 @@
 //!   * RegExp objects expose `.flags`, `.test()`, `.exec()` and `.lastIndex` but
 //!     NOT `.source`/`.global`/`.ignoreCase`/`.multiline` accessors (return
 //!     `undefined`); tests target matching behavior + `.flags`.
-//!   * `1 / -0` yields `Infinity` (negative-zero sign not preserved through
-//!     division); not asserted as `-Infinity`.
 
 use zapcode_core::vm::VmState;
 use zapcode_core::{ResourceLimits, ZapcodeRun};
@@ -160,12 +158,11 @@ fn exponent_literals() {
     assert_eq!(run_str("1.5e2"), "150");
     assert_eq!(run_str("2.5e-1"), "0.25");
     assert_eq!(run_str("1e+3"), "1000"); // explicit + sign
-    // Number-to-string here always emits full decimal (never exponential); V8
-    // would print "6.022e+23" / "1e+21" / "1e-7". Asserted as actual (documented
-    // number-stringification residual).
-    assert_eq!(run_str("6.022e23"), "602200000000000000000000");
-    assert_eq!(run_str("1e21"), "1000000000000000000000");
-    assert_eq!(run_str("1e-7"), "0.0000001");
+    // Number-to-string switches to exponential at magnitude >= 1e21 and for
+    // 0 < magnitude < 1e-6, matching V8 / ECMA-262 Number::toString.
+    assert_eq!(run_str("6.022e23"), "6.022e+23");
+    assert_eq!(run_str("1e21"), "1e+21");
+    assert_eq!(run_str("1e-7"), "1e-7");
     assert_eq!(run_str(".5e1"), "5");
 }
 
@@ -180,8 +177,8 @@ fn special_numeric_values() {
     // Negative zero stringifies as "0".
     assert_eq!(run_str("String(-0)"), "0");
     assert_eq!(run_str("-0 === 0"), "true"); // === treats -0 and 0 as equal
-    // NOTE: `1 / -0` yields "Infinity" here (negative-zero sign not preserved
-    // through division); V8 gives "-Infinity". Not asserted to avoid the residual.
+    // The negative-zero sign is preserved through division (matches V8).
+    assert_eq!(run_str("String(1 / -0)"), "-Infinity");
     assert_eq!(run_str("Number.isNaN(0 / 0)"), "true");
 }
 

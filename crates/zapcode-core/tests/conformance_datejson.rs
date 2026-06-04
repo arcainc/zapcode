@@ -123,6 +123,36 @@ fn date_construct_multi_arg_utc() {
 }
 
 #[test]
+fn date_construct_two_digit_year_maps_to_1900s() {
+    // MakeFullYear: a year in 0..=99 in the multi-arg form maps to 1900+yy.
+    check("new Date(99, 0, 1).getUTCFullYear()", "1999");
+    check("new Date(0, 0, 1).getUTCFullYear()", "1900");
+    check("new Date(50, 0, 1).getUTCFullYear()", "1950");
+    check("new Date(99, 5, 15, 10, 30, 0).toISOString()", "1999-06-15T10:30:00.000Z");
+    // 100 and up are taken literally (NOT offset).
+    check("new Date(100, 0, 1).getUTCFullYear()", "100");
+    check("new Date(1999, 0, 1).getUTCFullYear()", "1999");
+}
+
+#[test]
+fn date_time_magnitude_beyond_max_is_invalid() {
+    // The valid time window is ±8.64e15 ms; one past the edge is Invalid Date.
+    check("new Date(8640000000000000).getTime()", "8640000000000000");
+    check("String(new Date(8640000000000001).getTime())", "NaN");
+    check("new Date(-8640000000000000).getTime()", "-8640000000000000");
+    check("String(new Date(-8640000000000001).getTime())", "NaN");
+    check("String(new Date(1e16).getTime())", "NaN");
+    // The same clip applies to multi-arg / Date.UTC construction.
+    check("Date.UTC(275760, 0, 1)", "8639977881600000");
+    check("String(Date.UTC(275761, 0, 1))", "NaN");
+    check("Date.UTC(-271821, 3, 20)", "-8640000000000000");
+    check("String(Date.UTC(-271821, 3, 19))", "NaN");
+    // Out-of-range components must not panic — huge values clip to NaN.
+    check("String(Date.UTC(2020, 1e15, 1))", "NaN");
+    check("String(Date.UTC(2020, 0, 1, 1e15))", "NaN");
+}
+
+#[test]
 fn date_construct_no_args_is_epoch_zero() {
     // Deterministic sandbox: no wall clock, so `new Date()` is epoch 0.
     check("new Date().getTime()", "0");
@@ -145,6 +175,21 @@ fn date_static_utc() {
 }
 
 #[test]
+fn date_utc_nonfinite_component_is_nan() {
+    // Any non-finite (ToNumber-coerced) component makes the whole result NaN —
+    // it must NOT silently become 0 via an `as i64` cast.
+    check("String(Date.UTC(2020, NaN, 1))", "NaN");
+    check("String(Date.UTC(NaN, 0, 1))", "NaN");
+    check("String(Date.UTC(2020, 0, Infinity))", "NaN");
+    check("String(Date.UTC(2020, 0, -Infinity))", "NaN");
+    check("String(Date.UTC(2020, 'x', 1))", "NaN"); // ToNumber('x') -> NaN
+    // A finite call is unaffected.
+    check("Date.UTC(2020, 0, 1)", "1577836800000");
+    // Two-digit year is mapped to 1900+yy here too (MakeFullYear).
+    check("new Date(Date.UTC(99, 0, 1)).getUTCFullYear()", "1999");
+}
+
+#[test]
 fn date_static_parse() {
     check("Date.parse('1970-01-01T00:00:00.000Z')", "0");
     check("Date.parse('2020-01-01T00:00:00.000Z')", "1577836800000");
@@ -153,6 +198,34 @@ fn date_static_parse() {
     // Parse failure -> NaN.
     check("String(Date.parse('not a date'))", "NaN");
     check("String(Date.parse('2021-13-01'))", "NaN"); // month out of range
+}
+
+#[test]
+fn date_parse_iso_time_components_are_range_checked() {
+    // Node rejects out-of-range clock fields rather than rolling them over.
+    check("String(Date.parse('2020-01-01T25:00:00Z'))", "NaN"); // hour > 24
+    check("String(Date.parse('2020-01-01T23:60:00Z'))", "NaN"); // minute > 59
+    check("String(Date.parse('2020-01-01T23:59:60Z'))", "NaN"); // second > 59
+    // Hour 24 is the one over-23 value JS allows, but ONLY as 24:00:00.000.
+    check("Date.parse('2020-01-01T24:00:00Z')", "1577923200000");
+    check("String(Date.parse('2020-01-01T24:00:01Z'))", "NaN"); // 24 with non-zero sec -> NaN
+    check("String(Date.parse('2020-01-01T24:01:00Z'))", "NaN"); // 24 with non-zero min -> NaN
+    // In-range fields still parse.
+    check("Date.parse('2020-01-01T23:59:59Z')", "1577923199000");
+}
+
+#[test]
+fn date_parse_bare_far_future_integer_is_nan() {
+    // A bare integer string is read as a calendar year; one that overflows the
+    // representable Date window is Invalid Date, not a garbage far-future date.
+    check("String(Date.parse('1234567890123'))", "NaN");
+    check("String(new Date('1234567890123').getTime())", "NaN");
+    check("String(Date.parse('1234567'))", "NaN"); // year 1,234,567 is out of range
+    check("String(Date.parse('275761'))", "NaN"); // one past the max representable year
+    // Years that DO fit still parse (verified against Node).
+    check("Date.parse('2020')", "1577836800000");
+    check("Date.parse('123456')", "3833727840000000");
+    check("Date.parse('275760')", "8639977881600000"); // the boundary year
 }
 
 #[test]
@@ -322,7 +395,9 @@ fn date_to_iso_string() {
     check("new Date(1577836800000).toISOString()", "2020-01-01T00:00:00.000Z");
     check("new Date(1234567890123).toISOString()", "2009-02-13T23:31:30.123Z");
     // toISOString always renders fixed-width fields with millisecond precision.
-    check("new Date(Date.UTC(5, 0, 1)).toISOString()", "0005-01-01T00:00:00.000Z");
+    // (Constructed from raw epoch ms, not `Date.UTC(5,…)`, since a two-digit year
+    // in the multi-arg / Date.UTC form is mapped to 1900+yy by MakeFullYear.)
+    check("new Date(-62009366400000).toISOString()", "0005-01-01T00:00:00.000Z");
 }
 
 #[test]
@@ -589,11 +664,19 @@ fn json_parse_objects_and_arrays() {
 
 #[test]
 fn json_parse_string_escapes() {
-    // Escapes inside parsed strings are decoded.
-    check("JSON.parse('\"a\\nb\"')", "a\nb"); // \n decoded to a real newline
-    check("JSON.parse('\"tab\\tend\"')", "tab\tend");
-    check("JSON.parse('\"\\u0041\\u0042\"')", "AB"); // \u escapes
-    check("JSON.parse('\"quote\\\"in\"')", "quote\"in");
+    // Escapes inside parsed strings are decoded by a single left-to-right scan.
+    // The guest source must carry a JSON escape (backslash-n), so the Rust
+    // literal needs `\\n` — `\n` would be a real newline, which JSON rejects as
+    // a control character (matching Node's "Bad control character" SyntaxError).
+    check("JSON.parse('\"a\\\\nb\"')", "a\nb"); // backslash-n -> real newline
+    check("JSON.parse('\"tab\\\\tend\"')", "tab\tend");
+    // A doubled backslash followed by `n` is a literal backslash then `n`, NOT a
+    // newline (the old order-dependent .replace chain got this wrong).
+    check("JSON.parse('\"a\\\\\\\\nb\"')", "a\\nb");
+    check("JSON.parse('\"\\\\u0041\\\\u0042\"')", "AB"); // \uXXXX escapes -> "AB"
+    check("JSON.parse('\"\\\\u0041\"').length", "1"); // single A is one char
+    check("JSON.parse('\"\\\\/\\\\b\\\\f\\\\r\"')", "/\u{0008}\u{000C}\r"); // \/ \b \f \r
+    check("JSON.parse('\"quote\\\\\"in\"')", "quote\"in"); // escaped quote
 }
 
 #[test]

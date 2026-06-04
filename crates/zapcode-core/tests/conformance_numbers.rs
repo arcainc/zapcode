@@ -20,13 +20,6 @@
 //! against Node; zapcode's `to_js_string` uses Rust's f64 formatting / i128 integer
 //! arithmetic, which differ here). These are skipped, or the *actual* zapcode value
 //! is asserted with an explicit comment:
-//!   - `1 / -0` → `Infinity` (JS `-Infinity`): negative-zero sign in division.
-//!   - magnitudes JS renders exponential (`|x| >= 1e21` or `|x| < 1e-6`) print in
-//!     plain decimal here (e.g. `1e21` → `1000000000000000000000`).
-//!   - `Number.MAX_VALUE` / `MIN_VALUE` / `EPSILON` stringify as long decimals (no
-//!     `e` form); their *numeric* relationships are asserted instead.
-//!   - `Number.MAX_SAFE_INTEGER + 2` stays exact (`...993`) because constant is an
-//!     integer and `+2` is i128 arithmetic (JS loses precision → `...992`).
 //!   - `Math.min(1, NaN)` → `1` and `Math.max(1, NaN)` → `1` are NaN-poisoning
 //!     differences when NaN is not the first arg (asserted as zapcode's actual).
 //!   - `Math.trunc(-0.5)` / `Math.hypot()` → `-0` (JS String() → `0`): negative-zero
@@ -389,6 +382,51 @@ fn to_precision_zero_and_one() {
 }
 
 // ============================================================================
+// Shared ECMA-262 Number::toString formatter (default toString / String() /
+// templates / Array.join / JSON.stringify all route through one path)
+// ============================================================================
+
+#[test]
+fn number_to_string_switches_to_exponential() {
+    // >= 1e21 and 0 < |x| < 1e-6 use exponential; everything between is fixed.
+    // All values ground-truthed against Node's String().
+    assert_eq!(run_str("String(1e21)"), "1e+21");
+    assert_eq!(run_str("String(1e20)"), "100000000000000000000"); // boundary stays fixed
+    assert_eq!(run_str("String(2 ** 70)"), "1.1805916207174113e+21");
+    assert_eq!(run_str("String(1.5e300)"), "1.5e+300");
+    assert_eq!(run_str("String(6.022e23)"), "6.022e+23");
+    assert_eq!(run_str("String(1e-6)"), "0.000001"); // boundary stays fixed
+    assert_eq!(run_str("String(1e-7)"), "1e-7");
+    assert_eq!(run_str("String(9.999e-7)"), "9.999e-7");
+    assert_eq!(run_str("String(-3.14e-8)"), "-3.14e-8");
+    assert_eq!(run_str("String(Number.MAX_VALUE)"), "1.7976931348623157e+308");
+    // NB: use literals here, not Number.MIN_VALUE — that named constant is
+    // currently mis-defined as the smallest *normal* double (a separate bug);
+    // these exercise the formatter on the smallest subnormal and EPSILON.
+    assert_eq!(run_str("String(5e-324)"), "5e-324");
+    assert_eq!(run_str("String(2.220446049250313e-16)"), "2.220446049250313e-16");
+    // Mid-range values keep their plain decimal form.
+    assert_eq!(run_str("String(123.456)"), "123.456");
+    assert_eq!(run_str("String(0.5)"), "0.5");
+    assert_eq!(run_str("String(123456789012345680000)"), "123456789012345680000");
+}
+
+#[test]
+fn number_to_string_is_shared_across_coercion_paths() {
+    // The same formatter must drive templates, Array.join and JSON.stringify,
+    // not just String() — they previously emitted full positional decimals.
+    assert_eq!(run_str("`${1e21}`"), "1e+21");
+    assert_eq!(run_str("[1e21, 1e-7, 12345678].join(',')"), "1e+21,1e-7,12345678");
+    assert_eq!(
+        run_str("JSON.stringify({big: 1e21, small: 1e-7})"),
+        "{\"big\":1e+21,\"small\":1e-7}"
+    );
+    // Number.prototype.toString(10) and the >=1e21 toFixed fallthrough agree too.
+    assert_eq!(run_str("(1e21).toString()"), "1e+21");
+    assert_eq!(run_str("(1e21).toFixed(2)"), "1e+21");
+}
+
+// ============================================================================
 // Number.prototype.toExponential
 // ============================================================================
 
@@ -511,6 +549,28 @@ fn parse_int_nan_cases() {
 fn parse_int_number_namespace() {
     assert_eq!(run_str("Number.parseInt('100')"), "100");
     assert_eq!(run_str("Number.parseInt('ff', 16)"), "255");
+}
+
+#[test]
+fn parse_int_overflows_to_f64() {
+    // A string wider than i64 range returns the f64 value in JS, not NaN.
+    // (Node: parseInt("9999999999999999999") === 1e19.)  Previously zapcode's
+    // i64::from_str_radix overflowed and yielded NaN.
+    assert_eq!(
+        run_str("String(parseInt('9999999999999999999'))"),
+        "10000000000000000000"
+    );
+    assert_eq!(
+        run_str("String(parseInt('-9999999999999999999'))"),
+        "-10000000000000000000"
+    );
+    // It stays a finite number, not NaN.
+    assert_eq!(run_str("Number.isNaN(parseInt('9999999999999999999'))"), "false");
+    // Even-wider input keeps round-tripping as a double (matches Node's 1e32).
+    assert_eq!(
+        run_str("parseInt('99999999999999999999999999999999') === 1e32"),
+        "true"
+    );
 }
 
 // ============================================================================
@@ -908,9 +968,14 @@ fn negative_zero_equality() {
     assert_eq!(run_str("-0 === 0"), "true");
     // -0 prints as "0".
     assert_eq!(run_str("String(-0)"), "0");
-    // NOTE: 1 / -0 → Infinity in zapcode (JS: -Infinity); documented divergence,
-    // not asserted. But 1 / 0 === 1 / -0 is true in zapcode because both are +Inf.
-    assert_eq!(run_str("1 / 0 === 1 / -0"), "true");
+    // The sign of -0 is preserved through division: 1 / -0 is -Infinity (not
+    // +Infinity), so 1/0 and 1/-0 are no longer equal.
+    assert_eq!(run_str("String(1 / -0)"), "-Infinity");
+    assert_eq!(run_str("String(1 / 0)"), "Infinity");
+    assert_eq!(run_str("1 / 0 === 1 / -0"), "false");
+    // 0 / -5 is -0 (renders "0"); Object.is sees the sign.
+    assert_eq!(run_str("String(0 / -5)"), "0");
+    assert_eq!(run_str("String(Object.is(0 / -5, -0))"), "true");
 }
 
 // ============================================================================
@@ -935,6 +1000,30 @@ fn precision_loss_at_safe_integer_boundary() {
     assert_eq!(run_str("2 ** 53"), "9007199254740992");
     assert_eq!(run_str("9007199254740993"), "9007199254740992");
     assert_eq!(run_str("2 ** 53 === 2 ** 53 + 1"), "true"); // both round to the same f64
+
+    // Integer-literal arithmetic must also round once the result leaves the safe
+    // range: JS has no i64, so `a (+|-|*) b` behaves like a double past 2^53-1.
+    // Previously zapcode kept these as exact i64s (`...993`), diverging from Node.
+    assert_eq!(run_str("String(9007199254740991 + 2)"), "9007199254740992");
+    assert_eq!(run_str("9007199254740992 + 1 === 9007199254740992"), "true");
+    assert_eq!(
+        run_str("(function(){let x=9007199254740992; return x+1===x})()"),
+        "true"
+    );
+    // Subtraction toward larger magnitude and multiplication round the same way.
+    assert_eq!(run_str("9007199254740992 - (-1)"), "9007199254740992");
+    assert_eq!(run_str("4503599627370496 * 2 + 1"), "9007199254740992");
+    // ++ / -- share the path: incrementing past the boundary rounds, not panics.
+    assert_eq!(
+        run_str("(function(){let x=9007199254740991; x++; return x})()"),
+        "9007199254740992"
+    );
+    assert_eq!(
+        run_str("(function(){let x=9007199254740992; x++; return x===9007199254740992})()"),
+        "true"
+    );
+    // The result is still a JS number, not some other type.
+    assert_eq!(run_str("typeof (9007199254740991 + 2)"), "number");
 }
 
 // ============================================================================

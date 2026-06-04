@@ -18,6 +18,13 @@ use crate::value::{
 
 mod builtins;
 
+/// Re-exported so the napi binding can apply the SAME exact reserved-marker
+/// filter when marshalling guest objects across the host boundary.
+pub use builtins::is_internal_marker_key;
+/// Shared ECMA-262 `Number::toString` formatter, used both by VM string
+/// coercion (`value.rs`) and the builtin number methods so every path agrees.
+pub(crate) use builtins::format_number;
+
 /// The result of VM execution.
 #[derive(Debug)]
 pub enum VmState {
@@ -454,6 +461,7 @@ impl Vm {
         "JSON",
         "Object",
         "Array",
+        "Function",
         "Math",
         "Promise",
         "Map",
@@ -1952,6 +1960,22 @@ impl Vm {
         r
     }
 
+    /// Run a `JSON.parse` reviver with `this` bound to the holder object, per the
+    /// ES `InternalizeJSONProperty` spec. Reuses the field-initializer frame flag
+    /// so the reviver's return value is preserved verbatim — crucially, a reviver
+    /// returning `undefined` (to delete a property) must NOT trigger the
+    /// constructor-style "rewrite undefined-return to `this`" path, which would
+    /// otherwise splice the holder back into the result and create a cycle.
+    fn call_reviver(&mut self, callee: &Value, holder: Value, args: Vec<Value>) -> Result<Value> {
+        self.last_receiver_source = None;
+        self.next_frame_is_field_init = true;
+        let r = self.call_closure_internal(callee, args, Some(holder));
+        // Cleared in push_call_frame on success; reset here defensively in case
+        // the callee wasn't a function and no frame was pushed.
+        self.next_frame_is_field_init = false;
+        r
+    }
+
     /// Shared body for the internal-call helpers: push a frame (optionally with a
     /// bound `this`) and run it to completion, returning the result.
     fn call_closure_internal(
@@ -2371,7 +2395,7 @@ impl Vm {
                 seen.push(*h);
                 let mut pairs: Vec<(String, String)> = Vec::new();
                 for (k, v) in map.iter() {
-                    if k.starts_with("__") {
+                    if builtins::is_internal_marker_key(k) {
                         continue;
                     }
                     if let Some(w) = whitelist {
@@ -2468,14 +2492,16 @@ impl Vm {
             }
             _ => {}
         }
-        // Call reviver(key, value). JS binds `this` to the holder, but the
-        // receiver-writeback machinery would corrupt the value being revived, so
-        // we leave `this` undefined — revivers that read `this` are an accepted
-        // gap (none of the supported scenarios need it).
-        self.call_function_internal(reviver, vec![
-            Value::String(Arc::from(key)),
-            value,
-        ])
+        // Call reviver(key, value) with `this` bound to the HOLDER object, per
+        // the ES `InternalizeJSONProperty` spec, so a reviver that reads
+        // `this[otherKey]` sees its sibling values. `call_reviver` preserves the
+        // return value verbatim (an `undefined` return deletes the property and
+        // must NOT be rewritten to the holder).
+        self.call_reviver(
+            reviver,
+            holder.clone(),
+            vec![Value::String(Arc::from(key)), value],
+        )
     }
 
     /// Check if a callback value is an async function that might suspend.
@@ -3393,7 +3419,7 @@ impl Vm {
                 let right = self.to_primitive(&right, ToPrimitiveHint::Default)?;
                 let result = match (&left, &right) {
                     (Value::Int(a), Value::Int(b)) => match a.checked_add(*b) {
-                        Some(r) => Value::Int(r),
+                        Some(r) => int_arith_result(r),
                         None => Value::Float(*a as f64 + *b as f64),
                     },
                     (Value::Float(a), Value::Float(b)) => Value::Float(a + b),
@@ -3446,7 +3472,7 @@ impl Vm {
                 let right = self.to_primitive(&right, ToPrimitiveHint::Number)?;
                 let result = match (&left, &right) {
                     (Value::Int(a), Value::Int(b)) => match a.checked_sub(*b) {
-                        Some(r) => Value::Int(r),
+                        Some(r) => int_arith_result(r),
                         None => Value::Float(*a as f64 - *b as f64),
                     },
                     _ => Value::Float(
@@ -3462,7 +3488,7 @@ impl Vm {
                 let right = self.to_primitive(&right, ToPrimitiveHint::Number)?;
                 let result = match (&left, &right) {
                     (Value::Int(a), Value::Int(b)) => match a.checked_mul(*b) {
-                        Some(r) => Value::Int(r),
+                        Some(r) => int_arith_result(r),
                         None => Value::Float(*a as f64 * *b as f64),
                     },
                     _ => Value::Float(
@@ -3509,7 +3535,19 @@ impl Vm {
                 let val = self.pop()?;
                 let val = self.to_primitive(&val, ToPrimitiveHint::Number)?;
                 let result = match val {
-                    Value::Int(n) => Value::Int(-n),
+                    // Negating integer 0 must produce the IEEE-754 negative zero,
+                    // not the integer 0 — otherwise the sign is lost and
+                    // `1 / -0` yields +Infinity and `Object.is(-0, 0)` yields
+                    // true, both diverging from JS. ToString still renders it as
+                    // "0" (see format_number), so this is invisible except where
+                    // the sign is observable (division, Object.is/SameValue).
+                    Value::Int(0) => Value::Float(-0.0),
+                    // checked_neg guards the lone overflow case (-i64::MIN),
+                    // which would otherwise panic and abort the host.
+                    Value::Int(n) => match n.checked_neg() {
+                        Some(r) => Value::Int(r),
+                        None => Value::Float(-(n as f64)),
+                    },
                     _ => Value::Float(-val.to_number_heap(&self.heap)),
                 };
                 self.push(result)?;
@@ -4072,6 +4110,13 @@ impl Vm {
                         let entries = self.heap.object_map(h);
                         if let Some(map) = self.heap.object_mut(acc) {
                             for (k, v) in entries {
+                                // Spread copies own enumerable properties. Skip
+                                // reserved internal markers (so `{...instance}`
+                                // doesn't leak `__class__`/brands), but keep real
+                                // user keys that merely start with `__`.
+                                if builtins::is_internal_marker_key(&k) {
+                                    continue;
+                                }
                                 map.insert(k, v);
                             }
                         }
@@ -4111,7 +4156,16 @@ impl Vm {
                             }
                         }
                     }
-                    _ => false,
+                    // Functions are objects in JS; `"x" in fn` is valid (no
+                    // inspectable own data keys in this subset, so `false`).
+                    Value::Function(_) => false,
+                    // The RHS of `in` must be an object. Node throws a catchable
+                    // TypeError for primitives — e.g. `"length" in "abc"`.
+                    _ => {
+                        return Err(ZapcodeError::TypeError(
+                            "Cannot use 'in' operator to search in a non-object".to_string(),
+                        ));
+                    }
                 };
                 self.push(Value::Bool(result))?;
             }
@@ -4122,6 +4176,36 @@ impl Vm {
                 let has_key = |h: Handle, k: &str, heap: &Heap| -> bool {
                     heap.object(h).is_some_and(|m| m.contains_key(k))
                 };
+                // The RHS of `instanceof` must be callable (a constructor). Node
+                // throws a catchable TypeError otherwise — e.g. `x instanceof 5`
+                // or `x instanceof ({})`. Callable values here are user functions,
+                // builtin constructors (`__builtin_constructor__`), user classes
+                // (`__class_name__`), and bare global fns (`__global_fn__`).
+                let rhs_callable = match &right {
+                    Value::Function(_) => true,
+                    Value::Object(h) => self.heap.object(*h).is_some_and(|m| {
+                        m.contains_key("__builtin_constructor__")
+                            || m.contains_key("__class_name__")
+                            || m.contains_key("__global_fn__")
+                    }),
+                    _ => false,
+                };
+                if !rhs_callable {
+                    return Err(ZapcodeError::TypeError(
+                        "Right-hand side of 'instanceof' is not callable".to_string(),
+                    ));
+                }
+                // A user function value is an instance of the `Function` builtin
+                // (and of `Object`). Handle it before the object-map inspection
+                // below, which only covers `Value::Object` left operands.
+                if let Value::Function(_) = &left {
+                    let matches_fn = matches!(&right, Value::Object(h)
+                        if self.heap.object(*h).is_some_and(|m| matches!(
+                            m.get("__builtin_constructor__"),
+                            Some(Value::String(s)) if matches!(s.as_ref(), "Function" | "Object"))));
+                    self.push(Value::Bool(matches_fn))?;
+                    return Ok(None);
+                }
                 // Check if left's __class__ matches right's __class_name__
                 let result = if let Value::Object(class_h) = &right {
                     let class_obj = self.heap.object_map(*class_h);
@@ -4642,6 +4726,18 @@ impl Vm {
                         let r = self.construct_regexp(&args)?;
                         self.push(r)?;
                     }
+                    // `Function(...)` called WITHOUT `new` is equally forbidden;
+                    // the rejection is a catchable runtime sandbox violation.
+                    Value::Object(h)
+                        if self.heap.object(h).is_some_and(|m| {
+                            matches!(m.get("__builtin_constructor__"),
+                                Some(Value::String(s)) if s.as_ref() == "Function")
+                        }) =>
+                    {
+                        return Err(ZapcodeError::SandboxViolation(
+                            "Function constructor is forbidden in the sandbox".to_string(),
+                        ));
+                    }
                     _ => {
                         let msg = callee.to_js_string(&self.heap);
                         return Err(ZapcodeError::TypeError(format!("{} is not a function", msg)));
@@ -5119,7 +5215,10 @@ impl Vm {
             Instruction::Increment => {
                 let val = self.pop()?;
                 let result = match val {
-                    Value::Int(n) => Value::Int(n + 1),
+                    Value::Int(n) => match n.checked_add(1) {
+                        Some(r) => int_arith_result(r),
+                        None => Value::Float(n as f64 + 1.0),
+                    },
                     _ => Value::Float(val.to_number_heap(&self.heap) + 1.0),
                 };
                 self.push(result)?;
@@ -5127,7 +5226,10 @@ impl Vm {
             Instruction::Decrement => {
                 let val = self.pop()?;
                 let result = match val {
-                    Value::Int(n) => Value::Int(n - 1),
+                    Value::Int(n) => match n.checked_sub(1) {
+                        Some(r) => int_arith_result(r),
+                        None => Value::Float(n as f64 - 1.0),
+                    },
                     _ => Value::Float(val.to_number_heap(&self.heap) - 1.0),
                 };
                 self.push(result)?;
@@ -5411,6 +5513,16 @@ impl Vm {
                                     }
                                 }
                                 return Ok(None);
+                            }
+                            // `new Function(...)` is forbidden — but the rejection is
+                            // a (catchable) runtime sandbox violation, not a fatal
+                            // parse-time abort. The `Function` global itself exists so
+                            // `typeof`/`instanceof` work.
+                            "Function" => {
+                                return Err(ZapcodeError::SandboxViolation(
+                                    "Function constructor is forbidden in the sandbox"
+                                        .to_string(),
+                                ));
                             }
                             _ => {}
                         }
@@ -6305,6 +6417,29 @@ fn is_frozen_object(h: Handle, heap: &Heap) -> bool {
     )
 }
 
+/// JS `Number.MAX_SAFE_INTEGER` (`2^53 - 1`). Integer results outside
+/// `[-MAX_SAFE_INTEGER, MAX_SAFE_INTEGER]` cannot be represented exactly by an
+/// f64, so for parity with JS double arithmetic we must stop tracking them as a
+/// precise i64 and let the value round like a double would.
+const MAX_SAFE_INTEGER_I64: i64 = 9_007_199_254_740_991;
+
+/// Build the [`Value`] for an i64 arithmetic result while matching JS double
+/// semantics past the safe-integer boundary.
+///
+/// JS has no integer type: every number is an f64. zapcode keeps small integers
+/// as `Value::Int` for speed/precision, but the result of `a (+|-|*) b` must
+/// behave like a double once its magnitude exceeds `MAX_SAFE_INTEGER`, where
+/// doubles can no longer represent consecutive integers (e.g. `2^53 + 1`
+/// rounds to `2^53`). Keeping the exact i64 there would diverge from Node, so
+/// we fall back to f64 and let it round.
+fn int_arith_result(r: i64) -> Value {
+    if r.unsigned_abs() <= MAX_SAFE_INTEGER_I64 as u64 {
+        Value::Int(r)
+    } else {
+        Value::Float(r as f64)
+    }
+}
+
 fn js_to_int32(n: f64) -> i32 {
     if !n.is_finite() || n == 0.0 {
         return 0;
@@ -6696,6 +6831,16 @@ fn execute_map_method(
     }
 }
 
+/// Maximum absolute time value (in ms) of a valid JS Date: ±8.64e15. Anything
+/// beyond this is an Invalid Date (ECMA-262 "time clip").
+const MAX_TIME_MS: u64 = 8_640_000_000_000_000;
+
+/// A year whose magnitude exceeds this can never yield an in-range time value
+/// (the valid window is roughly ±271821..=275760). Reject earlier years before
+/// the `days_from_civil` arithmetic so a huge bare-integer string can't overflow
+/// the i64 math (which would panic in debug builds); they all map to NaN anyway.
+const MAX_TIME_YEAR: i64 = 300_000;
+
 fn make_date_object(millis: i64, heap: &mut Heap) -> Value {
     let mut obj = IndexMap::new();
     obj.insert(Arc::from("__date_ms__"), Value::Int(millis));
@@ -6724,52 +6869,80 @@ fn construct_date(args: &[Value], heap: &mut Heap) -> Value {
             },
             other => {
                 let n = other.to_number();
-                if n.is_finite() {
+                // ECMA-262 time-clip: only finite |t| <= 8.64e15 is a valid Date.
+                if n.is_finite() && (n as i64).unsigned_abs() <= MAX_TIME_MS {
                     make_date_object(n as i64, heap)
                 } else {
                     make_invalid_date(heap)
                 }
             }
         },
-        _ => {
-            let part = |i: usize, default: i64| -> i64 {
-                args.get(i).map(|v| v.to_number() as i64).unwrap_or(default)
-            };
-            let year = part(0, 1970);
-            let month = part(1, 0); // 0-indexed
-            let day = part(2, 1);
-            let hours = part(3, 0);
-            let minutes = part(4, 0);
-            let seconds = part(5, 0);
-            let ms = part(6, 0);
-            let days = days_from_civil(year, month + 1, day);
-            let millis = days * 86_400_000
-                + hours * 3_600_000
-                + minutes * 60_000
-                + seconds * 1_000
-                + ms;
-            make_date_object(millis, heap)
-        }
+        _ => match date_from_components(args) {
+            Some(millis) => make_date_object(millis, heap),
+            None => make_invalid_date(heap),
+        },
     }
 }
 
-/// `Date.UTC(year, monthIndex, day, ...)` -> epoch millis (UTC).
+/// `Date.UTC(year, monthIndex, day, ...)` -> epoch millis (UTC), or NaN for any
+/// non-finite component / out-of-range time value (matches Node).
 pub(crate) fn date_utc_millis(args: &[Value]) -> f64 {
-    let part = |i: usize, default: i64| -> i64 {
-        args.get(i).map(|v| v.to_number() as i64).unwrap_or(default)
+    date_from_components(args).map_or(f64::NAN, |ms| ms as f64)
+}
+
+/// Shared `(year, monthIndex, day, hours, minutes, seconds, ms)` -> epoch millis
+/// used by `Date.UTC` and the multi-arg `Date` constructor. Returns None (→ NaN /
+/// Invalid Date) if any supplied component is non-finite or the resulting time
+/// value falls outside ±8.64e15. Applies ECMA-262 MakeFullYear: a year in 0..=99
+/// maps to 1900+year.
+fn date_from_components(args: &[Value]) -> Option<i64> {
+    // ToNumber each supplied component; short-circuit to NaN on any non-finite.
+    let part = |i: usize, default: i64| -> Option<i64> {
+        match args.get(i) {
+            Some(v) => {
+                let n = v.to_number();
+                if n.is_finite() {
+                    Some(n as i64)
+                } else {
+                    None
+                }
+            }
+            None => Some(default),
+        }
     };
-    let year = part(0, 1970);
-    let month = part(1, 0);
-    let day = part(2, 1);
-    let hours = part(3, 0);
-    let minutes = part(4, 0);
-    let seconds = part(5, 0);
-    let ms = part(6, 0);
-    (days_from_civil(year, month + 1, day) * 86_400_000
-        + hours * 3_600_000
-        + minutes * 60_000
-        + seconds * 1_000
-        + ms) as f64
+    let year = part(0, 1970)?;
+    let month = part(1, 0)?; // 0-indexed
+    let day = part(2, 1)?;
+    let hours = part(3, 0)?;
+    let minutes = part(4, 0)?;
+    let seconds = part(5, 0)?;
+    let ms = part(6, 0)?;
+    // MakeFullYear: a two-digit year (0..=99) is offset into the 1900s.
+    let mut year = year as i128;
+    if (0..=99).contains(&year) {
+        year += 1900;
+    }
+    // Normalize a (possibly out-of-0..11) month into the year so `days_from_civil`
+    // only ever sees a bounded month. Done in i128 so huge components never panic.
+    year += (month as i128).div_euclid(12);
+    let month0 = (month as i128).rem_euclid(12); // 0..=11
+    // Reject years outside the representable window before the i64 math (which
+    // would otherwise overflow / panic in debug builds); they are NaN anyway.
+    if year.unsigned_abs() > MAX_TIME_YEAR as u128 {
+        return None;
+    }
+    // First-of-month day count uses bounded inputs; the arbitrary `day` is folded
+    // in afterward in i128 to stay overflow-free.
+    let days = days_from_civil(year as i64, (month0 as i64) + 1, 1) as i128 + (day as i128 - 1);
+    let millis = days * 86_400_000
+        + hours as i128 * 3_600_000
+        + minutes as i128 * 60_000
+        + seconds as i128 * 1_000
+        + ms as i128;
+    if millis.unsigned_abs() > MAX_TIME_MS as u128 {
+        return None;
+    }
+    Some(millis as i64)
 }
 
 /// Days since the Unix epoch for a civil (year, month 1-12, day) date (UTC).
@@ -6806,6 +6979,11 @@ pub(crate) fn parse_date_string(s: &str) -> Option<i64> {
     if dp.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
+    // A year beyond the representable Date window (e.g. a bare far-future integer
+    // string like "1234567890123") is Invalid Date; bail before the i64 math.
+    if year.unsigned_abs() > MAX_TIME_YEAR as u64 {
+        return None;
+    }
     let mut millis = days_from_civil(year, month, day) * 86_400_000;
 
     if let Some(time) = time_part {
@@ -6839,8 +7017,26 @@ pub(crate) fn parse_date_string(s: &str) -> Option<i64> {
             },
             None => (0, 0),
         };
+        // Range-check the clock like Node: minutes/seconds 0..=59 and hours
+        // 0..=24, with 24:00:00.000 the only value allowed at hour 24 (any
+        // non-zero minute/second/ms makes it Invalid Date, not a rollover).
+        if !(0..=59).contains(&minutes) || !(0..=59).contains(&seconds) {
+            return None;
+        }
+        if hours == 24 {
+            if minutes != 0 || seconds != 0 || frac_ms != 0 {
+                return None;
+            }
+        } else if !(0..=23).contains(&hours) {
+            return None;
+        }
         millis += hours * 3_600_000 + minutes * 60_000 + seconds * 1_000 + frac_ms;
         millis -= tz_offset_min * 60_000;
+    }
+    // A time value outside ±8.64e15 ms is an Invalid Date (so a bare far-future
+    // year string like "1234567890123" yields NaN rather than a garbage date).
+    if millis.unsigned_abs() > MAX_TIME_MS {
+        return None;
     }
     Some(millis)
 }

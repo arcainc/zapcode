@@ -20,9 +20,9 @@
 //!     ACTUAL behavior and flagged `// RESIDUAL`. The `+` operator DOES apply
 //!     ToPrimitive (it goes through string concatenation), so the `+` matrix matches
 //!     Node fully and is asserted as real-JS.
-//!   * preserve negative zero through arithmetic, so `1 / -0` is `Infinity` here
-//!     (Node: `-Infinity`). `String(-0)` is `"0"` in both. The sign-of-(-0) cases are
-//!     asserted at zapcode's ACTUAL behavior and flagged `// RESIDUAL`.
+//!   * preserve negative zero through unary minus and division, so `1 / -0` is
+//!     `-Infinity` and `Object.is(-0, 0)` is `false`, matching Node. `String(-0)`
+//!     is `"0"` in both (ToString drops the sign).
 
 use zapcode_core::vm::VmState;
 use zapcode_core::{ResourceLimits, ZapcodeRun};
@@ -735,11 +735,11 @@ fn negative_zero_stringification_matches() {
 }
 
 #[test]
-fn negative_zero_sign_documented_residual() {
-    // RESIDUAL: zapcode does not preserve the sign of negative zero through
-    // arithmetic, so `1 / -0` is `Infinity` here (Node: `-Infinity`) and
-    // `Math.sign(-0)` is `0` (Node: `-0`). Asserted at zapcode's ACTUAL behavior.
-    assert_eq!(run_str("1 / -0"), "Infinity"); // Node: -Infinity
-    assert_eq!(run_str("1 / (5 - 5)"), "Infinity"); // Node: Infinity (this one matches)
-    assert_eq!(run_str("Math.sign(-0)"), "0"); // Node: 0 (stringifies same)
+fn negative_zero_sign_through_division() {
+    // The sign of negative zero is preserved through unary minus and division:
+    // `1 / -0` is -Infinity, matching Node. `1 / (5 - 5)` is +Infinity because
+    // 5 - 5 is +0. Math.sign(-0) is -0, which stringifies as "0" like Node.
+    assert_eq!(run_str("1 / -0"), "-Infinity");
+    assert_eq!(run_str("1 / (5 - 5)"), "Infinity");
+    assert_eq!(run_str("Math.sign(-0)"), "0"); // Node: -0 (stringifies same)
 }

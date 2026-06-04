@@ -586,3 +586,102 @@ fn redact_via_string_pattern() {
         "call [redacted] now"
     );
 }
+
+// ============================================================================
+// ASCII shorthand classes (\d \D \w \W \b \B) — JS shorthands are ASCII-only,
+// unlike the regex crate's Unicode defaults. Every value below was cross-checked
+// against real `node -e`. This guards ID/ZIP/slug validation from silently
+// accepting non-ASCII input (Arabic-Indic digits, accented letters).
+// ============================================================================
+
+#[test]
+fn ascii_shorthand_digit_is_ascii_only() {
+    // `\d` matches ASCII 0-9 only — NOT Arabic-Indic digits (Node: false).
+    assert_eq!(run_str(r#"/^\d+$/.test("١٢٣")"#), "false");
+    assert_eq!(run_str(r#"/^\d+$/.test("123")"#), "true");
+    assert_eq!(run_str(r#"/\d/.test("١٢٣")"#), "false");
+    // ZIP validation: a non-ASCII-digit string must be rejected.
+    assert_eq!(run_str(r#"/^\d{5}$/.test("12345")"#), "true");
+    assert_eq!(run_str(r#"/^\d{5}$/.test("١٢٣٤٥")"#), "false");
+    // `\D` is "not an ASCII digit": an Arabic-Indic digit IS non-ASCII-digit.
+    assert_eq!(run_str(r#"/\D/.test("١")"#), "true");
+    assert_eq!(run_str(r#"/\D/.test("5")"#), "false");
+}
+
+#[test]
+fn ascii_shorthand_word_is_ascii_only() {
+    // `\w` matches ASCII [0-9A-Za-z_] only — NOT accented letters (Node: false).
+    assert_eq!(run_str(r#"/^\w+$/.test("café")"#), "false");
+    assert_eq!(run_str(r#"/^\w+$/.test("cafe")"#), "true");
+    assert_eq!(run_str(r#"/\w/.test("é")"#), "false");
+    // `\W` is "not an ASCII word char": an accented letter qualifies.
+    assert_eq!(run_str(r#"/\W/.test("é")"#), "true");
+    // Slug validation: an accented char must break a `[\w-]+` slug.
+    assert_eq!(run_str(r#"/^[\w-]+$/.test("my-slug-1")"#), "true");
+    assert_eq!(run_str(r#"/^[\w-]+$/.test("café-slug")"#), "false");
+    // `\s` stays as-is (whitespace), unaffected by the ASCII rewrite.
+    assert_eq!(run_str(r#"/\s/.test(" ")"#), "true");
+}
+
+#[test]
+fn ascii_shorthand_inside_char_class() {
+    // Inside a class, `\d`/`\w` contribute ASCII members; `\D`/`\W` become a
+    // nested negated ASCII class (the crate unions members, matching JS).
+    assert_eq!(run_str(r#"/[\D]/.test("١")"#), "true");
+    assert_eq!(run_str(r#"/[\D]/.test("5")"#), "false");
+    assert_eq!(run_str(r#"/[\W]/.test("é")"#), "true");
+    assert_eq!(run_str(r#"/[\W]/.test("a")"#), "false");
+    // ASCII `\w` members win over the Unicode default in a mixed class too.
+    assert_eq!(run_str(r#""café x".match(/\w+/g).join(",")"#), "caf,x");
+}
+
+#[test]
+fn ascii_shorthand_word_boundary_is_ascii() {
+    // `\b`/`\B` anchor on the ASCII word set.
+    assert_eq!(run_str(r#"/\bcat\b/.test("a cat here")"#), "true");
+    // An accented char isn't an ASCII word char, so `\b` does not see a boundary
+    // wrapping `café` the way it would for a pure-ASCII word (Node: false).
+    assert_eq!(run_str(r#"/\bcafé\b/.test("a café here")"#), "false");
+}
+
+// ============================================================================
+// Sticky flag /y — must anchor the match at lastIndex (the match has to START
+// at the search offset), not scan forward like /g. Cross-checked against Node.
+// ============================================================================
+
+#[test]
+fn sticky_flag_anchors_at_last_index() {
+    // `/a/y` against "baa" with lastIndex 0: 'a' is NOT at index 0 -> false.
+    assert_eq!(
+        run_str(r#"const r = /a/y; r.lastIndex = 0; r.test("baa")"#),
+        "false"
+    );
+    // With lastIndex 1, index 1 IS 'a' -> true.
+    assert_eq!(
+        run_str(r#"const r = /a/y; r.lastIndex = 1; r.test("baa")"#),
+        "true"
+    );
+    // Match at index 0 succeeds.
+    assert_eq!(
+        run_str(r#"const r = /a/y; r.lastIndex = 0; r.test("aab")"#),
+        "true"
+    );
+    // exec is anchored too: no match at offset 0 -> null (does not scan forward).
+    assert_eq!(run_str(r#"String(/a/y.exec("baa"))"#), "null");
+    // A digit class that isn't present at the offset also fails to anchor.
+    assert_eq!(run_str(r#"/\d+/y.test("baa")"#), "false");
+}
+
+#[test]
+fn sticky_flag_exec_loop_advances_contiguously() {
+    // A sticky exec loop consumes the contiguous run from lastIndex and stops at
+    // the first non-match (Node: a@0,a@1,a@2 then null on hitting 'b').
+    assert_eq!(
+        run_str(
+            r#"const r = /a/y; const res = []; let m; const s = "aaab"; while ((m = r.exec(s)) !== null) { res.push(m[0] + "@" + m.index); } res.join(",")"#
+        ),
+        "a@0,a@1,a@2"
+    );
+    // /g (no /y) still scans forward from lastIndex 0.
+    assert_eq!(run_str(r#"const r = /a/g; r.test("baa")"#), "true");
+}

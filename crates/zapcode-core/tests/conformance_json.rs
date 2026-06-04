@@ -174,3 +174,121 @@ fn user_to_json_on_plain_object_honored() {
     assert_eq!(run_str("JSON.stringify({toJSON(){ return 'custom'; }})"), "\"custom\"");
     assert_eq!(run_str("JSON.stringify({x: {toJSON(){ return 5; }}})"), "{\"x\":5}");
 }
+
+// ----------------------------------------------------------------------------
+// Strict JSON.parse grammar (matches Node: each invalid input throws a
+// catchable error). Verified against real Node v24.
+// ----------------------------------------------------------------------------
+
+/// `code` must throw at runtime; assert the guest catches it (`ok` -> "true").
+fn throws(code: &str) {
+    let wrapped = format!("let ok=false; try{{ {code} }}catch(e){{ ok=true }} ok");
+    assert_eq!(run_str(&wrapped), "true", "expected `{code}` to throw");
+}
+
+#[test]
+fn parse_rejects_non_json_grammar() {
+    // Numeric extensions Node rejects (the lenient f64 fallthrough used to accept
+    // these): Infinity / NaN / leading-+ / leading-zero / bare `1.` / `.5` / hex.
+    throws("JSON.parse('Infinity')");
+    throws("JSON.parse('NaN')");
+    throws("JSON.parse('-Infinity')");
+    throws("JSON.parse('+1')");
+    throws("JSON.parse('01')");
+    throws("JSON.parse('-01')");
+    throws("JSON.parse('1.')");
+    throws("JSON.parse('.5')");
+    throws("JSON.parse('0x1F')");
+    throws("JSON.parse('1 2')");
+    // Structural: trailing/empty commas and unquoted/single-quoted keys & strings.
+    throws("JSON.parse('[1,2,]')");
+    throws("JSON.parse('[1,,2]')");
+    throws("JSON.parse('[,]')");
+    throws("JSON.parse('{\"a\":1,}')");
+    throws("JSON.parse('{\"a\":1,,\"b\":2}')");
+    throws("JSON.parse('{a:1}')");
+    throws("JSON.parse(\"{'a':1}\")");
+    throws("JSON.parse(\"'abc'\")");
+    throws("JSON.parse('[[1,],2]')");
+    throws("JSON.parse('')");
+    throws("JSON.parse('{')");
+    throws("JSON.parse('[1')");
+}
+
+#[test]
+fn parse_accepts_valid_json_numbers() {
+    assert_eq!(run_str("JSON.parse('1e3')"), "1000");
+    assert_eq!(run_str("JSON.parse('1e+3')"), "1000");
+    assert_eq!(run_str("JSON.parse('1E-2')"), "0.01");
+    assert_eq!(run_str("JSON.parse('0.5')"), "0.5");
+    assert_eq!(run_str("JSON.parse('-0') === 0"), "true");
+    assert_eq!(run_str("JSON.parse('42')"), "42");
+    assert_eq!(run_str("JSON.parse('-17')"), "-17");
+    // Whitespace around values is allowed.
+    assert_eq!(run_str("JSON.parse('  [ 1 , 2 ]  ')[1]"), "2");
+}
+
+#[test]
+fn parse_decodes_escapes_left_to_right() {
+    // A real \uXXXX escape is decoded to its code point ("A", length 1) — the old
+    // .replace chain left it literal.
+    assert_eq!(run_str("JSON.parse('\"\\\\u0041\"')"), "A");
+    assert_eq!(run_str("JSON.parse('\"\\\\u0041\"').length"), "1");
+    assert_eq!(run_str("JSON.parse('\"\\\\u0041\\\\u0042\"')"), "AB");
+    // backslash-n -> newline.
+    assert_eq!(run_str("JSON.parse('\"a\\\\nb\"')"), "a\nb");
+    // A DOUBLED backslash then `n` is a literal backslash + `n`, NOT a newline —
+    // the old order-dependent replace turned "a\\nb" into a real newline.
+    assert_eq!(run_str("JSON.parse('\"a\\\\\\\\nb\"')"), "a\\nb");
+    // The full short-escape set: \" \\ \/ \b \f \n \r \t.
+    assert_eq!(run_str("JSON.parse('\"\\\\/\\\\b\\\\f\\\\r\\\\t\"')"), "/\u{0008}\u{000C}\r\t");
+    assert_eq!(run_str("JSON.parse('\"q\\\\\"x\"')"), "q\"x");
+    // An unescaped control character (a real newline produced by the guest `\n`
+    // escape) inside a JSON string is rejected at runtime, matching Node's
+    // "Bad control character in string literal" SyntaxError.
+    throws("JSON.parse('\"a\\nb\"')");
+    // A bad escape / incomplete \u is rejected.
+    throws("JSON.parse('\"\\\\x41\"')");
+    throws("JSON.parse('\"\\\\u00\"')");
+}
+
+#[test]
+fn parse_reviver_this_is_holder() {
+    // `this` inside the reviver is the holder object, so a reviver can read its
+    // sibling keys. Node: JSON.parse('{"a":1,"b":2}', fn) with a->this.b yields
+    // {"a":2,"b":2}.
+    assert_eq!(
+        run_str(
+            "JSON.stringify(JSON.parse('{\"a\":1,\"b\":2}', function(k,v){ return k==='a' ? this.b : v; }))"
+        ),
+        "{\"a\":2,\"b\":2}"
+    );
+    // The root holder is { "": value }, so the final reviver call has this[''].
+    assert_eq!(
+        run_str(
+            "JSON.parse('5', function(k,v){ return k==='' ? this[''] : v; })"
+        ),
+        "5"
+    );
+}
+
+#[test]
+fn stringify_keeps_user_double_underscore_keys() {
+    // JSON.stringify must NOT drop user keys that merely start with `__` — only
+    // the interpreter's exact reserved internal markers are hidden. Node:
+    // JSON.stringify({__v:1,a:2}) === '{"__v":1,"a":2}'.
+    assert_eq!(run_str("JSON.stringify({__v:1,a:2})"), "{\"__v\":1,\"a\":2}");
+    assert_eq!(
+        run_str("JSON.stringify({a:{__id__:3},__meta__:1})"),
+        "{\"a\":{\"__id__\":3},\"__meta__\":1}"
+    );
+    assert_eq!(
+        run_str("JSON.stringify({__proto_like__:'kept',normal:1})"),
+        "{\"__proto_like__\":\"kept\",\"normal\":1}"
+    );
+    // A class instance still hides its internal brand keys.
+    assert_eq!(
+        run_str("class C { a = 1; b = 2; } JSON.stringify(new C())"),
+        "{\"a\":1,\"b\":2}"
+    );
+}

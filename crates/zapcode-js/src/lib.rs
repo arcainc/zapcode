@@ -629,10 +629,12 @@ fn value_to_json_inner(
                 }
                 seen.push(*h);
                 for (k, v) in obj.iter() {
-                    // Internal brand keys (`__error__`, `__class__`,
+                    // Reserved internal brand keys (`__error__`, `__class__`,
                     // `__frozen__`, …) are VM bookkeeping, not guest-visible
-                    // properties — never marshal them across the boundary.
-                    if k.starts_with("__") {
+                    // properties — never marshal them across the boundary. This
+                    // is an EXACT allowlist, not a `__`-prefix filter, so real
+                    // user keys like `__id__`/`__typename`/`__v` survive.
+                    if zapcode_core::vm::is_internal_marker_key(k) {
                         continue;
                     }
                     map.insert(k.to_string(), value_to_json_inner(v, heap, seen, depth + 1)?);
