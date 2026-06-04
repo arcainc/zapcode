@@ -13,11 +13,11 @@
 //!   - block completion values and `return` from nested blocks
 //!
 //! Every assertion is checked against real Node behavior. Where zapcode has a
-//! KNOWN, DOCUMENTED divergence (for...in key ordering uses pure insertion order
-//! rather than the spec's integer-keys-ascending-first rule; labeled `continue`
-//! across nested `for...of` does not resume all outer iterations) the test pins
-//! zapcode's ACTUAL output and notes the JS answer in a comment, so the suite
-//! documents the boundary instead of asserting an answer the engine won't produce.
+//! KNOWN, DOCUMENTED divergence (labeled `continue` across nested `for...of`
+//! does not resume all outer iterations) the test pins zapcode's ACTUAL output
+//! and notes the JS answer in a comment, so the suite documents the boundary
+//! instead of asserting an answer the engine won't produce. (for...in key order
+//! now matches JS: integer-index keys ascending, then string keys insertion.)
 
 use zapcode_core::vm::VmState;
 use zapcode_core::{ResourceLimits, ZapcodeRun};
@@ -351,21 +351,16 @@ fn for_in_string_key_insertion_order() {
 }
 
 #[test]
-fn for_in_integer_key_order_documented_divergence() {
-    // DIVERGENCE (documented, key ordering): zapcode iterates for...in keys in
-    // PURE INSERTION ORDER. Real JS first emits integer-index keys in ascending
-    // numeric order, then string keys in insertion order. These pin zapcode's
-    // ACTUAL output; the JS answers are noted.
-    //
-    // JS: "12ba"  (1,2 ascending, then b,a in insertion order)
+fn for_in_integer_key_order() {
+    // for...in (like Object.keys) emits integer-index keys in ascending numeric
+    // order first, then string keys in insertion order — matching JS.
     assert_eq!(
         run_str("const o={}; o['b']=1; o[2]=1; o['a']=1; o[1]=1; let k=''; for(const x in o) k+=x; k"),
-        "b2a1"
+        "12ba"
     );
-    // JS: "123"  (ascending). zapcode keeps insertion order 3,1,2.
     assert_eq!(
         run_str("const o={}; o[3]=1; o[1]=1; o[2]=1; let k=''; for(const x in o) k+=x; k"),
-        "312"
+        "123"
     );
 }
 

@@ -433,4 +433,30 @@ await test("object-literal accessors invoke + enumerate across the host boundary
   assert.equal(r.output, '{"a":1,"b":7}');
 });
 
+// ── Number.MIN_VALUE constant + Object.fromEntries over any iterable ──
+await test("Number.MIN_VALUE and Object.fromEntries(iterable) match Node", async () => {
+  let r = await execute(`Number.MIN_VALUE`, {});
+  assert.equal(r.output, 5e-324);
+  assert.equal(r.output, Number.MIN_VALUE);
+
+  r = await execute(`JSON.stringify(Object.fromEntries(new Map([["a",1],["b",2]])))`, {});
+  assert.equal(r.output, '{"a":1,"b":2}');
+
+  r = await execute(`JSON.stringify(Object.fromEntries(Object.entries({a:1,b:2,c:3}).filter(([k,v]) => v > 1)))`, {});
+  assert.equal(r.output, '{"b":2,"c":3}');
+});
+
+// ── ECMA property key order (integer-index ascending, then insertion) ──
+await test("property enumeration order matches Node across the boundary", async () => {
+  let r = await execute(`Object.keys({ 2: "a", 1: "b", 10: "c", z: "d", a: "e" })`, {});
+  assert.deepEqual(r.output, ["1", "2", "10", "z", "a"]);
+
+  r = await execute(`JSON.stringify({ 2: "a", 1: "b", z: "c" })`, {});
+  assert.equal(r.output, '{"1":"b","2":"a","z":"c"}');
+
+  // for-in (desugars to Object.keys) sees the same order.
+  r = await execute(`(function(){ let o = {}; o[3] = 1; o[1] = 1; o[2] = 1; let k = ""; for (const x in o) k += x; return k; })()`, {});
+  assert.equal(r.output, "123");
+});
+
 console.log(`\n${passed} marshalling checks passed.`);

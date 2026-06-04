@@ -15,12 +15,9 @@
 //!     `{ value, done }`) and feed `Array.from` / `new Map`/`new Set`;
 //!   - `String` iteration via spread / `for…of` / `Array.from`;
 //!   - `Array.from(iterable, mapFn)`;
-//!   - generator objects as full step iterators (`it.next().value` / `.done`).
-//!
-//! DOCUMENTED DIVERGENCES (asserted at zapcode's ACTUAL behavior, with a comment,
-//! never the JS answer — verified against Node):
-//!   - `Object.fromEntries(map)` / `Object.fromEntries(set)` return `{}` — only
-//!     `Object.fromEntries(arrayOfPairs)` is consumed (JS consumes any iterable).
+//!   - generator objects as full step iterators (`it.next().value` / `.done`);
+//!   - `Object.fromEntries` consumes any iterable of pairs (array, Map, Set,
+//!     collection iterators).
 
 use zapcode_core::vm::VmState;
 use zapcode_core::{ResourceLimits, ZapcodeRun};
@@ -239,16 +236,16 @@ fn from_entries_from_array_of_pairs() {
 }
 
 #[test]
-fn from_entries_from_map_or_set_is_documented_divergence() {
-    // DIVERGENCE asserted as actual: JS consumes any iterable so a Map/Set of
-    // pairs builds the object; here only an array-of-pairs is consumed, so a Map
-    // or Set source yields an empty object.
-    assert_eq!(run_str("JSON.stringify(Object.fromEntries(new Map([['a', 1], ['b', 2]])))"), "{}");
-    assert_eq!(run_str("JSON.stringify(Object.fromEntries(new Set([['a', 1]])))"), "{}");
-    // The array workaround is correct.
+fn from_entries_consumes_any_iterable() {
+    // Object.fromEntries consumes ANY iterable of [k, v] pairs — Map, Set, and
+    // collection iterators — not just an array-of-pairs.
+    assert_eq!(run_str("JSON.stringify(Object.fromEntries(new Map([['a', 1], ['b', 2]])))"), "{\"a\":1,\"b\":2}");
+    assert_eq!(run_str("JSON.stringify(Object.fromEntries(new Set([['a', 1]])))"), "{\"a\":1}");
+    assert_eq!(run_str("JSON.stringify(Object.fromEntries(new Map([['x', 9]]).entries()))"), "{\"x\":9}");
+    // The classic transform pipeline: entries -> filter -> fromEntries.
     assert_eq!(
-        run_str("JSON.stringify(Object.fromEntries([...new Map([['a', 1]])]))"),
-        "{\"a\":1}"
+        run_str("JSON.stringify(Object.fromEntries(Object.entries({a:1,b:2,c:3}).filter(([k,v]) => v > 1)))"),
+        "{\"b\":2,\"c\":3}"
     );
 }
 

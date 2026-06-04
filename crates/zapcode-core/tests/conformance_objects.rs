@@ -14,19 +14,16 @@
 //! expression) so the harness's `to_js_string` output is deterministic and
 //! byte-comparable.
 //!
-//! DOCUMENTED DIVERGENCES asserted here against zapcode's ACTUAL behavior
-//! (NOT real-Node), each flagged inline with `DIVERGENCE`:
-//!   1. Integer-like keys are kept in insertion order; real JS reorders them
-//!      ascending ahead of string keys. zapcode has a single insertion-ordered
-//!      key list for all keys.
-//!   2. `get x()`/`set x()` are stored as ordinary function-valued properties,
-//!      not accessor descriptors: reading a getter yields the function itself,
-//!      and assigning through a setter just overwrites the property.
-//!   3. Object-spread of a string or array spreads no own enumerable string
-//!      keys (`{...[1,2]}` and `{...'ab'}` are `{}`); `Object.keys('ab')` is
-//!      `[]`. (zapcode does not expose index keys as own-enumerable on those.)
-//! `Object.freeze` is now enforcing (writes/adds/deletes on a frozen object are
-//! silently ignored) and `Object.isFrozen`, `Object.create`,
+//! Property enumeration follows ECMA-262 OrdinaryOwnPropertyKeys order
+//! (integer-index keys ascending, then string keys in insertion order), and
+//! `get x()`/`set x()` are real accessor properties (invoked on read/write,
+//! enumerable, getters invoked by JSON/spread/Object.*).
+//!
+//! DOCUMENTED DIVERGENCE asserted here against zapcode's ACTUAL behavior:
+//!   - Object-spread of a string or array spreads no own enumerable string
+//!     keys (`{...[1,2]}` and `{...'ab'}` are `{}`); `Object.keys('ab')` is
+//!     `[]`. (zapcode does not expose index keys as own-enumerable on those.)
+//! `Object.freeze` is enforcing; `Object.isFrozen`, `Object.create`,
 //! `Object.getPrototypeOf`, and `Object.getOwnPropertyNames` are implemented.
 //! `Object.defineProperty` is still not provided.
 
@@ -600,32 +597,32 @@ fn string_key_insertion_order_is_preserved() {
 }
 
 #[test]
-fn numeric_keys_kept_in_insertion_order() {
-    // DIVERGENCE: real JS reorders integer-like keys ascending; zapcode keeps a
-    // single insertion-ordered list. Asserted against zapcode's behavior.
-    assert_eq!(run_str("JSON.stringify(Object.keys({3: 1, 1: 2, 2: 3}))"), "[\"3\",\"1\",\"2\"]"); // real JS: ["1","2","3"]
+fn numeric_keys_ordered_ascending() {
+    // Integer-index keys enumerate in ascending NUMERIC order (not insertion or
+    // lexicographic), matching JS.
+    assert_eq!(run_str("JSON.stringify(Object.keys({3: 1, 1: 2, 2: 3}))"), "[\"1\",\"2\",\"3\"]");
     assert_eq!(
         run_str("const o = {}; o[3] = 'a'; o[1] = 'b'; o[2] = 'c'; JSON.stringify(Object.keys(o))"),
-        "[\"3\",\"1\",\"2\"]" // real JS: ["1","2","3"]
+        "[\"1\",\"2\",\"3\"]"
     );
     assert_eq!(
         run_str("JSON.stringify(Object.keys({100: 'a', 2: 'b', 30: 'c'}))"),
-        "[\"100\",\"2\",\"30\"]" // real JS: ["2","30","100"]
+        "[\"2\",\"30\",\"100\"]"
     );
-    // values follow the same insertion order
+    // values follow the same (reordered) key order: keys [2, 30, 100] -> b, c, a.
     assert_eq!(
         run_str("JSON.stringify(Object.values({100: 'a', 2: 'b', 30: 'c'}))"),
-        "[\"a\",\"b\",\"c\"]" // real JS: ["b","c","a"]
+        "[\"b\",\"c\",\"a\"]"
     );
 }
 
 #[test]
-fn mixed_numeric_and_string_keys_kept_in_insertion_order() {
-    // DIVERGENCE: real JS hoists integer keys ahead of string keys; zapcode
-    // preserves the literal insertion order.
+fn mixed_numeric_and_string_keys_order() {
+    // Integer keys are hoisted ahead of string keys (ascending), then string
+    // keys follow in insertion order — matching JS.
     assert_eq!(
         run_str("JSON.stringify(Object.keys({foo: 1, 2: 2, bar: 3, 1: 4}))"),
-        "[\"foo\",\"2\",\"bar\",\"1\"]" // real JS: ["1","2","foo","bar"]
+        "[\"1\",\"2\",\"foo\",\"bar\"]"
     );
 }
 
@@ -638,8 +635,8 @@ fn numeric_key_coercion_and_access() {
     assert_eq!(run_str("const o = {1: 'x'}; o['1'] === o[1]"), "true");
     // float key keeps its source string form
     assert_eq!(run_str("const o = {}; o[1.5] = 'a'; JSON.stringify(Object.keys(o))"), "[\"1.5\"]");
-    // negative key is a string key
-    assert_eq!(run_str("JSON.stringify(Object.keys({[-1]: 'a', 0: 'b'}))"), "[\"-1\",\"0\"]");
+    // negative key is a string key, so the integer key 0 sorts ahead of it.
+    assert_eq!(run_str("JSON.stringify(Object.keys({[-1]: 'a', 0: 'b'}))"), "[\"0\",\"-1\"]");
 }
 
 // ============================================================================
@@ -761,4 +758,24 @@ fn class_instance_internal_markers_stay_hidden_on_spread() {
         run_str("class C { a = 1; b = 2; } Object.keys({...new C()}).join(',')"),
         "a,b"
     );
+}
+
+#[test]
+fn property_enumeration_order_matches_ecma() {
+    // Integer-index keys ascending, then string keys in insertion order — the
+    // single OrdinaryOwnPropertyKeys order shared by keys/values/entries,
+    // for-in, and JSON.stringify.
+    assert_eq!(run_str("Object.keys({2:'a',1:'b',10:'c',z:'d',a:'e'}).join(',')"), "1,2,10,z,a");
+    assert_eq!(run_str("JSON.stringify({2:'a',1:'b',z:'c'})"), "{\"1\":\"b\",\"2\":\"a\",\"z\":\"c\"}");
+    // Canonical-index edge cases: leading zero, 2^32-1, and negatives are STRING
+    // keys (not integer indices), so they sort after and in insertion order.
+    assert_eq!(run_str("Object.keys({'01':1, 1:2, '0':3}).join(',')"), "0,1,01");
+    assert_eq!(
+        run_str("Object.keys({4294967295:'a', 5:'b', 4294967294:'c'}).join(',')"),
+        "5,4294967294,4294967295"
+    );
+    assert_eq!(run_str("Object.keys({'-1':1, 2:2, 1:3}).join(',')"), "1,2,-1");
+    // Spread / assign results reorder when read, too.
+    assert_eq!(run_str("Object.keys({...{2:'a',1:'b'}}).join(',')"), "1,2");
+    assert_eq!(run_str("JSON.stringify(Object.assign({}, {3:'c'}, {1:'a'}))"), "{\"1\":\"a\",\"3\":\"c\"}");
 }
