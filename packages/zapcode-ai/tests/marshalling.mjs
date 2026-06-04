@@ -433,4 +433,17 @@ await test("object-literal accessors invoke + enumerate across the host boundary
   assert.equal(r.output, '{"a":1,"b":7}');
 });
 
+// ── Number.MIN_VALUE constant + Object.fromEntries over any iterable ──
+await test("Number.MIN_VALUE and Object.fromEntries(iterable) match Node", async () => {
+  let r = await execute(`Number.MIN_VALUE`, {});
+  assert.equal(r.output, 5e-324);
+  assert.equal(r.output, Number.MIN_VALUE);
+
+  r = await execute(`JSON.stringify(Object.fromEntries(new Map([["a",1],["b",2]])))`, {});
+  assert.equal(r.output, '{"a":1,"b":2}');
+
+  r = await execute(`JSON.stringify(Object.fromEntries(Object.entries({a:1,b:2,c:3}).filter(([k,v]) => v > 1)))`, {});
+  assert.equal(r.output, '{"b":2,"c":3}');
+});
+
 console.log(`\n${passed} marshalling checks passed.`);

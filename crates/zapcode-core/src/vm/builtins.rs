@@ -209,7 +209,10 @@ fn global_fn(name: &str, heap: &mut Heap) -> Value {
             Value::Int(-9_007_199_254_740_991),
         );
         obj.insert(Arc::from("MAX_VALUE"), Value::Float(f64::MAX));
-        obj.insert(Arc::from("MIN_VALUE"), Value::Float(f64::MIN_POSITIVE));
+        // JS Number.MIN_VALUE is the smallest positive *subnormal* double
+        // (5e-324 == f64::from_bits(1)), NOT f64::MIN_POSITIVE which is the
+        // smallest *normal* double (~2.2e-308).
+        obj.insert(Arc::from("MIN_VALUE"), Value::Float(f64::from_bits(1)));
         obj.insert(Arc::from("EPSILON"), Value::Float(f64::EPSILON));
         obj.insert(Arc::from("POSITIVE_INFINITY"), Value::Float(f64::INFINITY));
         obj.insert(

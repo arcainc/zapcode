@@ -730,14 +730,17 @@ fn number_constants() {
 
 #[test]
 fn number_constant_relationships() {
-    // MAX_VALUE / MIN_VALUE / EPSILON stringify as long decimals here (no `e`
-    // notation), so assert their numeric properties rather than the string form.
     assert_eq!(run_str("Number.EPSILON > 0"), "true");
     assert_eq!(run_str("Number.EPSILON < 0.001"), "true");
     assert_eq!(run_str("Number.MAX_VALUE > 1e300"), "true");
     assert_eq!(run_str("Number.MIN_VALUE > 0"), "true");
     assert_eq!(run_str("Number.MIN_VALUE < 1e-300"), "true");
     assert_eq!(run_str("Number.MAX_SAFE_INTEGER === 2 ** 53 - 1"), "true");
+    // MIN_VALUE is the smallest positive *subnormal* double (5e-324), not the
+    // smallest normal one (~2.2e-308).
+    assert_eq!(run_str("Number.MIN_VALUE === 5e-324"), "true");
+    assert_eq!(run_str("String(Number.MIN_VALUE)"), "5e-324");
+    assert_eq!(run_str("Number.MAX_VALUE === 1.7976931348623157e308"), "true");
 }
 
 // ============================================================================

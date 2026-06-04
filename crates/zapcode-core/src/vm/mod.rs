@@ -4825,6 +4825,25 @@ impl Vm {
                                 }
                                 Some(Value::Object(target))
                             }
+                            // Object.fromEntries accepts ANY iterable of [k, v]
+                            // pairs (Map/Set/array-iterator/custom), not just a
+                            // plain array. Drain non-array iterables here (the pure
+                            // builtin only knows arrays), then reuse the builtin.
+                            "Object"
+                                if method_name.as_ref() == "fromEntries"
+                                    && !matches!(args.first(), Some(Value::Array(_))) =>
+                            {
+                                let src = args.first().cloned().unwrap_or(Value::Undefined);
+                                let pairs = self.drain_iterable(src)?;
+                                let arr = self.heap.alloc_array(pairs);
+                                builtins::call_global_method(
+                                    "Object",
+                                    "fromEntries",
+                                    &[Value::Array(arr)],
+                                    &mut self.stdout,
+                                    &mut self.heap,
+                                )?
+                            }
                             global_name => builtins::call_global_method(
                                 global_name,
                                 &method_name,
