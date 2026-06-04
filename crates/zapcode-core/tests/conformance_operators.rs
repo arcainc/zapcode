@@ -2,10 +2,8 @@
 //!
 //! Broad, test262-style coverage of the interpreter's operator surface, asserting
 //! the *real-Node* answer (verified against Node) at every point where zapcode is
-//! known to agree. Documented divergences are deliberately avoided here:
-//!   - `1 / -0` (zapcode renders `Infinity`, JS `-Infinity`) — numeric edge, skipped.
-//!   - very large/small magnitudes that JS renders in exponential form (`1e21`,
-//!     `1e-7`) — number-stringification divergence, skipped.
+//! known to agree (this now includes the negative-zero sign through division
+//! and exponential number formatting, both formerly divergent).
 //!   - UTF-16 vs code-point string indexing (G9) — covered/avoided in string suites.
 //! Everything asserted below produces byte-identical `to_js_string` output to Node's
 //! `String(...)` of the same expression.

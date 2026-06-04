@@ -341,4 +341,26 @@ await test("number stringification uses JS exponential notation like Node", asyn
   assert.equal(r.output, [1e21, 1e-7, 12345678].join(","));
 });
 
+// ── IEEE-754 negative zero is preserved through the host boundary ──
+// Unary `-0` yields a real Float(-0.0) (not the integer 0), so its sign is
+// observable in division and Object.is/SameValue while ToString still drops it.
+await test("negative zero keeps its sign across the host boundary like Node", async () => {
+  let r = await execute(`String(1 / -0)`, {});
+  assert.equal(r.output, "-Infinity");
+
+  r = await execute(`Object.is(-0, 0)`, {});
+  assert.equal(r.output, false);
+
+  r = await execute(`Object.is(-0, -0)`, {});
+  assert.equal(r.output, true);
+
+  // 0 / -5 is -0; its sign is visible to Object.is but ToString renders "0".
+  r = await execute(`[Object.is(0 / -5, -0), String(0 / -5)]`, {});
+  assert.deepEqual(r.output, [true, "0"]);
+
+  // -0 used as an index/key behaves exactly like +0.
+  r = await execute(`(function(){ const o = {}; o[-0] = 7; return o[0]; })()`, {});
+  assert.equal(r.output, 7);
+});
+
 console.log(`\n${passed} marshalling checks passed.`);

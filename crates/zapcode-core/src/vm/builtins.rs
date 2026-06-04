@@ -449,6 +449,9 @@ fn js_to_exponential(n: f64, digits: Option<usize>) -> String {
     if !n.is_finite() {
         return format_number(n);
     }
+    // toExponential drops the sign of negative zero ((-0).toExponential(1) is
+    // "0.0e+0", not "-0.0e+0"); canonicalize -0 to +0 before formatting.
+    let n = if n == 0.0 { 0.0 } else { n };
     let formatted = match digits {
         Some(d) => format!("{:.*e}", d, n),
         None => format!("{:e}", n),

@@ -21,8 +21,6 @@
 //!   * RegExp objects expose `.flags`, `.test()`, `.exec()` and `.lastIndex` but
 //!     NOT `.source`/`.global`/`.ignoreCase`/`.multiline` accessors (return
 //!     `undefined`); tests target matching behavior + `.flags`.
-//!   * `1 / -0` yields `Infinity` (negative-zero sign not preserved through
-//!     division); not asserted as `-Infinity`.
 
 use zapcode_core::vm::VmState;
 use zapcode_core::{ResourceLimits, ZapcodeRun};
@@ -179,8 +177,8 @@ fn special_numeric_values() {
     // Negative zero stringifies as "0".
     assert_eq!(run_str("String(-0)"), "0");
     assert_eq!(run_str("-0 === 0"), "true"); // === treats -0 and 0 as equal
-    // NOTE: `1 / -0` yields "Infinity" here (negative-zero sign not preserved
-    // through division); V8 gives "-Infinity". Not asserted to avoid the residual.
+    // The negative-zero sign is preserved through division (matches V8).
+    assert_eq!(run_str("String(1 / -0)"), "-Infinity");
     assert_eq!(run_str("Number.isNaN(0 / 0)"), "true");
 }
 

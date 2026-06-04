@@ -3535,7 +3535,19 @@ impl Vm {
                 let val = self.pop()?;
                 let val = self.to_primitive(&val, ToPrimitiveHint::Number)?;
                 let result = match val {
-                    Value::Int(n) => Value::Int(-n),
+                    // Negating integer 0 must produce the IEEE-754 negative zero,
+                    // not the integer 0 — otherwise the sign is lost and
+                    // `1 / -0` yields +Infinity and `Object.is(-0, 0)` yields
+                    // true, both diverging from JS. ToString still renders it as
+                    // "0" (see format_number), so this is invisible except where
+                    // the sign is observable (division, Object.is/SameValue).
+                    Value::Int(0) => Value::Float(-0.0),
+                    // checked_neg guards the lone overflow case (-i64::MIN),
+                    // which would otherwise panic and abort the host.
+                    Value::Int(n) => match n.checked_neg() {
+                        Some(r) => Value::Int(r),
+                        None => Value::Float(-(n as f64)),
+                    },
                     _ => Value::Float(-val.to_number_heap(&self.heap)),
                 };
                 self.push(result)?;

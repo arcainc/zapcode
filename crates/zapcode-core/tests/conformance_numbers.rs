@@ -20,7 +20,6 @@
 //! against Node; zapcode's `to_js_string` uses Rust's f64 formatting / i128 integer
 //! arithmetic, which differ here). These are skipped, or the *actual* zapcode value
 //! is asserted with an explicit comment:
-//!   - `1 / -0` → `Infinity` (JS `-Infinity`): negative-zero sign in division.
 //!   - `Math.min(1, NaN)` → `1` and `Math.max(1, NaN)` → `1` are NaN-poisoning
 //!     differences when NaN is not the first arg (asserted as zapcode's actual).
 //!   - `Math.trunc(-0.5)` / `Math.hypot()` → `-0` (JS String() → `0`): negative-zero
@@ -969,9 +968,14 @@ fn negative_zero_equality() {
     assert_eq!(run_str("-0 === 0"), "true");
     // -0 prints as "0".
     assert_eq!(run_str("String(-0)"), "0");
-    // NOTE: 1 / -0 → Infinity in zapcode (JS: -Infinity); documented divergence,
-    // not asserted. But 1 / 0 === 1 / -0 is true in zapcode because both are +Inf.
-    assert_eq!(run_str("1 / 0 === 1 / -0"), "true");
+    // The sign of -0 is preserved through division: 1 / -0 is -Infinity (not
+    // +Infinity), so 1/0 and 1/-0 are no longer equal.
+    assert_eq!(run_str("String(1 / -0)"), "-Infinity");
+    assert_eq!(run_str("String(1 / 0)"), "Infinity");
+    assert_eq!(run_str("1 / 0 === 1 / -0"), "false");
+    // 0 / -5 is -0 (renders "0"); Object.is sees the sign.
+    assert_eq!(run_str("String(0 / -5)"), "0");
+    assert_eq!(run_str("String(Object.is(0 / -5, -0))"), "true");
 }
 
 // ============================================================================
