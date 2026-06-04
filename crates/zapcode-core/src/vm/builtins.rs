@@ -1600,21 +1600,30 @@ fn call_string_method(
             Value::Bool(s[..byte_end].ends_with(&*search))
         }
         "slice" => {
-            let len = s.len() as i64;
-            let start = normalize_index(arg_int(args, 0), len);
+            // Index by CHARACTER position (consistent with charAt/substr/indexOf),
+            // not raw bytes — slicing `&s[byte..byte]` on a char-derived index would
+            // land mid-codepoint on multibyte input and panic (host SIGABRT).
+            let chars: Vec<char> = s.chars().collect();
+            let len = chars.len() as i64;
+            let start = normalize_index(arg_int(args, 0), len).min(chars.len());
             let end = if args.len() > 1 {
-                normalize_index(arg_int(args, 1), len)
+                normalize_index(arg_int(args, 1), len).min(chars.len())
             } else {
-                len as usize
+                chars.len()
             };
             if start >= end {
                 Value::String(Arc::from(""))
             } else {
-                Value::String(Arc::from(&s[start..end.min(s.len())]))
+                Value::String(Arc::from(
+                    chars[start..end].iter().collect::<String>().as_str(),
+                ))
             }
         }
         "substring" => {
-            let len = s.len();
+            // Character-indexed (see `slice`): byte-indexing here panics on
+            // multibyte input (e.g. `"ééé".substring(1,2)`).
+            let chars: Vec<char> = s.chars().collect();
+            let len = chars.len();
             let start = (arg_int(args, 0).max(0) as usize).min(len);
             let end = if args.len() > 1 {
                 (arg_int(args, 1).max(0) as usize).min(len)
@@ -1626,7 +1635,9 @@ fn call_string_method(
             } else {
                 (start, end)
             };
-            Value::String(Arc::from(&s[start..end]))
+            Value::String(Arc::from(
+                chars[start..end].iter().collect::<String>().as_str(),
+            ))
         }
         "toUpperCase" => Value::String(Arc::from(s.to_uppercase().as_str())),
         "toLowerCase" => Value::String(Arc::from(s.to_lowercase().as_str())),
@@ -1956,16 +1967,33 @@ fn same_value_zero(a: &Value, b: &Value) -> bool {
     matches!((a, b), (Value::Float(x), Value::Float(y)) if x.is_nan() && y.is_nan())
 }
 
-/// Recursive helper for `Array.prototype.flat(depth)`.
-fn flatten_into(arr: &[Value], depth: i64, out: &mut Vec<Value>, heap: &Heap) {
+/// Recursive helper for `Array.prototype.flat(depth)`. `native_depth` bounds the
+/// native recursion so a cyclic (`a.push(a); a.flat(Infinity)`) or pathologically
+/// deep array can't overflow the host stack (SIGSEGV). Exceeding the cap surfaces a
+/// catchable `RuntimeError` instead, matching the [`MAX_RENDER_DEPTH`] contract the
+/// JSON and structuredClone walkers already use.
+fn flatten_into(
+    arr: &[Value],
+    depth: i64,
+    out: &mut Vec<Value>,
+    heap: &Heap,
+    native_depth: usize,
+) -> Result<()> {
+    if native_depth > MAX_RENDER_DEPTH {
+        return Err(ZapcodeError::RuntimeError(format!(
+            "flatten depth exceeded (max {})",
+            MAX_RENDER_DEPTH
+        )));
+    }
     for item in arr {
         match item {
             Value::Array(inner) if depth > 0 => {
-                flatten_into(&heap.array_vec(*inner), depth - 1, out, heap)
+                flatten_into(&heap.array_vec(*inner), depth - 1, out, heap, native_depth + 1)?;
             }
             other => out.push(other.clone()),
         }
     }
+    Ok(())
 }
 
 fn call_array_method(
@@ -2069,7 +2097,7 @@ fn call_array_method(
                 }
             };
             let mut result = Vec::new();
-            flatten_into(arr, depth, &mut result, heap);
+            flatten_into(arr, depth, &mut result, heap, 0)?;
             Value::Array(heap.alloc_array(result))
         }
         "at" => {

@@ -112,6 +112,31 @@ await test("Array.from({length: huge}) hits the memory limit (no untracked OOM)"
   );
 });
 
+// ── String/array indexing & flatten host-abort regressions (audit C1/C2/C3) ──
+// Each of these aborted the host process on guest input (SIGSEGV/SIGABRT) and is
+// uncatchable from JS; they must now return the correct value or a catchable
+// error, with the host surviving.
+
+await test("substring/slice on multibyte input do not SIGABRT the host", async () => {
+  // C2: substring across a multibyte boundary used to panic on a non-char byte index.
+  const a = await execute(`"ééé".substring(1, 2)`, {});
+  assert.equal(a.output, "é");
+  // C3: indexOf returns a char index; slice must consume it as a char index, not bytes.
+  const b = await execute(`const u = "é://host"; u.slice(0, u.indexOf(":"))`, {});
+  assert.equal(b.output, "é");
+});
+
+await test("flat(Infinity) on a self-cyclic array is catchable, not a host abort", async () => {
+  const r = await execute(
+    `const a = []; a.push(a); let ok = false; try { a.flat(Infinity); } catch (e) { ok = true; } ok`,
+    {},
+  );
+  assert.equal(r.output, true);
+  // acyclic deep flatten is unaffected
+  const ok = await execute(`[1,[2,[3,[4,[5]]]]].flat(Infinity).join(",")`, {});
+  assert.equal(ok.output, "1,2,3,4,5");
+});
+
 await test("padStart/join past the cap hit the memory limit", async () => {
   await assert.rejects(
     () => execute(`'x'.padStart(200000000, 'ab').length`, {}, { memoryLimitMb: 8, timeLimitMs: 20000 }),

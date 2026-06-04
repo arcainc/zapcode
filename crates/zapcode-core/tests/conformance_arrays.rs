@@ -930,3 +930,30 @@ fn mutation_independence_after_copy() {
         "[[1,2,99],[1,2,3]]"
     );
 }
+
+// ----------------------------------------------------------------------------
+// Regression: `flat(depth)` is bounded against native-stack overflow. A
+// self-cyclic array flattened with `Infinity` used to recurse unguarded and
+// SIGSEGV the host (exit 139). It now hits the MAX_RENDER_DEPTH native cap and
+// surfaces a CATCHABLE error (Node throws a RangeError on the same input), while
+// ordinary acyclic flattening is unaffected.
+// ----------------------------------------------------------------------------
+
+#[test]
+fn flat_on_cyclic_array_is_catchable_not_host_abort() {
+    // C1: was SIGSEGV; now the guest `catch` runs (no host abort).
+    assert_eq!(
+        run_str(
+            "const a = []; a.push(a); let ok = false; \
+             try { a.flat(Infinity); } catch (e) { ok = true; } ok"
+        ),
+        "true"
+    );
+    // Acyclic deep flatten still works to arbitrary (in-cap) depth.
+    assert_eq!(
+        run_str("[1,[2,[3,[4,[5]]]]].flat(Infinity).join(',')"),
+        "1,2,3,4,5"
+    );
+    assert_eq!(run_str("[[1,2],[3,4]].flat().length"), "4");
+    assert_eq!(run_str("[1,[2,[3]]].flat(1).length"), "3");
+}
