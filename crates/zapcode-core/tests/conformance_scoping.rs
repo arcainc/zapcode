@@ -12,18 +12,16 @@
 //! divergence is captured rather than hidden. The documented residuals are:
 //!
 //!   * No TDZ: a `let`/`const` read before its initializer yields `undefined`
-//!     instead of throwing a ReferenceError.
-//!   * `let`/`const` are not block-fresh: an inner-block re-declaration of the
-//!     same name overwrites the outer binding rather than creating a distinct
-//!     one that is restored when the block ends, and such bindings are visible
-//!     after the block (effectively function-scoped, like `var`, but without
-//!     hoisting-to-`undefined`).
-//!   * Duplicate same-scope `let` is not rejected.
+//!     instead of throwing a ReferenceError. (And a block-scoped name read
+//!     AFTER its block falls through to a global read, yielding `undefined`
+//!     rather than a ReferenceError — undeclared reads don't throw yet.)
 //!   * Per-iteration capture is implemented for the C-style `for (let …;;)`
-//!     head ONLY; `for…of`, `for…in`, and `let`/`const` declared inside a loop
-//!     *body* block all share a single binding (last value wins).
-//!   * A closure nested inside a function that shadows an outer `let`/`const`
-//!     captures the OUTER binding, not the function-local shadow.
+//!     head ONLY; `for…of`/`for…in` and `let`/`const` declared inside a loop
+//!     *body* block share a single binding per loop (last value wins).
+//!
+//! FIXED (now match JS): `let`/`const` are block-scoped (shadow + restore, don't
+//! leak), duplicate same-scope `let`/`const` is a SyntaxError, and a closure
+//! captures the innermost (shadowing) binding. `const` reassignment throws.
 //!
 //! Everything NOT in that list is asserted at the real-JS answer.
 
@@ -46,6 +44,19 @@ fn run_str(code: &str) -> String {
     match result.state {
         VmState::Complete(v) => v.to_js_string(&result.heap),
         other => panic!("expected completion for `{code}`, got {other:?}"),
+    }
+}
+
+/// Return the compile/parse error string for code that JS rejects as an early
+/// (Syntax) error — e.g. a duplicate `let` in the same scope. The error may
+/// surface either when building the run or when it executes.
+fn compile_err(code: &str) -> String {
+    match ZapcodeRun::new(code.to_string(), Vec::new(), Vec::new(), ResourceLimits::default()) {
+        Err(e) => format!("{e:?}"),
+        Ok(run) => match run.run(Vec::new()) {
+            Err(e) => format!("{e:?}"),
+            Ok(_) => panic!("expected a compile error for `{code}`"),
+        },
     }
 }
 
@@ -231,48 +242,55 @@ fn const_reassignment_throws_type_error() {
 }
 
 #[test]
-fn duplicate_let_in_same_scope_is_not_rejected() {
-    // DIVERGENCE: real JS is a SyntaxError ("Identifier 'a' has already been
-    // declared"). zapcode treats the second `let` as a reassignment.
-    assert_eq!(
-        run_str("(function(){ let a = 1; let a = 2; return a; })()"),
-        "2"
-    );
+fn duplicate_let_in_same_scope_is_rejected() {
+    // A duplicate `let`/`const` in the same scope is an early SyntaxError in JS;
+    // here it surfaces as a compile error ("Identifier 'a' has already been
+    // declared"). A same-name binding in an INNER block is fine (shadowing).
+    assert!(compile_err("(function(){ let a = 1; let a = 2; return a; })()")
+        .contains("has already been declared"));
+    assert!(compile_err("(function(){ const a = 1; const a = 2; return a; })()")
+        .contains("has already been declared"));
+    // Shadowing in a nested block is allowed.
+    assert_eq!(run_str("(function(){ let a = 1; { let a = 2; } return a; })()"), "1");
 }
 
 #[test]
-fn let_const_block_redeclaration_overwrites_outer() {
-    // DIVERGENCE: in real JS an inner-block `let`/`const` of the same name is a
-    // distinct binding, so the outer value is RESTORED after the block (these
-    // would all be "1" in Node). zapcode instead overwrites the outer binding.
+fn let_const_block_redeclaration_shadows_and_restores_outer() {
+    // An inner-block `let`/`const` of the same name is a DISTINCT binding: the
+    // outer value is restored after the block (matches JS).
     assert_eq!(
         run_str("(function(){ let x = 1; { let x = 2; } return x; })()"),
-        "2"
+        "1"
     );
     assert_eq!(
         run_str("(function(){ let x = 1; if (true) { let x = 2; } return x; })()"),
-        "2"
+        "1"
     );
     assert_eq!(
         run_str("(function(){ const a = 1; { const a = 2; } return a; })()"),
-        "2"
+        "1"
     );
-    // Reading the inner shadow *inside* the block sees the inner value (this
-    // part matches JS); the divergence is only the lack of restoration after.
+    // Reading the inner shadow inside the block sees the inner value; after the
+    // block the outer binding is restored.
     assert_eq!(
         run_str("(function(){ let x = 1; let seen; { let x = 2; seen = x; } return seen + ',' + x; })()"),
-        "2,2"
+        "2,1"
     );
 }
 
 #[test]
-fn let_const_leak_out_of_blocks() {
-    // DIVERGENCE: real JS scopes these to the block, so `typeof a` after the
-    // block is "undefined". zapcode keeps them visible (function-scoped).
-    assert_eq!(run_str("(function(){ { let a = 1; } return typeof a; })()"), "number");
+fn let_const_do_not_leak_out_of_blocks() {
+    // `let`/`const` are block-scoped: after the block the name is not bound, so
+    // `typeof` (which doesn't throw on an unbound name) is "undefined".
+    assert_eq!(run_str("(function(){ { let a = 1; } return typeof a; })()"), "undefined");
     assert_eq!(
         run_str("(function(){ { const k = 'x'; } return typeof k; })()"),
-        "string"
+        "undefined"
+    );
+    // A loop's `let` head binding doesn't leak either.
+    assert_eq!(
+        run_str("(function(){ for (let i = 0; i < 3; i++) {} return typeof i; })()"),
+        "undefined"
     );
 }
 
