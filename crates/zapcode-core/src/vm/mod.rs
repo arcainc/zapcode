@@ -2644,7 +2644,7 @@ impl Vm {
                 Ok(Some(Value::Array(h)))
             }
             "filter" | "find" | "findIndex" | "findLast" | "findLastIndex" | "every" | "some"
-            | "reduce" | "reduceRight" | "sort" | "flatMap" => {
+            | "reduce" | "reduceRight" | "sort" | "toSorted" | "flatMap" => {
                 // Async callbacks are not supported for these methods
                 if self.is_async_callback(&callback) {
                     return Err(ZapcodeError::RuntimeError(format!(
@@ -2783,6 +2783,36 @@ impl Vm {
                         // sort() mutates in place and returns the same array.
                         self.heap.set_array(handle, result);
                         Ok(Some(Value::Array(handle)))
+                    }
+                    "toSorted" => {
+                        // Like sort, but returns a NEW array and leaves the
+                        // original untouched (ES2023).
+                        let mut result = arr;
+                        if matches!(callback, Value::Function(_)) {
+                            let len = result.len();
+                            for i in 1..len {
+                                let mut j = i;
+                                while j > 0 {
+                                    let cmp = self
+                                        .call_function_internal(
+                                            &callback,
+                                            vec![result[j - 1].clone(), result[j].clone()],
+                                        )?
+                                        .to_number();
+                                    if cmp > 0.0 {
+                                        result.swap(j - 1, j);
+                                        j -= 1;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                        } else {
+                            let heap = &self.heap;
+                            result.sort_by_key(|a| a.to_js_string(heap));
+                        }
+                        let h = self.heap.alloc_array(result);
+                        Ok(Some(Value::Array(h)))
                     }
                     "flatMap" => {
                         let mut result = Vec::new();
@@ -4422,7 +4452,8 @@ impl Vm {
                                     match method_name.as_ref() {
                                         "map" | "filter" | "forEach" | "find" | "findIndex"
                                         | "findLast" | "findLastIndex" | "every" | "some"
-                                        | "reduce" | "reduceRight" | "sort" | "flatMap" => {
+                                        | "reduce" | "reduceRight" | "sort" | "toSorted"
+                                        | "flatMap" => {
                                             match self.execute_array_callback_method(
                                                 arr,
                                                 &method_name,
@@ -7548,6 +7579,10 @@ fn is_array_method(name: &str) -> bool {
             | "toLocaleString"
             | "reverse"
             | "sort"
+            | "toReversed"
+            | "toSorted"
+            | "toSpliced"
+            | "with"
             | "indexOf"
             | "lastIndexOf"
             | "includes"

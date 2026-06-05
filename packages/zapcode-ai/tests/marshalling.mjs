@@ -597,4 +597,14 @@ await test("WeakMap/WeakSet work across the host boundary", async () => {
   assert.equal(r.output, false);
 });
 
+// ── ES2023 immutable array methods (toSorted/toReversed/with/toSpliced) ──
+await test("immutable array methods match Node across the host boundary", async () => {
+  let r = await execute(`[[3,1,2].toSorted(), [1,2,3].toReversed(), [1,2,3].with(1,9), [1,2,3,4].toSpliced(1,2,"a")]`, {});
+  assert.deepEqual(r.output, [[1,2,3], [3,2,1], [1,9,3], [1,"a",4]]);
+
+  // Original is unchanged.
+  r = await execute(`(function(){ const a=[3,1,2]; const b=a.toSorted(); return [a, b]; })()`, {});
+  assert.deepEqual(r.output, [[3,1,2], [1,2,3]]);
+});
+
 console.log(`\n${passed} marshalling checks passed.`);
