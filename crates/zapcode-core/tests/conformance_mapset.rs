@@ -493,3 +493,24 @@ fn map_of_collections_buckets() {
         "1"
     );
 }
+
+#[test]
+fn weakmap_and_weakset_basic_operations() {
+    // WeakMap: set/get/has/delete with object keys; set is chainable.
+    assert_eq!(run_str("(function(){ const w = new WeakMap(); const k = {}; w.set(k, 1); return w.get(k); })()"), "1");
+    assert_eq!(run_str("(function(){ const w = new WeakMap(); const k = {}; w.set(k, 5); return w.has(k) + ',' + w.has({}); })()"), "true,false");
+    assert_eq!(run_str("(function(){ const w = new WeakMap(); const k = {}; w.set(k, 1); w.delete(k); return w.has(k); })()"), "false");
+    assert_eq!(run_str("(function(){ const w = new WeakMap(); const k = {}; return w.set(k, 1) === w; })()"), "true");
+    assert_eq!(run_str("(function(){ const w = new WeakMap(); return w.get({}) === undefined; })()"), "true");
+    // Constructed from an iterable of [k, v] pairs.
+    assert_eq!(run_str("(function(){ const k = {}; const w = new WeakMap([[k, 7]]); return w.get(k); })()"), "7");
+    // WeakSet: add/has/delete; add is chainable.
+    assert_eq!(run_str("(function(){ const s = new WeakSet(); const k = {}; s.add(k); return s.has(k); })()"), "true");
+    assert_eq!(run_str("(function(){ const s = new WeakSet(); const k = {}; s.add(k); s.delete(k); return s.has(k); })()"), "false");
+    assert_eq!(run_str("(function(){ const s = new WeakSet(); const k = {}; return s.add(k) === s; })()"), "true");
+    // A common memoization pattern works.
+    assert_eq!(
+        run_str("(function(){ const cache = new WeakMap(); function memo(o){ if (cache.has(o)) return cache.get(o); const v = o.x * 2; cache.set(o, v); return v; } const o = { x: 5 }; return memo(o) + ',' + memo(o); })()"),
+        "10,10"
+    );
+}
