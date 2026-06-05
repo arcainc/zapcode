@@ -582,6 +582,12 @@ await test("catch-param and for-of/in loop scoping match Node", async () => {
   assert.deepEqual(r.output, ["a", "b"]);
 });
 
+// ── Symbol.for global registry ──
+await test("Symbol.for registry matches Node across the host boundary", async () => {
+  let r = await execute(`[Symbol.for("x") === Symbol.for("x"), Symbol.for("x") === Symbol("x"), Symbol.keyFor(Symbol.for("hi"))]`, {});
+  assert.deepEqual(r.output, [true, false, "hi"]);
+});
+
 // ── WeakMap / WeakSet basic operations ──
 await test("WeakMap/WeakSet work across the host boundary", async () => {
   let r = await execute(`(function(){ const w = new WeakMap(); const k = {}; w.set(k, 1); return [w.get(k), w.has(k), w.has({})]; })()`, {});
