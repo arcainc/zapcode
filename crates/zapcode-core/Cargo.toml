@@ -24,6 +24,9 @@ regex.workspace = true
 indexmap.workspace = true
 thiserror.workspace = true
 unicode-normalization = "0.1.25"
+num-bigint = { version = "0.4", features = ["serde"] }
+num-traits = "0.2"
+num-integer = "0.1"
 
 [dev-dependencies]
 insta.workspace = true

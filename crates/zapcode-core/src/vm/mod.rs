@@ -2358,6 +2358,12 @@ impl Vm {
             } else {
                 "null".to_string()
             }),
+            // JSON.stringify(bigint) throws a TypeError in JS.
+            Value::BigInt(_) => {
+                return Err(ZapcodeError::TypeError(
+                    "Do not know how to serialize a BigInt".to_string(),
+                ))
+            }
             Value::String(s) => Some(builtins::json_escape_string(s)),
             Value::Array(h) => {
                 if seen.contains(h) {
@@ -3397,6 +3403,7 @@ impl Vm {
                     Constant::Bool(b) => Value::Bool(b),
                     Constant::Int(n) => Value::Int(n),
                     Constant::Float(n) => Value::Float(n),
+                    Constant::BigInt(v) => Value::BigInt(v.clone()),
                     Constant::String(s) => Value::String(JsString::from(s.as_str())),
                 };
                 self.push(value)?;
@@ -3513,6 +3520,7 @@ impl Vm {
                     (Value::Float(a), Value::Float(b)) => Value::Float(a + b),
                     (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 + b),
                     (Value::Float(a), Value::Int(b)) => Value::Float(a + *b as f64),
+                    (Value::BigInt(a), Value::BigInt(b)) => Value::BigInt(a + b),
                     // Concatenate by UTF-16 code units so a trailing lone high
                     // surrogate and a leading lone low surrogate RE-PAIR into the
                     // astral char (e.g. `"\uD83D" + "\uDE00"` === "😀"), matching JS.
@@ -3552,6 +3560,9 @@ impl Vm {
                         s.push_str(&rhs);
                         Value::String(JsString::from(s.as_str()))
                     }
+                    _ if matches!(left, Value::BigInt(_)) || matches!(right, Value::BigInt(_)) => {
+                        return Err(mix_bigint_error());
+                    }
                     _ => Value::Float(
                         left.to_number_heap(&self.heap) + right.to_number_heap(&self.heap),
                     ),
@@ -3568,6 +3579,10 @@ impl Vm {
                         Some(r) => int_arith_result(r),
                         None => Value::Float(*a as f64 - *b as f64),
                     },
+                    (Value::BigInt(a), Value::BigInt(b)) => Value::BigInt(a - b),
+                    _ if matches!(left, Value::BigInt(_)) || matches!(right, Value::BigInt(_)) => {
+                        return Err(mix_bigint_error());
+                    }
                     _ => Value::Float(
                         left.to_number_heap(&self.heap) - right.to_number_heap(&self.heap),
                     ),
@@ -3584,6 +3599,10 @@ impl Vm {
                         Some(r) => int_arith_result(r),
                         None => Value::Float(*a as f64 * *b as f64),
                     },
+                    (Value::BigInt(a), Value::BigInt(b)) => Value::BigInt(a * b),
+                    _ if matches!(left, Value::BigInt(_)) || matches!(right, Value::BigInt(_)) => {
+                        return Err(mix_bigint_error());
+                    }
                     _ => Value::Float(
                         left.to_number_heap(&self.heap) * right.to_number_heap(&self.heap),
                     ),
@@ -3595,9 +3614,21 @@ impl Vm {
                 let left = self.pop()?;
                 let left = self.to_primitive(&left, ToPrimitiveHint::Number)?;
                 let right = self.to_primitive(&right, ToPrimitiveHint::Number)?;
-                let result = Value::Float(
-                    left.to_number_heap(&self.heap) / right.to_number_heap(&self.heap),
-                );
+                let result = match (&left, &right) {
+                    (Value::BigInt(a), Value::BigInt(b)) => {
+                        if num_traits::Zero::is_zero(b) {
+                            return Err(ZapcodeError::RangeError("Division by zero".to_string()));
+                        }
+                        // BigInt division truncates toward zero.
+                        Value::BigInt(a / b)
+                    }
+                    _ if matches!(left, Value::BigInt(_)) || matches!(right, Value::BigInt(_)) => {
+                        return Err(mix_bigint_error());
+                    }
+                    _ => Value::Float(
+                        left.to_number_heap(&self.heap) / right.to_number_heap(&self.heap),
+                    ),
+                };
                 self.push(result)?;
             }
             Instruction::Rem => {
@@ -3607,6 +3638,15 @@ impl Vm {
                 let right = self.to_primitive(&right, ToPrimitiveHint::Number)?;
                 let result = match (&left, &right) {
                     (Value::Int(a), Value::Int(b)) if *b != 0 => Value::Int(a % b),
+                    (Value::BigInt(a), Value::BigInt(b)) => {
+                        if num_traits::Zero::is_zero(b) {
+                            return Err(ZapcodeError::RangeError("Division by zero".to_string()));
+                        }
+                        Value::BigInt(a % b)
+                    }
+                    _ if matches!(left, Value::BigInt(_)) || matches!(right, Value::BigInt(_)) => {
+                        return Err(mix_bigint_error());
+                    }
                     _ => Value::Float(
                         left.to_number_heap(&self.heap) % right.to_number_heap(&self.heap),
                     ),
@@ -3618,10 +3658,31 @@ impl Vm {
                 let left = self.pop()?;
                 let left = self.to_primitive(&left, ToPrimitiveHint::Number)?;
                 let right = self.to_primitive(&right, ToPrimitiveHint::Number)?;
-                let result = Value::Float(
-                    left.to_number_heap(&self.heap)
-                        .powf(right.to_number_heap(&self.heap)),
-                );
+                let result = match (&left, &right) {
+                    (Value::BigInt(a), Value::BigInt(b)) => {
+                        // Exponent must be a non-negative integer that fits a u32.
+                        match num_traits::ToPrimitive::to_u32(b) {
+                            Some(e) => Value::BigInt(a.pow(e)),
+                            None if num_traits::Signed::is_negative(b) => {
+                                return Err(ZapcodeError::RangeError(
+                                    "Exponent must be non-negative".to_string(),
+                                ))
+                            }
+                            None => {
+                                return Err(ZapcodeError::RangeError(
+                                    "BigInt exponent is too large".to_string(),
+                                ))
+                            }
+                        }
+                    }
+                    _ if matches!(left, Value::BigInt(_)) || matches!(right, Value::BigInt(_)) => {
+                        return Err(mix_bigint_error());
+                    }
+                    _ => Value::Float(
+                        left.to_number_heap(&self.heap)
+                            .powf(right.to_number_heap(&self.heap)),
+                    ),
+                };
                 self.push(result)?;
             }
             Instruction::Neg => {
@@ -3641,6 +3702,7 @@ impl Vm {
                         Some(r) => Value::Int(r),
                         None => Value::Float(-(n as f64)),
                     },
+                    Value::BigInt(n) => Value::BigInt(-n),
                     _ => Value::Float(-val.to_number_heap(&self.heap)),
                 };
                 self.push(result)?;
@@ -4516,6 +4578,13 @@ impl Vm {
                                     .map(|v| v.to_number_heap(&self.heap))
                                     .unwrap_or(f64::NAN);
                                 builtins::call_number_method(n, &method_name, &args)?
+                            }
+                            "__bigint__" => {
+                                let n = match receiver.as_ref() {
+                                    Some(Value::BigInt(n)) => n.clone(),
+                                    _ => num_bigint::BigInt::from(0),
+                                };
+                                builtins::call_bigint_method(&n, &method_name, &args)?
                             }
                             "__object__" => match (&receiver, method_name.as_ref()) {
                                 (Some(Value::Object(map)), "hasOwnProperty") => {
@@ -6654,6 +6723,12 @@ impl Vm {
             Value::Int(_) | Value::Float(_) if builtins::is_number_method(name) => {
                 Ok(builtin_method("__number__", name))
             }
+            Value::BigInt(_) if builtins::is_bigint_method(name) => {
+                Ok(builtin_method("__bigint__", name))
+            }
+            Value::BigInt(_) if name == "constructor" => {
+                Ok(self.globals.get("BigInt").cloned().unwrap_or(Value::Undefined))
+            }
             _ => Ok(Value::Undefined),
         }
     }
@@ -6789,6 +6864,14 @@ fn int_arith_result(r: i64) -> Value {
     } else {
         Value::Float(r as f64)
     }
+}
+
+/// The TypeError JS throws when a BigInt is combined with a non-BigInt in
+/// arithmetic (`10n + 5`, `2n ** 3`, etc.).
+fn mix_bigint_error() -> ZapcodeError {
+    ZapcodeError::TypeError(
+        "Cannot mix BigInt and other types, use explicit conversions".to_string(),
+    )
 }
 
 fn js_to_int32(n: f64) -> i32 {

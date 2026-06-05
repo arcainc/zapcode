@@ -672,6 +672,7 @@ fn ensure_serializable_value_inner(
         | Value::Bool(_)
         | Value::Int(_)
         | Value::Float(_)
+        | Value::BigInt(_)
         | Value::String(_) => Ok(()),
         Value::Array(h) => {
             if !seen.insert(*h) {
