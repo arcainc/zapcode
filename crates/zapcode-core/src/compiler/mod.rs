@@ -70,7 +70,12 @@ impl CompiledFunction {
 struct Compiler {
     instructions: Vec<Instruction>,
     locals: Vec<String>,
-    local_indices: HashMap<String, usize>,
+    /// Lexical scope stack of name→slot maps. `scopes[0]` is the function scope
+    /// (`var`/params/`arguments`); each `{}` block / loop / catch pushes a scope
+    /// so `let`/`const` bindings shadow and don't leak. Resolution searches
+    /// innermost-out. Slots in `locals` are never reused, so a shadow gets its
+    /// own slot.
+    scopes: Vec<HashMap<String, usize>>,
     /// Local slots / top-level names bound by `const`. Assigning to one compiles
     /// to a runtime `TypeError` throw ("Assignment to constant variable"), like
     /// JS — caught by enclosing try/catch.
@@ -123,7 +128,7 @@ impl Compiler {
         Self {
             instructions: Vec::new(),
             locals: Vec::new(),
-            local_indices: HashMap::new(),
+            scopes: vec![HashMap::new()],
             const_slots: HashSet::new(),
             const_globals: HashSet::new(),
             functions: Rc::new(RefCell::new(Vec::new())),
@@ -145,7 +150,7 @@ impl Compiler {
         Self {
             instructions: Vec::new(),
             locals: Vec::new(),
-            local_indices: HashMap::new(),
+            scopes: vec![HashMap::new()],
             const_slots: HashSet::new(),
             const_globals: HashSet::new(),
             functions: Rc::new(RefCell::new(Vec::new())),
@@ -188,18 +193,86 @@ impl Compiler {
         }
     }
 
-    fn declare_local(&mut self, name: &str) -> usize {
-        if let Some(&idx) = self.local_indices.get(name) {
-            return idx;
-        }
+    /// Allocate a brand-new slot for `name` (always; never reused).
+    fn alloc_slot(&mut self, name: &str) -> usize {
         let idx = self.locals.len();
         self.locals.push(name.to_string());
-        self.local_indices.insert(name.to_string(), idx);
         idx
     }
 
+    /// Declare a FUNCTION-scoped binding (`var`, params, `arguments`,
+    /// hoisted names): lives in the outermost scope and is reused if already
+    /// present there.
+    fn declare_local(&mut self, name: &str) -> usize {
+        if let Some(&idx) = self.scopes[0].get(name) {
+            return idx;
+        }
+        let idx = self.alloc_slot(name);
+        self.scopes[0].insert(name.to_string(), idx);
+        idx
+    }
+
+    /// Declare a BLOCK-scoped binding (`let`/`const`, catch param): a fresh slot
+    /// in the CURRENT (innermost) scope, shadowing any same-named outer binding
+    /// and disappearing when the block ends.
+    fn declare_block_local(&mut self, name: &str) -> usize {
+        let idx = self.alloc_slot(name);
+        self.scopes
+            .last_mut()
+            .expect("at least one scope")
+            .insert(name.to_string(), idx);
+        idx
+    }
+
+    /// True if `name` is already declared in the CURRENT scope (a duplicate
+    /// `let`/`const`, which JS rejects as a SyntaxError).
+    fn declared_in_current_scope(&self, name: &str) -> bool {
+        self.scopes.last().is_some_and(|s| s.contains_key(name))
+    }
+
+    /// Declare a binding by its kind: `var` is function-scoped, `let`/`const`
+    /// are block-scoped (a duplicate `let`/`const` in the same scope is a
+    /// SyntaxError, surfaced here as a compile error).
+    fn declare_binding(&mut self, name: &str, kind: VarKind) -> Result<usize> {
+        match kind {
+            VarKind::Var => Ok(self.declare_local(name)),
+            VarKind::Let | VarKind::Const => {
+                if self.declared_in_current_scope(name) {
+                    return Err(ZapcodeError::CompileError(format!(
+                        "Identifier '{}' has already been declared",
+                        name
+                    )));
+                }
+                Ok(self.declare_block_local(name))
+            }
+        }
+    }
+
+    /// Resolve `name` to a slot, searching innermost scope outward.
     fn resolve_local(&self, name: &str) -> Option<usize> {
-        self.local_indices.get(name).copied()
+        self.scopes.iter().rev().find_map(|s| s.get(name).copied())
+    }
+
+    fn enter_scope(&mut self) {
+        self.scopes.push(HashMap::new());
+    }
+
+    fn exit_scope(&mut self) {
+        self.scopes.pop();
+    }
+
+    /// Compile a statement list inside a fresh lexical block scope so its
+    /// `let`/`const` bindings don't leak out (or clobber outer bindings).
+    fn compile_block_scoped(&mut self, stmts: &[Statement]) -> Result<()> {
+        self.enter_scope();
+        let r = (|| {
+            for s in stmts {
+                self.compile_statement(s)?;
+            }
+            Ok(())
+        })();
+        self.exit_scope();
+        r
     }
 
     fn is_session_chunk(&self) -> bool {
@@ -527,18 +600,14 @@ impl Compiler {
                 self.compile_expr(test)?;
                 let jump_else = self.emit(Instruction::JumpIfFalse(0));
 
-                for s in consequent {
-                    self.compile_statement(s)?;
-                }
+                self.compile_block_scoped(consequent)?;
 
                 if let Some(alt) = alternate {
                     let jump_end = self.emit(Instruction::Jump(0));
                     let else_target = self.current_offset();
                     self.patch_jump(jump_else, else_target);
 
-                    for s in alt {
-                        self.compile_statement(s)?;
-                    }
+                    self.compile_block_scoped(alt)?;
                     let end_target = self.current_offset();
                     self.patch_jump(jump_end, end_target);
                 } else {
@@ -557,9 +626,7 @@ impl Compiler {
                 self.compile_expr(test)?;
                 let exit_jump = self.emit(Instruction::JumpIfFalse(0));
 
-                for s in body {
-                    self.compile_statement(s)?;
-                }
+                self.compile_block_scoped(body)?;
 
                 self.emit(Instruction::Jump(loop_start));
                 let loop_end = self.current_offset();
@@ -581,9 +648,7 @@ impl Compiler {
                     label: self.pending_label.take(),
                 });
 
-                for s in body {
-                    self.compile_statement(s)?;
-                }
+                self.compile_block_scoped(body)?;
 
                 let continue_target = self.current_offset();
                 self.compile_expr(test)?;
@@ -605,6 +670,9 @@ impl Compiler {
                 body,
                 ..
             } => {
+                // A loop scope holds the `for (let i …)` head bindings so they
+                // don't leak after the loop.
+                self.enter_scope();
                 if let Some(init) = init {
                     self.compile_statement(init)?;
                 }
@@ -641,9 +709,7 @@ impl Compiler {
                     None
                 };
 
-                for s in body {
-                    self.compile_statement(s)?;
-                }
+                self.compile_block_scoped(body)?;
 
                 let continue_target = self.current_offset();
                 // Freshen captured let-loop bindings before the update runs, so a
@@ -671,6 +737,7 @@ impl Compiler {
                 for patch in loop_info.continue_patches {
                     self.patch_jump(patch, continue_target);
                 }
+                self.exit_scope();
             }
             Statement::ForOf {
                 binding,
@@ -682,6 +749,9 @@ impl Compiler {
                 self.compile_expr(iterable)?;
                 self.emit(Instruction::GetIterator);
 
+                // Loop scope for the `for (const x of …)` binding so it doesn't
+                // leak after the loop.
+                self.enter_scope();
                 let loop_start = self.current_offset();
                 self.loop_stack.push(LoopInfo {
                     break_patches: Vec::new(),
@@ -709,10 +779,10 @@ impl Compiler {
                     self.emit(Instruction::Await);
                 }
 
-                // Bind the value
+                // Bind the value (block-scoped to the loop)
                 match binding {
                     ForBinding::Ident(name) => {
-                        let idx = self.declare_local(name);
+                        let idx = self.declare_block_local(name);
                         self.emit(Instruction::StoreLocal(idx));
                     }
                     ForBinding::Destructure(pattern) => {
@@ -723,9 +793,7 @@ impl Compiler {
                     }
                 }
 
-                for s in body {
-                    self.compile_statement(s)?;
-                }
+                self.compile_block_scoped(body)?;
 
                 self.emit(Instruction::Jump(loop_start));
                 let loop_end = self.current_offset();
@@ -739,11 +807,10 @@ impl Compiler {
                 for patch in loop_info.continue_patches {
                     self.patch_jump(patch, loop_start);
                 }
+                self.exit_scope();
             }
             Statement::Block { body, .. } => {
-                for s in body {
-                    self.compile_statement(s)?;
-                }
+                self.compile_block_scoped(body)?;
             }
             Statement::Throw { value, .. } => {
                 self.compile_expr(value)?;
@@ -1302,7 +1369,7 @@ impl Compiler {
                     self.record_top_level_binding(name, TopLevelBindingKind::from_var_kind(kind))?;
                     None
                 } else {
-                    Some(self.declare_local(name))
+                    Some(self.declare_binding(name, kind)?)
                 };
                 if matches!(kind, VarKind::Const) {
                     match idx {
@@ -1433,7 +1500,7 @@ impl Compiler {
             }
             self.emit(Instruction::StoreGlobal(name.to_string()));
         } else {
-            let idx = self.declare_local(name);
+            let idx = self.declare_binding(name, kind)?;
             if matches!(kind, VarKind::Const) {
                 self.const_slots.insert(idx);
             }
@@ -1602,9 +1669,10 @@ impl Compiler {
         self.emit(Instruction::StrictEq);
         let skip = self.emit(Instruction::JumpIfFalse(0));
         self.compile_expr(default)?;
-        // Store the default's destructured pieces into the leaf slots (they were
-        // declared up-front), then drop the source value.
-        self.compile_destructure_pattern(pattern, VarKind::Let)?;
+        // Store the default's destructured pieces into the leaf slots. They were
+        // already declared up-front as params (function-scoped), so store with
+        // Var semantics (reuse the existing slot) rather than re-declaring.
+        self.compile_destructure_pattern(pattern, VarKind::Var)?;
         self.emit(Instruction::Pop);
         let after = self.current_offset();
         self.patch_jump(skip, after);

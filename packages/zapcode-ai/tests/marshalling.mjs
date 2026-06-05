@@ -542,4 +542,21 @@ await test("const reassignment throws like Node across the host boundary", async
   assert.deepEqual(r.output, [2, 2]);
 });
 
+// ── let/const are block-scoped (shadow + restore, don't leak) ──
+await test("let/const block scoping matches Node across the host boundary", async () => {
+  // Inner-block shadow restores the outer binding.
+  let r = await execute(`(function(){ let x = 1; { let x = 2; } return x; })()`, {});
+  assert.equal(r.output, 1);
+
+  // Block-scoped binding doesn't leak; typeof of an unbound name is "undefined".
+  r = await execute(`(function(){ { let a = 1; } return typeof a; })()`, {});
+  assert.equal(r.output, "undefined");
+
+  // Duplicate let in the same scope is a (compile) error, surfaced to the host.
+  await assert.rejects(
+    () => execute(`(function(){ let a = 1; let a = 2; return a; })()`, {}),
+    /has already been declared/,
+  );
+});
+
 console.log(`\n${passed} marshalling checks passed.`);

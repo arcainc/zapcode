@@ -154,15 +154,13 @@ fn block_scoping_inner_assignment() {
 }
 
 #[test]
-fn block_scoped_redeclaration_documented_divergence() {
-    // DIVERGENCE (documented, scoping): a `let`/`const` re-declaration inside a
-    // nested block is NOT isolated to that block — it writes through to (and
-    // leaks into) the enclosing scope. Real JS would shadow, leaving the outer
-    // binding `1`/`10` and `y` undefined outside its block. Asserting zapcode's
-    // ACTUAL behavior, with the JS answer noted.
-    assert_eq!(run_str("let x=1; { let x=2; } x"), "2"); // JS: 1
-    assert_eq!(run_str("const x=10; { const x=20; } x"), "20"); // JS: 10
-    assert_eq!(run_str("{ let y=5; } typeof y"), "number"); // JS: "undefined"
+fn block_scoped_redeclaration_shadows_and_restores() {
+    // A `let`/`const` re-declaration inside a nested block is a distinct,
+    // block-scoped binding: the outer binding is restored after the block and a
+    // block-only binding is not visible outside it — matching JS.
+    assert_eq!(run_str("let x=1; { let x=2; } x"), "1");
+    assert_eq!(run_str("const x=10; { const x=20; } x"), "10");
+    assert_eq!(run_str("{ let y=5; } typeof y"), "undefined");
 }
 
 #[test]
