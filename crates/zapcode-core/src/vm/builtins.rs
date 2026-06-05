@@ -101,6 +101,8 @@ pub fn register_globals(globals: &mut HashMap<String, Value>, heap: &mut Heap) {
     globals.insert("Promise".to_string(), Value::Object(empty));
     globals.insert("Map".to_string(), builtin_constructor("Map", heap));
     globals.insert("Set".to_string(), builtin_constructor("Set", heap));
+    globals.insert("WeakMap".to_string(), builtin_constructor("WeakMap", heap));
+    globals.insert("WeakSet".to_string(), builtin_constructor("WeakSet", heap));
     globals.insert("RegExp".to_string(), builtin_constructor("RegExp", heap));
     // `Function` is registered as a non-constructible builtin VALUE so that
     // `typeof Function === "function"` and `f instanceof Function` match Node.
@@ -198,6 +200,9 @@ fn global_fn(name: &str, heap: &mut Heap) -> Value {
             Arc::from("iterator"),
             Value::String(JsString::from(SYMBOL_ITERATOR_KEY)),
         );
+        // Global symbol registry: Symbol.for(key) / Symbol.keyFor(sym).
+        obj.insert(Arc::from("for"), global_fn_marker("Symbol.for", heap));
+        obj.insert(Arc::from("keyFor"), global_fn_marker("Symbol.keyFor", heap));
     }
     if name == "String" {
         for (prop, target) in [
@@ -771,6 +776,32 @@ pub fn call_global_fn(kind: &str, args: &[Value], heap: &mut Heap) -> Result<Val
             }
             Value::Object(heap.alloc_object(s))
         }
+        // `Symbol.for(key)` returns the registered symbol for `key`. We don't keep
+        // a persistent registry; instead each registered symbol carries its key in
+        // `__symbol_for__`, and `strict_eq` treats two registered symbols with the
+        // same key as identical — so `Symbol.for('x') === Symbol.for('x')`.
+        "Symbol.for" => {
+            let key = arg.to_js_string(heap);
+            let mut s = IndexMap::new();
+            s.insert(Arc::from("__symbol__"), Value::Bool(true));
+            s.insert(
+                Arc::from("__symbol_for__"),
+                Value::String(JsString::from(key.as_str())),
+            );
+            s.insert(
+                Arc::from("description"),
+                Value::String(JsString::from(key.as_str())),
+            );
+            Value::Object(heap.alloc_object(s))
+        }
+        // `Symbol.keyFor(sym)` returns a registered symbol's key, else undefined.
+        "Symbol.keyFor" => match &arg {
+            Value::Object(h) => heap
+                .object(*h)
+                .and_then(|m| m.get("__symbol_for__").cloned())
+                .unwrap_or(Value::Undefined),
+            _ => Value::Undefined,
+        },
         other => {
             return Err(ZapcodeError::TypeError(format!(
                 "{} is not a function",

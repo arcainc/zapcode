@@ -1873,6 +1873,24 @@ impl Vm {
     /// stub (no well-known symbols, object property keys are strings), so a
     /// `[Symbol.toPrimitive]` computed key can't be reliably matched. See
     /// STRESS-PASS-BUGS.md.
+    /// Heap-aware `===`. Identical to `Value::strict_eq` except that two distinct
+    /// objects that are both registered symbols (`Symbol.for`) compare equal when
+    /// they share a registry key — so `Symbol.for('x') === Symbol.for('x')`.
+    fn strict_eq_heap(&self, left: &Value, right: &Value) -> bool {
+        if let (Value::Object(a), Value::Object(b)) = (left, right) {
+            if a != b {
+                if let (Some(ma), Some(mb)) = (self.heap.object(*a), self.heap.object(*b)) {
+                    if let (Some(ka), Some(kb)) =
+                        (ma.get("__symbol_for__"), mb.get("__symbol_for__"))
+                    {
+                        return ka.strict_eq(kb);
+                    }
+                }
+            }
+        }
+        left.strict_eq(right)
+    }
+
     fn to_primitive(&mut self, value: &Value, hint: ToPrimitiveHint) -> Result<Value> {
         let handle = match value {
             Value::Object(h) => *h,
@@ -3685,7 +3703,7 @@ impl Vm {
             Instruction::StrictEq => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                self.push(Value::Bool(left.strict_eq(&right)))?;
+                self.push(Value::Bool(self.strict_eq_heap(&left, &right)))?;
             }
             Instruction::Neq => {
                 let right = self.pop()?;
@@ -3695,7 +3713,7 @@ impl Vm {
             Instruction::StrictNeq => {
                 let right = self.pop()?;
                 let left = self.pop()?;
-                self.push(Value::Bool(!left.strict_eq(&right)))?;
+                self.push(Value::Bool(!self.strict_eq_heap(&left, &right)))?;
             }
             Instruction::Lt => {
                 let right = self.pop()?;
@@ -5659,6 +5677,24 @@ impl Vm {
                             }
                             "Set" => {
                                 // Accepts an array, string, Set, or Map.
+                                let arg = args.first().cloned().unwrap_or(Value::Undefined);
+                                let items = iterable_items(&arg, &mut self.heap);
+                                let s = make_set_object(items, &mut self.heap);
+                                self.push(s)?;
+                                return Ok(None);
+                            }
+                            // WeakMap/WeakSet are backed by the same machinery as
+                            // Map/Set (get/set/has/delete and add/has/delete work).
+                            // We don't model the weak-reference GC semantics; they're
+                            // also not iterable in JS, which matches our use.
+                            "WeakMap" => {
+                                let arg = args.first().cloned().unwrap_or(Value::Undefined);
+                                let entries = build_map_entries(&arg, &mut self.heap);
+                                let m = make_map_object(entries, &mut self.heap);
+                                self.push(m)?;
+                                return Ok(None);
+                            }
+                            "WeakSet" => {
                                 let arg = args.first().cloned().unwrap_or(Value::Undefined);
                                 let items = iterable_items(&arg, &mut self.heap);
                                 let s = make_set_object(items, &mut self.heap);

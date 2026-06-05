@@ -582,6 +582,21 @@ await test("catch-param and for-of/in loop scoping match Node", async () => {
   assert.deepEqual(r.output, ["a", "b"]);
 });
 
+// ── Symbol.for global registry ──
+await test("Symbol.for registry matches Node across the host boundary", async () => {
+  let r = await execute(`[Symbol.for("x") === Symbol.for("x"), Symbol.for("x") === Symbol("x"), Symbol.keyFor(Symbol.for("hi"))]`, {});
+  assert.deepEqual(r.output, [true, false, "hi"]);
+});
+
+// ── WeakMap / WeakSet basic operations ──
+await test("WeakMap/WeakSet work across the host boundary", async () => {
+  let r = await execute(`(function(){ const w = new WeakMap(); const k = {}; w.set(k, 1); return [w.get(k), w.has(k), w.has({})]; })()`, {});
+  assert.deepEqual(r.output, [1, true, false]);
+
+  r = await execute(`(function(){ const s = new WeakSet(); const k = {}; s.add(k); s.delete(k); return s.has(k); })()`, {});
+  assert.equal(r.output, false);
+});
+
 // ── ES2023 immutable array methods (toSorted/toReversed/with/toSpliced) ──
 await test("immutable array methods match Node across the host boundary", async () => {
   let r = await execute(`[[3,1,2].toSorted(), [1,2,3].toReversed(), [1,2,3].with(1,9), [1,2,3,4].toSpliced(1,2,"a")]`, {});
