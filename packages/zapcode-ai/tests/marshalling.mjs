@@ -532,4 +532,14 @@ await test("strings are UTF-16-indexed (astral chars) like Node", async () => {
   assert.equal(r.output, "😀");
 });
 
+// ── const reassignment throws a catchable TypeError (mutation still allowed) ──
+await test("const reassignment throws like Node across the host boundary", async () => {
+  let r = await execute(`(function(){ try { const c = 1; c = 2; return "no"; } catch (e) { return e.name; } })()`, {});
+  assert.equal(r.output, "TypeError");
+
+  // Mutating a const object/array is allowed; only re-binding throws.
+  r = await execute(`(function(){ const o = { x: 1 }; o.x = 2; const a = [1]; a.push(2); return [o.x, a.length]; })()`, {});
+  assert.deepEqual(r.output, [2, 2]);
+});
+
 console.log(`\n${passed} marshalling checks passed.`);

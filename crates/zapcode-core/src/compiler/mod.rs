@@ -71,6 +71,11 @@ struct Compiler {
     instructions: Vec<Instruction>,
     locals: Vec<String>,
     local_indices: HashMap<String, usize>,
+    /// Local slots / top-level names bound by `const`. Assigning to one compiles
+    /// to a runtime `TypeError` throw ("Assignment to constant variable"), like
+    /// JS — caught by enclosing try/catch.
+    const_slots: HashSet<usize>,
+    const_globals: HashSet<String>,
     /// The program's flat function table, SHARED across the top-level compiler
     /// and every per-function sub-compiler (`compile_function_def`). Parser-
     /// assigned function indices occupy slots `0..program.functions.len()`;
@@ -119,6 +124,8 @@ impl Compiler {
             instructions: Vec::new(),
             locals: Vec::new(),
             local_indices: HashMap::new(),
+            const_slots: HashSet::new(),
+            const_globals: HashSet::new(),
             functions: Rc::new(RefCell::new(Vec::new())),
             loop_stack: Vec::new(),
             external_functions,
@@ -139,6 +146,8 @@ impl Compiler {
             instructions: Vec::new(),
             locals: Vec::new(),
             local_indices: HashMap::new(),
+            const_slots: HashSet::new(),
+            const_globals: HashSet::new(),
             functions: Rc::new(RefCell::new(Vec::new())),
             loop_stack: Vec::new(),
             external_functions,
@@ -1295,6 +1304,16 @@ impl Compiler {
                 } else {
                     Some(self.declare_local(name))
                 };
+                if matches!(kind, VarKind::Const) {
+                    match idx {
+                        Some(i) => {
+                            self.const_slots.insert(i);
+                        }
+                        None => {
+                            self.const_globals.insert(name.to_string());
+                        }
+                    }
+                }
                 match &decl.init {
                     Some(expr) => {
                         self.compile_expr(expr)?;
@@ -1409,9 +1428,15 @@ impl Compiler {
     fn store_binding(&mut self, name: &str, kind: VarKind) -> Result<()> {
         if self.is_session_chunk() {
             self.record_top_level_binding(name, TopLevelBindingKind::from_var_kind(kind))?;
+            if matches!(kind, VarKind::Const) {
+                self.const_globals.insert(name.to_string());
+            }
             self.emit(Instruction::StoreGlobal(name.to_string()));
         } else {
             let idx = self.declare_local(name);
+            if matches!(kind, VarKind::Const) {
+                self.const_slots.insert(idx);
+            }
             self.emit(self.top_level_store_instruction(name, idx));
         }
         Ok(())
@@ -2356,7 +2381,9 @@ impl Compiler {
                     } if is_place_expr(object) => {
                         self.compile_expr(object)?;
                         self.emit(Instruction::DeleteProperty(property.clone()));
-                        self.compile_store(object)?;
+                        // Write-back of the same (mutated) reference, not a const
+                        // rebind — `delete` on a const object's key is allowed.
+                        self.compile_store_inner(object, false)?;
                         self.emit(Instruction::Push(Constant::Bool(true)));
                     }
                     Expr::ComputedMember {
@@ -2365,7 +2392,7 @@ impl Compiler {
                         self.compile_expr(object)?;
                         self.compile_expr(property)?;
                         self.emit(Instruction::DeleteIndex);
-                        self.compile_store(object)?;
+                        self.compile_store_inner(object, false)?;
                         self.emit(Instruction::Push(Constant::Bool(true)));
                     }
                     // `delete` on a non-reference (or a non-place object) is a
@@ -2661,14 +2688,40 @@ impl Compiler {
         }
     }
 
+    /// Emit code that throws `new TypeError(msg)` at runtime (catchable). Used
+    /// for errors JS surfaces at runtime rather than parse time, e.g. assigning
+    /// to a `const`. The bytecode appends to whatever is on the stack; the throw
+    /// unwinds it.
+    fn emit_throw_type_error(&mut self, msg: &str) {
+        self.emit(Instruction::LoadGlobal("TypeError".to_string()));
+        self.emit(Instruction::Push(Constant::String(msg.to_string())));
+        self.emit(Instruction::Construct(1));
+        self.emit(Instruction::Throw);
+    }
+
     fn compile_store(&mut self, target: &Expr) -> Result<()> {
+        self.compile_store_inner(target, true)
+    }
+
+    /// Compile a store to `target`. When `check_const` is true (a direct
+    /// assignment), assigning to a `const` binding throws. The member/index
+    /// write-back paths pass `false`: `const o = {}; o.x = 1` mutates the object
+    /// in place (the binding still holds the same reference), which JS allows.
+    fn compile_store_inner(&mut self, target: &Expr, check_const: bool) -> Result<()> {
         match target {
             Expr::Ident(name) if name == "this" => {
                 self.emit(Instruction::StoreThis);
             }
             Expr::Ident(name) => {
                 if let Some(idx) = self.resolve_local(name) {
-                    self.emit(Instruction::StoreLocal(idx));
+                    if check_const && self.const_slots.contains(&idx) {
+                        // Assigning to a const binding is a runtime TypeError in JS.
+                        self.emit_throw_type_error("Assignment to constant variable.");
+                    } else {
+                        self.emit(Instruction::StoreLocal(idx));
+                    }
+                } else if check_const && self.const_globals.contains(name) {
+                    self.emit_throw_type_error("Assignment to constant variable.");
                 } else {
                     self.emit(Instruction::StoreGlobal(name.clone()));
                 }
@@ -2678,8 +2731,9 @@ impl Compiler {
             } => {
                 self.compile_expr(object)?;
                 self.emit(Instruction::SetProperty(property.clone()));
-                // SetProperty pushes the modified object back — store it to the parent
-                self.compile_store(object)?;
+                // SetProperty pushes the modified object back — store it to the
+                // parent (a write-back of the same reference, never a const rebind).
+                self.compile_store_inner(object, false)?;
             }
             Expr::ComputedMember {
                 object, property, ..
@@ -2687,8 +2741,8 @@ impl Compiler {
                 self.compile_expr(object)?;
                 self.compile_expr(property)?;
                 self.emit(Instruction::SetIndex);
-                // SetIndex pushes the modified object back — store it to the parent
-                self.compile_store(object)?;
+                // SetIndex pushes the modified object back — write it to the parent.
+                self.compile_store_inner(object, false)?;
             }
             _ => {
                 return Err(ZapcodeError::CompileError(

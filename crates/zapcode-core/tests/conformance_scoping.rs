@@ -18,7 +18,6 @@
 //!     one that is restored when the block ends, and such bindings are visible
 //!     after the block (effectively function-scoped, like `var`, but without
 //!     hoisting-to-`undefined`).
-//!   * `const` reassignment is not rejected.
 //!   * Duplicate same-scope `let` is not rejected.
 //!   * Per-iteration capture is implemented for the C-style `for (let …;;)`
 //!     head ONLY; `for…of`, `for…in`, and `let`/`const` declared inside a loop
@@ -204,13 +203,31 @@ fn no_tdz_for_let_and_const() {
 }
 
 #[test]
-fn const_reassignment_is_not_rejected() {
-    // DIVERGENCE: real JS throws TypeError ("Assignment to constant variable").
-    // zapcode permits the reassignment.
+fn const_reassignment_throws_type_error() {
+    // Assigning to a const binding throws a catchable TypeError, like JS —
+    // including compound assignment and ++/--. Mutating a const object/array is
+    // still allowed (only re-binding the variable is forbidden).
     assert_eq!(
-        run_str("(function(){ const c = 1; c = 2; return c; })()"),
-        "2"
+        run_str("(function(){ try { const c = 1; c = 2; return 'no'; } catch (e) { return e.name; } })()"),
+        "TypeError"
     );
+    assert_eq!(
+        run_str("(function(){ try { const c = 1; c += 2; return 'no'; } catch (e) { return e.message.includes('constant'); } })()"),
+        "true"
+    );
+    assert_eq!(
+        run_str("(function(){ try { const c = 1; c++; return 'no'; } catch (e) { return e.name; } })()"),
+        "TypeError"
+    );
+    assert_eq!(
+        run_str("(function(){ try { const { a } = { a: 1 }; a = 2; return 'no'; } catch (e) { return e.name; } })()"),
+        "TypeError"
+    );
+    // Mutating through a const reference is fine.
+    assert_eq!(run_str("(function(){ const o = { x: 1 }; o.x = 2; return o.x; })()"), "2");
+    assert_eq!(run_str("(function(){ const a = [1]; a.push(2); a[0] = 9; return a[0] + ',' + a.length; })()"), "9,2");
+    assert_eq!(run_str("(function(){ const o = { a: { b: 1 } }; o.a.b = 5; return o.a.b; })()"), "5");
+    assert_eq!(run_str("(function(){ const o = { x: 1, y: 2 }; delete o.x; return Object.keys(o).join(','); })()"), "y");
 }
 
 #[test]
