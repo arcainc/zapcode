@@ -2738,6 +2738,42 @@ fn call_array_method(
             }
             Value::Array(handle)
         }
+        // ── ES2023 immutable (change-array-by-copy) methods ──
+        "toReversed" => {
+            let mut v = arr.to_vec();
+            v.reverse();
+            Value::Array(heap.alloc_array(v))
+        }
+        "with" => {
+            // Returns a copy with index `i` replaced; out-of-range -> RangeError.
+            let len = arr.len() as i64;
+            let raw = arg_int(args, 0);
+            let i = if raw < 0 { raw + len } else { raw };
+            if i < 0 || i >= len {
+                return Err(ZapcodeError::RangeError(format!("Invalid index : {}", raw)));
+            }
+            let mut v = arr.to_vec();
+            v[i as usize] = args.get(1).cloned().unwrap_or(Value::Undefined);
+            Value::Array(heap.alloc_array(v))
+        }
+        "toSpliced" => {
+            let len = arr.len() as i64;
+            let raw_start = if args.is_empty() { 0 } else { arg_int(args, 0) };
+            let start = if raw_start < 0 {
+                (len + raw_start).max(0) as usize
+            } else {
+                (raw_start as usize).min(arr.len())
+            };
+            let delete_count = if args.len() > 1 {
+                (arg_int(args, 1).max(0) as usize).min(arr.len() - start)
+            } else {
+                arr.len() - start
+            };
+            let inserts: Vec<Value> = if args.len() > 2 { args[2..].to_vec() } else { Vec::new() };
+            let mut v = arr.to_vec();
+            v.splice(start..start + delete_count, inserts);
+            Value::Array(heap.alloc_array(v))
+        }
         // Array iterators. JS returns iterator objects; we return plain arrays,
         // which spread (`[...arr.entries()]`) and for-of iterate identically.
         "entries" => {

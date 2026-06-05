@@ -957,3 +957,28 @@ fn flat_on_cyclic_array_is_catchable_not_host_abort() {
     assert_eq!(run_str("[[1,2],[3,4]].flat().length"), "4");
     assert_eq!(run_str("[1,[2,[3]]].flat(1).length"), "3");
 }
+
+#[test]
+fn es2023_immutable_change_by_copy_methods() {
+    // toSorted / toReversed / with / toSpliced return a NEW array and leave the
+    // original untouched.
+    assert_eq!(run_str("JSON.stringify([3, 1, 2].toSorted())"), "[1,2,3]");
+    assert_eq!(run_str("JSON.stringify([3, 1, 2, 10].toSorted((a, b) => a - b))"), "[1,2,3,10]");
+    assert_eq!(run_str("JSON.stringify([1, 2, 3].toReversed())"), "[3,2,1]");
+    assert_eq!(run_str("JSON.stringify([1, 2, 3].with(1, 9))"), "[1,9,3]");
+    assert_eq!(run_str("JSON.stringify([1, 2, 3].with(-1, 9))"), "[1,2,9]");
+    assert_eq!(run_str("JSON.stringify([1, 2, 3, 4].toSpliced(1, 2, 'a'))"), "[1,\"a\",4]");
+    // Originals are unchanged.
+    assert_eq!(
+        run_str("(function(){ const a = [3, 1, 2]; const b = a.toSorted(); return JSON.stringify(a) + '|' + JSON.stringify(b); })()"),
+        "[3,1,2]|[1,2,3]"
+    );
+    assert_eq!(run_str("(function(){ const a = [1, 2, 3]; a.toReversed(); a.with(0, 9); a.toSpliced(0, 1); return JSON.stringify(a); })()"), "[1,2,3]");
+    // `with` out of range is a RangeError.
+    assert_eq!(
+        run_str("(function(){ try { [1, 2, 3].with(5, 9); return 'no'; } catch (e) { return e.name; } })()"),
+        "RangeError"
+    );
+    // Chainable.
+    assert_eq!(run_str("JSON.stringify([3, 1, 2].toSorted().toReversed())"), "[3,2,1]");
+}
