@@ -15,13 +15,16 @@
 //!     instead of throwing a ReferenceError. (And a block-scoped name read
 //!     AFTER its block falls through to a global read, yielding `undefined`
 //!     rather than a ReferenceError — undeclared reads don't throw yet.)
-//!   * Per-iteration capture is implemented for the C-style `for (let …;;)`
-//!     head ONLY; `for…of`/`for…in` and `let`/`const` declared inside a loop
-//!     *body* block share a single binding per loop (last value wins).
+//!   * `let`/`const` declared inside a loop *body* block (not the loop head)
+//!     share one binding per loop, so closures capturing such a body-local see
+//!     the last value. (The loop *head* variable — C-style `for (let …)`,
+//!     `for…of`, `for…in` — IS freshened per iteration.)
 //!
 //! FIXED (now match JS): `let`/`const` are block-scoped (shadow + restore, don't
-//! leak), duplicate same-scope `let`/`const` is a SyntaxError, and a closure
-//! captures the innermost (shadowing) binding. `const` reassignment throws.
+//! leak); duplicate same-scope `let`/`const` is a SyntaxError; a closure captures
+//! the innermost (shadowing) binding; `const` reassignment throws; the catch
+//! parameter is block-scoped; and `for…of`/`for…in` loop variables get a fresh
+//! per-iteration binding.
 //!
 //! Everything NOT in that list is asserted at the real-JS answer.
 
@@ -429,20 +432,23 @@ fn loop_body_block_let_is_not_per_iteration() {
 }
 
 #[test]
-fn for_of_and_for_in_capture_share_one_binding() {
-    // DIVERGENCE: real JS gives a fresh per-iteration binding for `for…of` /
-    // `for…in` loop variables (so these would be 1,2,3 and a,b). zapcode shares
-    // one binding, so the captured closures all observe the final value.
+fn for_of_and_for_in_give_fresh_per_iteration_bindings() {
+    // `for…of` / `for…in` give each iteration a FRESH binding, so closures
+    // created per iteration observe distinct values (like JS).
     assert_eq!(
         run_str("(function(){ const fs = []; for (const v of [1, 2, 3]) fs.push(() => v); return fs.map(f => f()).join(','); })()"),
-        "3,3,3"
+        "1,2,3"
     );
     assert_eq!(
         run_str("(function(){ const fs = []; for (const k in { a: 1, b: 2 }) fs.push(() => k); return fs.map(f => f()).join(','); })()"),
-        "b,b"
+        "a,b"
     );
-    // Eagerly snapshotting the value per iteration (the workaround) is fine and
-    // matches JS, since each pushed value is computed at iteration time.
+    // A destructured for-of binding freshens per iteration too.
+    assert_eq!(
+        run_str("(function(){ const fs = []; for (const [a, b] of [[1, 2], [3, 4]]) fs.push(() => a + b); return fs.map(f => f()).join(','); })()"),
+        "3,7"
+    );
+    // Eager per-iteration snapshotting still works.
     assert_eq!(
         run_str("(function(){ const out = []; for (const v of [1, 2, 3]) out.push(v * 2); return out.join(','); })()"),
         "2,4,6"

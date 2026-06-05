@@ -568,4 +568,18 @@ await test("constructor property matches Node across the host boundary", async (
   assert.equal(r.output, "TypeError");
 });
 
+// ── catch-param scoping + for-of/in per-iteration binding ──
+await test("catch-param and for-of/in loop scoping match Node", async () => {
+  // Catch param shadows an outer binding only inside the clause.
+  let r = await execute(`(function(){ let e = "outer"; try { throw "x"; } catch (e) {} return e; })()`, {});
+  assert.equal(r.output, "outer");
+
+  // for-of / for-in loop variables get a fresh per-iteration binding.
+  r = await execute(`(function(){ const fs = []; for (const v of [1,2,3]) fs.push(() => v); return fs.map(f => f()); })()`, {});
+  assert.deepEqual(r.output, [1, 2, 3]);
+
+  r = await execute(`(function(){ const fs = []; for (const k in {a:1,b:2}) fs.push(() => k); return fs.map(f => f()); })()`, {});
+  assert.deepEqual(r.output, ["a", "b"]);
+});
+
 console.log(`\n${passed} marshalling checks passed.`);
