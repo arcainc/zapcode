@@ -559,4 +559,13 @@ await test("let/const block scoping matches Node across the host boundary", asyn
   );
 });
 
+// ── .constructor on built-in instances resolves to the global constructor ──
+await test("constructor property matches Node across the host boundary", async () => {
+  let r = await execute(`[({}).constructor === Object, [].constructor === Array, new TypeError("x").constructor === TypeError]`, {});
+  assert.deepEqual(r.output, [true, true, true]);
+
+  r = await execute(`(function(){ try { null.x; } catch (e) { return e.constructor.name; } })()`, {});
+  assert.equal(r.output, "TypeError");
+});
+
 console.log(`\n${passed} marshalling checks passed.`);
