@@ -413,3 +413,22 @@ fn mixed_expression_ternary_chain_classification() {
         "neg,zero,small,big"
     );
 }
+
+#[test]
+fn symbol_for_global_registry() {
+    // Symbol.for(key) returns the same registered symbol for the same key.
+    assert_eq!(run_str("Symbol.for('x') === Symbol.for('x')"), "true");
+    assert_eq!(run_str("Symbol.for('x') === Symbol.for('y')"), "false");
+    assert_eq!(run_str("Symbol.for('a') !== Symbol.for('b')"), "true");
+    // A registered symbol is distinct from a plain Symbol with the same description.
+    assert_eq!(run_str("Symbol.for('x') === Symbol('x')"), "false");
+    assert_eq!(run_str("Symbol('x') === Symbol('x')"), "false");
+    // keyFor returns the registry key for a registered symbol, else undefined.
+    assert_eq!(run_str("Symbol.keyFor(Symbol.for('hello'))"), "hello");
+    assert_eq!(run_str("Symbol.keyFor(Symbol('z')) === undefined"), "true");
+    // description and typeof.
+    assert_eq!(run_str("Symbol.for('d').description"), "d");
+    assert_eq!(run_str("typeof Symbol.for('x')"), "symbol");
+    // A registered symbol works as a computed property key.
+    assert_eq!(run_str("(function(){ const s = Symbol.for('k'); const o = { [s]: 1 }; return o[s]; })()"), "1");
+}
