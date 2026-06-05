@@ -582,4 +582,13 @@ await test("catch-param and for-of/in loop scoping match Node", async () => {
   assert.deepEqual(r.output, ["a", "b"]);
 });
 
+// ── WeakMap / WeakSet basic operations ──
+await test("WeakMap/WeakSet work across the host boundary", async () => {
+  let r = await execute(`(function(){ const w = new WeakMap(); const k = {}; w.set(k, 1); return [w.get(k), w.has(k), w.has({})]; })()`, {});
+  assert.deepEqual(r.output, [1, true, false]);
+
+  r = await execute(`(function(){ const s = new WeakSet(); const k = {}; s.add(k); s.delete(k); return s.has(k); })()`, {});
+  assert.equal(r.output, false);
+});
+
 console.log(`\n${passed} marshalling checks passed.`);

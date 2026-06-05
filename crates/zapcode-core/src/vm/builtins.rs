@@ -101,6 +101,8 @@ pub fn register_globals(globals: &mut HashMap<String, Value>, heap: &mut Heap) {
     globals.insert("Promise".to_string(), Value::Object(empty));
     globals.insert("Map".to_string(), builtin_constructor("Map", heap));
     globals.insert("Set".to_string(), builtin_constructor("Set", heap));
+    globals.insert("WeakMap".to_string(), builtin_constructor("WeakMap", heap));
+    globals.insert("WeakSet".to_string(), builtin_constructor("WeakSet", heap));
     globals.insert("RegExp".to_string(), builtin_constructor("RegExp", heap));
     // `Function` is registered as a non-constructible builtin VALUE so that
     // `typeof Function === "function"` and `f instanceof Function` match Node.

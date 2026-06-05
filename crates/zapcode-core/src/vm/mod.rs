@@ -5634,6 +5634,24 @@ impl Vm {
                                 self.push(s)?;
                                 return Ok(None);
                             }
+                            // WeakMap/WeakSet are backed by the same machinery as
+                            // Map/Set (get/set/has/delete and add/has/delete work).
+                            // We don't model the weak-reference GC semantics; they're
+                            // also not iterable in JS, which matches our use.
+                            "WeakMap" => {
+                                let arg = args.first().cloned().unwrap_or(Value::Undefined);
+                                let entries = build_map_entries(&arg, &mut self.heap);
+                                let m = make_map_object(entries, &mut self.heap);
+                                self.push(m)?;
+                                return Ok(None);
+                            }
+                            "WeakSet" => {
+                                let arg = args.first().cloned().unwrap_or(Value::Undefined);
+                                let items = iterable_items(&arg, &mut self.heap);
+                                let s = make_set_object(items, &mut self.heap);
+                                self.push(s)?;
+                                return Ok(None);
+                            }
                             "Date" => {
                                 let d = construct_date(&args, &mut self.heap);
                                 self.push(d)?;
