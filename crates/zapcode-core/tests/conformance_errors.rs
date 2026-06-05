@@ -321,15 +321,13 @@ fn catch_optional_binding() {
 }
 
 #[test]
-fn divergence_catch_parameter_not_block_scoped() {
-    // DIVERGENCE: in real JS the catch parameter is its own block-scoped binding
-    // that shadows an outer `let e` only inside the catch block (so `e` is still
-    // "outer" afterward). zapcode binds the catch parameter to the SAME slot as
-    // the outer `e`, so the caught value leaks out. Pinned to actual behavior.
-    assert_eq!(run_str("let e = 'outer'; try { throw 'inner'; } catch(e){ } e"), "inner");
+fn catch_parameter_is_block_scoped() {
+    // The catch parameter is its own block-scoped binding that shadows an outer
+    // `let e` only inside the catch clause, so `e` is restored afterward.
+    assert_eq!(run_str("let e = 'outer'; try { throw 'inner'; } catch(e){ } e"), "outer");
     assert_eq!(
         run_str("let e = 'outer'; let seen; try { throw 'inner'; } catch(e){ seen = e; } seen + '|' + e"),
-        "inner|inner"
+        "inner|outer"
     );
 }
 

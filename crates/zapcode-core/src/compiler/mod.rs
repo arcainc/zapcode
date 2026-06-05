@@ -792,9 +792,20 @@ impl Compiler {
                         self.emit(Instruction::Pop);
                     }
                 }
+                // `for (const x of …)` gives each iteration a FRESH binding, so a
+                // closure created this iteration keeps the value it saw rather than
+                // sharing one slot (the loop scope holds only the binding slots).
+                let per_iter_slots: Vec<usize> = self
+                    .scopes
+                    .last()
+                    .map(|s| s.values().copied().collect())
+                    .unwrap_or_default();
 
                 self.compile_block_scoped(body)?;
 
+                for &slot in &per_iter_slots {
+                    self.emit(Instruction::FreshenBinding(slot));
+                }
                 self.emit(Instruction::Jump(loop_start));
                 let loop_end = self.current_offset();
                 self.patch_jump(exit_jump, loop_end);
@@ -1141,13 +1152,17 @@ impl Compiler {
 
             let catch_start = self.current_offset();
             self.patch_jump(setup, catch_start);
+            // The catch param is block-scoped to the catch clause (shadows an
+            // outer binding of the same name, gone after the clause).
+            self.enter_scope();
             if let Some(param) = catch_param {
-                let idx = self.declare_local(param);
+                let idx = self.declare_block_local(param);
                 self.emit(Instruction::StoreLocal(idx));
             } else {
                 self.emit(Instruction::Pop);
             }
             self.compile_body(catch_body, completion)?;
+            self.exit_scope();
 
             let after_catch = self.current_offset();
             self.patch_jump(jump_past_catch, after_catch);
@@ -1178,16 +1193,18 @@ impl Compiler {
         self.compile_body(try_body, completion)?;
         let try_to_finally = self.emit(Instruction::EnterFinallyNormal(0));
 
-        // Catch block (optional).
+        // Catch block (optional). The catch param is block-scoped to the clause.
         let catch_start = self.current_offset();
         if has_catch {
+            self.enter_scope();
             if let Some(param) = catch_param {
-                let idx = self.declare_local(param);
+                let idx = self.declare_block_local(param);
                 self.emit(Instruction::StoreLocal(idx));
             } else {
                 self.emit(Instruction::Pop);
             }
             self.compile_body(catch_body, completion)?;
+            self.exit_scope();
         }
         // After the catch body (or, when there is no catch, this point is never
         // reached by fall-through) route to the finally with a Normal completion.
