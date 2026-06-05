@@ -830,3 +830,24 @@ fn get_own_property_descriptor() {
     // restriction is NOT enforced (a second defineProperty succeeds here; JS
     // throws "Cannot redefine property").
 }
+
+#[test]
+fn constructor_property_resolves_to_the_global() {
+    // `.constructor` on a built-in instance is the matching global constructor,
+    // and `Ctor.name` is its name — like JS.
+    assert_eq!(run_str("({}).constructor === Object"), "true");
+    assert_eq!(run_str("[].constructor === Array"), "true");
+    assert_eq!(run_str("'x'.constructor === String"), "true");
+    assert_eq!(run_str("(5).constructor === Number"), "true");
+    assert_eq!(run_str("(true).constructor === Boolean"), "true");
+    assert_eq!(run_str("new Error('x').constructor === Error"), "true");
+    assert_eq!(run_str("new TypeError('x').constructor === TypeError"), "true");
+    assert_eq!(run_str("new TypeError('x').constructor.name"), "TypeError");
+    assert_eq!(run_str("new RangeError('x').constructor.name"), "RangeError");
+    // A caught built-in error reports its constructor.
+    assert_eq!(run_str("(function(){ try { null.x; } catch (e) { return e.constructor.name; } })()"), "TypeError");
+    // Object.name / Array.name reflect the constructor name.
+    assert_eq!(run_str("Object.name + ',' + Array.name"), "Object,Array");
+    // A custom error subclass keeps reporting its own class.
+    assert_eq!(run_str("class E extends Error {} new E().constructor.name"), "E");
+}
