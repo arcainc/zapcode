@@ -6439,6 +6439,46 @@ impl Vm {
                         }
                     }
                 }
+                // `.constructor` on a built-in object resolves to the matching
+                // global constructor (so `({}).constructor === Object`,
+                // `(new TypeError).constructor === TypeError`, etc.).
+                if name == "constructor" {
+                    let ctor = if map.contains_key("__error__") {
+                        match map.get("name") {
+                            Some(Value::String(s)) if is_error_ctor_name(s) => s.to_string(),
+                            _ => "Error".to_string(),
+                        }
+                    } else if map.contains_key("__map__") {
+                        "Map".to_string()
+                    } else if map.contains_key("__set__") {
+                        "Set".to_string()
+                    } else if map.contains_key("__date_ms__") {
+                        "Date".to_string()
+                    } else if map.contains_key("__regexp__") {
+                        "RegExp".to_string()
+                    } else if map.contains_key("__builtin_constructor__")
+                        || map.contains_key("__class_name__")
+                        || map.contains_key("__global_fn__")
+                    {
+                        // A constructor/function value's own `.constructor` is Function.
+                        "Function".to_string()
+                    } else {
+                        "Object".to_string()
+                    };
+                    if let Some(g) = self.globals.get(&ctor) {
+                        return Ok(g.clone());
+                    }
+                }
+                // A built-in constructor / type-conversion global exposes its
+                // `.name` (e.g. `Object.name === "Object"`, `TypeError.name`).
+                if name == "name" {
+                    if let Some(Value::String(n)) = map
+                        .get("__builtin_constructor__")
+                        .or_else(|| map.get("__global_fn__"))
+                    {
+                        return Ok(Value::String(n.clone()));
+                    }
+                }
                 // Check if this is a promise instance — expose .then/.catch/.finally
                 if builtins::is_promise(obj, &self.heap) && is_promise_method(name) {
                     return Ok(builtin_method("__promise__", name));
@@ -6504,6 +6544,7 @@ impl Vm {
             }
             Value::Array(h) => match name {
                 "length" => Ok(Value::Int(self.heap.array(*h).len() as i64)),
+                "constructor" => Ok(self.globals.get("Array").cloned().unwrap_or(Value::Undefined)),
                 _ if is_array_method(name) => Ok(builtin_method("__array__", name)),
                 _ => {
                     if let Ok(idx) = name.parse::<usize>() {
@@ -6515,9 +6556,16 @@ impl Vm {
             },
             Value::String(s) => match name {
                 "length" => Ok(Value::Int(s.len_utf16() as i64)),
+                "constructor" => Ok(self.globals.get("String").cloned().unwrap_or(Value::Undefined)),
                 _ if is_string_method(name) => Ok(builtin_method("__string__", name)),
                 _ => Ok(Value::Undefined),
             },
+            Value::Int(_) | Value::Float(_) if name == "constructor" => {
+                Ok(self.globals.get("Number").cloned().unwrap_or(Value::Undefined))
+            }
+            Value::Bool(_) if name == "constructor" => {
+                Ok(self.globals.get("Boolean").cloned().unwrap_or(Value::Undefined))
+            }
             Value::Function(closure) => match name {
                 // Function reflection: `.length` is the arity (params before the
                 // first default/rest), `.name` is the declared/inferred name.
