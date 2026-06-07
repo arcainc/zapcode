@@ -607,4 +607,18 @@ await test("immutable array methods match Node across the host boundary", async 
   assert.deepEqual(r.output, [[3,1,2], [1,2,3]]);
 });
 
+// ── BigInt: arbitrary precision in-guest; marshals to a number at the boundary ──
+await test("BigInt works in-guest and marshals to a number across the host boundary", async () => {
+  // Arbitrary-precision arithmetic and typeof are correct inside the guest.
+  let r = await execute(`(function(){ return [typeof 10n, String(2n ** 64n), String(123456789012345678901234567890n + 1n)]; })()`, {});
+  assert.deepEqual(r.output, ["bigint", "18446744073709551616", "123456789012345678901234567891"]);
+
+  // A BigInt result marshals to a JS number (i64 when it fits).
+  r = await execute(`10n + 20n`, {});
+  assert.equal(r.output, 30);
+
+  // Mixing BigInt and Number is a catchable TypeError.
+  await assert.rejects(() => execute(`10n + 5`, {}), /Cannot mix BigInt/);
+});
+
 console.log(`\n${passed} marshalling checks passed.`);

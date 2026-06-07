@@ -604,6 +604,17 @@ fn value_to_json_inner(
                 serde_json::Value::Null
             }
         }
+        Value::BigInt(n) => {
+            // The host bridge (serde_json) has no BigInt; marshal to a JSON
+            // number — i64 when it fits, else f64 like Number(bigint) — matching
+            // the existing "BigInt marshals to a number" host-boundary behavior.
+            let s = n.to_string();
+            if let Ok(i) = s.parse::<i64>() {
+                serde_json::json!(i)
+            } else {
+                serde_json::json!(s.parse::<f64>().unwrap_or(f64::NAN))
+            }
+        }
         Value::String(s) => serde_json::Value::String(s.to_string()),
         Value::Array(h) => {
             if seen.contains(h) {

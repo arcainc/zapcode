@@ -22,6 +22,10 @@ pub enum Value {
     Bool(bool),
     Int(i64),
     Float(f64),
+    /// An arbitrary-precision integer (`10n`). A distinct type from Number:
+    /// `typeof 10n === "bigint"`, and mixing BigInt with Number in arithmetic is
+    /// a TypeError, matching JS.
+    BigInt(num_bigint::BigInt),
     String(JsString),
     /// Reference to an array slot in the [`Heap`]. Cloning shares the handle.
     Array(Handle),
@@ -134,6 +138,7 @@ impl Value {
             Value::Null => "null",
             Value::Bool(_) => "boolean",
             Value::Int(_) | Value::Float(_) => "number",
+            Value::BigInt(_) => "bigint",
             Value::String(_) => "string",
             Value::Array(_) => "object",
             Value::Object(_) => "object",
@@ -149,6 +154,7 @@ impl Value {
             Value::Bool(b) => *b,
             Value::Int(n) => *n != 0,
             Value::Float(n) => *n != 0.0 && !n.is_nan(),
+            Value::BigInt(n) => !num_traits::Zero::is_zero(n),
             Value::String(s) => !s.is_empty(),
             Value::Array(_)
             | Value::Object(_)
@@ -170,6 +176,8 @@ impl Value {
             Value::Bool(false) => 0.0,
             Value::Int(n) => *n as f64,
             Value::Float(n) => *n,
+            // `Number(bigint)` converts; precision past 2^53 is lost, like JS.
+            Value::BigInt(n) => num_traits::ToPrimitive::to_f64(n).unwrap_or(f64::NAN),
             Value::String(s) => Self::parse_number_str(s),
             _ => f64::NAN,
         }
@@ -244,6 +252,8 @@ impl Value {
             // JSON.stringify and Number.prototype.toString (exponential at
             // magnitude >= 1e21 or < 1e-6, shortest round-tripping decimal).
             Value::Float(n) => crate::vm::format_number(*n),
+            // `String(10n) === "10"` — decimal digits, no `n` suffix.
+            Value::BigInt(n) => n.to_string(),
             Value::String(s) => s.to_string(),
             Value::Array(h) => {
                 if depth >= MAX_RENDER_DEPTH {
@@ -324,6 +334,8 @@ impl Value {
             (Value::Float(a), Value::Float(b)) => a == b,
             (Value::Int(a), Value::Float(b)) => (*a as f64) == *b,
             (Value::Float(a), Value::Int(b)) => *a == (*b as f64),
+            // BigInt === only equals another BigInt of the same value (never a Number).
+            (Value::BigInt(a), Value::BigInt(b)) => a == b,
             (Value::String(a), Value::String(b)) => a == b,
             // Reference identity for arrays/objects (same heap slot).
             (Value::Array(a), Value::Array(b)) => a == b,
@@ -354,12 +366,39 @@ impl Value {
                 let b = other.to_number();
                 !a.is_nan() && !b.is_nan() && a == b
             }
+            // BigInt == BigInt: exact value comparison.
+            (Value::BigInt(a), Value::BigInt(b)) => a == b,
+            // BigInt == Number / String: compare mathematical values exactly
+            // (e.g. `10n == 10`, `10n == "10"`; `10n == 10.5` is false).
+            (Value::BigInt(a), Value::Int(_) | Value::Float(_) | Value::String(_))
+            | (Value::Int(_) | Value::Float(_) | Value::String(_), Value::BigInt(a)) => {
+                let other_num = if matches!(self, Value::BigInt(_)) {
+                    other.to_number()
+                } else {
+                    self.to_number()
+                };
+                bigint_eq_f64(a, other_num)
+            }
             // boolean coerces to number, then compare.
             (Value::Bool(_), _) => Value::Float(self.to_number()).loose_eq(other),
             (_, Value::Bool(_)) => self.loose_eq(&Value::Float(other.to_number())),
             // Arrays/objects: reference identity only.
             _ => self.strict_eq(other),
         }
+    }
+}
+
+/// Exact `BigInt == Number` comparison: true only when `b` is a finite integer
+/// whose mathematical value equals `a` (so `10n == 10`, but `10n == 10.5` and
+/// `10n == NaN` are false). Uses an exact f64->BigInt conversion to avoid 2^53
+/// precision loss.
+fn bigint_eq_f64(a: &num_bigint::BigInt, b: f64) -> bool {
+    if !b.is_finite() || b.fract() != 0.0 {
+        return false;
+    }
+    match <num_bigint::BigInt as num_traits::FromPrimitive>::from_f64(b) {
+        Some(bi) => *a == bi,
+        None => false,
     }
 }
 

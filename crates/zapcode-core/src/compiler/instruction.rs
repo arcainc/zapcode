@@ -280,5 +280,6 @@ pub enum Constant {
     Bool(bool),
     Int(i64),
     Float(f64),
+    BigInt(num_bigint::BigInt),
     String(String),
 }

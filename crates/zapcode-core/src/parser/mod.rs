@@ -1032,6 +1032,30 @@ impl<'a> AstLowerer<'a> {
     fn lower_expr(&mut self, expr: &ast::Expression<'_>) -> Result<Expr> {
         match expr {
             ast::Expression::NumericLiteral(lit) => Ok(Expr::NumberLit(lit.value)),
+            ast::Expression::BigIntLiteral(lit) => {
+                // `lit.raw` is the source text (e.g. "10n", "0xFFn", "1_000n").
+                // Strip the `n` suffix, any radix prefix, and digit separators,
+                // then parse to an arbitrary-precision integer.
+                let raw = lit.raw.as_ref().map(|a| a.as_str()).unwrap_or("");
+                let body = raw.strip_suffix('n').unwrap_or(raw).replace('_', "");
+                let (digits, radix) = if let Some(r) =
+                    body.strip_prefix("0x").or_else(|| body.strip_prefix("0X"))
+                {
+                    (r, 16)
+                } else if let Some(r) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
+                    (r, 8)
+                } else if let Some(r) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
+                    (r, 2)
+                } else {
+                    (body.as_str(), 10)
+                };
+                let value = num_bigint::BigInt::parse_bytes(digits.as_bytes(), radix)
+                    .ok_or_else(|| ZapcodeError::UnsupportedSyntax {
+                        span: "unknown".to_string(),
+                        description: "invalid BigInt literal".to_string(),
+                    })?;
+                Ok(Expr::BigIntLit(value))
+            }
             ast::Expression::StringLiteral(lit) => Ok(Expr::StringLit(lit.value.to_string())),
             ast::Expression::BooleanLiteral(lit) => Ok(Expr::BoolLit(lit.value)),
             ast::Expression::NullLiteral(_) => Ok(Expr::NullLit),
