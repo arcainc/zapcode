@@ -280,6 +280,7 @@ pub enum AssignTarget {
 pub enum Expr {
     // Literals
     NumberLit(f64),
+    BigIntLit(num_bigint::BigInt),
     StringLit(String),
     BoolLit(bool),
     NullLit,

@@ -137,6 +137,7 @@ pub fn register_globals(globals: &mut HashMap<String, Value>, heap: &mut Heap) {
     for name in [
         "String",
         "Number",
+        "BigInt",
         "Boolean",
         "parseInt",
         "parseFloat",
@@ -425,6 +426,54 @@ pub fn call_number_method(n: f64, method: &str, args: &[Value]) -> Result<Option
     Ok(Some(result))
 }
 
+pub fn is_bigint_method(name: &str) -> bool {
+    matches!(name, "toString" | "valueOf" | "toLocaleString")
+}
+
+/// Methods on BigInt primitives: `(255n).toString(16)`, `(10n).valueOf()`, …
+pub fn call_bigint_method(
+    n: &num_bigint::BigInt,
+    method: &str,
+    args: &[Value],
+) -> Result<Option<Value>> {
+    let result = match method {
+        "toString" => {
+            let radix = match args.first() {
+                None | Some(Value::Undefined) => 10u32,
+                Some(v) => v.to_number() as u32,
+            };
+            if !(2..=36).contains(&radix) {
+                return Err(ZapcodeError::RangeError(
+                    "toString() radix must be between 2 and 36".to_string(),
+                ));
+            }
+            Value::String(JsString::from(n.to_str_radix(radix).as_str()))
+        }
+        "valueOf" => Value::BigInt(n.clone()),
+        "toLocaleString" => {
+            // No ICU/locale data — group the decimal digits in threes, like the
+            // Number default (sign preserved).
+            let s = n.to_string();
+            let (sign, digits) = match s.strip_prefix('-') {
+                Some(rest) => ("-", rest),
+                None => ("", s.as_str()),
+            };
+            let bytes = digits.as_bytes();
+            let len = bytes.len();
+            let mut out = String::from(sign);
+            for (i, b) in bytes.iter().enumerate() {
+                if i > 0 && (len - i) % 3 == 0 {
+                    out.push(',');
+                }
+                out.push(*b as char);
+            }
+            Value::String(JsString::from(out.as_str()))
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(result))
+}
+
 /// `Number.prototype.toFixed`: round half away from zero (JS semantics, unlike
 /// Rust's `{:.*}` which rounds half-to-even), then format with `digits` decimals.
 fn js_to_fixed(n: f64, digits: usize) -> String {
@@ -682,6 +731,43 @@ pub fn call_global_fn(kind: &str, args: &[Value], heap: &mut Heap) -> Result<Val
     Ok(match kind {
         "String" => Value::String(JsString::from(arg.to_js_string(heap).as_str())),
         "Number" => finite_number(arg.to_number_heap(heap)),
+        // BigInt(x): integers/booleans/numeric strings -> BigInt; a non-integer
+        // Number or unparseable string is a RangeError/SyntaxError, like JS.
+        "BigInt" => match &arg {
+            Value::BigInt(n) => Value::BigInt(n.clone()),
+            Value::Int(n) => Value::BigInt(num_bigint::BigInt::from(*n)),
+            Value::Bool(b) => Value::BigInt(num_bigint::BigInt::from(*b as i64)),
+            Value::Float(f) => {
+                if f.is_finite() && f.fract() == 0.0 {
+                    match <num_bigint::BigInt as num_traits::FromPrimitive>::from_f64(*f) {
+                        Some(v) => Value::BigInt(v),
+                        None => return Err(ZapcodeError::RangeError(
+                            "The number is not a safe integer".to_string(),
+                        )),
+                    }
+                } else {
+                    return Err(ZapcodeError::RangeError(
+                        "The number is not a safe integer".to_string(),
+                    ));
+                }
+            }
+            other => {
+                let s = other.to_js_string(heap);
+                let t = s.trim();
+                let parsed = if t.is_empty() {
+                    Some(num_bigint::BigInt::from(0))
+                } else {
+                    num_bigint::BigInt::parse_bytes(t.as_bytes(), 10)
+                };
+                match parsed {
+                    Some(v) => Value::BigInt(v),
+                    None => return Err(ZapcodeError::TypeError(format!(
+                        "Cannot convert {} to a BigInt",
+                        s
+                    ))),
+                }
+            }
+        },
         "Boolean" => Value::Bool(arg.is_truthy()),
         "parseInt" | "Number.parseInt" => {
             // radix 0 means "auto-detect": js_parse_int infers hex from a 0x
@@ -1139,6 +1225,10 @@ fn serialize_json(
         } else {
             "null".to_string()
         })),
+        // JSON.stringify(bigint) throws a TypeError in JS.
+        Value::BigInt(_) => Err(ZapcodeError::TypeError(
+            "Do not know how to serialize a BigInt".to_string(),
+        )),
         Value::String(s) => Ok(Some(json_escape_string(s))),
         Value::Array(h) => {
             if seen.contains(h) {

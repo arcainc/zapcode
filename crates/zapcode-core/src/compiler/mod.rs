@@ -1773,6 +1773,9 @@ impl Compiler {
                     self.emit(Instruction::Push(Constant::Float(*n)));
                 }
             }
+            Expr::BigIntLit(v) => {
+                self.emit(Instruction::Push(Constant::BigInt(v.clone())));
+            }
             Expr::StringLit(s) => {
                 self.emit(Instruction::Push(Constant::String(s.clone())));
             }
