@@ -40,7 +40,10 @@ const MAGIC: &[u8; 4] = b"ZPC1";
 /// the snapshot carries the heap itself — incompatible with v1 byte layouts.
 /// v3: `Value::String` changed from a bare `Arc<str>` to the enum-tagged,
 /// UTF-16-aware `JsString` (see `jsstring`) — incompatible with v2 string bytes.
-pub(crate) const FORMAT_VERSION: u16 = 3;
+/// v4: added `Value::BigInt` / `Constant::BigInt` (separate change).
+/// v5: added the `microtasks` queue to the VM snapshot — a new trailing struct
+/// field, incompatible with v3/v4 (postcard reads fields positionally).
+pub(crate) const FORMAT_VERSION: u16 = 5;
 
 const HEADER_LEN: usize = 4 + 2 + 1 + 1 + 32;
 
