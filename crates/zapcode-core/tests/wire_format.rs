@@ -124,7 +124,7 @@ use sha2::{Digest, Sha256};
 fn forge_frame(kind: u8, compression: u8, stored: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"ZPC1");
-    out.extend_from_slice(&4u16.to_le_bytes()); // FORMAT_VERSION
+    out.extend_from_slice(&5u16.to_le_bytes()); // FORMAT_VERSION
     out.push(kind); // 1 = snapshot, 2 = session
     out.push(compression); // 0 = none, 1 = deflate
     out.extend_from_slice(&Sha256::digest(stored));

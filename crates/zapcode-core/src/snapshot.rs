@@ -55,6 +55,11 @@ pub(crate) struct VmSnapshot {
     /// snapshot or those handles dangle on resume.
     #[serde(default)]
     pub(crate) heap: crate::heap::Heap,
+    /// The microtask (Promise-reaction) queue, carried so a suspension that
+    /// happens mid-drain (a host call inside a `.then`/`await` continuation)
+    /// resumes with the remaining reactions intact.
+    #[serde(default)]
+    pub(crate) microtasks: std::collections::VecDeque<crate::vm::Microtask>,
 }
 
 impl VmSnapshot {
@@ -100,6 +105,7 @@ impl VmSnapshot {
             allocations: vm.tracker.allocations,
             rng_state: vm.rng_state,
             heap: vm.heap.clone(),
+            microtasks: vm.microtasks.clone(),
         }
     }
 
@@ -133,6 +139,7 @@ impl VmSnapshot {
         vm.tracker.allocations = self.allocations;
         vm.rng_state = self.rng_state;
         vm.cells = self.cells;
+        vm.microtasks = self.microtasks;
         vm
     }
 }

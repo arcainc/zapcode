@@ -42,7 +42,9 @@ const MAGIC: &[u8; 4] = b"ZPC1";
 /// UTF-16-aware `JsString` (see `jsstring`) — incompatible with v2 string bytes.
 /// v4: added `Value::BigInt` and `Constant::BigInt` — new enum variants shift
 /// the postcard discriminants, incompatible with v3.
-pub(crate) const FORMAT_VERSION: u16 = 4;
+/// v5: added the `microtasks` queue to the VM snapshot — a new trailing struct
+/// field, incompatible with v4 (postcard reads fields positionally).
+pub(crate) const FORMAT_VERSION: u16 = 5;
 
 const HEADER_LEN: usize = 4 + 2 + 1 + 1 + 32;
 

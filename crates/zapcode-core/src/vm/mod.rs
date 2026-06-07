@@ -176,6 +176,26 @@ pub(crate) enum Continuation {
     },
 }
 
+/// A queued microtask (a Promise reaction). When drained, run `handler(value)`
+/// — or, with no handler, pass `value` straight through — and settle
+/// `result_promise` with the outcome (which in turn enqueues *its* reactions).
+/// Draining the queue only after the synchronous run completes is what gives
+/// `.then`/`await` their JS ordering. Serialized so a suspension mid-drain (a
+/// host call inside a `.then`) resumes with the queue intact.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Microtask {
+    /// The `.then`/`.catch`/`.finally` handler, or `Undefined` for a pass-through
+    /// reaction (e.g. `.then(undefined)` on a settled promise).
+    pub(crate) handler: Value,
+    /// The settled value (fulfilment value or rejection reason) passed to the handler.
+    pub(crate) value: Value,
+    /// True if `value` is a rejection reason (the reaction is on the reject path).
+    pub(crate) is_rejection: bool,
+    pub(crate) mode: PromiseCallbackMode,
+    /// The dependent promise to settle with the handler's outcome.
+    pub(crate) result_promise: Value,
+}
+
 /// What a [`Continuation::PromiseCallback`] does with the callback's return value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum PromiseCallbackMode {
@@ -288,6 +308,11 @@ pub struct Vm {
     /// method + callbacks so the resumed value is wrapped in a settled promise
     /// and the callback chain runs. Serialized so it survives dump/load/resume.
     pub(crate) resume_action: Option<ResumeAction>,
+    /// The microtask (Promise-reaction) queue. `.then`/`.catch`/`.finally`
+    /// enqueue here instead of running inline; the queue is drained after the
+    /// synchronous run completes (and after each host-call resume), giving JS
+    /// Promise ordering. Serialized so a suspension mid-drain resumes cleanly.
+    pub(crate) microtasks: std::collections::VecDeque<Microtask>,
 }
 
 /// Deferred action applied to the value the host delivers when resuming a
@@ -453,6 +478,7 @@ impl Vm {
             to_primitive_depth: 0,
             next_frame_is_field_init: false,
             resume_action: None,
+            microtasks: std::collections::VecDeque::new(),
         }
     }
 
@@ -542,6 +568,7 @@ impl Vm {
             to_primitive_depth: 0,
             next_frame_is_field_init: false,
             resume_action: None,
+            microtasks: std::collections::VecDeque::new(),
         }
     }
 
