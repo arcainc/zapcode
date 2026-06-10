@@ -124,13 +124,16 @@ pub(crate) struct CallFrame {
     /// Local slots that have been promoted to shared upvalue cells (captured by
     /// a nested closure): slot -> cell id. Reads/writes of these slots route
     /// through the cell arena so the closure and this frame stay in sync.
+    /// `BTreeMap` (not `HashMap`) so a decoded frame re-serializes to the
+    /// same bytes — snapshot determinism (content-addressing) requires it.
     #[serde(default)]
-    pub(crate) boxed: HashMap<usize, u64>,
+    pub(crate) boxed: BTreeMap<usize, u64>,
     /// Free-variable bindings for a closure frame: name -> cell id. A name found
     /// here shadows the global of the same name (LoadGlobal/StoreGlobal consult
     /// it first), connecting captured names to their shared cells.
+    /// `BTreeMap` for the same determinism reason as `boxed`.
     #[serde(default)]
-    pub(crate) env: HashMap<String, u64>,
+    pub(crate) env: BTreeMap<String, u64>,
     /// Set on an async function body frame the first time it detaches at an
     /// `await` (microtask-design Stage 3): the pending result promise the
     /// caller received at detach time. A frame with this set has NO caller
@@ -1280,6 +1283,41 @@ impl Vm {
         Ok(())
     }
 
+    /// Top-level `await` tick: the operand is already settled (or a plain
+    /// value) but reactions are queued. The top-level frame cannot detach, so
+    /// deliver the outcome through a fresh pending promise whose settling
+    /// microtask sits at the END of the current queue, and re-dispatch this
+    /// Await against it — the drain-until-settled path then runs exactly the
+    /// already-queued jobs first. This is Node's "the resumption is enqueued
+    /// after the current queue" order: jobs that those reactions enqueue run
+    /// AFTER the continuation. With an empty queue the caller delivers
+    /// inline — there is nothing to interleave with, so no tick is
+    /// observable.
+    fn requeue_top_level_await(&mut self, value: Value, is_rejection: bool) -> Result<()> {
+        let sentinel = builtins::make_pending_promise(&mut self.heap);
+        // Mark the sentinel so the re-dispatched Await delivers its settled
+        // outcome INLINE — exactly one tick per await. Without the marker the
+        // re-await would requeue again while jobs remain, draining the whole
+        // queue (jobs enqueued during the tick must run AFTER this
+        // continuation, as in Node).
+        if let Value::Object(h) = &sentinel {
+            if let Some(map) = self.heap.object_mut(*h) {
+                map.insert(Arc::from("__await_tick__"), Value::Bool(true));
+            }
+        }
+        self.microtasks.push_back(Microtask {
+            handler: Value::Undefined,
+            value,
+            is_rejection,
+            mode: PromiseCallbackMode::WrapResult,
+            result_promise: sentinel.clone(),
+            task: None,
+        });
+        self.push(sentinel)?;
+        self.current_frame_mut().ip -= 1;
+        Ok(())
+    }
+
     /// Settle a detached async body's result promise with its return value,
     /// adopting thenables: a returned settled promise unwraps one level, a
     /// returned pending chain forwards via a handler-less reaction, and a
@@ -2141,7 +2179,7 @@ impl Vm {
 
         // Captured-by-reference variables: the frame's env maps each name to its
         // shared cell so LoadGlobal/StoreGlobal in the body see and mutate it.
-        let env: HashMap<String, u64> = closure.env.iter().cloned().collect();
+        let env: BTreeMap<String, u64> = closure.env.iter().cloned().collect();
 
         // Consume the one-shot field-initializer flag (set by `call_field_init`).
         let is_field_init = std::mem::take(&mut self.next_frame_is_field_init);
@@ -2154,7 +2192,7 @@ impl Vm {
             stack_base: self.stack.len(),
             this_value,
             receiver_source,
-            boxed: HashMap::new(),
+            boxed: BTreeMap::new(),
             env,
             is_field_init,
             async_result: None,
@@ -2178,8 +2216,8 @@ impl Vm {
             stack_base: 0,
             this_value: None,
             receiver_source: None,
-            boxed: HashMap::new(),
-            env: HashMap::new(),
+            boxed: BTreeMap::new(),
+            env: BTreeMap::new(),
             is_field_init: false,
             async_result: None,
         });
@@ -3916,7 +3954,7 @@ impl Vm {
                     }
                 }
                 let stack_base = self.stack.len();
-                let env: HashMap<String, u64> = gen_obj.env.iter().cloned().collect();
+                let env: BTreeMap<String, u64> = gen_obj.env.iter().cloned().collect();
                 self.frames.push(CallFrame {
                     program_index: func_ref.program_id,
                     func_index: Some(func_ref.function_id),
@@ -3925,7 +3963,7 @@ impl Vm {
                     stack_base,
                     this_value: None,
                     receiver_source: None,
-                    boxed: HashMap::new(),
+                    boxed: BTreeMap::new(),
                     env,
                     is_field_init: false,
                     async_result: None,
@@ -3939,7 +3977,7 @@ impl Vm {
                     self.push(val.clone())?;
                 }
                 self.push(arg)?;
-                let env: HashMap<String, u64> = gen_obj.env.iter().cloned().collect();
+                let env: BTreeMap<String, u64> = gen_obj.env.iter().cloned().collect();
                 self.frames.push(CallFrame {
                     program_index: func_ref.program_id,
                     func_index: Some(func_ref.function_id),
@@ -3948,7 +3986,7 @@ impl Vm {
                     stack_base,
                     this_value: None,
                     receiver_source: None,
-                    boxed: HashMap::new(),
+                    boxed: suspended.boxed,
                     env,
                     is_field_init: false,
                     async_result: None,
@@ -3999,6 +4037,17 @@ impl Vm {
                     } else {
                         self.push(Value::Undefined)?;
                     }
+                    // The popped frame may be a microtask handler started by
+                    // an `await` of a pending chain inside this generator
+                    // body — the continuation must settle its chain promise
+                    // (and pops the pushed value itself), exactly as the main
+                    // loop does. A tool call inside such a handler cannot
+                    // suspend here.
+                    if self.process_continuation()?.is_some() {
+                        return Err(ZapcodeError::RuntimeError(
+                            "cannot suspend inside a generator".to_string(),
+                        ));
+                    }
                     continue;
                 }
                 let frame = self.frames.pop().unwrap();
@@ -4018,6 +4067,7 @@ impl Vm {
                     ip: frame.ip,
                     locals: frame.locals,
                     stack: frame_stack,
+                    boxed: frame.boxed,
                 });
                 gen_obj.done = false;
                 self.store_generator(gen_obj);
@@ -4031,6 +4081,15 @@ impl Vm {
                     self.tracker.pop_frame();
                     self.stack.truncate(frame.stack_base);
                     self.push(return_val)?;
+                    // Settle a microtask handler's chain (see the ip-overflow
+                    // arm above) — without this, an `await <chain>` inside
+                    // the generator body leaks the handler's return value
+                    // onto the generator's stack.
+                    if self.process_continuation()?.is_some() {
+                        return Err(ZapcodeError::RuntimeError(
+                            "cannot suspend inside a generator".to_string(),
+                        ));
+                    }
                     continue;
                 }
                 let frame = self.frames.pop().unwrap();
@@ -6475,6 +6534,15 @@ impl Vm {
                                     }
                                 } else if in_async_body {
                                     self.park_and_tick(inner, false)?;
+                                } else if !self.microtasks.is_empty()
+                                    && !map.contains_key("__await_tick__")
+                                {
+                                    // Top-level await yields a tick too: the
+                                    // queued reactions run before this
+                                    // continuation (Node module TLA order).
+                                    // (A settled tick sentinel delivers
+                                    // inline — its tick already happened.)
+                                    self.requeue_top_level_await(inner, false)?;
                                 } else {
                                     self.push(inner)?;
                                 }
@@ -6486,6 +6554,12 @@ impl Vm {
                                 let reason = map.get("reason").cloned().unwrap_or(Value::Undefined);
                                 if in_async_body {
                                     self.park_and_tick(reason, true)?;
+                                } else if !self.microtasks.is_empty()
+                                    && !map.contains_key("__await_tick__")
+                                {
+                                    // Queued reactions run before the rethrow
+                                    // (the sentinel re-await rejects then).
+                                    self.requeue_top_level_await(reason, true)?;
                                 } else {
                                     // Rethrow the *original* reason (identity
                                     // preserved for guest catch) via
@@ -6578,9 +6652,16 @@ impl Vm {
                                         ))
                                     }
                                 };
-                                // Already settled (awaited before): reuse the value.
+                                // Already settled (awaited before): reuse the
+                                // value — but still yield the await tick.
                                 if let Some(cached) = self.resolved.get(&id).cloned() {
-                                    self.push(cached)?;
+                                    if in_async_body {
+                                        self.park_and_tick(cached, false)?;
+                                    } else if !self.microtasks.is_empty() {
+                                        self.requeue_top_level_await(cached, false)?;
+                                    } else {
+                                        self.push(cached)?;
+                                    }
                                 } else {
                                     self.resume_action = Some(ResumeAction::CacheValue { id });
                                     return self.suspend_on_pending_call(id);
@@ -6590,6 +6671,8 @@ impl Vm {
                                 // Unknown status — treat as a plain value.
                                 if in_async_body {
                                     self.park_and_tick(val, false)?;
+                                } else if !self.microtasks.is_empty() {
+                                    self.requeue_top_level_await(val, false)?;
                                 } else {
                                     self.push(val)?;
                                 }
@@ -6597,12 +6680,16 @@ impl Vm {
                         }
                     } else if in_async_body {
                         self.park_and_tick(val, false)?;
+                    } else if !self.microtasks.is_empty() {
+                        self.requeue_top_level_await(val, false)?;
                     } else {
                         self.push(val)?;
                     }
                 } else if in_async_body {
                     // `await` of a non-promise still yields one tick (spec).
                     self.park_and_tick(val, false)?;
+                } else if !self.microtasks.is_empty() {
+                    self.requeue_top_level_await(val, false)?;
                 } else {
                     // Not a promise — pass through (await on non-promise returns the value)
                     self.push(val)?;

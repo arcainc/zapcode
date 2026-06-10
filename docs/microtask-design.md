@@ -1,9 +1,11 @@
 # Design: Microtask / Event-Loop Ordering
 
-Status: **in progress** — Stage 0 landed (PR #26), Stage 2 (PR #27), Stage 1
-(PR #28); Stage 3 (`await` suspends the task) implemented on
-`microtask-stage3-await-suspend`. Stage 4 (durable hardening / fuzzing)
-remains, though Stage 3 already ships with parked-task dump/load tests.
+Status: **complete** — Stage 0 landed (PR #26), Stage 2 (PR #27), Stage 1
+(PR #28), Stage 3 (PR #29); Stage 4 (durable hardening) implemented on
+`microtask-stage4-durable-hardening`, and the Stage-3 residuals (await
+ticks at top level / cached re-awaits, async-generator chain awaits) on
+`microtask-residuals-await-ticks`. See the Stage 3 entry for the one
+remaining pinned divergence (generator-body awaits are tickless).
 Author: conformance hardening effort
 Scope: make Promise/`async`/`await` ordering match Node, without breaking the
 durable-execution (snapshot/suspend/resume) core.
@@ -282,14 +284,50 @@ durable-session suite).
    interleave their host calls Node-style (first awaits of every element
    before second steps). Tests: `tests/conformance_async_interleave.rs`
    (Node ground-truthed; incl. dump/load with a parked task and tool calls
-   after a park). Residuals for Stage 4 follow-ups: top-level `await` of a
-   settled promise is still inline (wrap ordering-sensitive code in
-   `async function main()`), `await` inside async *generator* bodies keeps
-   the old inline semantics, and a cached re-await of a host-call promise
-   skips its tick.
+   after a park). The three residuals this stage left were addressed by the
+   `microtask-residuals-await-ticks` follow-up: (a) a top-level `await` of a
+   settled/non-promise operand now yields a tick via a marked sentinel
+   pending promise enqueued at the END of the current queue (Node module-TLA
+   order, including rejections; tested against Node in
+   `tests/conformance_await_tick.rs`); (b) a cached re-await of a host-call
+   promise yields its tick (park in async bodies, sentinel at top level);
+   (c) `await` of a pending `.then` chain inside async *generator* bodies
+   now settles correctly — the generator drive loop fires
+   `process_continuation` for handler frames (the handler's return used to
+   leak onto the generator's stack), and `SuspendedFrame` carries the
+   frame's promoted-cell map (`boxed`, wire v7 → v8) — fixing a latent
+   pre-existing bug where a boxed generator local written between yields
+   silently reverted on resume, in sync generators too. Remaining pinned
+   divergence: generator-body awaits run inline (no tick) — full task
+   semantics for generators would mean running generator frames in the main
+   loop.
 5. **Stage 4 — durable hardening.** Snapshot/resume tests with microtasks and
    suspended async tasks in flight across a host call; wire-version bump; fuzz
    the drain across suspensions.
+   **✅ Implemented** (`microtask-stage4-durable-hardening`), as
+   `tests/durable_async_state.rs`:
+   - **Replay determinism**: a driver runs each program twice — in-memory vs
+     a dump→load round-trip at EVERY suspension — and asserts identical
+     suspension traces and final outcomes, over fan-outs of parked tasks,
+     mid-drain tool calls with queued reactions, task-awaits-task chains,
+     try/catch in parked bodies with scripted `resume_with_error`, batch
+     suspensions inside handlers, `finally`-forced cleanup calls, for-await,
+     unhandled-rejection marks crossing a hop, and rejection cascades.
+   - **Byte determinism**: double-dump equality AND dump→load→dump
+     idempotence with parked tasks / queued microtasks / unhandled marks in
+     flight. This caught a real (pre-async, latent) bug: `CallFrame.boxed`/
+     `env` were `HashMap`s, whose randomized per-instance iteration order
+     made a *decoded* frame re-serialize to different bytes — breaking
+     content-addressing for any suspension inside a closure with ≥2 captured
+     bindings. Both are `BTreeMap` now (same postcard wire shape; no version
+     bump needed — v7 snapshots load unchanged).
+   - **Runaway drains hit limits (R4)**: infinite `.then` loops, infinite
+     async recursion, and mutual async ping-pong all error against
+     allocation/time limits rather than hanging.
+   - Session chunks hop (dump/load) between chunks and at every suspension
+     with async state crossing the boundaries.
+   (The wire-version bumps this stage anticipated shipped with Stages 1 and
+   3: v5 → v6 → v7.)
 
 If Stage 3 proves too risky, Stages 0–2 alone already remove the *throwing* bug
 and fix `.then`/`.finally` ordering — a shippable partial win — with `await`

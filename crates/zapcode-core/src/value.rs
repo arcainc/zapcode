@@ -129,6 +129,13 @@ pub struct SuspendedFrame {
     pub ip: usize,
     pub locals: Vec<Value>,
     pub stack: Vec<Value>,
+    /// Local slots promoted to shared upvalue cells (slot -> cell id), carried
+    /// across the yield — without this, a boxed local written between yields
+    /// silently reverts on resume (the write went to the cell, but the
+    /// resumed frame read stale `locals`). `BTreeMap` for snapshot byte
+    /// determinism; `serde(default)` so pre-existing generator state loads.
+    #[serde(default)]
+    pub boxed: std::collections::BTreeMap<usize, u64>,
 }
 
 impl Value {
