@@ -507,23 +507,16 @@ fn test_await_in_expression() {
 // ── Promise object without await (just creation) ────────────────────
 
 #[test]
-fn test_promise_resolve_creates_object() {
-    let (result, heap) = run(
-        r#"
+fn test_promise_as_final_value_unwraps_for_host() {
+    // The program result is implicitly awaited at the host boundary: a settled
+    // promise as the final value delivers its fulfilled value, never the
+    // internal `{__promise__: ...}` object. (Within the program it is still an
+    // object — see conformance_async `typeof Promise.resolve(1)`.)
+    let (result, _heap) = run(r#"
         const p = Promise.resolve(42);
         p
-    "#,
-    );
-    // Should be a promise object (not unwrapped)
-    match result {
-        Value::Object(h) => {
-            let map = heap.object_map(h);
-            assert_eq!(map.get("__promise__"), Some(&Value::Bool(true)));
-            assert_eq!(map.get("status"), Some(&Value::String("resolved".into())));
-            assert_eq!(map.get("value"), Some(&Value::Int(42)));
-        }
-        other => panic!("expected object, got {:?}", other),
-    }
+    "#);
+    assert_eq!(result, Value::Int(42));
 }
 
 // ── Promise .then() ──────────────────────────────────────────────────

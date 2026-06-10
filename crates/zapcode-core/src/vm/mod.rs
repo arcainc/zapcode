@@ -611,7 +611,7 @@ impl Vm {
                 }
             }
         }
-        self.execute()
+        self.execute_to_host()
     }
 
     /// Apply a [`ResumeAction`] to the settled (resolved/rejected) promise that a
@@ -711,14 +711,14 @@ impl Vm {
                 let rejected = builtins::make_rejected_promise(error.clone(), &mut self.heap);
                 return match self.run_resume_action(action, rejected)? {
                     Some(state) => Ok(state),
-                    None => self.execute(),
+                    None => self.execute_to_host(),
                 };
             }
         }
         // Route the rejection to the nearest catch or finally (running finallys
         // on the way), exactly as the execute loop does for a runtime error.
         if self.route_thrown(error.clone(), 0)? {
-            self.execute()
+            self.execute_to_host()
         } else {
             // No handler — the failure is the program's failure.
             Err(ZapcodeError::ExternalError(error.to_js_string(&self.heap)))
@@ -877,6 +877,57 @@ impl Vm {
         }
     }
 
+    /// True if `frame` runs an `async` function body, so its return value is
+    /// shaped into a resolved Promise on the way out. Async *generators* are
+    /// excluded: their returns flow through the iterator protocol, not the
+    /// async-call return path. (A `throw` escaping an async body still
+    /// propagates synchronously — rejected-promise shaping arrives with await
+    /// suspension, microtask-design Stage 3.)
+    fn frame_is_async(&self, frame: &CallFrame) -> bool {
+        frame.func_index.is_some_and(|fi| {
+            self.program(frame.program_index)
+                .functions
+                .get(fi)
+                .is_some_and(|f| f.is_async && !f.is_generator)
+        })
+    }
+
+    /// Run the main loop and shape the finished state for the host. The
+    /// program result is implicitly awaited (like a runtime awaiting its entry
+    /// point): completing with a *settled* internal promise — the value of an
+    /// unawaited `async f()` call or a bare `Promise.resolve(...)` — delivers
+    /// the fulfilled value, and a rejected one surfaces as an
+    /// unhandled-rejection error. Deferred host-call promises (`pending_call`/
+    /// `pending_all`) pass through untouched: their calls were never triggered.
+    /// Every host-facing entry (`run_program`, `resume_*`) must route its final
+    /// `execute()` through this, so a promise object never leaks to the host.
+    fn execute_to_host(&mut self) -> Result<VmState> {
+        let state = self.execute()?;
+        let VmState::Complete(val) = state else {
+            return Ok(state);
+        };
+        if builtins::is_promise(&val, &self.heap) {
+            if let Value::Object(h) = &val {
+                let map = self.heap.object_map(*h);
+                match map.get("status") {
+                    Some(Value::String(s)) if s.as_ref() == "resolved" => {
+                        let inner = map.get("value").cloned().unwrap_or(Value::Undefined);
+                        return Ok(VmState::Complete(inner));
+                    }
+                    Some(Value::String(s)) if s.as_ref() == "rejected" => {
+                        let reason = map.get("reason").cloned().unwrap_or(Value::Undefined);
+                        return Err(ZapcodeError::RuntimeError(format!(
+                            "Unhandled promise rejection: {}",
+                            reason.to_js_string(&self.heap)
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(VmState::Complete(val))
+    }
+
     /// Pop the current call frame and deliver `return_val` to the caller (the
     /// body of the old `Return` instruction). Returns `VmState::Complete` at the
     /// top level. The caller must already have run any escaped `finally` blocks.
@@ -909,6 +960,14 @@ impl Vm {
             }
         } else {
             return_val
+        };
+
+        // An async function's result is a resolved Promise (a returned promise is
+        // adopted). So `f().then(...)` works and `await f()` unwraps it.
+        let actual_return = if self.frame_is_async(&frame) {
+            builtins::make_resolved_promise(actual_return, &mut self.heap)
+        } else {
+            actual_return
         };
 
         self.stack.truncate(frame.stack_base);
@@ -954,7 +1013,7 @@ impl Vm {
                 }
                 let value = results.into_iter().next().unwrap_or(Value::Undefined);
                 self.push(value)?;
-                self.execute()
+                self.execute_to_host()
             }
             // all/allSettled deliver one settled entry per pending call, in the
             // order the calls were presented; reassemble in element order.
@@ -975,7 +1034,7 @@ impl Vm {
                 };
                 let h = self.heap.alloc_array(array);
                 self.push(Value::Array(h))?;
-                self.execute()
+                self.execute_to_host()
             }
         }
     }
@@ -1599,7 +1658,7 @@ impl Vm {
             is_field_init: false,
         });
 
-        self.execute()
+        self.execute_to_host()
     }
 
     fn execute(&mut self) -> Result<VmState> {
@@ -1624,16 +1683,24 @@ impl Vm {
                     };
                     return Ok(VmState::Complete(result));
                 } else {
-                    // Return from function
+                    // Return from function (fell off the end → implicit undefined)
                     let frame = self.frames.pop().unwrap();
                     self.tracker.pop_frame();
+                    let is_async = self.frame_is_async(&frame);
                     // If this was a constructor, return `this`
-                    if let Some(this_val) = frame.this_value {
+                    let ret = if let Some(this_val) = frame.this_value {
                         self.stack.truncate(frame.stack_base);
-                        self.push(this_val)?;
+                        this_val
                     } else {
-                        self.push(Value::Undefined)?;
-                    }
+                        Value::Undefined
+                    };
+                    // An async function falling off the end resolves with undefined.
+                    let ret = if is_async {
+                        builtins::make_resolved_promise(ret, &mut self.heap)
+                    } else {
+                        ret
+                    };
+                    self.push(ret)?;
                     // Check if a continuation callback just completed
                     if let Some(state) = self.process_continuation()? {
                         return Ok(state);
