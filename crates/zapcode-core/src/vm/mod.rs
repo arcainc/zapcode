@@ -1708,6 +1708,7 @@ impl Vm {
                 }
                 let value = results.into_iter().next().unwrap_or(Value::Undefined);
                 self.push(value)?;
+                self.apply_batch_resume_action()?;
                 self.execute_to_host()
             }
             // all/allSettled deliver one settled entry per pending call, in the
@@ -1730,9 +1731,32 @@ impl Vm {
                 };
                 let h = self.heap.alloc_array(array);
                 self.push(Value::Array(h))?;
+                self.apply_batch_resume_action()?;
                 self.execute_to_host()
             }
         }
+    }
+
+    /// If a `.then`/`.catch`/`.finally` on the batch promise forced this
+    /// batch (see `execute_promise_method`'s `pending_all` arm), run the
+    /// recorded method against the just-pushed assembled result — the batch
+    /// analogue of the single-call `PromiseMethod` handling in
+    /// `resume_execution`. The method's dependent promise replaces the raw
+    /// result on the stack; the following `execute_to_host` drives any
+    /// enqueued reaction.
+    fn apply_batch_resume_action(&mut self) -> Result<()> {
+        if let Some(action) = self.resume_action.take() {
+            let assembled = self.pop()?;
+            let settled = builtins::make_resolved_promise(assembled, &mut self.heap);
+            if let Some(state) = self.run_resume_action(action, settled)? {
+                // Promise methods on assembled results never re-suspend
+                // synchronously (the batch's calls are all resolved).
+                return Err(ZapcodeError::RuntimeError(format!(
+                    "internal error: unexpected suspension applying a batch promise method: {state:?}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// A combinator consuming its elements handles their rejections: a
@@ -3940,6 +3964,59 @@ impl Vm {
                 return match self.suspend_on_pending_call(id)? {
                     Some(state) => Ok(PromiseMethodOutcome::Suspend(state)),
                     None => unreachable!("suspend_on_pending_call always suspends"),
+                };
+            }
+            // A *batch* promise (`Promise.all/race/any/allSettled` over host
+            // calls): `.then`/`.catch`/`.finally` forces the batch, exactly
+            // like the single-call path above — suspend on all of its calls
+            // with a `PromiseMethod` action that re-runs the method against
+            // the assembled result on resume (`resume_many` applies it; a
+            // host-rejected combinator routes through `resume_with_error`,
+            // delivering a rejected promise to the method). Batches that mix
+            // in microtask-pending chain elements keep the legacy
+            // pass-through (their chains can only settle in the main loop) —
+            // `await` the combinator instead.
+            if status == "pending_all"
+                && !{
+                    let items = match map.get("items") {
+                        Some(Value::Array(a)) => self.heap.array_vec(*a),
+                        _ => Vec::new(),
+                    };
+                    items.iter().any(|i| self.is_internal_pending(i))
+                }
+            {
+                let items = match map.get("items") {
+                    Some(Value::Array(a)) => self.heap.array_vec(*a),
+                    _ => Vec::new(),
+                };
+                let kind = match map.get("__batch_kind__") {
+                    Some(Value::String(k)) => match k.as_ref() {
+                        "race" => BatchKind::Race,
+                        "any" => BatchKind::Any,
+                        "allSettled" => BatchKind::AllSettled,
+                        _ => BatchKind::All,
+                    },
+                    _ => BatchKind::All,
+                };
+                self.resume_action = Some(ResumeAction::PromiseMethod {
+                    method: method.to_string(),
+                    args,
+                });
+                return match self.await_batch(kind, items)? {
+                    Some(state) => Ok(PromiseMethodOutcome::Suspend(state)),
+                    None => {
+                        // Every element was already settled: the batch value
+                        // was assembled and pushed inline. Run the method on
+                        // it now, as the resume path would have.
+                        let action = self.resume_action.take();
+                        let Some(ResumeAction::PromiseMethod { method, args }) = action else {
+                            unreachable!("recorded action consumed unexpectedly");
+                        };
+                        let assembled = self.pop()?;
+                        let settled =
+                            builtins::make_resolved_promise(assembled, &mut self.heap);
+                        self.execute_promise_method(settled, &method, args)
+                    }
                 };
             }
             let value = map.get("value").cloned().unwrap_or(Value::Undefined);

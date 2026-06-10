@@ -13,10 +13,10 @@
 //!
 //! All assertions ground-truthed against real Node.
 //!
-//! Pinned (pre-existing): promise methods chained directly on a *batch*
-//! promise (`Promise.race(...).catch(h)` where the batch holds deferred host
-//! calls) are pass-through no-ops — guard the `await` with try/catch
-//! instead.
+//! Promise methods on *batch* promises (deferred host calls) force the
+//! batch — see `conformance_batch_methods.rs`. Batches mixing in
+//! microtask-pending chain elements keep the legacy pass-through; guard the
+//! `await` with try/catch for those.
 
 use zapcode_core::vm::VmState;
 use zapcode_core::{ResourceLimits, ZapcodeRun};

@@ -59,13 +59,16 @@ list's promise items:
   branded error: `instanceof AggregateError` AND `instanceof Error`,
   `.name`, `.errors` all match Node.
 
-Remaining known divergences after round 10:
+Remaining known divergences after round 10 (and the batch-methods
+follow-up):
 - Awaits inside async *generator* bodies run inline (no tick) — full task
   semantics for generators would mean running generator frames in the main
-  loop; dedicated project.
-- Promise methods chained directly on a *batch* promise (one holding
-  deferred host calls) are pass-through no-ops — guard the `await` with
-  try/catch instead.
+  loop; dedicated project (see `docs/generator-mainloop-design.md`).
+- (FIXED in the batch-methods follow-up) `.then`/`.catch`/`.finally` on a
+  *batch* promise now force the batch like the single-call N5 path and run
+  the method on the assembled result (`conformance_batch_methods.rs`);
+  batches mixing in microtask-pending chain elements keep the pass-through
+  (await the combinator instead).
 - `Promise.race([])`/`any([])` settle-never pins and `Symbol.toPrimitive`
   non-dispatch are unchanged (documented in `conformance_async.rs` and the
   ToPrimitive notes below).
