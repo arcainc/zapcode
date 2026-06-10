@@ -2,6 +2,74 @@
 
 ## Fix status (in progress)
 
+**Round 9 (PRs #26–#31) — microtask / event-loop ordering: the async model is
+now Node's.** Full plan and per-stage detail in `docs/microtask-design.md`
+(status: complete). What this closes, beyond what rounds 4–6 left:
+
+- **Eager `.then` ordering — FIXED.** Reactions defer to a serialized FIFO
+  microtask queue (drained at top-level completion and at awaits) instead of
+  running inline; `.then`/nested-`.then`/`finally` ordering, and the classic
+  async-ordering kata, match Node byte-for-byte
+  (`conformance_microtask.rs`, `conformance_async_interleave.rs`).
+- **`async` returns a Promise; `await` suspends the function — FIXED.**
+  `f().then(...)` works; `await` detaches the body into a serializable parked
+  `AsyncTask` and always yields a tick (top-level `await` ticks too, via a
+  sentinel job — `conformance_await_tick.rs`). Async bodies interleave with
+  sync code and each other in Node order; `Promise.all` fan-outs interleave
+  their host calls.
+- **Throw semantics — FIXED.** A throw escaping an async body rejects the
+  call's result promise (callers' try/catch correctly does NOT see it;
+  `f().catch(h)` does). The await-rejection boundary rethrows the ORIGINAL
+  reason — the wrapped-`Error` divergence documented in
+  `conformance_async.rs` is gone, including for `for await` and combinator
+  rejections (`Promise.any` now surfaces its real AggregateError reason).
+- **Unhandled rejections — FIXED.** A rejection nobody handles fails the run
+  deterministically at end-of-drain (Node's unhandled-rejection crash, made
+  replay-safe).
+- **Durability hardened.** All of the new async state (queue, reaction
+  records, parked tasks, unhandled marks) is serialized; replay with a
+  dump→load at EVERY suspension is byte- and trace-identical
+  (`durable_async_state.rs`). Runaway drains hit resource limits. Wire
+  v4 → v8 across the rounds (see `wire.rs`).
+- **Generator fixes flushed out en route:** the generator drive loop now
+  settles handler continuations (an `await <then-chain>` inside an async
+  generator no longer corrupts the generator's stack), and
+  `SuspendedFrame` carries the promoted-cell map — a *latent sync-generator
+  bug* where a boxed local written between yields silently reverted on
+  resume.
+
+**Round 10 (branch `conformance-promise-constructor`)** closed the round-9
+list's promise items:
+- **`new Promise(executor)` — FIXED.** The executor runs synchronously with
+  serializable resolve/reject capability objects that settle through the
+  microtask machinery; thenable adoption, the deferred pattern, the spec'd
+  constructor catch (a throw rejects the promise without escaping), tool
+  calls inside executors, and combinator interop all work
+  (`conformance_promise_constructor.rs`). Pinned: `typeof resolve` inside
+  the executor is `"object"` (capabilities are marker objects).
+- **`Promise.race`/`any` tick order — FIXED.** With pending-chain elements
+  the winner is the first to settle (race) / fulfill (any) as the drain
+  progresses; losers' later rejections are absorbed, not unhandled
+  (`conformance_combinator_ticks.rs`).
+- **`p.then()` identity — FIXED.** `.then`/`.catch`/`.finally` always
+  return a NEW dependent promise; non-callable handlers become
+  pass-through reactions (`p.then() === p` is now `false`, and
+  `Promise.reject(x).then(undefined, undefined).catch(h)` forwards `x`).
+- **AggregateError — FIXED.** The `Promise.any` all-reject reason is a real
+  branded error: `instanceof AggregateError` AND `instanceof Error`,
+  `.name`, `.errors` all match Node.
+
+Remaining known divergences after round 10:
+- Awaits inside async *generator* bodies run inline (no tick) — full task
+  semantics for generators would mean running generator frames in the main
+  loop; dedicated project.
+- Promise methods chained directly on a *batch* promise (one holding
+  deferred host calls) are pass-through no-ops — guard the `await` with
+  try/catch instead.
+- `Promise.race([])`/`any([])` settle-never pins and `Symbol.toPrimitive`
+  non-dispatch are unchanged (documented in `conformance_async.rs` and the
+  ToPrimitive notes below).
+
 **Round 8 (branch `arca/conformance-fixes`) — cluster wrap-up + reflection / RegExp / coercion-builtin edges.**
 
 This round confirms the earlier-landed clusters are GREEN-by-construction (asserting

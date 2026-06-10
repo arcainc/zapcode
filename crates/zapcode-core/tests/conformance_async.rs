@@ -26,11 +26,9 @@
 //!     boundary used to wrap reasons in a fresh `Error`; the ORIGINAL reason
 //!     (identity, type, message) now rethrows at `await`, matching Node, and
 //!     IS asserted below.
-//!   * `Promise.any` ALL-REJECT delivers the real AggregateError-shaped
-//!     reason (`e instanceof AggregateError`, `e.name === "AggregateError"`,
-//!     `e.errors` populated) since Stage 3. Residual divergence pinned WITH a
-//!     comment: it is not an `Error` *instance* (`e instanceof Error` is
-//!     `false`; Node: `true`).
+//!   * (FIXED) `Promise.any` ALL-REJECT delivers a real AggregateError —
+//!     `instanceof AggregateError` AND `instanceof Error`, `.name`,
+//!     `.errors` all match Node.
 //!   * TOP-LEVEL AWAIT IS STILL INLINE (Stage 3 covers async *function*
 //!     bodies, which now park at `await` with spec tick order): a top-level
 //!     `await` of an already-settled promise continues inline rather than
@@ -346,9 +344,8 @@ fn any_mixes_plain_values() {
 
 #[test]
 fn any_all_reject_throws_catchable_error() {
-    // The original AggregateError-shaped reason now reaches the catch (Node:
-    // "true|true|AggregateError"). Residual divergence pinned WITH a comment:
-    // the constructed AggregateError is not an `Error` instance here.
+    // The real AggregateError reaches the catch — instance checks and name
+    // all match Node.
     assert_eq!(
         run_main(
             r#"
@@ -358,7 +355,7 @@ fn any_all_reject_throws_catchable_error() {
             }
             "#
         ),
-        "true|false|AggregateError"
+        "true|true|AggregateError"
     );
 }
 

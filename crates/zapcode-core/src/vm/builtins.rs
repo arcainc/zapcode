@@ -45,6 +45,9 @@ const INTERNAL_MARKER_KEYS: &[&str] = &[
     "__prototype__",
     "__super__",
     "__builtin_constructor__",
+    // Promise-executor capability functions (`new Promise((resolve, reject))`).
+    "__promise_capability__",
+    "__capability_reject__",
     // Accessor descriptor tables and field initializers.
     "__getters__",
     "__setters__",
@@ -97,8 +100,7 @@ pub fn register_globals(globals: &mut HashMap<String, Value>, heap: &mut Heap) {
     globals.insert("JSON".to_string(), Value::Object(empty));
     globals.insert("Object".to_string(), builtin_constructor("Object", heap));
     globals.insert("Array".to_string(), builtin_constructor("Array", heap));
-    let empty = heap.alloc_object(IndexMap::new());
-    globals.insert("Promise".to_string(), Value::Object(empty));
+    globals.insert("Promise".to_string(), builtin_constructor("Promise", heap));
     globals.insert("Map".to_string(), builtin_constructor("Map", heap));
     globals.insert("Set".to_string(), builtin_constructor("Set", heap));
     globals.insert("WeakMap".to_string(), builtin_constructor("WeakMap", heap));
@@ -3747,6 +3749,9 @@ fn call_promise_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<
             }
             let errors_arr = Value::Array(heap.alloc_array(errors));
             let mut agg = IndexMap::new();
+            // The `__error__` brand makes `e instanceof Error` true (Node:
+            // AggregateError extends Error).
+            agg.insert(Arc::from("__error__"), Value::Bool(true));
             agg.insert(
                 Arc::from("name"),
                 Value::String(JsString::from("AggregateError")),
