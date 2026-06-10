@@ -2,6 +2,56 @@
 
 ## Fix status (in progress)
 
+**Round 9 (PRs #26–#31) — microtask / event-loop ordering: the async model is
+now Node's.** Full plan and per-stage detail in `docs/microtask-design.md`
+(status: complete). What this closes, beyond what rounds 4–6 left:
+
+- **Eager `.then` ordering — FIXED.** Reactions defer to a serialized FIFO
+  microtask queue (drained at top-level completion and at awaits) instead of
+  running inline; `.then`/nested-`.then`/`finally` ordering, and the classic
+  async-ordering kata, match Node byte-for-byte
+  (`conformance_microtask.rs`, `conformance_async_interleave.rs`).
+- **`async` returns a Promise; `await` suspends the function — FIXED.**
+  `f().then(...)` works; `await` detaches the body into a serializable parked
+  `AsyncTask` and always yields a tick (top-level `await` ticks too, via a
+  sentinel job — `conformance_await_tick.rs`). Async bodies interleave with
+  sync code and each other in Node order; `Promise.all` fan-outs interleave
+  their host calls.
+- **Throw semantics — FIXED.** A throw escaping an async body rejects the
+  call's result promise (callers' try/catch correctly does NOT see it;
+  `f().catch(h)` does). The await-rejection boundary rethrows the ORIGINAL
+  reason — the wrapped-`Error` divergence documented in
+  `conformance_async.rs` is gone, including for `for await` and combinator
+  rejections (`Promise.any` now surfaces its real AggregateError reason).
+- **Unhandled rejections — FIXED.** A rejection nobody handles fails the run
+  deterministically at end-of-drain (Node's unhandled-rejection crash, made
+  replay-safe).
+- **Durability hardened.** All of the new async state (queue, reaction
+  records, parked tasks, unhandled marks) is serialized; replay with a
+  dump→load at EVERY suspension is byte- and trace-identical
+  (`durable_async_state.rs`). Runaway drains hit resource limits. Wire
+  v4 → v8 across the rounds (see `wire.rs`).
+- **Generator fixes flushed out en route:** the generator drive loop now
+  settles handler continuations (an `await <then-chain>` inside an async
+  generator no longer corrupts the generator's stack), and
+  `SuspendedFrame` carries the promoted-cell map — a *latent sync-generator
+  bug* where a boxed local written between yields silently reverted on
+  resume.
+
+Remaining known divergences after round 9:
+- `new Promise(executor)` is not constructible (next up).
+- `Promise.race`/`any` over microtask-pending chains settle by element
+  order, not tick order.
+- `p.then()` (no handlers) returns the receiver, not a new promise
+  (`p.then() === p` is `true`).
+- The `Promise.any` all-reject AggregateError is not an `Error` *instance*.
+- Awaits inside async *generator* bodies run inline (no tick) — full task
+  semantics for generators would mean running generator frames in the main
+  loop; dedicated project.
+- `Promise.race([])`/`any([])` settle-never pins and `Symbol.toPrimitive`
+  non-dispatch are unchanged (documented in `conformance_async.rs` and the
+  ToPrimitive notes below).
+
 **Round 8 (branch `arca/conformance-fixes`) — cluster wrap-up + reflection / RegExp / coercion-builtin edges.**
 
 This round confirms the earlier-landed clusters are GREEN-by-construction (asserting
