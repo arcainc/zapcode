@@ -50,7 +50,9 @@ const MAGIC: &[u8; 4] = b"ZPC1";
 /// v7: microtask Stage 3 — `CallFrame.async_result`, `Microtask.task`, and
 /// the `async_tasks` snapshot field (parked async calls), incompatible
 /// with v6.
-pub(crate) const FORMAT_VERSION: u16 = 7;
+/// v8: `SuspendedFrame.boxed` (generator frames carry their promoted-cell
+/// map across yields), incompatible with v7.
+pub(crate) const FORMAT_VERSION: u16 = 8;
 
 const HEADER_LEN: usize = 4 + 2 + 1 + 1 + 32;
 

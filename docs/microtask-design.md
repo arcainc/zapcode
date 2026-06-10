@@ -2,8 +2,10 @@
 
 Status: **complete** — Stage 0 landed (PR #26), Stage 2 (PR #27), Stage 1
 (PR #28), Stage 3 (PR #29); Stage 4 (durable hardening) implemented on
-`microtask-stage4-durable-hardening`. Remaining known residuals are listed
-under the Stage 3 entry below.
+`microtask-stage4-durable-hardening`, and the Stage-3 residuals (await
+ticks at top level / cached re-awaits, async-generator chain awaits) on
+`microtask-residuals-await-ticks`. See the Stage 3 entry for the one
+remaining pinned divergence (generator-body awaits are tickless).
 Author: conformance hardening effort
 Scope: make Promise/`async`/`await` ordering match Node, without breaking the
 durable-execution (snapshot/suspend/resume) core.
@@ -282,11 +284,23 @@ durable-session suite).
    interleave their host calls Node-style (first awaits of every element
    before second steps). Tests: `tests/conformance_async_interleave.rs`
    (Node ground-truthed; incl. dump/load with a parked task and tool calls
-   after a park). Residuals for Stage 4 follow-ups: top-level `await` of a
-   settled promise is still inline (wrap ordering-sensitive code in
-   `async function main()`), `await` inside async *generator* bodies keeps
-   the old inline semantics, and a cached re-await of a host-call promise
-   skips its tick.
+   after a park). The three residuals this stage left were addressed by the
+   `microtask-residuals-await-ticks` follow-up: (a) a top-level `await` of a
+   settled/non-promise operand now yields a tick via a marked sentinel
+   pending promise enqueued at the END of the current queue (Node module-TLA
+   order, including rejections; tested against Node in
+   `tests/conformance_await_tick.rs`); (b) a cached re-await of a host-call
+   promise yields its tick (park in async bodies, sentinel at top level);
+   (c) `await` of a pending `.then` chain inside async *generator* bodies
+   now settles correctly — the generator drive loop fires
+   `process_continuation` for handler frames (the handler's return used to
+   leak onto the generator's stack), and `SuspendedFrame` carries the
+   frame's promoted-cell map (`boxed`, wire v7 → v8) — fixing a latent
+   pre-existing bug where a boxed generator local written between yields
+   silently reverted on resume, in sync generators too. Remaining pinned
+   divergence: generator-body awaits run inline (no tick) — full task
+   semantics for generators would mean running generator frames in the main
+   loop.
 5. **Stage 4 — durable hardening.** Snapshot/resume tests with microtasks and
    suspended async tasks in flight across a host call; wire-version bump; fuzz
    the drain across suspensions.
