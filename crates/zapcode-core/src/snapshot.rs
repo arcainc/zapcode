@@ -72,6 +72,10 @@ pub(crate) struct VmSnapshot {
     pub(crate) async_tasks: BTreeMap<u64, crate::vm::AsyncTask>,
     #[serde(default)]
     pub(crate) next_async_task_id: u64,
+    /// Try-frames covering suspended generator bodies (see
+    /// `Vm::generator_try_frames`).
+    #[serde(default)]
+    pub(crate) generator_try_frames: BTreeMap<u64, Vec<TryInfo>>,
 }
 
 impl VmSnapshot {
@@ -121,6 +125,7 @@ impl VmSnapshot {
             unhandled_rejections: vm.unhandled_rejections.clone(),
             async_tasks: vm.async_tasks.clone(),
             next_async_task_id: vm.next_async_task_id,
+            generator_try_frames: vm.generator_try_frames.clone(),
         }
     }
 
@@ -158,6 +163,7 @@ impl VmSnapshot {
         vm.unhandled_rejections = self.unhandled_rejections;
         vm.async_tasks = self.async_tasks;
         vm.next_async_task_id = self.next_async_task_id;
+        vm.generator_try_frames = self.generator_try_frames;
         vm
     }
 }

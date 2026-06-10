@@ -1,6 +1,8 @@
 # Design: Generators in the Main Loop
 
-Status: **proposal** (no core code changed yet)
+Status: **in progress** — Stage 0 implemented on `generator-mainloop-stage0`
+(plus the latent yield-in-try fix in BOTH drivers, and tool-suspension
+inside `.next()`-pulled bodies arriving early). Stages 1–4 remain.
 Author: conformance hardening effort
 Scope: drive generator bodies with the main `execute()` loop instead of the
 nested drive loop, so tool calls inside generators suspend durably and
@@ -101,6 +103,23 @@ test:e2e-full`.
 1. **Stage 0 — `.next()` through the main loop, behavior-identical.**
    `GeneratorNext` continuation + Yield-as-detach + try-frame migration.
    Delete the nested drive loop. Pure re-plumbing; the suite must not move.
+   **✅ Implemented** (`generator-mainloop-stage0`): `gen.next(arg)` pushes
+   the body frame plus `Continuation::GeneratorNext` (the in-flight
+   generator object rides on the continuation); the main loop's `Yield` arm
+   detaches frame + stack + try-frames (stashed in a new
+   `Vm.generator_try_frames` map keyed by generator id — `TryInfo` stays
+   out of `value.rs`); return/fall-off answers `{value, done: true}` via
+   `process_continuation`; a throw escaping the body propagates to the
+   `.next()` caller and marks the generator done; re-entrant pulls raise
+   Node's "Generator is already running" TypeError. The try-frame
+   stash/restore also went into the legacy nested driver, fixing the latent
+   yield-in-try leak for `for…of`/spread paths too. The nested driver's
+   Yield interception is depth-gated so a main-loop pull of another
+   generator inside a nested-driven body coexists. Suite unchanged (99
+   binaries green); wire v9 → v10. EARLY Stage-2 capability: tool calls and
+   pending-chain awaits inside `.next()`-pulled bodies suspend/drain
+   durably (`tests/generator_mainloop.rs`, incl. dump/load mid-body). The
+   nested driver still serves `for…of`/spread/`yield*` until Stage 1.
 2. **Stage 1 — lazy `for…of`/`yield*`/spread.** Retire `drain_generator`;
    infinite generators with `break` start working.
 3. **Stage 2 — tool calls inside generator bodies.** Lift the
