@@ -65,6 +65,13 @@ pub(crate) struct VmSnapshot {
     /// reports the rejection deterministically at end-of-drain after resume.
     #[serde(default)]
     pub(crate) unhandled_rejections: Vec<crate::heap::Handle>,
+    /// Async function calls parked at an `await` (Stage 3) — restored so a
+    /// host-call suspension with tasks in flight resumes them when their
+    /// awaited promises settle.
+    #[serde(default)]
+    pub(crate) async_tasks: BTreeMap<u64, crate::vm::AsyncTask>,
+    #[serde(default)]
+    pub(crate) next_async_task_id: u64,
 }
 
 impl VmSnapshot {
@@ -112,6 +119,8 @@ impl VmSnapshot {
             heap: vm.heap.clone(),
             microtasks: vm.microtasks.clone(),
             unhandled_rejections: vm.unhandled_rejections.clone(),
+            async_tasks: vm.async_tasks.clone(),
+            next_async_task_id: vm.next_async_task_id,
         }
     }
 
@@ -147,6 +156,8 @@ impl VmSnapshot {
         vm.cells = self.cells;
         vm.microtasks = self.microtasks;
         vm.unhandled_rejections = self.unhandled_rejections;
+        vm.async_tasks = self.async_tasks;
+        vm.next_async_task_id = self.next_async_task_id;
         vm
     }
 }

@@ -47,7 +47,10 @@ const MAGIC: &[u8; 4] = b"ZPC1";
 /// v6: microtask Stage 1 — new `Continuation::MicrotaskReaction` and
 /// `ResumeAction::SettleResult` variants (shifted discriminants) and the
 /// `unhandled_rejections` snapshot field, incompatible with v5.
-pub(crate) const FORMAT_VERSION: u16 = 6;
+/// v7: microtask Stage 3 — `CallFrame.async_result`, `Microtask.task`, and
+/// the `async_tasks` snapshot field (parked async calls), incompatible
+/// with v6.
+pub(crate) const FORMAT_VERSION: u16 = 7;
 
 const HEADER_LEN: usize = 4 + 2 + 1 + 1 + 32;
 

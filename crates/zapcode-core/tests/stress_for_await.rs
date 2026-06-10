@@ -167,9 +167,9 @@ fn for_await_rejected_promise_throws_and_is_catchable() {
             main();
         "#
         ),
-        // Awaiting a rejected promise throws the same RuntimeError that a bare
-        // `await Promise.reject(...)` does; for-await inherits that behavior.
-        "caught:Error: Unhandled promise rejection: boom"
+        // Awaiting a rejected promise rethrows the ORIGINAL reason (identity
+        // preserved since microtask Stage 3); for-await inherits that.
+        "caught:boom"
     );
 }
 

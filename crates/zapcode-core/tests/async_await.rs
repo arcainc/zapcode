@@ -758,14 +758,16 @@ fn test_sequential_external_calls_in_loop() {
 
 #[test]
 fn test_array_map_async_callback_with_external() {
-    // The core use case: arr.map(async fn => await external())
+    // The core use case: await Promise.all(arr.map(async fn => await external())).
+    // Since microtask Stage 3 the async callbacks park at `await`, so .map()
+    // yields an array of promises (as in Node) — Promise.all gathers them.
     let code = r#"
         const items = ["a", "b", "c"];
         const results = items.map(async (item) => {
             const data = await fetchData(item);
             return data;
         });
-        results
+        await Promise.all(results)
     "#;
 
     let state = start_with_externals(code, vec!["fetchData"], Vec::new());
@@ -873,14 +875,14 @@ fn test_array_map_sync_still_works() {
 
 #[test]
 fn test_array_map_async_single_element() {
-    // Edge case: single element
+    // Edge case: single element (promise gathered via Promise.all, as in Node).
     let code = r#"
         const items = ["only"];
         const results = items.map(async (item) => {
             const data = await fetchData(item);
             return data;
         });
-        results
+        await Promise.all(results)
     "#;
 
     let state = start_with_externals(code, vec!["fetchData"], Vec::new());
@@ -1032,10 +1034,10 @@ fn test_callback_result_user_object_not_unwrapped() {
     // unwrapped as if it were an internal promise.
     let code = r#"
         const items = ["x"];
-        items.map(async (item) => {
+        await Promise.all(items.map(async (item) => {
             const data = await fetchData(item);
             return data;
-        })
+        }))
     "#;
 
     let state = start_with_externals(code, vec!["fetchData"], Vec::new());
