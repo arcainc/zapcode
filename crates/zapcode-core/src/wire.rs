@@ -44,7 +44,10 @@ const MAGIC: &[u8; 4] = b"ZPC1";
 /// the postcard discriminants, incompatible with v3.
 /// v5: added the `microtasks` queue to the VM snapshot — a new trailing struct
 /// field, incompatible with v4 (postcard reads fields positionally).
-pub(crate) const FORMAT_VERSION: u16 = 5;
+/// v6: microtask Stage 1 — new `Continuation::MicrotaskReaction` and
+/// `ResumeAction::SettleResult` variants (shifted discriminants) and the
+/// `unhandled_rejections` snapshot field, incompatible with v5.
+pub(crate) const FORMAT_VERSION: u16 = 6;
 
 const HEADER_LEN: usize = 4 + 2 + 1 + 1 + 32;
 
