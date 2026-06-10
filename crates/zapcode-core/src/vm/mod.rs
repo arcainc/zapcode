@@ -124,13 +124,16 @@ pub(crate) struct CallFrame {
     /// Local slots that have been promoted to shared upvalue cells (captured by
     /// a nested closure): slot -> cell id. Reads/writes of these slots route
     /// through the cell arena so the closure and this frame stay in sync.
+    /// `BTreeMap` (not `HashMap`) so a decoded frame re-serializes to the
+    /// same bytes — snapshot determinism (content-addressing) requires it.
     #[serde(default)]
-    pub(crate) boxed: HashMap<usize, u64>,
+    pub(crate) boxed: BTreeMap<usize, u64>,
     /// Free-variable bindings for a closure frame: name -> cell id. A name found
     /// here shadows the global of the same name (LoadGlobal/StoreGlobal consult
     /// it first), connecting captured names to their shared cells.
+    /// `BTreeMap` for the same determinism reason as `boxed`.
     #[serde(default)]
-    pub(crate) env: HashMap<String, u64>,
+    pub(crate) env: BTreeMap<String, u64>,
     /// Set on an async function body frame the first time it detaches at an
     /// `await` (microtask-design Stage 3): the pending result promise the
     /// caller received at detach time. A frame with this set has NO caller
@@ -2141,7 +2144,7 @@ impl Vm {
 
         // Captured-by-reference variables: the frame's env maps each name to its
         // shared cell so LoadGlobal/StoreGlobal in the body see and mutate it.
-        let env: HashMap<String, u64> = closure.env.iter().cloned().collect();
+        let env: BTreeMap<String, u64> = closure.env.iter().cloned().collect();
 
         // Consume the one-shot field-initializer flag (set by `call_field_init`).
         let is_field_init = std::mem::take(&mut self.next_frame_is_field_init);
@@ -2154,7 +2157,7 @@ impl Vm {
             stack_base: self.stack.len(),
             this_value,
             receiver_source,
-            boxed: HashMap::new(),
+            boxed: BTreeMap::new(),
             env,
             is_field_init,
             async_result: None,
@@ -2178,8 +2181,8 @@ impl Vm {
             stack_base: 0,
             this_value: None,
             receiver_source: None,
-            boxed: HashMap::new(),
-            env: HashMap::new(),
+            boxed: BTreeMap::new(),
+            env: BTreeMap::new(),
             is_field_init: false,
             async_result: None,
         });
@@ -3916,7 +3919,7 @@ impl Vm {
                     }
                 }
                 let stack_base = self.stack.len();
-                let env: HashMap<String, u64> = gen_obj.env.iter().cloned().collect();
+                let env: BTreeMap<String, u64> = gen_obj.env.iter().cloned().collect();
                 self.frames.push(CallFrame {
                     program_index: func_ref.program_id,
                     func_index: Some(func_ref.function_id),
@@ -3925,7 +3928,7 @@ impl Vm {
                     stack_base,
                     this_value: None,
                     receiver_source: None,
-                    boxed: HashMap::new(),
+                    boxed: BTreeMap::new(),
                     env,
                     is_field_init: false,
                     async_result: None,
@@ -3939,7 +3942,7 @@ impl Vm {
                     self.push(val.clone())?;
                 }
                 self.push(arg)?;
-                let env: HashMap<String, u64> = gen_obj.env.iter().cloned().collect();
+                let env: BTreeMap<String, u64> = gen_obj.env.iter().cloned().collect();
                 self.frames.push(CallFrame {
                     program_index: func_ref.program_id,
                     func_index: Some(func_ref.function_id),
@@ -3948,7 +3951,7 @@ impl Vm {
                     stack_base,
                     this_value: None,
                     receiver_source: None,
-                    boxed: HashMap::new(),
+                    boxed: BTreeMap::new(),
                     env,
                     is_field_init: false,
                     async_result: None,
