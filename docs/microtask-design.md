@@ -1,6 +1,9 @@
 # Design: Microtask / Event-Loop Ordering
 
-Status: **proposal** (no core code changed yet)
+Status: **in progress** — Stage 0 landed (PR #26); Stage 2 (`async` returns a
+Promise + host-boundary implicit await) implemented on
+`conformance-async-returns-promise`; Stage 1 (microtask queue + drain)
+implemented on `microtask-stage1-then-enqueue`. Stages 3, 4 remain.
 Author: conformance hardening effort
 Scope: make Promise/`async`/`await` ordering match Node, without breaking the
 durable-execution (snapshot/suspend/resume) core.
@@ -225,14 +228,40 @@ durable-session suite).
 1. **Stage 0 — Promise state machine + `resolve_promise` + reaction lists**, but
    keep eager drain (reactions still run inline). No behavior change; pure
    refactor that introduces the data model. Lowest risk; lands first.
+   **✅ Landed** (PR #26): the serializable `microtasks` queue + wire v5; the
+   reaction-list promise extension arrives with Stage 1.
 2. **Stage 1 — Microtask queue + drain at top-level completion.** Switch
    `.then`/`.catch`/`.finally` from run-now to enqueue. Fixes `.then`
    ordering and nested-`.then` order. `await` still inline for now.
    - Test: `then_order`, `nested_then`, `finally_order`.
+   **✅ Implemented** (`microtask-stage1-then-enqueue`): settled receivers
+   enqueue a `Microtask`, pending chain links carry reaction records in the
+   heap (`register_reaction`/`settle_promise`), the drain runs at top-level
+   completion, and `await` of a pending chain drains one microtask per pass
+   (re-dispatching the `Await` — suspension-safe, frames stay in the main
+   loop). A `throw` escaping a handler rejects the chain (so
+   `p.then(throwing).catch(h)` is spec-correct, with reason identity), and
+   rejections nobody handles fail the run at end-of-drain (R3). Tool calls
+   inside handlers suspend mid-drain via `ResumeAction::SettleResult` with
+   the queue in the snapshot. The old eager `Continuation::PromiseCallback`/
+   `ChainResult` machinery was removed; wire v5 → v6. Tests:
+   `tests/conformance_microtask.rs` (Node ground-truthed, incl. dump/load
+   mid-drain). Residual for Stage 3: `await` of a *settled* promise is still
+   inline (no await-tick), so interleaving around `await` can run ahead of
+   Node; `Promise.race`/`any` over pending chains settle by element order,
+   not tick order.
 3. **Stage 2 — `async` returns a Promise.** Fixes `async function(){return 5}`
    `.then` throwing, and `f().then(...)`. `await` of that promise still settles
    synchronously within the body.
    - Test: `async_return`; ensure `const x = await f()` unchanged.
+   **✅ Implemented** (`conformance-async-returns-promise`): async returns wrap
+   in a resolved Promise (returned promises adopted; async *generators*
+   excluded), and the host boundary implicitly awaits the program result — a
+   settled final promise unwraps for the host, a rejected one surfaces as an
+   "Unhandled promise rejection" error (`Vm::execute_to_host`). Tests:
+   `tests/conformance_async_return.rs`. Residual for Stage 3: a `throw`
+   escaping an async body still propagates synchronously (so `f().catch(...)`
+   cannot observe it), and reactions still run eagerly.
 4. **Stage 3 — `await` suspends the task** (AsyncTask detach + `ResumeAsync`).
    Fixes interleaving (`await_order`, `two_awaits`, `microtask_vs_sync`). The
    invasive stage; do last, behind the now-proven queue/drain.

@@ -60,6 +60,11 @@ pub(crate) struct VmSnapshot {
     /// resumes with the remaining reactions intact.
     #[serde(default)]
     pub(crate) microtasks: std::collections::VecDeque<crate::vm::Microtask>,
+    /// Rejected promises with no handler at settle time (see
+    /// `Vm::unhandled_rejections`) — carried so a suspension mid-drain still
+    /// reports the rejection deterministically at end-of-drain after resume.
+    #[serde(default)]
+    pub(crate) unhandled_rejections: Vec<crate::heap::Handle>,
 }
 
 impl VmSnapshot {
@@ -106,6 +111,7 @@ impl VmSnapshot {
             rng_state: vm.rng_state,
             heap: vm.heap.clone(),
             microtasks: vm.microtasks.clone(),
+            unhandled_rejections: vm.unhandled_rejections.clone(),
         }
     }
 
@@ -140,6 +146,7 @@ impl VmSnapshot {
         vm.rng_state = self.rng_state;
         vm.cells = self.cells;
         vm.microtasks = self.microtasks;
+        vm.unhandled_rejections = self.unhandled_rejections;
         vm
     }
 }

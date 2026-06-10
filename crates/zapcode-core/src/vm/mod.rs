@@ -159,18 +159,25 @@ pub(crate) enum Continuation {
         caller_frame_depth: usize,
         callback_frame_index: usize,
     },
-    /// Running a `.then()`/`.catch()`/`.finally()` callback that may itself make
-    /// an external (tool) call and therefore must be able to suspend. The main
-    /// `execute()` loop drives the callback the same way it drives array
-    /// callbacks; when the callback's frame pops, the continuation shapes the
-    /// result into the promise the chain expects and pushes it. Because the
-    /// continuation is part of the serialized VM state, a suspension mid-callback
-    /// resumes cleanly and finishes the chain.
-    PromiseCallback {
-        /// How to turn the callback's return value into the chain's result.
+    /// Running a drained [`Microtask`]'s handler — a `.then()`/`.catch()`/
+    /// `.finally()` callback, which may itself make an external (tool) call
+    /// and therefore must be able to suspend. The main `execute()` loop
+    /// drives the callback the same way it drives array callbacks. The
+    /// chain's dependent promise already exists (created when the method
+    /// enqueued), so when the callback's frame pops, its return value
+    /// *settles* `result_promise` (with thenable adoption) and nothing is
+    /// pushed. A `throw` escaping the callback rejects `result_promise`
+    /// instead of propagating to the code that happened to be running when
+    /// the drain started (microtasks are their own turn — see the `Err` arm
+    /// of `execute()`).
+    MicrotaskReaction {
         mode: PromiseCallbackMode,
-        /// The original promise (used by `finally`, which passes it through).
-        original_promise: Value,
+        /// The dependent promise to settle with the callback's outcome.
+        result_promise: Value,
+        /// The receiver's settled outcome (`PassThrough`/`finally` re-settles
+        /// `result_promise` with this, discarding the callback's return value).
+        original_value: Value,
+        original_is_rejection: bool,
         caller_frame_depth: usize,
         callback_frame_index: usize,
     },
@@ -211,11 +218,11 @@ pub(crate) enum PromiseCallbackMode {
 /// Outcome of dispatching a `.then`/`.catch`/`.finally` method. See
 /// [`Vm::execute_promise_method`].
 enum PromiseMethodOutcome {
-    /// Completed synchronously (no callback ran); the value should be pushed.
+    /// Completed synchronously; the value should be pushed. With the microtask
+    /// model this is the only success shape: the handler never runs inline —
+    /// the value is the receiver (pass-through) or a new pending promise that
+    /// the enqueued/registered reaction settles during the drain.
     Value(Value),
-    /// A callback frame + [`Continuation::PromiseCallback`] were pushed; the
-    /// dispatch caller must return `Ok(None)` so the main loop drives it.
-    ContinuationStarted,
     /// The method was called on a deferred single-call promise (N5), forcing its
     /// host call: the VM must suspend on it. The dispatch caller returns this
     /// `VmState` up to the host; on resume, `resume_action` finishes the method.
@@ -313,6 +320,13 @@ pub struct Vm {
     /// synchronous run completes (and after each host-call resume), giving JS
     /// Promise ordering. Serialized so a suspension mid-drain resumes cleanly.
     pub(crate) microtasks: std::collections::VecDeque<Microtask>,
+    /// Promises that settled rejected with nobody to handle the rejection
+    /// (no reject reaction at settle time). Cleared when a handler attaches
+    /// (`.catch` on a rejected promise) or the rejection is consumed (`await`,
+    /// host boundary). Anything still here at end-of-drain surfaces as an
+    /// "Unhandled promise rejection" error — JS's unhandled-rejection event,
+    /// made deterministic. Serialized: a suspension mid-drain must not lose it.
+    pub(crate) unhandled_rejections: Vec<Handle>,
 }
 
 /// Deferred action applied to the value the host delivers when resuming a
@@ -325,20 +339,22 @@ pub(crate) enum ResumeAction {
     /// and run `method` with `args`, threading through the normal promise-method
     /// machinery (which supports tool calls inside the callback, per N4).
     PromiseMethod { method: String, args: Vec<Value> },
-    /// The suspension was driven by a promise callback *returning* a deferred
-    /// single-call promise (thenable adoption): the chain forced that call. On
-    /// resume, the settled promise becomes (or is folded into) the chain's
-    /// result per `mode`. See the `PromiseCallback` arm of `process_continuation`.
-    ChainResult {
-        mode: PromiseCallbackMode,
-        original_promise: Value,
-    },
     /// A plain `await p` on a deferred single-call promise forced its call. The
     /// resumed value is the await result (pushed by the host) — but we also cache
     /// it under the call id so a *second* `await p` / `p.then(...)` on the same
     /// promise reuses the settled value instead of re-invoking the host (matching
     /// JS, where a promise settles once).
     CacheValue { id: u64 },
+    /// A *microtask* callback returned a deferred single-call promise (thenable
+    /// adoption mid-drain): the drain forced that call. On resume, settle
+    /// `result_promise` with the host outcome — or, when `pass_original` is set
+    /// (`finally`), with the receiver's original outcome `(value, is_rejection)`
+    /// once the forced call completes. The drain then continues from the
+    /// top-level overflow branch.
+    SettleResult {
+        result_promise: Value,
+        pass_original: Option<(Value, bool)>,
+    },
 }
 
 /// The preferred type passed to [`Vm::to_primitive`], mirroring the JS
@@ -479,6 +495,7 @@ impl Vm {
             next_frame_is_field_init: false,
             resume_action: None,
             microtasks: std::collections::VecDeque::new(),
+            unhandled_rejections: Vec::new(),
         }
     }
 
@@ -569,6 +586,7 @@ impl Vm {
             next_frame_is_field_init: false,
             resume_action: None,
             microtasks: std::collections::VecDeque::new(),
+            unhandled_rejections: Vec::new(),
         }
     }
 
@@ -611,7 +629,7 @@ impl Vm {
                 }
             }
         }
-        self.execute()
+        self.execute_to_host()
     }
 
     /// Apply a [`ResumeAction`] to the settled (resolved/rejected) promise that a
@@ -635,9 +653,6 @@ impl Vm {
                         self.push(v)?;
                         Ok(None)
                     }
-                    // A callback frame + continuation were started; the main loop
-                    // drives them.
-                    PromiseMethodOutcome::ContinuationStarted => Ok(None),
                     // The callback itself was a tool call that suspended again.
                     PromiseMethodOutcome::Suspend(state) => Ok(Some(state)),
                     PromiseMethodOutcome::NotAPromise => {
@@ -648,36 +663,35 @@ impl Vm {
                     }
                 }
             }
-            ResumeAction::ChainResult {
-                mode,
-                original_promise,
+            // A microtask handler returned a deferred single-call promise; its
+            // forced host call has now settled into `settled`. Settle the
+            // chain's dependent promise: the host outcome for `.then`/`.catch`
+            // adoption, or the receiver's original outcome for `.finally`
+            // (which awaited the cleanup promise but discards its value). The
+            // caller's `execute()` then continues the drain. Nothing is pushed
+            // — the chain expression already received the dependent promise.
+            ResumeAction::SettleResult {
+                result_promise,
+                pass_original,
             } => {
-                // A promise callback returned a deferred single-call promise; its
-                // host call has now settled into `settled`. Fold it into the chain
-                // result per the callback mode, then continue the execute loop.
-                let is_rejected = matches!(
-                    &settled,
-                    Value::Object(h) if matches!(
-                        self.heap.object(*h).and_then(|m| m.get("status")),
-                        Some(Value::String(s)) if s.as_ref() == "rejected"
-                    )
-                );
-                let chain_result = match mode {
-                    // `.then`/`.catch`: adopt the settled promise as the chain's
-                    // next promise (resolved value flows on; a rejection rejects).
-                    PromiseCallbackMode::WrapResult => settled,
-                    // `.finally`: the returned promise is awaited but its *value*
-                    // is discarded — the original promise passes through on
-                    // success; a rejection from the cleanup promise wins.
-                    PromiseCallbackMode::PassThrough => {
-                        if is_rejected {
-                            settled
-                        } else {
-                            original_promise
-                        }
+                let (outcome, is_rejection) = if let Some(original) = pass_original {
+                    original
+                } else if let Value::Object(h) = &settled {
+                    let map = self.heap.object_map(*h);
+                    match map.get("status") {
+                        Some(Value::String(s)) if s.as_ref() == "rejected" => (
+                            map.get("reason").cloned().unwrap_or(Value::Undefined),
+                            true,
+                        ),
+                        _ => (
+                            map.get("value").cloned().unwrap_or(Value::Undefined),
+                            false,
+                        ),
                     }
+                } else {
+                    (settled, false)
                 };
-                self.push(chain_result)?;
+                self.settle_promise(&result_promise, outcome, is_rejection)?;
                 Ok(None)
             }
             // `CacheValue` is handled inline by `resume_execution` /
@@ -711,14 +725,14 @@ impl Vm {
                 let rejected = builtins::make_rejected_promise(error.clone(), &mut self.heap);
                 return match self.run_resume_action(action, rejected)? {
                     Some(state) => Ok(state),
-                    None => self.execute(),
+                    None => self.execute_to_host(),
                 };
             }
         }
         // Route the rejection to the nearest catch or finally (running finallys
         // on the way), exactly as the execute loop does for a runtime error.
         if self.route_thrown(error.clone(), 0)? {
-            self.execute()
+            self.execute_to_host()
         } else {
             // No handler — the failure is the program's failure.
             Err(ZapcodeError::ExternalError(error.to_js_string(&self.heap)))
@@ -877,11 +891,273 @@ impl Vm {
         }
     }
 
+    /// True if `frame` runs an `async` function body, so its return value is
+    /// shaped into a resolved Promise on the way out. Async *generators* are
+    /// excluded: their returns flow through the iterator protocol, not the
+    /// async-call return path. (A `throw` escaping an async body still
+    /// propagates synchronously — rejected-promise shaping arrives with await
+    /// suspension, microtask-design Stage 3.)
+    fn frame_is_async(&self, frame: &CallFrame) -> bool {
+        frame.func_index.is_some_and(|fi| {
+            self.program(frame.program_index)
+                .functions
+                .get(fi)
+                .is_some_and(|f| f.is_async && !f.is_generator)
+        })
+    }
+
+    /// Register a `.then`/`.catch`/`.finally` reaction on a *pending* internal
+    /// promise. The record lives on the promise object (so it serializes with
+    /// the heap); `settle_promise` turns each record into a microtask. For
+    /// `then(f, r)` pass both handlers; for `catch(h)` only `on_rejected`; for
+    /// `finally(h)` pass `h` as both with `PassThrough` mode.
+    fn register_reaction(
+        &mut self,
+        receiver: Handle,
+        on_fulfilled: Value,
+        on_rejected: Value,
+        mode: PromiseCallbackMode,
+        result: Value,
+    ) -> Result<()> {
+        let mut record = IndexMap::new();
+        record.insert(Arc::from("on_fulfilled"), on_fulfilled);
+        record.insert(Arc::from("on_rejected"), on_rejected);
+        record.insert(
+            Arc::from("mode"),
+            Value::String(JsString::from(match mode {
+                PromiseCallbackMode::WrapResult => "wrap",
+                PromiseCallbackMode::PassThrough => "pass",
+            })),
+        );
+        record.insert(Arc::from("result"), result);
+        let rec = Value::Object(self.heap.alloc_object(record));
+        let reactions = match self.heap.object(receiver).and_then(|m| m.get("__reactions__")) {
+            Some(Value::Array(a)) => *a,
+            _ => {
+                return Err(ZapcodeError::RuntimeError(
+                    "internal error: pending promise has no reaction list".to_string(),
+                ))
+            }
+        };
+        self.heap
+            .array_mut(reactions)
+            .ok_or_else(|| {
+                ZapcodeError::RuntimeError(
+                    "internal error: promise reaction list is not an array".to_string(),
+                )
+            })?
+            .push(rec);
+        Ok(())
+    }
+
+    /// Settle a pending internal promise: flip its status, record the outcome,
+    /// and enqueue every registered reaction as a microtask (FIFO — this is
+    /// what gives `.then` chains their tick order). Settling an
+    /// already-settled promise is a no-op (spec double-settle). A rejection
+    /// with no reactions is marked unhandled; the mark clears when a reject
+    /// handler attaches or the rejection is consumed, and anything still
+    /// marked at end-of-drain surfaces as an error.
+    ///
+    /// `outcome` must be a plain (non-promise) value — adoption of a returned
+    /// promise is the *caller's* job (see the `MicrotaskReaction` arm of
+    /// `process_continuation`).
+    fn settle_promise(
+        &mut self,
+        promise: &Value,
+        outcome: Value,
+        is_rejection: bool,
+    ) -> Result<()> {
+        let Value::Object(h) = promise else {
+            return Err(ZapcodeError::RuntimeError(
+                "internal error: settle_promise on a non-object".to_string(),
+            ));
+        };
+        let reactions = {
+            let map = self.heap.object_mut(*h).ok_or_else(|| {
+                ZapcodeError::RuntimeError(
+                    "internal error: settle_promise on a dangling handle".to_string(),
+                )
+            })?;
+            if !matches!(map.get("status"), Some(Value::String(s)) if s.as_ref() == "pending") {
+                return Ok(()); // already settled — no-op
+            }
+            let reactions = match map.shift_remove("__reactions__") {
+                Some(Value::Array(a)) => a,
+                _ => {
+                    return Err(ZapcodeError::RuntimeError(
+                        "internal error: pending promise has no reaction list".to_string(),
+                    ))
+                }
+            };
+            if is_rejection {
+                map.insert(
+                    Arc::from("status"),
+                    Value::String(JsString::from("rejected")),
+                );
+                map.insert(Arc::from("reason"), outcome.clone());
+            } else {
+                map.insert(
+                    Arc::from("status"),
+                    Value::String(JsString::from("resolved")),
+                );
+                map.insert(Arc::from("value"), outcome.clone());
+            }
+            reactions
+        };
+        let records = self.heap.array_vec(reactions);
+        if is_rejection && records.is_empty() {
+            self.unhandled_rejections.push(*h);
+        }
+        for rec in records {
+            let Value::Object(rh) = rec else { continue };
+            let map = self.heap.object_map(rh);
+            let handler = if is_rejection {
+                map.get("on_rejected").cloned().unwrap_or(Value::Undefined)
+            } else {
+                map.get("on_fulfilled").cloned().unwrap_or(Value::Undefined)
+            };
+            let mode = match map.get("mode") {
+                Some(Value::String(s)) if s.as_ref() == "pass" => PromiseCallbackMode::PassThrough,
+                _ => PromiseCallbackMode::WrapResult,
+            };
+            let result_promise = map.get("result").cloned().unwrap_or(Value::Undefined);
+            self.microtasks.push_back(Microtask {
+                handler,
+                value: outcome.clone(),
+                is_rejection,
+                mode,
+                result_promise,
+            });
+        }
+        Ok(())
+    }
+
+    /// Clear an unhandled-rejection mark: a reject handler attached to the
+    /// promise, or its rejection was consumed (`await` rethrow, host boundary).
+    fn mark_rejection_handled(&mut self, h: Handle) {
+        self.unhandled_rejections.retain(|m| *m != h);
+    }
+
+    /// True for a *microtask-pending* internal promise (a `.then` chain link
+    /// that settles during the drain) — as opposed to `pending_call`/
+    /// `pending_all` host promises or the never-settling pinned promises
+    /// (e.g. `Promise.race([])`), which carry no reaction list.
+    fn is_internal_pending(&self, v: &Value) -> bool {
+        if let Value::Object(h) = v {
+            if let Some(m) = self.heap.object(*h) {
+                return matches!(m.get("__promise__"), Some(Value::Bool(true)))
+                    && matches!(m.get("status"), Some(Value::String(s)) if s.as_ref() == "pending")
+                    && m.contains_key("__reactions__");
+            }
+        }
+        false
+    }
+
+    /// Begin running a drained microtask. A callable handler gets a frame plus
+    /// a [`Continuation::MicrotaskReaction`] — the main loop drives it, so a
+    /// tool call inside the handler suspends normally. A non-callable handler
+    /// is the pass-through reaction: settle `result_promise` with the
+    /// receiver's outcome directly, no frames (the caller's loop just
+    /// continues; any reactions this settle enqueued run on later passes).
+    fn start_microtask(&mut self, m: Microtask) -> Result<()> {
+        if let Value::Function(closure) = &m.handler {
+            let closure = closure.clone();
+            let args = match m.mode {
+                PromiseCallbackMode::WrapResult => vec![m.value.clone()],
+                PromiseCallbackMode::PassThrough => Vec::new(),
+            };
+            let caller_frame_depth = self.frames.len();
+            self.push_call_frame(&closure, &args, None)?;
+            self.continuations.push(Continuation::MicrotaskReaction {
+                mode: m.mode,
+                result_promise: m.result_promise,
+                original_value: m.value,
+                original_is_rejection: m.is_rejection,
+                caller_frame_depth,
+                callback_frame_index: self.frames.len() - 1,
+            });
+        } else {
+            self.settle_promise(&m.result_promise, m.value, m.is_rejection)?;
+        }
+        Ok(())
+    }
+
+    /// The deterministic end-of-drain unhandled-rejection report (R3): if any
+    /// promise settled rejected with nobody handling it by the time the
+    /// program and its microtasks finished, the run fails with the first one.
+    fn unhandled_rejection_error(&self) -> Option<ZapcodeError> {
+        let h = self.unhandled_rejections.first()?;
+        let reason = self
+            .heap
+            .object(*h)
+            .and_then(|m| m.get("reason"))
+            .cloned()
+            .unwrap_or(Value::Undefined);
+        Some(ZapcodeError::RuntimeError(format!(
+            "Unhandled promise rejection: {}",
+            reason.to_js_string(&self.heap)
+        )))
+    }
+
+    /// Run the main loop and shape the finished state for the host. The
+    /// program result is implicitly awaited (like a runtime awaiting its entry
+    /// point): completing with a *settled* internal promise — the value of an
+    /// unawaited `async f()` call or a bare `Promise.resolve(...)` — delivers
+    /// the fulfilled value, and a rejected one surfaces as an
+    /// unhandled-rejection error. Deferred host-call promises (`pending_call`/
+    /// `pending_all`) pass through untouched: their calls were never triggered.
+    /// Every host-facing entry (`run_program`, `resume_*`) must route its final
+    /// `execute()` through this, so a promise object never leaks to the host.
+    fn execute_to_host(&mut self) -> Result<VmState> {
+        let state = self.execute()?;
+        let VmState::Complete(val) = state else {
+            return Ok(state);
+        };
+        if builtins::is_promise(&val, &self.heap) {
+            if let Value::Object(h) = &val {
+                let map = self.heap.object_map(*h);
+                match map.get("status") {
+                    Some(Value::String(s)) if s.as_ref() == "resolved" => {
+                        let inner = map.get("value").cloned().unwrap_or(Value::Undefined);
+                        return Ok(VmState::Complete(inner));
+                    }
+                    Some(Value::String(s)) if s.as_ref() == "rejected" => {
+                        let reason = map.get("reason").cloned().unwrap_or(Value::Undefined);
+                        return Err(ZapcodeError::RuntimeError(format!(
+                            "Unhandled promise rejection: {}",
+                            reason.to_js_string(&self.heap)
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(VmState::Complete(val))
+    }
+
     /// Pop the current call frame and deliver `return_val` to the caller (the
     /// body of the old `Return` instruction). Returns `VmState::Complete` at the
     /// top level. The caller must already have run any escaped `finally` blocks.
     fn perform_return(&mut self, return_val: Value) -> Result<Option<VmState>> {
         if self.frames.len() <= 1 {
+            // Top-level return: route through the end-of-program branch of
+            // `execute()` so queued microtasks drain (and unhandled rejections
+            // report) before completion — park the value on the stack and jump
+            // past the last instruction.
+            if !self.microtasks.is_empty() || !self.unhandled_rejections.is_empty() {
+                self.push(return_val)?;
+                let frame = self.frames.last().unwrap();
+                let end = match frame.func_index {
+                    Some(idx) => {
+                        self.program(frame.program_index).functions[idx]
+                            .instructions
+                            .len()
+                    }
+                    None => self.program(frame.program_index).instructions.len(),
+                };
+                self.current_frame_mut().ip = end;
+                return Ok(None);
+            }
             return Ok(Some(VmState::Complete(return_val)));
         }
 
@@ -909,6 +1185,14 @@ impl Vm {
             }
         } else {
             return_val
+        };
+
+        // An async function's result is a resolved Promise (a returned promise is
+        // adopted). So `f().then(...)` works and `await f()` unwraps it.
+        let actual_return = if self.frame_is_async(&frame) {
+            builtins::make_resolved_promise(actual_return, &mut self.heap)
+        } else {
+            actual_return
         };
 
         self.stack.truncate(frame.stack_base);
@@ -954,7 +1238,7 @@ impl Vm {
                 }
                 let value = results.into_iter().next().unwrap_or(Value::Undefined);
                 self.push(value)?;
-                self.execute()
+                self.execute_to_host()
             }
             // all/allSettled deliver one settled entry per pending call, in the
             // order the calls were presented; reassemble in element order.
@@ -969,13 +1253,27 @@ impl Vm {
                 for (id, value) in batch.call_ids.iter().zip(results) {
                     self.resolved.insert(*id, value);
                 }
+                self.consume_batch_element_rejections(&batch.items);
                 let array = match batch.kind {
                     BatchKind::AllSettled => self.build_settled_array(batch.items)?,
                     _ => self.build_batch_array(batch.items)?,
                 };
                 let h = self.heap.alloc_array(array);
                 self.push(Value::Array(h))?;
-                self.execute()
+                self.execute_to_host()
+            }
+        }
+    }
+
+    /// A combinator consuming its elements handles their rejections: a
+    /// rejected `.then`-chain element feeding `Promise.all`/`allSettled`/...
+    /// becomes the batch's outcome (a rejection that propagates, or a
+    /// `{status:"rejected"}` entry), so it must not also report as an
+    /// unhandled rejection at end-of-drain.
+    fn consume_batch_element_rejections(&mut self, items: &[Value]) {
+        for item in items {
+            if let Value::Object(h) = item {
+                self.mark_rejection_handled(*h);
             }
         }
     }
@@ -1084,6 +1382,7 @@ impl Vm {
 
         if call_ids.is_empty() {
             // Every element already settled — assemble inline without the host.
+            self.consume_batch_element_rejections(&items);
             self.assemble_batch_inline(kind, items)?;
             return Ok(None);
         }
@@ -1599,7 +1898,7 @@ impl Vm {
             is_field_init: false,
         });
 
-        self.execute()
+        self.execute_to_host()
     }
 
     fn execute(&mut self) -> Result<VmState> {
@@ -1616,6 +1915,22 @@ impl Vm {
             if frame.ip >= instructions.len() {
                 // End of function/program
                 if self.frames.len() <= 1 {
+                    // The synchronous run is over — drain the microtask queue
+                    // before completing. Each drained reaction runs as its own
+                    // turn in this same loop (its callback frames sit on top of
+                    // the finished top-level frame, whose ip stays past the
+                    // end, so control returns here for the next microtask). A
+                    // host call inside a reaction suspends with the remaining
+                    // queue in the snapshot; resume re-enters this drain.
+                    if let Some(m) = self.microtasks.pop_front() {
+                        self.start_microtask(m)?;
+                        continue;
+                    }
+                    // End of drain: a rejection nobody handled fails the run
+                    // deterministically (JS's unhandled-rejection event).
+                    if let Some(err) = self.unhandled_rejection_error() {
+                        return Err(err);
+                    }
                     // Top-level: return last value on stack or undefined
                     let result = if self.stack.is_empty() {
                         Value::Undefined
@@ -1624,16 +1939,24 @@ impl Vm {
                     };
                     return Ok(VmState::Complete(result));
                 } else {
-                    // Return from function
+                    // Return from function (fell off the end → implicit undefined)
                     let frame = self.frames.pop().unwrap();
                     self.tracker.pop_frame();
+                    let is_async = self.frame_is_async(&frame);
                     // If this was a constructor, return `this`
-                    if let Some(this_val) = frame.this_value {
+                    let ret = if let Some(this_val) = frame.this_value {
                         self.stack.truncate(frame.stack_base);
-                        self.push(this_val)?;
+                        this_val
                     } else {
-                        self.push(Value::Undefined)?;
-                    }
+                        Value::Undefined
+                    };
+                    // An async function falling off the end resolves with undefined.
+                    let ret = if is_async {
+                        builtins::make_resolved_promise(ret, &mut self.heap)
+                    } else {
+                        ret
+                    };
+                    self.push(ret)?;
                     // Check if a continuation callback just completed
                     if let Some(state) = self.process_continuation()? {
                         return Ok(state);
@@ -1657,10 +1980,46 @@ impl Vm {
                     }
                 }
                 Err(err) => {
-                    // Route the error to the nearest catch or finally. If no
-                    // handler remains it propagates to the host.
                     let error_val = self.caught_error_value(&err);
-                    if !self.route_thrown(error_val, 0)? {
+                    // A throw inside a *microtask* callback is its own turn: it
+                    // may route to handlers within the callback, but escaping
+                    // the callback rejects the reaction's chain promise — it
+                    // must NOT reach handlers of whatever code happened to be
+                    // running when the drain started. This is what makes
+                    // `p.then(throwing).catch(h)` deliver the throw to `h`.
+                    let microtask_boundary = match self.continuations.last() {
+                        Some(Continuation::MicrotaskReaction {
+                            caller_frame_depth,
+                            callback_frame_index,
+                            ..
+                        }) if self.frames.len() > *caller_frame_depth
+                            && self.frames.len() >= *callback_frame_index =>
+                        {
+                            Some(*caller_frame_depth)
+                        }
+                        _ => None,
+                    };
+                    if let Some(depth) = microtask_boundary {
+                        if !self.route_thrown(error_val, depth)? {
+                            // No handler inside the callback — unwind its
+                            // frames and reject the chain with the original
+                            // thrown value (identity preserved for `.catch`).
+                            let reason = self.pending_throw.take().unwrap_or(Value::Undefined);
+                            let stack_base = self.frames[depth].stack_base;
+                            while self.frames.len() > depth {
+                                self.frames.pop();
+                                self.tracker.pop_frame();
+                            }
+                            self.stack.truncate(stack_base);
+                            if let Some(Continuation::MicrotaskReaction {
+                                result_promise, ..
+                            }) = self.continuations.pop()
+                            {
+                                self.settle_promise(&result_promise, reason, true)?;
+                            }
+                        }
+                    } else if !self.route_thrown(error_val, 0)? {
+                        // No handler remains — propagate to the host.
                         return Err(err);
                     }
                 }
@@ -1694,7 +2053,7 @@ impl Vm {
                 caller_frame_depth,
                 ..
             } => (*callback_frame_index, *caller_frame_depth),
-            Continuation::PromiseCallback {
+            Continuation::MicrotaskReaction {
                 callback_frame_index,
                 caller_frame_depth,
                 ..
@@ -1717,15 +2076,15 @@ impl Vm {
         // so an empty stack here indicates a VM bug.
         let callback_result = self.pop()?;
 
-        // `PromiseCallback` continuations re-wrap the callback's return value
-        // into the chain's next promise (see `make_resolved_promise`), so we
-        // must NOT eagerly unwrap/error on internal promises here — that is the
-        // promise-arm's job. Array continuations, by contrast, expect a plain
+        // `MicrotaskReaction` continuations adopt the callback's return value
+        // into the chain's dependent promise themselves, so we must NOT
+        // eagerly unwrap/error on internal promises here — that is the
+        // reaction arm's job. Array continuations, by contrast, expect a plain
         // value per element, so they unwrap a resolved promise and treat a
         // rejected one as an unhandled rejection.
         let is_promise_cont = matches!(
             self.continuations.last(),
-            Some(Continuation::PromiseCallback { .. })
+            Some(Continuation::MicrotaskReaction { .. })
         );
 
         // Unwrap internal promise values: async callbacks return
@@ -1831,18 +2190,20 @@ impl Vm {
                     Ok(None)
                 }
             }
-            Continuation::PromiseCallback {
+            Continuation::MicrotaskReaction {
                 mode,
-                original_promise,
+                result_promise,
+                original_value,
+                original_is_rejection,
                 ..
             } => {
-                // If the callback returned a *deferred single-call promise* (a bare
-                // tool call, N5), the chain must adopt it: force its host call now
-                // and let the settled value flow into the chain. This makes
-                // `.then(() => tool())`, `.catch(() => tool())`, and
-                // `.finally(() => tool())` all drive the deferred call (matching JS
-                // thenable adoption), and preserves the pre-N5 eager behavior where
-                // a bare tool call inside a callback ran the tool.
+                // A drained reaction's handler returned: settle the chain's
+                // dependent promise (created when `.then` enqueued). Nothing is
+                // pushed — the chain expression already received the promise.
+                //
+                // A returned *deferred single-call promise* (bare tool call,
+                // N5) is adopted by forcing its host call now; the recorded
+                // `SettleResult` action settles the chain on resume.
                 if let Value::Object(h) = &callback_result {
                     let is_pending_call = matches!(
                         self.heap.object(*h).and_then(|m| m.get("status")),
@@ -1858,27 +2219,91 @@ impl Vm {
                                 ))
                             }
                         };
-                        self.resume_action = Some(ResumeAction::ChainResult {
-                            mode,
-                            original_promise,
+                        // Already settled (awaited before): use the cached value.
+                        if let Some(cached) = self.resolved.get(&id).cloned() {
+                            match mode {
+                                PromiseCallbackMode::WrapResult => {
+                                    self.settle_promise(&result_promise, cached, false)?;
+                                }
+                                PromiseCallbackMode::PassThrough => {
+                                    self.settle_promise(
+                                        &result_promise,
+                                        original_value,
+                                        original_is_rejection,
+                                    )?;
+                                }
+                            }
+                            return Ok(None);
+                        }
+                        self.resume_action = Some(ResumeAction::SettleResult {
+                            result_promise,
+                            pass_original: match mode {
+                                PromiseCallbackMode::WrapResult => None,
+                                PromiseCallbackMode::PassThrough => {
+                                    Some((original_value, original_is_rejection))
+                                }
+                            },
                         });
                         return self.suspend_on_pending_call(id);
                     }
                 }
-                // The promise callback finished (possibly after suspending for a
-                // tool call). Shape its result into the chain's next promise.
-                let chain_result = match mode {
-                    // `.then`/`.catch`: the callback's return value becomes the
-                    // resolved value of the next promise. `make_resolved_promise`
-                    // unwraps a returned promise (thenable) so chaining works.
+                match mode {
                     PromiseCallbackMode::WrapResult => {
-                        builtins::make_resolved_promise(callback_result, &mut self.heap)
+                        // Thenable adoption of internal promises.
+                        if builtins::is_promise(&callback_result, &self.heap) {
+                            if let Value::Object(h) = &callback_result {
+                                let map = self.heap.object_map(*h);
+                                match map.get("status") {
+                                    Some(Value::String(s)) if s.as_ref() == "resolved" => {
+                                        let inner =
+                                            map.get("value").cloned().unwrap_or(Value::Undefined);
+                                        self.settle_promise(&result_promise, inner, false)?;
+                                    }
+                                    Some(Value::String(s)) if s.as_ref() == "rejected" => {
+                                        let reason =
+                                            map.get("reason").cloned().unwrap_or(Value::Undefined);
+                                        self.mark_rejection_handled(*h);
+                                        self.settle_promise(&result_promise, reason, true)?;
+                                    }
+                                    Some(Value::String(s)) if s.as_ref() == "pending" => {
+                                        // Adopt a microtask-pending promise: a
+                                        // handler-less reaction forwards its
+                                        // eventual outcome to the chain.
+                                        self.register_reaction(
+                                            *h,
+                                            Value::Undefined,
+                                            Value::Undefined,
+                                            PromiseCallbackMode::WrapResult,
+                                            result_promise.clone(),
+                                        )?;
+                                    }
+                                    _ => {
+                                        // pending_all (a batch promise): settle
+                                        // with the promise object itself — an
+                                        // `await` of the chain re-awaits it (the
+                                        // resolved-with-a-promise adoption arm).
+                                        self.settle_promise(
+                                            &result_promise,
+                                            callback_result,
+                                            false,
+                                        )?;
+                                    }
+                                }
+                                return Ok(None);
+                            }
+                        }
+                        self.settle_promise(&result_promise, callback_result, false)?;
                     }
-                    // `.finally`: ignore the callback's return value and pass the
-                    // original promise through unchanged.
-                    PromiseCallbackMode::PassThrough => original_promise,
-                };
-                self.push(chain_result)?;
+                    PromiseCallbackMode::PassThrough => {
+                        // `.finally`: discard the handler's return value and
+                        // re-settle with the receiver's original outcome.
+                        self.settle_promise(
+                            &result_promise,
+                            original_value,
+                            original_is_rejection,
+                        )?;
+                    }
+                }
                 Ok(None)
             }
         }
@@ -2880,19 +3305,18 @@ impl Vm {
 
     /// Execute .then(), .catch(), or .finally() on a resolved/rejected promise.
     ///
-    /// The callback is run via the continuation machinery (a
-    /// [`Continuation::PromiseCallback`]) rather than synchronously, so a tool
-    /// (external) call inside the callback can suspend the VM and resume — this
-    /// is what makes `primary().catch(() => fallbackTool())` work. The main
-    /// `execute()` loop drives the callback; when it returns, the continuation
-    /// shapes the result into the chain's next promise.
+    /// The handler never runs here (microtask-design Stage 1): a settled
+    /// receiver enqueues a [`Microtask`], a microtask-pending receiver
+    /// registers a reaction, and either way the method's value is a new
+    /// pending promise the reaction settles during the drain. The drain runs
+    /// the handler via [`Continuation::MicrotaskReaction`] in the main
+    /// `execute()` loop, so a tool (external) call inside the handler can
+    /// suspend the VM and resume — this is what makes
+    /// `primary().catch(() => fallbackTool())` work.
     ///
     /// Returns:
-    /// - `PromiseMethodOutcome::Value(v)` — completed synchronously (no callback
-    ///   to run); push `v`.
-    /// - `PromiseMethodOutcome::ContinuationStarted` — a callback frame and
-    ///   continuation were pushed; the caller must return `Ok(None)` so the
-    ///   main loop drives it.
+    /// - `PromiseMethodOutcome::Value(v)` — push `v` (the dependent promise,
+    ///   or the receiver passed through when no applicable handler).
     /// - `PromiseMethodOutcome::NotAPromise` — the receiver was not a promise /
     ///   the method is unknown; fall through to the normal error path.
     fn execute_promise_method(
@@ -2948,107 +3372,135 @@ impl Vm {
 
         let on_fulfilled = args.first().cloned().unwrap_or(Value::Undefined);
         let on_rejected = args.get(1).cloned().unwrap_or(Value::Undefined);
+        let receiver = match &promise {
+            Value::Object(h) => *h,
+            _ => unreachable!("non-objects returned NotAPromise above"),
+        };
 
+        // A settled receiver enqueues a microtask; a microtask-pending receiver
+        // registers a reaction (enqueued when it settles). Either way the
+        // method's value is a NEW pending promise the reaction will settle —
+        // the handler no longer runs inline (microtask-design Stage 1).
+        // A method with no applicable callable handler keeps the cheap
+        // pass-through of the receiver itself.
         match method {
-            "then" => {
-                if status == "resolved" {
-                    if matches!(on_fulfilled, Value::Function(_)) {
-                        self.start_promise_callback(
-                            on_fulfilled,
-                            vec![value],
-                            PromiseCallbackMode::WrapResult,
-                            promise,
-                        )
-                    } else {
-                        // No callback — pass through the promise
-                        Ok(PromiseMethodOutcome::Value(promise))
-                    }
-                } else if status == "rejected" {
-                    if matches!(on_rejected, Value::Function(_)) {
-                        self.start_promise_callback(
-                            on_rejected,
-                            vec![reason],
-                            PromiseCallbackMode::WrapResult,
-                            promise,
-                        )
-                    } else {
-                        // No onRejected — pass through the rejection
-                        Ok(PromiseMethodOutcome::Value(promise))
-                    }
-                } else {
-                    Ok(PromiseMethodOutcome::Value(promise))
+            "then" => match status.as_str() {
+                "resolved" if matches!(on_fulfilled, Value::Function(_)) => {
+                    let result = builtins::make_pending_promise(&mut self.heap);
+                    self.microtasks.push_back(Microtask {
+                        handler: on_fulfilled,
+                        value,
+                        is_rejection: false,
+                        mode: PromiseCallbackMode::WrapResult,
+                        result_promise: result.clone(),
+                    });
+                    Ok(PromiseMethodOutcome::Value(result))
                 }
-            }
+                "rejected" if matches!(on_rejected, Value::Function(_)) => {
+                    self.mark_rejection_handled(receiver);
+                    let result = builtins::make_pending_promise(&mut self.heap);
+                    self.microtasks.push_back(Microtask {
+                        handler: on_rejected,
+                        value: reason,
+                        is_rejection: true,
+                        mode: PromiseCallbackMode::WrapResult,
+                        result_promise: result.clone(),
+                    });
+                    Ok(PromiseMethodOutcome::Value(result))
+                }
+                "pending" if self.is_internal_pending(&promise) => {
+                    let result = builtins::make_pending_promise(&mut self.heap);
+                    self.register_reaction(
+                        receiver,
+                        on_fulfilled,
+                        on_rejected,
+                        PromiseCallbackMode::WrapResult,
+                        result.clone(),
+                    )?;
+                    Ok(PromiseMethodOutcome::Value(result))
+                }
+                _ => Ok(PromiseMethodOutcome::Value(promise)),
+            },
             "catch" => {
-                if status == "rejected" {
-                    let handler = args.first().cloned().unwrap_or(Value::Undefined);
-                    if matches!(handler, Value::Function(_)) {
-                        self.start_promise_callback(
+                let handler = args.first().cloned().unwrap_or(Value::Undefined);
+                match status.as_str() {
+                    "rejected" if matches!(handler, Value::Function(_)) => {
+                        self.mark_rejection_handled(receiver);
+                        let result = builtins::make_pending_promise(&mut self.heap);
+                        self.microtasks.push_back(Microtask {
                             handler,
-                            vec![reason],
-                            PromiseCallbackMode::WrapResult,
-                            promise,
-                        )
-                    } else {
-                        Ok(PromiseMethodOutcome::Value(promise))
+                            value: reason,
+                            is_rejection: true,
+                            mode: PromiseCallbackMode::WrapResult,
+                            result_promise: result.clone(),
+                        });
+                        Ok(PromiseMethodOutcome::Value(result))
                     }
-                } else {
-                    // Resolved — pass through
-                    Ok(PromiseMethodOutcome::Value(promise))
+                    "pending"
+                        if self.is_internal_pending(&promise)
+                            && matches!(handler, Value::Function(_)) =>
+                    {
+                        let result = builtins::make_pending_promise(&mut self.heap);
+                        self.register_reaction(
+                            receiver,
+                            Value::Undefined,
+                            handler,
+                            PromiseCallbackMode::WrapResult,
+                            result.clone(),
+                        )?;
+                        Ok(PromiseMethodOutcome::Value(result))
+                    }
+                    _ => Ok(PromiseMethodOutcome::Value(promise)),
                 }
             }
             "finally" => {
                 let handler = args.first().cloned().unwrap_or(Value::Undefined);
-                if matches!(handler, Value::Function(_)) {
-                    // finally callback receives no arguments and its return value
-                    // is discarded — the original promise passes through.
-                    self.start_promise_callback(
-                        handler,
-                        vec![],
-                        PromiseCallbackMode::PassThrough,
-                        promise,
-                    )
-                } else {
-                    // No handler — pass through the original promise
-                    Ok(PromiseMethodOutcome::Value(promise))
+                if !matches!(handler, Value::Function(_)) {
+                    return Ok(PromiseMethodOutcome::Value(promise));
+                }
+                match status.as_str() {
+                    "resolved" => {
+                        let result = builtins::make_pending_promise(&mut self.heap);
+                        self.microtasks.push_back(Microtask {
+                            handler,
+                            value,
+                            is_rejection: false,
+                            mode: PromiseCallbackMode::PassThrough,
+                            result_promise: result.clone(),
+                        });
+                        Ok(PromiseMethodOutcome::Value(result))
+                    }
+                    "rejected" => {
+                        // `finally` observes but does not consume the rejection:
+                        // responsibility transfers to the result promise, which
+                        // re-settles rejected (and is marked then if unhandled).
+                        self.mark_rejection_handled(receiver);
+                        let result = builtins::make_pending_promise(&mut self.heap);
+                        self.microtasks.push_back(Microtask {
+                            handler,
+                            value: reason,
+                            is_rejection: true,
+                            mode: PromiseCallbackMode::PassThrough,
+                            result_promise: result.clone(),
+                        });
+                        Ok(PromiseMethodOutcome::Value(result))
+                    }
+                    "pending" if self.is_internal_pending(&promise) => {
+                        let result = builtins::make_pending_promise(&mut self.heap);
+                        self.register_reaction(
+                            receiver,
+                            handler.clone(),
+                            handler,
+                            PromiseCallbackMode::PassThrough,
+                            result.clone(),
+                        )?;
+                        Ok(PromiseMethodOutcome::Value(result))
+                    }
+                    _ => Ok(PromiseMethodOutcome::Value(promise)),
                 }
             }
             _ => Ok(PromiseMethodOutcome::NotAPromise),
         }
-    }
-
-    /// Push a promise-callback frame plus a [`Continuation::PromiseCallback`] so
-    /// the main `execute()` loop drives the callback. This lets a tool call
-    /// inside the callback suspend the VM (the continuation is part of the
-    /// serialized state and resumes cleanly).
-    fn start_promise_callback(
-        &mut self,
-        callback: Value,
-        args: Vec<Value>,
-        mode: PromiseCallbackMode,
-        original_promise: Value,
-    ) -> Result<PromiseMethodOutcome> {
-        let closure = match &callback {
-            Value::Function(c) => c.clone(),
-            _ => {
-                return Err(ZapcodeError::TypeError(
-                    "promise callback is not a function".to_string(),
-                ))
-            }
-        };
-
-        let caller_frame_depth = self.frames.len();
-        self.push_call_frame(&closure, &args, None)?;
-        let callback_frame_index = self.frames.len() - 1;
-
-        self.continuations.push(Continuation::PromiseCallback {
-            mode,
-            original_promise,
-            caller_frame_depth,
-            callback_frame_index,
-        });
-
-        Ok(PromiseMethodOutcome::ContinuationStarted)
     }
 
     fn alloc_generator_id(&mut self) -> u64 {
@@ -4698,13 +5150,6 @@ impl Vm {
                                         .execute_promise_method(promise, &method_name, args)?
                                     {
                                         PromiseMethodOutcome::Value(v) => Some(v),
-                                        // A continuation was started — the main
-                                        // execute() loop drives the callback (and
-                                        // suspends if it makes a tool call). Don't
-                                        // push a result here.
-                                        PromiseMethodOutcome::ContinuationStarted => {
-                                            return Ok(None);
-                                        }
                                         // A deferred single-call promise forced its
                                         // host call — propagate the suspension; the
                                         // recorded resume_action finishes the method.
@@ -5641,9 +6086,20 @@ impl Vm {
                         match status {
                             Value::String(s) if s.as_ref() == "resolved" => {
                                 let inner = map.get("value").cloned().unwrap_or(Value::Undefined);
-                                self.push(inner)?;
+                                if builtins::is_promise(&inner, &self.heap) {
+                                    // Resolved *with* a promise (e.g. a `.then`
+                                    // callback returned `Promise.all(...)`):
+                                    // adopt by re-awaiting the inner promise.
+                                    self.push(inner)?;
+                                    self.current_frame_mut().ip -= 1;
+                                } else {
+                                    self.push(inner)?;
+                                }
                             }
                             Value::String(s) if s.as_ref() == "rejected" => {
+                                // The rejection is consumed here: it surfaces at
+                                // the await site (guest try/catch or the host).
+                                self.mark_rejection_handled(*h);
                                 let reason = map.get("reason").cloned().unwrap_or(Value::Undefined);
                                 let reason = reason.to_js_string(&self.heap);
                                 return Err(ZapcodeError::RuntimeError(format!(
@@ -5651,11 +6107,42 @@ impl Vm {
                                     reason
                                 )));
                             }
+                            Value::String(s) if s.as_ref() == "pending" => {
+                                // A microtask-pending `.then` chain: run queued
+                                // microtasks one per pass (re-dispatching this
+                                // Await each time) until it settles. The
+                                // callback frames run in the main loop, so a
+                                // tool call inside a handler suspends normally
+                                // — with this frame's ip parked on the Await.
+                                if let Some(m) = self.microtasks.pop_front() {
+                                    self.push(val)?;
+                                    self.current_frame_mut().ip -= 1;
+                                    self.start_microtask(m)?;
+                                } else {
+                                    // Queue is dry and the promise can never
+                                    // settle (e.g. `Promise.race([])`) — pass
+                                    // the still-pending promise through, the
+                                    // pinned pre-microtask behavior.
+                                    self.push(val)?;
+                                }
+                            }
                             Value::String(s) if s.as_ref() == "pending_all" => {
                                 let items = match map.get("items") {
                                     Some(Value::Array(a)) => self.heap.array_vec(*a),
                                     _ => Vec::new(),
                                 };
+                                // Settle microtask-pending elements (`.then`
+                                // chains inside the combinator) before the batch
+                                // is classified/assembled — one microtask per
+                                // pass, re-dispatching this Await.
+                                if items.iter().any(|i| self.is_internal_pending(i)) {
+                                    if let Some(m) = self.microtasks.pop_front() {
+                                        self.push(val)?;
+                                        self.current_frame_mut().ip -= 1;
+                                        self.start_microtask(m)?;
+                                        return Ok(None);
+                                    }
+                                }
                                 let kind = match map.get("__batch_kind__") {
                                     Some(Value::String(k)) => match k.as_ref() {
                                         "race" => BatchKind::Race,

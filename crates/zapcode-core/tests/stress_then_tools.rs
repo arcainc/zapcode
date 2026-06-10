@@ -3,11 +3,11 @@
 //! Previously a tool call inside one of these callbacks tripped the
 //! "cannot call an external function inside an array-callback method" guard,
 //! because the callback ran synchronously via `call_function_internal` (which
-//! cannot suspend). The callbacks now run through the continuation machinery
-//! (a `Continuation::PromiseCallback`) driven by the main `execute()` loop, so
-//! a `CallExternal` inside them suspends the VM and resumes with the tool
-//! result — making the common `primary().catch(() => fallbackTool())` retry
-//! pattern work.
+//! cannot suspend). The callbacks now run as drained microtasks through the
+//! continuation machinery (a `Continuation::MicrotaskReaction`) driven by the
+//! main `execute()` loop, so a `CallExternal` inside them suspends the VM and
+//! resumes with the tool result — making the common
+//! `primary().catch(() => fallbackTool())` retry pattern work.
 //!
 //! Harness copied from `error_resume.rs` (note: `run_str` ends with
 //! `v.to_js_string(&result.heap)`).
