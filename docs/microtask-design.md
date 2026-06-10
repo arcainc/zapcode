@@ -1,9 +1,9 @@
 # Design: Microtask / Event-Loop Ordering
 
-Status: **in progress** — Stage 0 landed (PR #26); Stage 2 (`async` returns a
-Promise + host-boundary implicit await) implemented on
-`conformance-async-returns-promise`; Stage 1 (microtask queue + drain)
-implemented on `microtask-stage1-then-enqueue`. Stages 3, 4 remain.
+Status: **in progress** — Stage 0 landed (PR #26), Stage 2 (PR #27), Stage 1
+(PR #28); Stage 3 (`await` suspends the task) implemented on
+`microtask-stage3-await-suspend`. Stage 4 (durable hardening / fuzzing)
+remains, though Stage 3 already ships with parked-task dump/load tests.
 Author: conformance hardening effort
 Scope: make Promise/`async`/`await` ordering match Node, without breaking the
 durable-execution (snapshot/suspend/resume) core.
@@ -259,12 +259,34 @@ durable-session suite).
    excluded), and the host boundary implicitly awaits the program result — a
    settled final promise unwraps for the host, a rejected one surfaces as an
    "Unhandled promise rejection" error (`Vm::execute_to_host`). Tests:
-   `tests/conformance_async_return.rs`. Residual for Stage 3: a `throw`
-   escaping an async body still propagates synchronously (so `f().catch(...)`
-   cannot observe it), and reactions still run eagerly.
+   `tests/conformance_async_return.rs`. (The then-residual — a `throw`
+   escaping an async body propagating synchronously — was fixed by Stage 3.)
 4. **Stage 3 — `await` suspends the task** (AsyncTask detach + `ResumeAsync`).
    Fixes interleaving (`await_order`, `two_awaits`, `microtask_vs_sync`). The
    invasive stage; do last, behind the now-proven queue/drain.
+   **✅ Implemented** (`microtask-stage3-await-suspend`): `await` inside an
+   async function body detaches exactly its own frame (plus expression stack
+   and covering try-frames, depths rebased) into a serializable `AsyncTask`;
+   the caller receives the pending result promise as if the call returned
+   early, so `.then(async …)` handlers adopt through the existing
+   continuation machinery unchanged. Every `await` yields a tick (an
+   immediate `ResumeAsync` microtask for settled/non-promise operands, a
+   "task" reaction for pending chains), giving Node interleaving — the
+   classic async-ordering kata passes byte-for-byte. Both Stage-2 throw
+   residuals are fixed: a `throw` escaping an async body (detached or not)
+   rejects the call's result promise (marked unhandled until consumed), and
+   the await-rethrow delivers the ORIGINAL reason (the long-pinned
+   wrapped-Error divergence is gone). `await tool()` still suspends the
+   whole VM — the durable boundary — and parked tasks serialize with the
+   snapshot (wire v6 → v7). `Promise.all` fan-outs of async calls now
+   interleave their host calls Node-style (first awaits of every element
+   before second steps). Tests: `tests/conformance_async_interleave.rs`
+   (Node ground-truthed; incl. dump/load with a parked task and tool calls
+   after a park). Residuals for Stage 4 follow-ups: top-level `await` of a
+   settled promise is still inline (wrap ordering-sensitive code in
+   `async function main()`), `await` inside async *generator* bodies keeps
+   the old inline semantics, and a cached re-await of a host-call promise
+   skips its tick.
 5. **Stage 4 — durable hardening.** Snapshot/resume tests with microtasks and
    suspended async tasks in flight across a host call; wire-version bump; fuzz
    the drain across suspensions.

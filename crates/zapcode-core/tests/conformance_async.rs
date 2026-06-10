@@ -22,28 +22,20 @@
 //!
 //! ── Documented divergences from real JS (NOT asserted to the real answer) ────
 //!   (verified against the live interpreter; see STRESS-PASS-BUGS.md for context)
-//!   * UNHANDLED-REJECTION WRAPPING: when a rejected promise propagates to an
-//!     `await` (or to the top level) and is caught by a guest `try/catch`, the
-//!     caught value is a *fresh* `Error` whose `.name === "Error"` and whose
-//!     message is `"Unhandled promise rejection: <reason>"` — the original
-//!     reason's identity/type/message are NOT preserved at that boundary. (When
-//!     the rejection is instead consumed by a `.catch(fn)` / `.then(_, fn)`
-//!     handler, the *original* reason IS passed to the handler — that path is
-//!     spec-correct and IS asserted.) Tests below therefore assert only
-//!     `e instanceof Error` / catchability at the `await`-rejection boundary, not
-//!     the reason text/type.
-//!   * `Promise.any` ALL-REJECT does NOT raise a real `AggregateError`: it
-//!     surfaces a generic wrapped `Error` (`e instanceof AggregateError` is
-//!     `false`, `e.name === "Error"`). The interpreter's actual behavior is
-//!     pinned WITH a comment; `AggregateError` *constructed directly*
-//!     (`new AggregateError(errs, msg)`) does work and is asserted separately.
-//!   * AWAIT IS STILL INLINE (microtask-design Stage 3 pending): `.then`/
-//!     `.catch`/`.finally` handlers ARE deferred to a FIFO microtask queue
-//!     (see conformance_microtask.rs), but `await` of an already-*settled*
-//!     promise continues inline rather than yielding a tick, so interleaving
-//!     around `await` can differ from real JS. No test here asserts ordering
-//!     that depends on an await-tick; the sequential/parallel tests assert
-//!     only order that is identical under both models (data-dependency order).
+//!   * (FIXED by microtask Stage 3 — kept for history) the await-rejection
+//!     boundary used to wrap reasons in a fresh `Error`; the ORIGINAL reason
+//!     (identity, type, message) now rethrows at `await`, matching Node, and
+//!     IS asserted below.
+//!   * `Promise.any` ALL-REJECT delivers the real AggregateError-shaped
+//!     reason (`e instanceof AggregateError`, `e.name === "AggregateError"`,
+//!     `e.errors` populated) since Stage 3. Residual divergence pinned WITH a
+//!     comment: it is not an `Error` *instance* (`e instanceof Error` is
+//!     `false`; Node: `true`).
+//!   * TOP-LEVEL AWAIT IS STILL INLINE (Stage 3 covers async *function*
+//!     bodies, which now park at `await` with spec tick order): a top-level
+//!     `await` of an already-settled promise continues inline rather than
+//!     yielding a tick. Tests wrap ordering-sensitive code in
+//!     `async function main()` (the recommended pattern anyway).
 //!   * `Promise.race([])` / `Promise.any([])` over an *empty* array stay pending
 //!     forever in real JS; here the awaited value is a still-pending promise that
 //!     string-coerces to `"[object Promise]"`. Pinned WITH a comment.
@@ -155,27 +147,27 @@ fn reject_caught_by_handler_passes_original_reason() {
 
 #[test]
 fn reject_propagating_to_await_is_catchable_error() {
-    // At the await-rejection boundary the reason is wrapped in a fresh Error
-    // (documented divergence): assert only catchability + Error-ness.
+    // The await-rejection rethrows the ORIGINAL reason (identity preserved
+    // since microtask Stage 3) — a caught string is that string, as in Node.
     assert_eq!(
         run_main(
             r#"
             try { await Promise.reject('boom'); return 'no-throw'; }
-            catch (e) { return (e instanceof Error) + '|' + (typeof e.message === 'string'); }
+            catch (e) { return 'caught:' + e + '|' + (typeof e === 'string'); }
             "#
         ),
-        "true|true"
+        "caught:boom|true"
     );
-    // Rejecting with an Error instance is still caught as an Error at the await
-    // boundary (its message text is wrapped — not asserted here).
+    // Rejecting with an Error instance: the SAME Error object (message intact)
+    // rethrows at the await boundary.
     assert_eq!(
         run_main(
             r#"
             try { await Promise.reject(new Error('m')); return 'no-throw'; }
-            catch (e) { return e instanceof Error; }
+            catch (e) { return (e instanceof Error) + ':' + e.message; }
             "#
         ),
-        "true"
+        "true:m"
     );
 }
 
@@ -248,15 +240,15 @@ fn all_preserves_object_element_shapes() {
 
 #[test]
 fn all_rejects_when_any_element_rejects() {
-    // First rejection short-circuits; surfaces as a catchable Error at await.
+    // First rejection short-circuits; await rethrows the original reason.
     assert_eq!(
         run_main(
             r#"
             try { await Promise.all([Promise.resolve(1), Promise.reject('bad'), Promise.resolve(3)]); return 'no-throw'; }
-            catch (e) { return e instanceof Error; }
+            catch (e) { return 'caught:' + e; }
             "#
         ),
-        "true"
+        "caught:bad"
     );
 }
 
@@ -306,10 +298,10 @@ fn race_rejection_first_propagates_as_error() {
         run_main(
             r#"
             try { await Promise.race([Promise.reject('R'), Promise.resolve('ok')]); return 'no-throw'; }
-            catch (e) { return e instanceof Error; }
+            catch (e) { return 'caught:' + e; }
             "#
         ),
-        "true"
+        "caught:R"
     );
 }
 
@@ -354,19 +346,19 @@ fn any_mixes_plain_values() {
 
 #[test]
 fn any_all_reject_throws_catchable_error() {
-    // Documented divergence: this is NOT a real AggregateError here. The
-    // interpreter surfaces a generic wrapped Error. Assert the ACTUAL behavior.
+    // The original AggregateError-shaped reason now reaches the catch (Node:
+    // "true|true|AggregateError"). Residual divergence pinned WITH a comment:
+    // the constructed AggregateError is not an `Error` instance here.
     assert_eq!(
         run_main(
             r#"
             try { await Promise.any([Promise.reject('a'), Promise.reject('b')]); return 'no-throw'; }
             catch (e) {
-                // zapcode: NOT an AggregateError (divergence); IS a plain Error.
                 return (e instanceof AggregateError) + '|' + (e instanceof Error) + '|' + e.name;
             }
             "#
         ),
-        "false|true|Error"
+        "true|false|AggregateError"
     );
 }
 
@@ -584,15 +576,15 @@ fn finally_runs_side_effect_and_preserves_value() {
 
 #[test]
 fn finally_on_rejection_still_throws() {
-    // finally does not swallow a rejection; it propagates as a catchable Error.
+    // finally does not swallow a rejection; the original reason rethrows.
     assert_eq!(
         run_main(
             r#"
             try { await Promise.reject('boom').finally(() => 'ignored'); return 'no-throw'; }
-            catch (e) { return e instanceof Error; }
+            catch (e) { return 'caught:' + e; }
             "#
         ),
-        "true"
+        "caught:boom"
     );
 }
 

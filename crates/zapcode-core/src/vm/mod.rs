@@ -131,6 +131,30 @@ pub(crate) struct CallFrame {
     /// it first), connecting captured names to their shared cells.
     #[serde(default)]
     pub(crate) env: HashMap<String, u64>,
+    /// Set on an async function body frame the first time it detaches at an
+    /// `await` (microtask-design Stage 3): the pending result promise the
+    /// caller received at detach time. A frame with this set has NO caller
+    /// expecting a pushed return value — completion *settles* this promise
+    /// (return → resolve with adoption, escaped throw → reject) instead.
+    #[serde(default)]
+    pub(crate) async_result: Option<Value>,
+}
+
+/// A parked async function call (microtask-design Stage 3): its body frame,
+/// detached at an `await`, plus the expression stack above the frame's base
+/// and any try-frames covering the body (depths stored *relative* so they
+/// rebase on resume). Restored by a `ResumeAsync` microtask (`Microtask.task`)
+/// when the awaited promise settles; the result promise the caller holds
+/// lives in `frame.async_result`. Serialized with the snapshot, so a parked
+/// task survives a host-call suspension like every other piece of async state.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct AsyncTask {
+    pub(crate) frame: CallFrame,
+    /// The frame's expression stack slice (above its old `stack_base`).
+    pub(crate) stack: Vec<Value>,
+    /// Try frames covering the body. `frame_depth` is stored relative to the
+    /// frames below the task frame; `stack_depth` relative to its stack base.
+    pub(crate) try_entries: Vec<TryInfo>,
 }
 
 /// A continuation for array callback methods that may suspend (e.g., `.map()` with async callbacks).
@@ -201,6 +225,12 @@ pub(crate) struct Microtask {
     pub(crate) mode: PromiseCallbackMode,
     /// The dependent promise to settle with the handler's outcome.
     pub(crate) result_promise: Value,
+    /// `Some(id)` makes this a **ResumeAsync** job instead of a reaction: the
+    /// drain restores parked [`AsyncTask`] `id` and delivers `value` at its
+    /// `await` site (or rethrows it when `is_rejection`). `handler` and
+    /// `result_promise` are unused (`Undefined`).
+    #[serde(default)]
+    pub(crate) task: Option<u64>,
 }
 
 /// What a [`Continuation::PromiseCallback`] does with the callback's return value.
@@ -327,6 +357,14 @@ pub struct Vm {
     /// "Unhandled promise rejection" error — JS's unhandled-rejection event,
     /// made deterministic. Serialized: a suspension mid-drain must not lose it.
     pub(crate) unhandled_rejections: Vec<Handle>,
+    /// Async function calls parked at an `await` (Stage 3), keyed by task id.
+    /// `BTreeMap` so the serialized snapshot is deterministic. Resumed by
+    /// `ResumeAsync` microtasks; tasks still parked at end-of-drain simply
+    /// never finish (their awaited promise can no longer settle), matching a
+    /// Node process exiting with pending awaits.
+    pub(crate) async_tasks: BTreeMap<u64, AsyncTask>,
+    /// Id source for [`AsyncTask`]s (like `next_call_id`).
+    pub(crate) next_async_task_id: u64,
 }
 
 /// Deferred action applied to the value the host delivers when resuming a
@@ -496,6 +534,8 @@ impl Vm {
             resume_action: None,
             microtasks: std::collections::VecDeque::new(),
             unhandled_rejections: Vec::new(),
+            async_tasks: BTreeMap::new(),
+            next_async_task_id: 0,
         }
     }
 
@@ -587,6 +627,8 @@ impl Vm {
             resume_action: None,
             microtasks: std::collections::VecDeque::new(),
             unhandled_rejections: Vec::new(),
+            async_tasks: BTreeMap::new(),
+            next_async_task_id: 0,
         }
     }
 
@@ -1011,6 +1053,23 @@ impl Vm {
         for rec in records {
             let Value::Object(rh) = rec else { continue };
             let map = self.heap.object_map(rh);
+            // A "task" record parks no handler — it resumes the AsyncTask
+            // awaiting this promise (microtask-design Stage 3, ResumeAsync).
+            if matches!(map.get("mode"), Some(Value::String(s)) if s.as_ref() == "task") {
+                let task = match map.get("task") {
+                    Some(Value::Int(id)) => Some(*id as u64),
+                    _ => None,
+                };
+                self.microtasks.push_back(Microtask {
+                    handler: Value::Undefined,
+                    value: outcome.clone(),
+                    is_rejection,
+                    mode: PromiseCallbackMode::WrapResult,
+                    result_promise: Value::Undefined,
+                    task,
+                });
+                continue;
+            }
             let handler = if is_rejection {
                 map.get("on_rejected").cloned().unwrap_or(Value::Undefined)
             } else {
@@ -1027,8 +1086,35 @@ impl Vm {
                 is_rejection,
                 mode,
                 result_promise,
+                task: None,
             });
         }
+        Ok(())
+    }
+
+    /// Register a *ResumeAsync* reaction on a pending internal promise: when
+    /// it settles, parked [`AsyncTask`] `task_id` resumes with the outcome.
+    fn register_task_reaction(&mut self, receiver: Handle, task_id: u64) -> Result<()> {
+        let mut record = IndexMap::new();
+        record.insert(Arc::from("mode"), Value::String(JsString::from("task")));
+        record.insert(Arc::from("task"), Value::Int(task_id as i64));
+        let rec = Value::Object(self.heap.alloc_object(record));
+        let reactions = match self.heap.object(receiver).and_then(|m| m.get("__reactions__")) {
+            Some(Value::Array(a)) => *a,
+            _ => {
+                return Err(ZapcodeError::RuntimeError(
+                    "internal error: pending promise has no reaction list".to_string(),
+                ))
+            }
+        };
+        self.heap
+            .array_mut(reactions)
+            .ok_or_else(|| {
+                ZapcodeError::RuntimeError(
+                    "internal error: promise reaction list is not an array".to_string(),
+                )
+            })?
+            .push(rec);
         Ok(())
     }
 
@@ -1060,6 +1146,9 @@ impl Vm {
     /// receiver's outcome directly, no frames (the caller's loop just
     /// continues; any reactions this settle enqueued run on later passes).
     fn start_microtask(&mut self, m: Microtask) -> Result<()> {
+        if let Some(task_id) = m.task {
+            return self.resume_async_task(task_id, m.value, m.is_rejection);
+        }
         if let Value::Function(closure) = &m.handler {
             let closure = closure.clone();
             let args = match m.mode {
@@ -1078,6 +1167,195 @@ impl Vm {
             });
         } else {
             self.settle_promise(&m.result_promise, m.value, m.is_rejection)?;
+        }
+        Ok(())
+    }
+
+    /// True when the current frame is an `async` function body (not the
+    /// top-level program) — a frame `await` may detach into an [`AsyncTask`].
+    fn current_frame_is_async_body(&self) -> bool {
+        self.frames.len() > 1 && self.frame_is_async(self.frames.last().unwrap())
+    }
+
+    /// Detach the current async-body frame into a parked [`AsyncTask`]
+    /// (Stage 3). The caller resumes at the instruction after the call with
+    /// the async call's pending result promise on the stack — exactly the
+    /// shape of an early return, so call sites (including `.then(async …)`
+    /// handler continuations) need no special handling. Try-frames covering
+    /// the body travel with the task, depths stored relative for rebasing.
+    /// Returns the new task id; the caller schedules its resumption (an
+    /// immediate ResumeAsync tick, or a task reaction on the awaited promise).
+    fn detach_async_task(&mut self) -> Result<u64> {
+        let mut frame = self.frames.pop().unwrap();
+        self.tracker.pop_frame();
+        // First detach creates the result promise and hands it to the caller
+        // (whose Call is waiting for a pushed value). A re-detach — a later
+        // await in a body that was *resumed* by the drain — keeps the
+        // original promise and pushes NOTHING: the frame sits on top of the
+        // drain, not on top of a caller.
+        let first_detach = frame.async_result.is_none();
+        let result_promise = match frame.async_result.clone() {
+            Some(p) => p,
+            None => {
+                let p = builtins::make_pending_promise(&mut self.heap);
+                frame.async_result = Some(p.clone());
+                p
+            }
+        };
+        let below = self.frames.len();
+        let stack = self.stack.split_off(frame.stack_base);
+        let mut try_entries = Vec::new();
+        while matches!(self.try_stack.last(), Some(t) if t.frame_depth > below) {
+            let mut t = self.try_stack.pop().unwrap();
+            t.frame_depth -= below; // relative: 1 == the task frame itself
+            t.stack_depth = t.stack_depth.saturating_sub(frame.stack_base);
+            try_entries.push(t);
+        }
+        try_entries.reverse();
+        let id = self.next_async_task_id;
+        self.next_async_task_id += 1;
+        self.async_tasks.insert(
+            id,
+            AsyncTask {
+                frame,
+                stack,
+                try_entries,
+            },
+        );
+        if first_detach {
+            self.push(result_promise)?;
+        }
+        Ok(id)
+    }
+
+    /// Restore parked [`AsyncTask`] `id` on top of the current frames and
+    /// deliver the awaited outcome at its `await` site: push `value` as the
+    /// await result, or — for a rejection — rethrow the *original* reason
+    /// inside the body (its own try/catch may handle it; escaping rejects the
+    /// task's result promise).
+    fn resume_async_task(&mut self, id: u64, value: Value, is_rejection: bool) -> Result<()> {
+        let task = self.async_tasks.remove(&id).ok_or_else(|| {
+            ZapcodeError::RuntimeError(format!("internal error: unknown async task {id}"))
+        })?;
+        let below = self.frames.len();
+        let stack_base = self.stack.len();
+        let mut frame = task.frame;
+        frame.stack_base = stack_base;
+        self.tracker.push_frame();
+        for v in task.stack {
+            self.push(v)?;
+        }
+        for mut t in task.try_entries {
+            t.frame_depth += below;
+            t.stack_depth += stack_base;
+            self.try_stack.push(t);
+        }
+        self.frames.push(frame);
+        if is_rejection {
+            if !self.route_thrown(value, below)? {
+                let reason = self.pending_throw.take().unwrap_or(Value::Undefined);
+                self.reject_detached_body(below, reason)?;
+            }
+        } else {
+            self.push(value)?;
+        }
+        Ok(())
+    }
+
+    /// Park the current async body at this `await` and schedule an immediate
+    /// ResumeAsync tick delivering `value` (or rethrowing it when
+    /// `is_rejection`). `await` always yields at least one microtask turn
+    /// (spec), even for non-promise and already-settled operands — this is
+    /// what gives async interleaving its Node order.
+    fn park_and_tick(&mut self, value: Value, is_rejection: bool) -> Result<()> {
+        let id = self.detach_async_task()?;
+        self.microtasks.push_back(Microtask {
+            handler: Value::Undefined,
+            value,
+            is_rejection,
+            mode: PromiseCallbackMode::WrapResult,
+            result_promise: Value::Undefined,
+            task: Some(id),
+        });
+        Ok(())
+    }
+
+    /// Settle a detached async body's result promise with its return value,
+    /// adopting thenables: a returned settled promise unwraps one level, a
+    /// returned pending chain forwards via a handler-less reaction, and a
+    /// returned deferred host call is forced (suspending the VM; the recorded
+    /// `SettleResult` settles on resume — hence the `Option<VmState>`).
+    fn settle_async_return(&mut self, promise: Value, value: Value) -> Result<Option<VmState>> {
+        if builtins::is_promise(&value, &self.heap) {
+            if let Value::Object(h) = &value {
+                let map = self.heap.object_map(*h);
+                match map.get("status") {
+                    Some(Value::String(s)) if s.as_ref() == "resolved" => {
+                        let inner = map.get("value").cloned().unwrap_or(Value::Undefined);
+                        self.settle_promise(&promise, inner, false)?;
+                    }
+                    Some(Value::String(s)) if s.as_ref() == "rejected" => {
+                        let reason = map.get("reason").cloned().unwrap_or(Value::Undefined);
+                        self.mark_rejection_handled(*h);
+                        self.settle_promise(&promise, reason, true)?;
+                    }
+                    Some(Value::String(s)) if s.as_ref() == "pending" => {
+                        self.register_reaction(
+                            *h,
+                            Value::Undefined,
+                            Value::Undefined,
+                            PromiseCallbackMode::WrapResult,
+                            promise.clone(),
+                        )?;
+                    }
+                    Some(Value::String(s)) if s.as_ref() == "pending_call" => {
+                        let id = match map.get("__call_id__") {
+                            Some(Value::Int(n)) => *n as u64,
+                            _ => {
+                                return Err(ZapcodeError::RuntimeError(
+                                    "internal error: pending_call promise missing __call_id__"
+                                        .to_string(),
+                                ))
+                            }
+                        };
+                        if let Some(cached) = self.resolved.get(&id).cloned() {
+                            self.settle_promise(&promise, cached, false)?;
+                        } else {
+                            self.resume_action = Some(ResumeAction::SettleResult {
+                                result_promise: promise,
+                                pass_original: None,
+                            });
+                            return self.suspend_on_pending_call(id);
+                        }
+                    }
+                    _ => {
+                        // pending_all (a batch promise): settle with the
+                        // promise object itself — an `await` of the result
+                        // re-awaits it (the resolved-with-a-promise arm).
+                        self.settle_promise(&promise, value, false)?;
+                    }
+                }
+                return Ok(None);
+            }
+        }
+        self.settle_promise(&promise, value, false)?;
+        Ok(None)
+    }
+
+    /// Unwind a detached async body whose base frame sits at index `base`
+    /// (helper frames above included) and reject its result promise with
+    /// `reason`. Used when a throw escapes the body or its awaited promise
+    /// rejected with no handler inside the body.
+    fn reject_detached_body(&mut self, base: usize, reason: Value) -> Result<()> {
+        let stack_base = self.frames[base].stack_base;
+        let promise = self.frames[base].async_result.clone();
+        while self.frames.len() > base {
+            self.frames.pop();
+            self.tracker.pop_frame();
+        }
+        self.stack.truncate(stack_base);
+        if let Some(p) = promise {
+            self.settle_promise(&p, reason, true)?;
         }
         Ok(())
     }
@@ -1148,11 +1426,9 @@ impl Vm {
                 self.push(return_val)?;
                 let frame = self.frames.last().unwrap();
                 let end = match frame.func_index {
-                    Some(idx) => {
-                        self.program(frame.program_index).functions[idx]
-                            .instructions
-                            .len()
-                    }
+                    Some(idx) => self.program(frame.program_index).functions[idx]
+                        .instructions
+                        .len(),
                     None => self.program(frame.program_index).instructions.len(),
                 };
                 self.current_frame_mut().ip = end;
@@ -1186,6 +1462,14 @@ impl Vm {
         } else {
             return_val
         };
+
+        // A detached async body (Stage 3) has no caller frame expecting a
+        // pushed value — the caller got the result promise at detach time.
+        // Settle it with the return value (with thenable adoption) instead.
+        if let Some(promise) = frame.async_result.clone() {
+            self.stack.truncate(frame.stack_base);
+            return self.settle_async_return(promise, actual_return);
+        }
 
         // An async function's result is a resolved Promise (a returned promise is
         // adopted). So `f().then(...)` works and `await f()` unwraps it.
@@ -1873,6 +2157,7 @@ impl Vm {
             boxed: HashMap::new(),
             env,
             is_field_init,
+            async_result: None,
         });
         Ok(())
     }
@@ -1896,6 +2181,7 @@ impl Vm {
             boxed: HashMap::new(),
             env: HashMap::new(),
             is_field_init: false,
+            async_result: None,
         });
 
         self.execute_to_host()
@@ -1942,6 +2228,15 @@ impl Vm {
                     // Return from function (fell off the end → implicit undefined)
                     let frame = self.frames.pop().unwrap();
                     self.tracker.pop_frame();
+                    // A detached async body resolves its result promise with
+                    // undefined; nothing is pushed (no caller frame).
+                    if let Some(promise) = frame.async_result.clone() {
+                        self.stack.truncate(frame.stack_base);
+                        if let Some(state) = self.settle_async_return(promise, Value::Undefined)? {
+                            return Ok(state);
+                        }
+                        continue;
+                    }
                     let is_async = self.frame_is_async(&frame);
                     // If this was a constructor, return `this`
                     let ret = if let Some(this_val) = frame.this_value {
@@ -1999,28 +2294,91 @@ impl Vm {
                         }
                         _ => None,
                     };
-                    if let Some(depth) = microtask_boundary {
-                        if !self.route_thrown(error_val, depth)? {
-                            // No handler inside the callback — unwind its
-                            // frames and reject the chain with the original
-                            // thrown value (identity preserved for `.catch`).
-                            let reason = self.pending_throw.take().unwrap_or(Value::Undefined);
-                            let stack_base = self.frames[depth].stack_base;
-                            while self.frames.len() > depth {
-                                self.frames.pop();
-                                self.tracker.pop_frame();
-                            }
-                            self.stack.truncate(stack_base);
-                            if let Some(Continuation::MicrotaskReaction {
-                                result_promise, ..
-                            }) = self.continuations.pop()
-                            {
-                                self.settle_promise(&result_promise, reason, true)?;
+                    // An *async function body* is a boundary too (Stage 3): a
+                    // throw escaping it rejects the call's result promise —
+                    // for a detached body that settles the promise the caller
+                    // already holds; for a body that has not yet awaited, the
+                    // caller receives an (unhandled-marked) rejected promise
+                    // as the call's value. Either way `f().catch(h)` sees the
+                    // body throw, and the caller's own try/catch does not
+                    // (matching Node).
+                    let async_boundary = self
+                        .frames
+                        .iter()
+                        .enumerate()
+                        .skip(1)
+                        .rev()
+                        .find(|(_, f)| f.async_result.is_some() || self.frame_is_async(f))
+                        .map(|(i, _)| i);
+                    // The innermost boundary wins. (When an async handler frame
+                    // is both watched by a MicrotaskReaction and async, the
+                    // indices coincide and either path settles the same chain.)
+                    let boundary = match (microtask_boundary, async_boundary) {
+                        (Some(d), Some(j)) if j > d => Some((j, true)),
+                        (Some(d), _) => Some((d, false)),
+                        (None, Some(j)) => Some((j, true)),
+                        (None, None) => None,
+                    };
+                    match boundary {
+                        Some((depth, is_async_frame)) if is_async_frame => {
+                            if !self.route_thrown(error_val, depth)? {
+                                let reason = self.pending_throw.take().unwrap_or(Value::Undefined);
+                                if self.frames[depth].async_result.is_some() {
+                                    // Detached body: reject the promise the
+                                    // caller received at detach time.
+                                    self.reject_detached_body(depth, reason)?;
+                                } else {
+                                    // Not yet detached: the call evaluates to
+                                    // a rejected promise (marked unhandled
+                                    // until someone consumes it).
+                                    let stack_base = self.frames[depth].stack_base;
+                                    while self.frames.len() > depth {
+                                        self.frames.pop();
+                                        self.tracker.pop_frame();
+                                    }
+                                    self.stack.truncate(stack_base);
+                                    let rejected =
+                                        builtins::make_rejected_promise(reason, &mut self.heap);
+                                    if let Value::Object(h) = &rejected {
+                                        self.unhandled_rejections.push(*h);
+                                    }
+                                    self.push(rejected)?;
+                                    // The pop looks like a return — a watching
+                                    // continuation (e.g. `.then(async …)`)
+                                    // must fire and adopt the rejection.
+                                    if let Some(state) = self.process_continuation()? {
+                                        return Ok(state);
+                                    }
+                                }
                             }
                         }
-                    } else if !self.route_thrown(error_val, 0)? {
-                        // No handler remains — propagate to the host.
-                        return Err(err);
+                        Some((depth, _)) => {
+                            if !self.route_thrown(error_val, depth)? {
+                                // No handler inside the callback — unwind its
+                                // frames and reject the chain with the original
+                                // thrown value (identity preserved for `.catch`).
+                                let reason = self.pending_throw.take().unwrap_or(Value::Undefined);
+                                let stack_base = self.frames[depth].stack_base;
+                                while self.frames.len() > depth {
+                                    self.frames.pop();
+                                    self.tracker.pop_frame();
+                                }
+                                self.stack.truncate(stack_base);
+                                if let Some(Continuation::MicrotaskReaction {
+                                    result_promise,
+                                    ..
+                                }) = self.continuations.pop()
+                                {
+                                    self.settle_promise(&result_promise, reason, true)?;
+                                }
+                            }
+                        }
+                        None => {
+                            if !self.route_thrown(error_val, 0)? {
+                                // No handler remains — propagate to the host.
+                                return Err(err);
+                            }
+                        }
                     }
                 }
             }
@@ -3393,6 +3751,7 @@ impl Vm {
                         is_rejection: false,
                         mode: PromiseCallbackMode::WrapResult,
                         result_promise: result.clone(),
+                        task: None,
                     });
                     Ok(PromiseMethodOutcome::Value(result))
                 }
@@ -3405,6 +3764,7 @@ impl Vm {
                         is_rejection: true,
                         mode: PromiseCallbackMode::WrapResult,
                         result_promise: result.clone(),
+                        task: None,
                     });
                     Ok(PromiseMethodOutcome::Value(result))
                 }
@@ -3433,6 +3793,7 @@ impl Vm {
                             is_rejection: true,
                             mode: PromiseCallbackMode::WrapResult,
                             result_promise: result.clone(),
+                            task: None,
                         });
                         Ok(PromiseMethodOutcome::Value(result))
                     }
@@ -3467,6 +3828,7 @@ impl Vm {
                             is_rejection: false,
                             mode: PromiseCallbackMode::PassThrough,
                             result_promise: result.clone(),
+                            task: None,
                         });
                         Ok(PromiseMethodOutcome::Value(result))
                     }
@@ -3482,6 +3844,7 @@ impl Vm {
                             is_rejection: true,
                             mode: PromiseCallbackMode::PassThrough,
                             result_promise: result.clone(),
+                            task: None,
                         });
                         Ok(PromiseMethodOutcome::Value(result))
                     }
@@ -3565,6 +3928,7 @@ impl Vm {
                     boxed: HashMap::new(),
                     env,
                     is_field_init: false,
+                    async_result: None,
                 });
                 self.run_generator_until_yield_or_return(gen_obj)
             }
@@ -3587,6 +3951,7 @@ impl Vm {
                     boxed: HashMap::new(),
                     env,
                     is_field_init: false,
+                    async_result: None,
                 });
                 self.run_generator_until_yield_or_return(gen_obj)
             }
@@ -6069,8 +6434,16 @@ impl Vm {
 
             Instruction::Await => {
                 // Check if the value on the stack is a Promise object.
-                // If resolved, unwrap its value. If rejected, throw its reason.
-                // If it's a regular (non-promise) value, leave it as-is.
+                // Inside an async function body, `await` *parks the call*
+                // (microtask-design Stage 3): the frame detaches into an
+                // AsyncTask, the caller receives the call's pending result
+                // promise, and a ResumeAsync microtask (or a reaction on the
+                // awaited promise) continues the body later — so `await`
+                // always yields a tick. At top level, `await` keeps the
+                // Stage-1 inline semantics (unwrap settled values; drain the
+                // queue for a pending chain). Host-call promises
+                // (`pending_call`/`pending_all`) suspend the whole VM in both
+                // positions — that is the durable-execution boundary.
                 let val = self.pop()?;
                 if matches!(val, Value::Pending(_)) {
                     // A deferred call only ever lives inside a Promise.all batch;
@@ -6079,6 +6452,7 @@ impl Vm {
                         "internal error: awaited a deferred call outside Promise.all".to_string(),
                     ));
                 }
+                let in_async_body = self.current_frame_is_async_body();
                 if builtins::is_promise(&val, &self.heap) {
                     if let Value::Object(h) = &val {
                         let map = self.heap.object_map(*h);
@@ -6090,8 +6464,17 @@ impl Vm {
                                     // Resolved *with* a promise (e.g. a `.then`
                                     // callback returned `Promise.all(...)`):
                                     // adopt by re-awaiting the inner promise.
-                                    self.push(inner)?;
-                                    self.current_frame_mut().ip -= 1;
+                                    if in_async_body {
+                                        // Park ON the Await so the resumed task
+                                        // re-awaits the delivered inner promise.
+                                        self.current_frame_mut().ip -= 1;
+                                        self.park_and_tick(inner, false)?;
+                                    } else {
+                                        self.push(inner)?;
+                                        self.current_frame_mut().ip -= 1;
+                                    }
+                                } else if in_async_body {
+                                    self.park_and_tick(inner, false)?;
                                 } else {
                                     self.push(inner)?;
                                 }
@@ -6101,20 +6484,43 @@ impl Vm {
                                 // the await site (guest try/catch or the host).
                                 self.mark_rejection_handled(*h);
                                 let reason = map.get("reason").cloned().unwrap_or(Value::Undefined);
-                                let reason = reason.to_js_string(&self.heap);
-                                return Err(ZapcodeError::RuntimeError(format!(
-                                    "Unhandled promise rejection: {}",
-                                    reason
-                                )));
+                                if in_async_body {
+                                    self.park_and_tick(reason, true)?;
+                                } else {
+                                    // Rethrow the *original* reason (identity
+                                    // preserved for guest catch) via
+                                    // pending_throw; the message below is what
+                                    // the host sees when nothing catches.
+                                    let msg = reason.to_js_string(&self.heap);
+                                    self.pending_throw = Some(reason);
+                                    return Err(ZapcodeError::RuntimeError(format!(
+                                        "Unhandled promise rejection: {}",
+                                        msg
+                                    )));
+                                }
                             }
                             Value::String(s) if s.as_ref() == "pending" => {
-                                // A microtask-pending `.then` chain: run queued
-                                // microtasks one per pass (re-dispatching this
-                                // Await each time) until it settles. The
-                                // callback frames run in the main loop, so a
-                                // tool call inside a handler suspends normally
-                                // — with this frame's ip parked on the Await.
-                                if let Some(m) = self.microtasks.pop_front() {
+                                if in_async_body {
+                                    if self.is_internal_pending(&val) {
+                                        // Park the body; the promise's settle
+                                        // enqueues the ResumeAsync.
+                                        let id = self.detach_async_task()?;
+                                        self.register_task_reaction(*h, id)?;
+                                    } else {
+                                        // A never-settling promise (e.g.
+                                        // `Promise.race([])`): the body parks
+                                        // forever — its result promise simply
+                                        // never settles, like Node exiting
+                                        // with a pending await.
+                                        let _ = self.detach_async_task()?;
+                                    }
+                                } else if let Some(m) = self.microtasks.pop_front() {
+                                    // Top level: run queued microtasks one per
+                                    // pass (re-dispatching this Await) until
+                                    // the chain settles. Callback frames run
+                                    // in the main loop, so a tool call inside
+                                    // a handler suspends normally — with this
+                                    // frame's ip parked on the Await.
                                     self.push(val)?;
                                     self.current_frame_mut().ip -= 1;
                                     self.start_microtask(m)?;
@@ -6181,13 +6587,22 @@ impl Vm {
                                 }
                             }
                             _ => {
-                                // Unknown status — pass through
-                                self.push(val)?;
+                                // Unknown status — treat as a plain value.
+                                if in_async_body {
+                                    self.park_and_tick(val, false)?;
+                                } else {
+                                    self.push(val)?;
+                                }
                             }
                         }
+                    } else if in_async_body {
+                        self.park_and_tick(val, false)?;
                     } else {
                         self.push(val)?;
                     }
+                } else if in_async_body {
+                    // `await` of a non-promise still yields one tick (spec).
+                    self.park_and_tick(val, false)?;
                 } else {
                     // Not a promise — pass through (await on non-promise returns the value)
                     self.push(val)?;
