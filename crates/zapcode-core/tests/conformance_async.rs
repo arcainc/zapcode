@@ -37,12 +37,13 @@
 //!     `false`, `e.name === "Error"`). The interpreter's actual behavior is
 //!     pinned WITH a comment; `AggregateError` *constructed directly*
 //!     (`new AggregateError(errs, msg)`) does work and is asserted separately.
-//!   * NO MICROTASK QUEUE: `await`/`then` callbacks run eagerly rather than being
-//!     deferred to a microtask turn, so event-loop interleaving order differs
-//!     from real JS. No test asserts ordering that depends on microtask
-//!     deferral; the sequential/parallel tests assert only order that is
-//!     identical under both models (data-dependency order, which is observable
-//!     regardless of the queue).
+//!   * AWAIT IS STILL INLINE (microtask-design Stage 3 pending): `.then`/
+//!     `.catch`/`.finally` handlers ARE deferred to a FIFO microtask queue
+//!     (see conformance_microtask.rs), but `await` of an already-*settled*
+//!     promise continues inline rather than yielding a tick, so interleaving
+//!     around `await` can differ from real JS. No test here asserts ordering
+//!     that depends on an await-tick; the sequential/parallel tests assert
+//!     only order that is identical under both models (data-dependency order).
 //!   * `Promise.race([])` / `Promise.any([])` over an *empty* array stay pending
 //!     forever in real JS; here the awaited value is a still-pending promise that
 //!     string-coerces to `"[object Promise]"`. Pinned WITH a comment.

@@ -2,7 +2,8 @@
 
 Status: **in progress** — Stage 0 landed (PR #26); Stage 2 (`async` returns a
 Promise + host-boundary implicit await) implemented on
-`conformance-async-returns-promise`. Stages 1, 3, 4 not started.
+`conformance-async-returns-promise`; Stage 1 (microtask queue + drain)
+implemented on `microtask-stage1-then-enqueue`. Stages 3, 4 remain.
 Author: conformance hardening effort
 Scope: make Promise/`async`/`await` ordering match Node, without breaking the
 durable-execution (snapshot/suspend/resume) core.
@@ -233,6 +234,22 @@ durable-session suite).
    `.then`/`.catch`/`.finally` from run-now to enqueue. Fixes `.then`
    ordering and nested-`.then` order. `await` still inline for now.
    - Test: `then_order`, `nested_then`, `finally_order`.
+   **✅ Implemented** (`microtask-stage1-then-enqueue`): settled receivers
+   enqueue a `Microtask`, pending chain links carry reaction records in the
+   heap (`register_reaction`/`settle_promise`), the drain runs at top-level
+   completion, and `await` of a pending chain drains one microtask per pass
+   (re-dispatching the `Await` — suspension-safe, frames stay in the main
+   loop). A `throw` escaping a handler rejects the chain (so
+   `p.then(throwing).catch(h)` is spec-correct, with reason identity), and
+   rejections nobody handles fail the run at end-of-drain (R3). Tool calls
+   inside handlers suspend mid-drain via `ResumeAction::SettleResult` with
+   the queue in the snapshot. The old eager `Continuation::PromiseCallback`/
+   `ChainResult` machinery was removed; wire v5 → v6. Tests:
+   `tests/conformance_microtask.rs` (Node ground-truthed, incl. dump/load
+   mid-drain). Residual for Stage 3: `await` of a *settled* promise is still
+   inline (no await-tick), so interleaving around `await` can run ahead of
+   Node; `Promise.race`/`any` over pending chains settle by element order,
+   not tick order.
 3. **Stage 2 — `async` returns a Promise.** Fixes `async function(){return 5}`
    `.then` throwing, and `f().then(...)`. `await` of that promise still settles
    synchronously within the body.

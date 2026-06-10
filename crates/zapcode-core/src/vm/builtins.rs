@@ -3558,13 +3558,19 @@ fn try_lower_pending_call_batch(method: &str, args: &[Value], heap: &mut Heap) -
         Some(Value::Array(h)) => heap.array_vec(*h),
         _ => return None,
     };
-    let has_pending_call = arr.iter().any(|item| {
+    // Lower to a batch promise when any element is not yet settled: a deferred
+    // single-call promise (host call) or a microtask-pending `.then` chain.
+    // The `Await` pending_all arm drains microtasks / suspends on the host so
+    // every element is settled before the batch is assembled.
+    let has_unsettled = arr.iter().any(|item| {
         matches!(item, Value::Object(h) if matches!(
             heap.object(*h).and_then(|m| m.get("status")),
             Some(Value::String(s)) if s.as_ref() == "pending_call"
+                || (s.as_ref() == "pending"
+                    && heap.object(*h).is_some_and(|m| m.contains_key("__reactions__")))
         ))
     });
-    if !has_pending_call {
+    if !has_unsettled {
         return None;
     }
     // Replace each deferred single-call promise with its `Value::Pending(id)`.
@@ -3771,6 +3777,19 @@ pub fn is_promise(val: &Value, heap: &Heap) -> bool {
     } else {
         false
     }
+}
+
+/// Create a pending internal promise with an empty reaction list.
+/// `.then`/`.catch`/`.finally` on it register reactions (see
+/// `Vm::register_reaction`); `Vm::settle_promise` flips it to
+/// resolved/rejected and enqueues the reactions as microtasks.
+pub fn make_pending_promise(heap: &mut Heap) -> Value {
+    let reactions = heap.alloc_array(Vec::new());
+    let mut obj = IndexMap::new();
+    obj.insert(Arc::from("__promise__"), Value::Bool(true));
+    obj.insert(Arc::from("status"), Value::String(JsString::from("pending")));
+    obj.insert(Arc::from("__reactions__"), Value::Array(reactions));
+    Value::Object(heap.alloc_object(obj))
 }
 
 /// Create a resolved promise wrapping the given value.
