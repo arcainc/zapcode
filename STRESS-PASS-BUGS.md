@@ -38,16 +38,34 @@ now Node's.** Full plan and per-stage detail in `docs/microtask-design.md`
   bug* where a boxed local written between yields silently reverted on
   resume.
 
-Remaining known divergences after round 9:
-- `new Promise(executor)` is not constructible (next up).
-- `Promise.race`/`any` over microtask-pending chains settle by element
-  order, not tick order.
-- `p.then()` (no handlers) returns the receiver, not a new promise
-  (`p.then() === p` is `true`).
-- The `Promise.any` all-reject AggregateError is not an `Error` *instance*.
+**Round 10 (branch `conformance-promise-constructor`)** closed the round-9
+list's promise items:
+- **`new Promise(executor)` — FIXED.** The executor runs synchronously with
+  serializable resolve/reject capability objects that settle through the
+  microtask machinery; thenable adoption, the deferred pattern, the spec'd
+  constructor catch (a throw rejects the promise without escaping), tool
+  calls inside executors, and combinator interop all work
+  (`conformance_promise_constructor.rs`). Pinned: `typeof resolve` inside
+  the executor is `"object"` (capabilities are marker objects).
+- **`Promise.race`/`any` tick order — FIXED.** With pending-chain elements
+  the winner is the first to settle (race) / fulfill (any) as the drain
+  progresses; losers' later rejections are absorbed, not unhandled
+  (`conformance_combinator_ticks.rs`).
+- **`p.then()` identity — FIXED.** `.then`/`.catch`/`.finally` always
+  return a NEW dependent promise; non-callable handlers become
+  pass-through reactions (`p.then() === p` is now `false`, and
+  `Promise.reject(x).then(undefined, undefined).catch(h)` forwards `x`).
+- **AggregateError — FIXED.** The `Promise.any` all-reject reason is a real
+  branded error: `instanceof AggregateError` AND `instanceof Error`,
+  `.name`, `.errors` all match Node.
+
+Remaining known divergences after round 10:
 - Awaits inside async *generator* bodies run inline (no tick) — full task
   semantics for generators would mean running generator frames in the main
   loop; dedicated project.
+- Promise methods chained directly on a *batch* promise (one holding
+  deferred host calls) are pass-through no-ops — guard the `await` with
+  try/catch instead.
 - `Promise.race([])`/`any([])` settle-never pins and `Symbol.toPrimitive`
   non-dispatch are unchanged (documented in `conformance_async.rs` and the
   ToPrimitive notes below).

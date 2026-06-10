@@ -52,7 +52,9 @@ const MAGIC: &[u8; 4] = b"ZPC1";
 /// with v6.
 /// v8: `SuspendedFrame.boxed` (generator frames carry their promoted-cell
 /// map across yields), incompatible with v7.
-pub(crate) const FORMAT_VERSION: u16 = 8;
+/// v9: `Continuation::PromiseExecutor` (`new Promise(executor)` support) —
+/// shifted discriminants, incompatible with v8.
+pub(crate) const FORMAT_VERSION: u16 = 9;
 
 const HEADER_LEN: usize = 4 + 2 + 1 + 1 + 32;
 

@@ -208,6 +208,18 @@ pub(crate) enum Continuation {
         caller_frame_depth: usize,
         callback_frame_index: usize,
     },
+    /// Running a `new Promise(executor)` executor synchronously. When its
+    /// frame pops, the executor's return value is DISCARDED and the new
+    /// promise is pushed as the `new` expression's value. A throw escaping
+    /// the executor rejects the promise (a no-op if a capability already
+    /// settled it) instead of propagating — the spec'd constructor catch.
+    PromiseExecutor {
+        /// The promise under construction (settled by the resolve/reject
+        /// capability functions handed to the executor).
+        promise: Value,
+        caller_frame_depth: usize,
+        callback_frame_index: usize,
+    },
 }
 
 /// A queued microtask (a Promise reaction). When drained, run `handler(value)`
@@ -1056,6 +1068,11 @@ impl Vm {
         for rec in records {
             let Value::Object(rh) = rec else { continue };
             let map = self.heap.object_map(rh);
+            // A "sink" record consumes the settlement silently (a decided
+            // race/any absorbed this loser) — no job, no unhandled mark.
+            if matches!(map.get("mode"), Some(Value::String(s)) if s.as_ref() == "sink") {
+                continue;
+            }
             // A "task" record parks no handler — it resumes the AsyncTask
             // awaiting this promise (microtask-design Stage 3, ResumeAsync).
             if matches!(map.get("mode"), Some(Value::String(s)) if s.as_ref() == "task") {
@@ -1092,6 +1109,62 @@ impl Vm {
                 task: None,
             });
         }
+        Ok(())
+    }
+
+    /// The settled outcome of a `race`/`any` batch element, if it has one:
+    /// a plain value counts as fulfilled; a settled internal promise yields
+    /// its value/reason; a resolved-cache hit for a deferred host call counts
+    /// as fulfilled. In-flight elements (pending chains, untriggered host
+    /// calls, nested batches) return `None`.
+    fn batch_element_outcome(&self, v: &Value) -> Option<(Value, bool)> {
+        match v {
+            Value::Pending(id) => self.resolved.get(id).cloned().map(|c| (c, false)),
+            Value::Object(h) => {
+                let map = self.heap.object(*h)?;
+                if !matches!(map.get("__promise__"), Some(Value::Bool(true))) {
+                    return Some((v.clone(), false));
+                }
+                match map.get("status") {
+                    Some(Value::String(s)) if s.as_ref() == "resolved" => Some((
+                        map.get("value").cloned().unwrap_or(Value::Undefined),
+                        false,
+                    )),
+                    Some(Value::String(s)) if s.as_ref() == "rejected" => Some((
+                        map.get("reason").cloned().unwrap_or(Value::Undefined),
+                        true,
+                    )),
+                    _ => None,
+                }
+            }
+            other => Some((other.clone(), false)),
+        }
+    }
+
+    /// Register a *sink* reaction on a pending internal promise: its eventual
+    /// settlement is consumed silently (no microtask, no unhandled-rejection
+    /// mark). Used for the losing elements of a decided `race`/`any` — the
+    /// combinator absorbed responsibility for them.
+    fn register_sink_reaction(&mut self, receiver: Handle) -> Result<()> {
+        let mut record = IndexMap::new();
+        record.insert(Arc::from("mode"), Value::String(JsString::from("sink")));
+        let rec = Value::Object(self.heap.alloc_object(record));
+        let reactions = match self.heap.object(receiver).and_then(|m| m.get("__reactions__")) {
+            Some(Value::Array(a)) => *a,
+            _ => {
+                return Err(ZapcodeError::RuntimeError(
+                    "internal error: pending promise has no reaction list".to_string(),
+                ))
+            }
+        };
+        self.heap
+            .array_mut(reactions)
+            .ok_or_else(|| {
+                ZapcodeError::RuntimeError(
+                    "internal error: promise reaction list is not an array".to_string(),
+                )
+            })?
+            .push(rec);
         Ok(())
     }
 
@@ -1316,6 +1389,81 @@ impl Vm {
         self.push(sentinel)?;
         self.current_frame_mut().ip -= 1;
         Ok(())
+    }
+
+    /// Invoke a Promise-executor capability (`resolve`/`reject` from
+    /// `new Promise(executor)`). Settling an already-settled promise is a
+    /// no-op (spec). `resolve` adopts thenables: a settled promise unwraps,
+    /// a pending chain forwards via a handler-less reaction, and a deferred
+    /// host call is forced (the VM suspends; `SettleResult` finishes on
+    /// resume — the call's `undefined` result is pre-pushed so the resumed
+    /// stack is balanced). `reject` never adopts (spec).
+    fn settle_capability(
+        &mut self,
+        promise: &Value,
+        value: Value,
+        is_rejection: bool,
+    ) -> Result<Option<VmState>> {
+        if is_rejection {
+            self.settle_promise(promise, value, true)?;
+            return Ok(None);
+        }
+        if builtins::is_promise(&value, &self.heap) {
+            if let Value::Object(h) = &value {
+                let map = self.heap.object_map(*h);
+                match map.get("status") {
+                    Some(Value::String(s)) if s.as_ref() == "resolved" => {
+                        let inner = map.get("value").cloned().unwrap_or(Value::Undefined);
+                        self.settle_promise(promise, inner, false)?;
+                    }
+                    Some(Value::String(s)) if s.as_ref() == "rejected" => {
+                        let reason = map.get("reason").cloned().unwrap_or(Value::Undefined);
+                        self.mark_rejection_handled(*h);
+                        self.settle_promise(promise, reason, true)?;
+                    }
+                    Some(Value::String(s)) if s.as_ref() == "pending" => {
+                        self.register_reaction(
+                            *h,
+                            Value::Undefined,
+                            Value::Undefined,
+                            PromiseCallbackMode::WrapResult,
+                            promise.clone(),
+                        )?;
+                    }
+                    Some(Value::String(s)) if s.as_ref() == "pending_call" => {
+                        let id = match map.get("__call_id__") {
+                            Some(Value::Int(n)) => *n as u64,
+                            _ => {
+                                return Err(ZapcodeError::RuntimeError(
+                                    "internal error: pending_call promise missing __call_id__"
+                                        .to_string(),
+                                ))
+                            }
+                        };
+                        if let Some(cached) = self.resolved.get(&id).cloned() {
+                            self.settle_promise(promise, cached, false)?;
+                        } else {
+                            // Balance the stack for the resume: the
+                            // capability call itself evaluates to undefined.
+                            self.push(Value::Undefined)?;
+                            self.resume_action = Some(ResumeAction::SettleResult {
+                                result_promise: promise.clone(),
+                                pass_original: None,
+                            });
+                            return self.suspend_on_pending_call(id);
+                        }
+                    }
+                    _ => {
+                        // pending_all: settle with the batch promise itself —
+                        // an `await` of the chain re-awaits it.
+                        self.settle_promise(promise, value, false)?;
+                    }
+                }
+                return Ok(None);
+            }
+        }
+        self.settle_promise(promise, value, false)?;
+        Ok(None)
     }
 
     /// Settle a detached async body's result promise with its return value,
@@ -1807,6 +1955,9 @@ impl Vm {
                     None => {
                         let errors_arr = Value::Array(self.heap.alloc_array(errors));
                         let mut agg = IndexMap::new();
+                        // Branded so `e instanceof Error` is true (Node:
+                        // AggregateError extends Error).
+                        agg.insert(Arc::from("__error__"), Value::Bool(true));
                         agg.insert(
                             Arc::from("name"),
                             Value::String(JsString::from("AggregateError")),
@@ -1817,10 +1968,13 @@ impl Vm {
                         );
                         agg.insert(Arc::from("errors"), errors_arr);
                         let reason = Value::Object(self.heap.alloc_object(agg));
-                        let reason = reason.to_js_string(&self.heap);
+                        let msg = reason.to_js_string(&self.heap);
+                        // Rethrow the AggregateError object itself (identity
+                        // preserved for guest catch), as at any await site.
+                        self.pending_throw = Some(reason);
                         return Err(ZapcodeError::RuntimeError(format!(
                             "Unhandled promise rejection: {}",
-                            reason
+                            msg
                         )));
                     }
                 }
@@ -2325,6 +2479,11 @@ impl Vm {
                             caller_frame_depth,
                             callback_frame_index,
                             ..
+                        })
+                        | Some(Continuation::PromiseExecutor {
+                            caller_frame_depth,
+                            callback_frame_index,
+                            ..
                         }) if self.frames.len() > *caller_frame_depth
                             && self.frames.len() >= *callback_frame_index =>
                         {
@@ -2402,12 +2561,22 @@ impl Vm {
                                     self.tracker.pop_frame();
                                 }
                                 self.stack.truncate(stack_base);
-                                if let Some(Continuation::MicrotaskReaction {
-                                    result_promise,
-                                    ..
-                                }) = self.continuations.pop()
-                                {
-                                    self.settle_promise(&result_promise, reason, true)?;
+                                match self.continuations.pop() {
+                                    Some(Continuation::MicrotaskReaction {
+                                        result_promise, ..
+                                    }) => {
+                                        self.settle_promise(&result_promise, reason, true)?;
+                                    }
+                                    Some(Continuation::PromiseExecutor { promise, .. }) => {
+                                        // The spec'd constructor catch: the
+                                        // throw rejects the promise (no-op if
+                                        // a capability already settled it) and
+                                        // the `new` expression still evaluates
+                                        // to the promise.
+                                        self.settle_promise(&promise, reason, true)?;
+                                        self.push(promise)?;
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -2454,6 +2623,11 @@ impl Vm {
                 caller_frame_depth,
                 ..
             } => (*callback_frame_index, *caller_frame_depth),
+            Continuation::PromiseExecutor {
+                callback_frame_index,
+                caller_frame_depth,
+                ..
+            } => (*callback_frame_index, *caller_frame_depth),
         };
 
         // The callback frame is still active — not done yet
@@ -2481,6 +2655,7 @@ impl Vm {
         let is_promise_cont = matches!(
             self.continuations.last(),
             Some(Continuation::MicrotaskReaction { .. })
+                | Some(Continuation::PromiseExecutor { .. })
         );
 
         // Unwrap internal promise values: async callbacks return
@@ -2700,6 +2875,14 @@ impl Vm {
                         )?;
                     }
                 }
+                Ok(None)
+            }
+            Continuation::PromiseExecutor { promise, .. } => {
+                // The executor returned: its value is discarded (spec); the
+                // `new Promise(...)` expression evaluates to the promise,
+                // settled or not. (`callback_result` was already popped.)
+                let _ = callback_result;
+                self.push(promise)?;
                 Ok(None)
             }
         }
@@ -3779,54 +3962,42 @@ impl Vm {
         // the handler no longer runs inline (microtask-design Stage 1).
         // A method with no applicable callable handler keeps the cheap
         // pass-through of the receiver itself.
+        // Each method on a settled / pending receiver returns a NEW dependent
+        // promise (`p.then() !== p`, spec), settled by an enqueued/registered
+        // reaction. A non-callable handler is the pass-through reaction
+        // (`Undefined` handler forwards the outcome). Only the still-special
+        // statuses (`pending_call`/`pending_all`/unknown) keep the legacy
+        // pass-the-receiver-through behavior.
         match method {
-            "then" => match status.as_str() {
-                "resolved" if matches!(on_fulfilled, Value::Function(_)) => {
-                    let result = builtins::make_pending_promise(&mut self.heap);
-                    self.microtasks.push_back(Microtask {
-                        handler: on_fulfilled,
-                        value,
-                        is_rejection: false,
-                        mode: PromiseCallbackMode::WrapResult,
-                        result_promise: result.clone(),
-                        task: None,
-                    });
-                    Ok(PromiseMethodOutcome::Value(result))
-                }
-                "rejected" if matches!(on_rejected, Value::Function(_)) => {
-                    self.mark_rejection_handled(receiver);
-                    let result = builtins::make_pending_promise(&mut self.heap);
-                    self.microtasks.push_back(Microtask {
-                        handler: on_rejected,
-                        value: reason,
-                        is_rejection: true,
-                        mode: PromiseCallbackMode::WrapResult,
-                        result_promise: result.clone(),
-                        task: None,
-                    });
-                    Ok(PromiseMethodOutcome::Value(result))
-                }
-                "pending" if self.is_internal_pending(&promise) => {
-                    let result = builtins::make_pending_promise(&mut self.heap);
-                    self.register_reaction(
-                        receiver,
-                        on_fulfilled,
-                        on_rejected,
-                        PromiseCallbackMode::WrapResult,
-                        result.clone(),
-                    )?;
-                    Ok(PromiseMethodOutcome::Value(result))
-                }
-                _ => Ok(PromiseMethodOutcome::Value(promise)),
-            },
-            "catch" => {
-                let handler = args.first().cloned().unwrap_or(Value::Undefined);
+            "then" => {
+                let pass = |h: Value| {
+                    if matches!(h, Value::Function(_)) {
+                        h
+                    } else {
+                        Value::Undefined
+                    }
+                };
                 match status.as_str() {
-                    "rejected" if matches!(handler, Value::Function(_)) => {
+                    "resolved" => {
+                        let result = builtins::make_pending_promise(&mut self.heap);
+                        self.microtasks.push_back(Microtask {
+                            handler: pass(on_fulfilled),
+                            value,
+                            is_rejection: false,
+                            mode: PromiseCallbackMode::WrapResult,
+                            result_promise: result.clone(),
+                            task: None,
+                        });
+                        Ok(PromiseMethodOutcome::Value(result))
+                    }
+                    "rejected" => {
+                        // With no onRejected the rejection forwards to (and
+                        // marks) the dependent promise; either way this
+                        // receiver now has a consumer.
                         self.mark_rejection_handled(receiver);
                         let result = builtins::make_pending_promise(&mut self.heap);
                         self.microtasks.push_back(Microtask {
-                            handler,
+                            handler: pass(on_rejected),
                             value: reason,
                             is_rejection: true,
                             mode: PromiseCallbackMode::WrapResult,
@@ -3835,10 +4006,53 @@ impl Vm {
                         });
                         Ok(PromiseMethodOutcome::Value(result))
                     }
-                    "pending"
-                        if self.is_internal_pending(&promise)
-                            && matches!(handler, Value::Function(_)) =>
-                    {
+                    "pending" if self.is_internal_pending(&promise) => {
+                        let result = builtins::make_pending_promise(&mut self.heap);
+                        self.register_reaction(
+                            receiver,
+                            on_fulfilled,
+                            on_rejected,
+                            PromiseCallbackMode::WrapResult,
+                            result.clone(),
+                        )?;
+                        Ok(PromiseMethodOutcome::Value(result))
+                    }
+                    _ => Ok(PromiseMethodOutcome::Value(promise)),
+                }
+            }
+            "catch" => {
+                let handler = args.first().cloned().unwrap_or(Value::Undefined);
+                match status.as_str() {
+                    "resolved" => {
+                        let result = builtins::make_pending_promise(&mut self.heap);
+                        self.microtasks.push_back(Microtask {
+                            handler: Value::Undefined,
+                            value,
+                            is_rejection: false,
+                            mode: PromiseCallbackMode::WrapResult,
+                            result_promise: result.clone(),
+                            task: None,
+                        });
+                        Ok(PromiseMethodOutcome::Value(result))
+                    }
+                    "rejected" => {
+                        self.mark_rejection_handled(receiver);
+                        let result = builtins::make_pending_promise(&mut self.heap);
+                        self.microtasks.push_back(Microtask {
+                            handler: if matches!(handler, Value::Function(_)) {
+                                handler
+                            } else {
+                                Value::Undefined
+                            },
+                            value: reason,
+                            is_rejection: true,
+                            mode: PromiseCallbackMode::WrapResult,
+                            result_promise: result.clone(),
+                            task: None,
+                        });
+                        Ok(PromiseMethodOutcome::Value(result))
+                    }
+                    "pending" if self.is_internal_pending(&promise) => {
                         let result = builtins::make_pending_promise(&mut self.heap);
                         self.register_reaction(
                             receiver,
@@ -3854,9 +4068,13 @@ impl Vm {
             }
             "finally" => {
                 let handler = args.first().cloned().unwrap_or(Value::Undefined);
-                if !matches!(handler, Value::Function(_)) {
-                    return Ok(PromiseMethodOutcome::Value(promise));
-                }
+                // A non-callable handler degenerates to a value/rejection
+                // pass-through (same observable as `finally(() => {})`).
+                let (handler, mode) = if matches!(handler, Value::Function(_)) {
+                    (handler, PromiseCallbackMode::PassThrough)
+                } else {
+                    (Value::Undefined, PromiseCallbackMode::WrapResult)
+                };
                 match status.as_str() {
                     "resolved" => {
                         let result = builtins::make_pending_promise(&mut self.heap);
@@ -3864,7 +4082,7 @@ impl Vm {
                             handler,
                             value,
                             is_rejection: false,
-                            mode: PromiseCallbackMode::PassThrough,
+                            mode,
                             result_promise: result.clone(),
                             task: None,
                         });
@@ -3880,7 +4098,7 @@ impl Vm {
                             handler,
                             value: reason,
                             is_rejection: true,
-                            mode: PromiseCallbackMode::PassThrough,
+                            mode,
                             result_promise: result.clone(),
                             task: None,
                         });
@@ -3892,7 +4110,7 @@ impl Vm {
                             receiver,
                             handler.clone(),
                             handler,
-                            PromiseCallbackMode::PassThrough,
+                            mode,
                             result.clone(),
                         )?;
                         Ok(PromiseMethodOutcome::Value(result))
@@ -5919,6 +6137,34 @@ impl Vm {
                         let r = self.construct_regexp(&args)?;
                         self.push(r)?;
                     }
+                    // A Promise-executor capability: calling `resolve(v)` /
+                    // `reject(r)` settles the constructed promise (no-op once
+                    // settled). The call expression evaluates to undefined.
+                    Value::Object(h)
+                        if self
+                            .heap
+                            .object(h)
+                            .is_some_and(|m| m.contains_key("__promise_capability__")) =>
+                    {
+                        let (promise, is_reject) = {
+                            let m = self.heap.object_map(h);
+                            (
+                                m.get("__promise_capability__")
+                                    .cloned()
+                                    .unwrap_or(Value::Undefined),
+                                matches!(
+                                    m.get("__capability_reject__"),
+                                    Some(Value::Bool(true))
+                                ),
+                            )
+                        };
+                        let arg = args.first().cloned().unwrap_or(Value::Undefined);
+                        if let Some(state) = self.settle_capability(&promise, arg, is_reject)? {
+                            return Ok(Some(state));
+                        }
+                        self.push(Value::Undefined)?;
+                        self.last_receiver = None;
+                    }
                     // `Function(...)` called WITHOUT `new` is equally forbidden;
                     // the rejection is a catchable runtime sandbox violation.
                     Value::Object(h)
@@ -6611,6 +6857,61 @@ impl Vm {
                                     Some(Value::Array(a)) => self.heap.array_vec(*a),
                                     _ => Vec::new(),
                                 };
+                                let kind = match map.get("__batch_kind__") {
+                                    Some(Value::String(k)) => match k.as_ref() {
+                                        "race" => BatchKind::Race,
+                                        "any" => BatchKind::Any,
+                                        "allSettled" => BatchKind::AllSettled,
+                                        _ => BatchKind::All,
+                                    },
+                                    _ => BatchKind::All,
+                                };
+                                // race/any settle with the FIRST element to
+                                // settle (race) / fulfill (any) in tick order,
+                                // scanning between drained jobs — as in Node,
+                                // a shallower chain in a later slot beats a
+                                // deeper chain in an earlier one.
+                                if matches!(kind, BatchKind::Race | BatchKind::Any) {
+                                    let winner = items.iter().enumerate().find_map(|(i, item)| {
+                                        self.batch_element_outcome(item).and_then(
+                                            |(outcome, rejected)| {
+                                                if rejected && matches!(kind, BatchKind::Any) {
+                                                    None // any skips rejections
+                                                } else {
+                                                    Some((i, outcome, rejected))
+                                                }
+                                            },
+                                        )
+                                    });
+                                    if let Some((idx, outcome, rejected)) = winner {
+                                        // Losers' future rejections are the
+                                        // combinator's to absorb, not unhandled.
+                                        for (i, item) in items.iter().enumerate() {
+                                            if i == idx {
+                                                continue;
+                                            }
+                                            if let Value::Object(lh) = item {
+                                                self.mark_rejection_handled(*lh);
+                                                if self.is_internal_pending(item) {
+                                                    self.register_sink_reaction(*lh)?;
+                                                }
+                                            }
+                                        }
+                                        if rejected {
+                                            if let Value::Object(wh) = &items[idx] {
+                                                self.mark_rejection_handled(*wh);
+                                            }
+                                            let msg = outcome.to_js_string(&self.heap);
+                                            self.pending_throw = Some(outcome);
+                                            return Err(ZapcodeError::RuntimeError(format!(
+                                                "Unhandled promise rejection: {}",
+                                                msg
+                                            )));
+                                        }
+                                        self.push(outcome)?;
+                                        return Ok(None);
+                                    }
+                                }
                                 // Settle microtask-pending elements (`.then`
                                 // chains inside the combinator) before the batch
                                 // is classified/assembled — one microtask per
@@ -6623,15 +6924,6 @@ impl Vm {
                                         return Ok(None);
                                     }
                                 }
-                                let kind = match map.get("__batch_kind__") {
-                                    Some(Value::String(k)) => match k.as_ref() {
-                                        "race" => BatchKind::Race,
-                                        "any" => BatchKind::Any,
-                                        "allSettled" => BatchKind::AllSettled,
-                                        _ => BatchKind::All,
-                                    },
-                                    _ => BatchKind::All,
-                                };
                                 // Suspend on the whole batch (or resolve inline if
                                 // every element is already available).
                                 return self.await_batch(kind, items);
@@ -6752,6 +7044,53 @@ impl Vm {
                         });
                     if let Some(name) = builtin_ctor {
                         match name.as_ref() {
+                            "Promise" => {
+                                // `new Promise(executor)`: run the executor
+                                // synchronously with serializable resolve /
+                                // reject capability objects that settle the
+                                // new pending promise (microtask machinery
+                                // takes it from there). The executor's frame
+                                // is driven by the main loop, so a tool call
+                                // inside it suspends normally; its return
+                                // value is discarded and the `new` expression
+                                // evaluates to the promise (see
+                                // `Continuation::PromiseExecutor`).
+                                let executor = args.first().cloned().unwrap_or(Value::Undefined);
+                                let Value::Function(closure) = executor else {
+                                    return Err(ZapcodeError::TypeError(format!(
+                                        "Promise resolver {} is not a function",
+                                        args.first()
+                                            .cloned()
+                                            .unwrap_or(Value::Undefined)
+                                            .to_js_string(&self.heap)
+                                    )));
+                                };
+                                let promise = builtins::make_pending_promise(&mut self.heap);
+                                let mut make_capability = |reject: bool, heap: &mut Heap| {
+                                    let mut cap = IndexMap::new();
+                                    cap.insert(
+                                        Arc::from("__promise_capability__"),
+                                        promise.clone(),
+                                    );
+                                    cap.insert(
+                                        Arc::from("__capability_reject__"),
+                                        Value::Bool(reject),
+                                    );
+                                    Value::Object(heap.alloc_object(cap))
+                                };
+                                let resolve = make_capability(false, &mut self.heap);
+                                let reject = make_capability(true, &mut self.heap);
+                                let caller_frame_depth = self.frames.len();
+                                self.push_call_frame(&closure, &[resolve, reject], None)?;
+                                self.continuations.push(Continuation::PromiseExecutor {
+                                    promise,
+                                    caller_frame_depth,
+                                    callback_frame_index: self.frames.len() - 1,
+                                });
+                                // The main loop drives the executor frame; the
+                                // continuation pushes the promise when it pops.
+                                return Ok(None);
+                            }
                             "Map" => {
                                 // Accepts an array of [k, v] pairs OR another Map.
                                 let arg = args.first().cloned().unwrap_or(Value::Undefined);
