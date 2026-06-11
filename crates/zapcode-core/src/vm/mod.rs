@@ -1241,6 +1241,23 @@ impl Vm {
         false
     }
 
+    /// True for a `pending_all` batch promise holding at least one
+    /// microtask-pending chain element (which only the drain can settle).
+    fn batch_has_pending_chains(&self, v: &Value) -> bool {
+        let Value::Object(h) = v else { return false };
+        let Some(map) = self.heap.object(*h) else {
+            return false;
+        };
+        if !matches!(map.get("status"), Some(Value::String(s)) if s.as_ref() == "pending_all") {
+            return false;
+        }
+        let items = match map.get("items") {
+            Some(Value::Array(a)) => self.heap.array_vec(*a),
+            _ => return false,
+        };
+        items.iter().any(|i| self.is_internal_pending(i))
+    }
+
     /// Begin running a drained microtask. A callable handler gets a frame plus
     /// a [`Continuation::MicrotaskReaction`] — the main loop drives it, so a
     /// tool call inside the handler suspends normally. A non-callable handler
@@ -2334,9 +2351,15 @@ impl Vm {
                     }
                 }
                 // Destructuring params bind multiple locals in declaration order;
-                // extract the fields from the argument into those slots.
+                // extract the fields from the argument into those slots. A
+                // pattern with a field-level default keeps the raw argument in
+                // a hidden temp first, so the compiler prologue can repair the
+                // leaves when the field arrives undefined.
                 ParamPattern::ObjectDestructure(_) | ParamPattern::ArrayDestructure(_) => {
                     let arg = args.get(i).cloned().unwrap_or(Value::Undefined);
+                    if param.has_field_level_default() {
+                        locals.push(arg.clone());
+                    }
                     extract_pattern(param, &arg, &mut locals, heap);
                 }
             }
@@ -3091,6 +3114,36 @@ impl Vm {
     /// Call a function value with the given arguments and run it to completion.
     /// Returns the function's return value.
     fn call_function_internal(&mut self, callee: &Value, args: Vec<Value>) -> Result<Value> {
+        // Bare conversion globals (`String`/`Number`/`Boolean`, marker
+        // objects) are callable as callbacks too — `arr.map(String)` etc. —
+        // with the same ToPrimitive shaping the Call instruction applies.
+        if let Value::Object(h) = callee {
+            let kind = self
+                .heap
+                .object(*h)
+                .and_then(|m| m.get("__global_fn__"))
+                .and_then(|v| match v {
+                    Value::String(s) => Some(s.to_string()),
+                    _ => None,
+                });
+            if let Some(kind) = kind {
+                let mut args = args;
+                match kind.as_str() {
+                    "String" => {
+                        if let Some(first) = args.first().cloned() {
+                            args[0] = self.to_primitive(&first, ToPrimitiveHint::String)?;
+                        }
+                    }
+                    "Number" => {
+                        if let Some(first) = args.first().cloned() {
+                            args[0] = self.to_primitive(&first, ToPrimitiveHint::Number)?;
+                        }
+                    }
+                    _ => {}
+                }
+                return builtins::call_global_fn(&kind, &args, &mut self.heap);
+            }
+        }
         self.call_closure_internal(callee, args, None)
     }
 
@@ -3616,6 +3669,13 @@ impl Vm {
                 .object(*h)
                 .and_then(|m| m.get(key))
                 .cloned()
+                .unwrap_or(Value::Undefined),
+            // An ARRAY holder reads its element by index — without this, every
+            // element of a revived array was visited as `undefined`.
+            Value::Array(h) => key
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| self.heap.array(*h).get(i).cloned())
                 .unwrap_or(Value::Undefined),
             _ => Value::Undefined,
         };
@@ -6141,6 +6201,29 @@ impl Vm {
                             }
                             "__promise__" => {
                                 if let Some(promise) = receiver {
+                                    // A combinator batch holding microtask-pending
+                                    // chain elements: settle them first — one
+                                    // drained job per re-dispatch of this Call —
+                                    // so the method can force the batch with every
+                                    // chain element settled. This is what makes
+                                    // `Promise.all([p.then(f), …]).then(cb)` work.
+                                    if self.batch_has_pending_chains(&promise) {
+                                        if let Some(m) = self.microtasks.pop_front() {
+                                            let callee = Value::BuiltinMethod {
+                                                object_name: object_name.clone(),
+                                                method_name: method_name.clone(),
+                                                recv: Some(Box::new(promise.clone())),
+                                                place: place.clone(),
+                                            };
+                                            self.push(callee)?;
+                                            for a in &args {
+                                                self.push(a.clone())?;
+                                            }
+                                            self.current_frame_mut().ip -= 1;
+                                            self.start_microtask(m)?;
+                                            return Ok(None);
+                                        }
+                                    }
                                     match self
                                         .execute_promise_method(promise, &method_name, args)?
                                     {

@@ -210,16 +210,19 @@ fn generator_consumed_by_for_of_and_spread() {
 // ============================================================================
 
 #[test]
-fn collection_iterator_manual_next_is_documented_divergence() {
-    // DIVERGENCE asserted as actual: collection iterators are spreadable /
-    // for-of-able but NOT manual step iterators. JS supports `.next()`.
+fn collection_iterator_manual_next_matches_node() {
+    // FIXED (differential round): entries()/keys()/values() return real
+    // iterator objects, so manual `.next()` stepping works alongside
+    // spread/for-of (which consume the same cursor).
     assert_eq!(
-        run_str("try { [10, 20].values().next(); 'no' } catch (e) { e.name }"),
-        "TypeError"
+        run_str(
+            "const it = [10, 20].values();              const r1 = it.next(); const r2 = it.next(); const r3 = it.next();              [r1.value, r1.done, r2.value, r2.done, String(r3.value), r3.done].join(',')"
+        ),
+        "10,false,20,false,undefined,true"
     );
     assert_eq!(
-        run_str("try { [1].keys().next(); 'no' } catch (e) { e instanceof TypeError ? 'te' : 'o' }"),
-        "te"
+        run_str("const k = [7, 8].keys(); k.next().value + '|' + [...k].join(',')"),
+        "0|1"
     );
 }
 

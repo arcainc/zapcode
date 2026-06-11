@@ -501,6 +501,11 @@ impl Compiler {
                     }
                 },
                 ParamPattern::ObjectDestructure(fields) => {
+                    // A field-level default (`{b: {c} = {…}}`) needs the raw
+                    // argument in a hidden temp (see has_field_level_default).
+                    if param.has_field_level_default() {
+                        func_compiler.declare_local(&Self::param_temp_name(i));
+                    }
                     func_compiler.declare_destructure_locals(fields);
                 }
                 ParamPattern::ArrayDestructure(elems) => {
@@ -541,6 +546,10 @@ impl Compiler {
                     }
                 },
                 ParamPattern::ObjectDestructure(_) | ParamPattern::ArrayDestructure(_) => {
+                    if param.has_field_level_default() {
+                        func_compiler
+                            .emit_field_level_defaults(&Self::param_temp_name(i), param)?;
+                    }
                     func_compiler.emit_pattern_inner_defaults(param)?;
                 }
                 _ => {}
@@ -1693,6 +1702,38 @@ impl Compiler {
         self.emit(Instruction::Pop);
         let after = self.current_offset();
         self.patch_jump(skip, after);
+        Ok(())
+    }
+
+    /// `function f({b: {c} = {c: 9}})`: for each top-level field carrying BOTH
+    /// a nested pattern and a default, read the raw field off the hidden temp,
+    /// apply the default if it is undefined, and re-destructure into the
+    /// already-declared leaf slots (Var semantics reuse them). The VM's flat
+    /// extraction bound those leaves from `undefined` when the field was
+    /// missing; this prologue pass repairs them. (Deeper-than-top-level field
+    /// defaults inside params remain unsupported.)
+    fn emit_field_level_defaults(&mut self, temp: &str, pattern: &ParamPattern) -> Result<()> {
+        let Some(slot) = self.resolve_local(temp) else {
+            return Ok(());
+        };
+        let ParamPattern::ObjectDestructure(fields) = pattern else {
+            return Ok(());
+        };
+        for field in fields {
+            let (Some(nested), Some(default)) = (&field.nested, &field.default) else {
+                continue;
+            };
+            self.emit(Instruction::LoadLocal(slot));
+            if let Some(key_expr) = &field.computed_key {
+                self.compile_expr(key_expr)?;
+                self.emit(Instruction::GetIndex);
+            } else {
+                self.emit(Instruction::GetProperty(field.key.clone()));
+            }
+            self.emit_apply_default(Some(default))?;
+            self.compile_destructure_pattern(nested, VarKind::Var)?;
+            self.emit(Instruction::Pop);
+        }
         Ok(())
     }
 

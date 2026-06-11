@@ -2897,20 +2897,20 @@ fn call_array_method(
             v.splice(start..start + delete_count, inserts);
             Value::Array(heap.alloc_array(v))
         }
-        // Array iterators. JS returns iterator objects; we return plain arrays,
-        // which spread (`[...arr.entries()]`) and for-of iterate identically.
+        // Array iterators: real iterator objects (`__array_iterator__`), so
+        // `.next()` works AND spread / for-of consume them via the cursor.
         "entries" => {
             let mut out = Vec::with_capacity(arr.len());
             for (i, v) in arr.iter().enumerate() {
                 let pair = heap.alloc_array(vec![Value::Int(i as i64), v.clone()]);
                 out.push(Value::Array(pair));
             }
-            Value::Array(heap.alloc_array(out))
+            make_array_iterator(out, heap)
         }
         "keys" => {
-            Value::Array(heap.alloc_array((0..arr.len()).map(|i| Value::Int(i as i64)).collect()))
+            make_array_iterator((0..arr.len()).map(|i| Value::Int(i as i64)).collect(), heap)
         }
-        "values" => Value::Array(heap.alloc_array(arr.to_vec())),
+        "values" => make_array_iterator(arr.to_vec(), heap),
         "every" | "some" | "map" | "filter" | "reduce" | "reduceRight" | "forEach" | "find"
         | "findIndex" | "findLast" | "findLastIndex" | "sort" | "flatMap" => {
             // These require function callbacks — handled in VM dispatch
@@ -3770,6 +3770,17 @@ fn call_promise_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<
         }
         _ => Ok(None),
     }
+}
+
+/// Build a built-in array-iterator object: `for…of`, spread, and `.next()`
+/// all consume it through the `__items__`/`__cursor__` protocol.
+pub fn make_array_iterator(items: Vec<Value>, heap: &mut Heap) -> Value {
+    let items_h = heap.alloc_array(items);
+    let mut obj = IndexMap::new();
+    obj.insert(Arc::from("__array_iterator__"), Value::Bool(true));
+    obj.insert(Arc::from("__items__"), Value::Array(items_h));
+    obj.insert(Arc::from("__cursor__"), Value::Int(0));
+    Value::Object(heap.alloc_object(obj))
 }
 
 /// Check if a value is a promise object (has __promise__: true).

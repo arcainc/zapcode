@@ -80,6 +80,32 @@ follow-up):
   non-dispatch are unchanged (documented in `conformance_async.rs` and the
   ToPrimitive notes below).
 
+**Round 11 (branch `parity-differential-harness`) — the differential gate.**
+`packages/zapcode-ai/tests/differential.mjs` runs a 130-snippet corpus
+through BOTH zapcode and real Node in the same process and deep-compares the
+results (normalized for the documented host-marshalling rules). It is wired
+into `test:e2e-full`, so parity is now checked mechanically on every run;
+documented pins are asserted as pins (and fail loudly if they start agreeing
+with Node, forcing promotion into the corpus). Its FIRST run found five real
+divergences, all fixed in this round:
+- **`arr.map(String)` / conversion globals as callbacks** — `String`/
+  `Number`/`Boolean` marker objects are now callable through every internal
+  callback path (with the same ToPrimitive shaping as a direct call).
+- **`entries()`/`keys()`/`values()`** now return real iterator objects:
+  manual `.next()` stepping works alongside spread/for-of (the old
+  plain-array pin in `conformance_iterators.rs` is rewritten as a
+  capability test).
+- **`JSON.parse(text, reviver)` over arrays** — the reviver walk read every
+  array element as `undefined` (the holder-read arm only handled objects).
+- **Param destructuring field-level defaults** (`({a, b: {c} = {c: 9}})`) —
+  the raw argument now rides a hidden temp so the compiler prologue can
+  re-destructure the default when the field arrives undefined (mirrors the
+  whole-pattern-default mechanism).
+- **`Promise.all([p.then(f), …]).then(cb)`** — a batch holding
+  microtask-pending chain elements now settles them (one drained job per
+  re-dispatch of the method call) before the method forces the batch,
+  closing the carve-out from the batch-methods round.
+
 **Round 8 (branch `arca/conformance-fixes`) — cluster wrap-up + reflection / RegExp / coercion-builtin edges.**
 
 This round confirms the earlier-landed clusters are GREEN-by-construction (asserting
