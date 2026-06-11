@@ -2959,6 +2959,7 @@ impl Vm {
                 // done; answer the pull with {value, done: true} — or, for a
                 // for…of pull, the protocol pair [done-triple, return-value].
                 let gen_id = gen_obj.id;
+                let is_async_gen = self.current_function(gen_obj.func_ref).is_async;
                 if for_of {
                     let _ = self.finish_generator(gen_obj, Value::Undefined);
                     let triple = self.gen_iter_triple(gen_id, true);
@@ -2966,6 +2967,11 @@ impl Vm {
                     self.push(callback_result)?;
                 } else {
                     let res = self.finish_generator(gen_obj, callback_result);
+                    let res = if is_async_gen {
+                        builtins::make_resolved_promise(res, &mut self.heap)
+                    } else {
+                        res
+                    };
                     self.push(res)?;
                 }
                 Ok(None)
@@ -4433,6 +4439,11 @@ impl Vm {
                 self.push(Value::Undefined)?;
             } else {
                 let res = self.make_iterator_result(Value::Undefined, true);
+                let res = if self.current_function(gen_obj.func_ref).is_async {
+                    builtins::make_resolved_promise(res, &mut self.heap)
+                } else {
+                    res
+                };
                 self.push(res)?;
             }
             return Ok(());
@@ -6091,12 +6102,22 @@ impl Vm {
                                                     "Generator is already running".to_string(),
                                                 ));
                                             } else {
-                                                Some(
-                                                    self.make_iterator_result(
-                                                        Value::Undefined,
-                                                        true,
-                                                    ),
-                                                )
+                                                let res = self.make_iterator_result(
+                                                    Value::Undefined,
+                                                    true,
+                                                );
+                                                let res = if self
+                                                    .current_function(gen_obj.func_ref)
+                                                    .is_async
+                                                {
+                                                    builtins::make_resolved_promise(
+                                                        res,
+                                                        &mut self.heap,
+                                                    )
+                                                } else {
+                                                    res
+                                                };
+                                                Some(res)
                                             }
                                         }
                                         "return" => {
@@ -7077,6 +7098,7 @@ impl Vm {
                 // dispatch() pre-incremented ip, so the frame resumes just
                 // past this Yield.
                 let gen_id = gen_obj.id;
+                let is_async_gen = self.current_function(gen_obj.func_ref).is_async;
                 gen_obj.suspended = Some(SuspendedFrame {
                     ip: frame.ip,
                     locals: frame.locals,
@@ -7091,6 +7113,14 @@ impl Vm {
                     self.push(yielded)?;
                 } else {
                     let res = self.make_iterator_result(yielded, false);
+                    // An async generator's next() answers a Promise of the
+                    // iterator result (Node), so `it.next().then(...)` and
+                    // `await it.next()` both work.
+                    let res = if is_async_gen {
+                        builtins::make_resolved_promise(res, &mut self.heap)
+                    } else {
+                        res
+                    };
                     self.push(res)?;
                 }
             }
