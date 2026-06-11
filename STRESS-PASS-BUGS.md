@@ -65,10 +65,12 @@ follow-up):
   body in the main loop — tool calls inside generator bodies suspend
   durably (the old "cannot suspend inside a generator" pin is gone), the
   yield-in-try leak is fixed, and re-entrant pulls raise Node's TypeError.
-  Remaining (Stage 3): async-generator `next()` returns the raw
-  `{value, done}` instead of a Promise, and body awaits between yields run
-  without full tick interleaving; spread/`Array.from`/destructure still
-  materialize eagerly via the nested driver (no tool calls there).
+  Stage 3 made async-generator `next()` answer a Promise of the iterator
+  result (`it.next().then(...)` works). Remaining pins: body awaits
+  between yields run with in-place drains (cross-task tick interleaving
+  during a pull can run ahead; results match Node), and
+  spread/`Array.from`/destructure still materialize eagerly via the nested
+  driver (no tool calls there).
 - (FIXED in the batch-methods follow-up) `.then`/`.catch`/`.finally` on a
   *batch* promise now force the batch like the single-call N5 path and run
   the method on the assembled result (`conformance_batch_methods.rs`);

@@ -162,3 +162,50 @@ fn yield_star_over_a_tool_calling_generator() {
         "pre,r0,post"
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Stage 3: async-generator next() answers a Promise
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn async_generator_next_returns_a_promise() {
+    // Node: it.next() is thenable; await unwraps the iterator result.
+    assert_eq!(
+        run_str(
+            "async function* g() { yield 1; return 'end'; } \
+             async function main() { \
+                 const it = g(); \
+                 const r1 = await it.next(); \
+                 const r2 = await it.next().then(r => r); \
+                 const r3 = await it.next(); \
+                 return `${r1.value},${r1.done}|${r2.value},${r2.done}|${String(r3.value)},${r3.done}`; \
+             } \
+             main();"
+        ),
+        // Node: 1,false|end,true|undefined,true
+        "1,false|end,true|undefined,true"
+    );
+}
+
+#[test]
+fn sync_generator_next_still_returns_a_plain_object() {
+    assert_eq!(
+        run_str(
+            "function* g() { yield 1; } \
+             const r = g().next(); \
+             `${typeof r}:${r.value},${r.done}`"
+        ),
+        "object:1,false"
+    );
+}
+
+#[test]
+fn async_generator_next_chains_then() {
+    assert_eq!(
+        run_str(
+            "async function* g() { yield 7; } \
+             await g().next().then(r => r.value * 2)"
+        ),
+        "14"
+    );
+}
