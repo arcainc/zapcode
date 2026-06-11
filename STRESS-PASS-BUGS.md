@@ -106,6 +106,46 @@ divergences, all fixed in this round:
   re-dispatch of the method call) before the method forces the batch,
   closing the carve-out from the batch-methods round.
 
+**Round 12 (branch `parity-differential-harness`, second pass) — PR-review
+fixes.** Worked the valid findings from the PR #35/#37 review comments (one —
+the claimed array-destructure local-slot misalignment — was a false positive:
+the hidden-temp push is gated on `has_field_level_default()`, which is
+identically false for array patterns in both VM and compiler):
+- **`Promise.all([pending]).then(cb)` with an EMPTY microtask queue dropped
+  `cb`.** The round-11 fix borrowed a drained job per re-dispatch, so it only
+  worked while the queue was non-empty; with nothing queued, the method fell
+  through to the legacy pass-through (returning the batch itself — Node 11
+  vs zapcode `[1]` on the gate repro). A combinator whose every element is
+  internal (settled / plain / microtask-pending — no host call to force) now
+  LOWERS to a real pending promise: each pending element gets a `"combine"`
+  reaction carrying the batch + index, per-kind progress lives on the batch
+  object itself (plain heap data — snapshots for free), and the method runs
+  through the ordinary pending-promise path. All four kinds implemented
+  (all / race / any incl. AggregateError / allSettled); mixed host+chain
+  batches keep the drain-borrowing path. `conformance_batch_lowering.rs`
+  (12 tests incl. a snapshot-hop) + 7 differential snippets.
+- **Nested destructure defaults evaluated TWICE** (and, worse, field-level
+  defaults under a whole-pattern default never applied when the argument was
+  supplied: `f({})` against `{a: {b} = {b: 9}} = {}` bound `b` undefined).
+  The repair prologue re-destructures the nested subtree — which applies its
+  inner defaults — and the inner-defaults pass then descended the same
+  subtree again. Fix: the whole-pattern-default path gained a proper
+  defined-argument else-branch running the same repair as plain patterns,
+  and the inner pass skips fields the repair already covered. Side-effecting
+  defaults now run exactly once on every call shape (Node-verified).
+- **`gen_iter_triple` allocated without resource accounting** — every
+  loop-driven generator pull allocated an untracked 3-slot protocol array;
+  now charged against the limits like every other allocation site.
+- **Guest JSON.stringify could ABORT THE HOST** (pre-existing, surfaced by
+  this round's test runs): `Vm::serialize_json_dynamic` uses ~7.5 KB of
+  stack per frame unoptimized, so the 256-level `MAX_RENDER_DEPTH` budget
+  (~1.9 MB) overran a default 2 MiB thread stack *before the depth guard
+  could fire* — a sandbox hole (`security.rs` only passed by margin).
+  `MAX_RENDER_DEPTH` is now 128, keeping the fattest walker's worst case
+  under ~1 MB.
+- Hygiene: the duplicate `make_array_iterator` in `vm/mod.rs` now delegates
+  to the `builtins` copy.
+
 **Round 8 (branch `arca/conformance-fixes`) — cluster wrap-up + reflection / RegExp / coercion-builtin edges.**
 
 This round confirms the earlier-landed clusters are GREEN-by-construction (asserting

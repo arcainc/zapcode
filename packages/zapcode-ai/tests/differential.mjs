@@ -209,6 +209,23 @@ const corpus = [
   `return ['x-1', 'y-2'].map(s => s.match(/([a-z])-(\\d)/)).map(m => m[1] + m[2]).join(',');`,
   `return /^[\\w.]+@[\\w.]+$/.test('a.b@c.io') + ',' + /^\\d+$/.test('12a');`,
   `return 'one  two\\tthree'.split(/\\s+/).join('|');`,
+
+  // ── combinators over internal chains (.then with empty queue) ─────────
+  // PR-review round: lowered batches (combine reactions) replace the legacy
+  // pass-through that dropped handlers when the microtask queue was empty.
+  `let resolve; const gate = new Promise(r => { resolve = r; }); async function worker() { await gate; return 1; } const chained = Promise.all([worker()]).then(v => v[0] + 10); resolve(5); return await chained;`,
+  `let reject; const gate = new Promise((r, j) => { reject = j; }); async function w() { await gate; } const c = Promise.all([w()]).catch(e => 'caught:' + e); reject('bad'); return await c;`,
+  `let r1, r2; const g1 = new Promise(r => r1 = r), g2 = new Promise(r => r2 = r); async function a() { return 'A:' + await g1; } async function b() { return 'B:' + await g2; } const c = Promise.race([a(), b()]).then(v => 'won:' + v); r2('two'); r1('one'); return await c;`,
+  `let j1, j2; const g1 = new Promise((r, j) => j1 = j), g2 = new Promise((r, j) => j2 = j); async function a() { await g1; } async function b() { await g2; } const c = Promise.any([a(), b()]).catch(e => e.name + ':' + e.errors.join(',')); j1('e1'); j2('e2'); return await c;`,
+  `let r1, j2; const g1 = new Promise(r => r1 = r), g2 = new Promise((r, j) => j2 = j); async function a() { return 'va' + await g1; } async function b() { await g2; return 'never'; } const c = Promise.allSettled([a(), b()]).then(rs => rs.map(r => r.status + ':' + (r.value ?? r.reason)).join('|')); r1('1'); j2('e'); return await c;`,
+  `let resolve; const gate = new Promise(r => { resolve = r; }); async function w() { await gate; return 7; } const log = []; const c = Promise.all([w()]).finally(() => log.push('fin')).then(v => v[0] + ':' + log.join(',')); resolve(0); return await c;`,
+  `let resolve; const gate = new Promise(r => { resolve = r; }); async function w() { await gate; return 3; } const batch = Promise.all([w()]); const c = batch.then(v => v[0] * 2); resolve(0); const direct = await batch; return (await c) + ':' + direct.join(',');`,
+
+  // ── destructure-default repair (single evaluation, all call shapes) ───
+  `function f({a: {b} = {b: 9}} = {}) { return b; } return [f(), f({}), f({a: {b: 1}})].join(',');`,
+  `const calls = []; function f({a: {b = (calls.push('hit'), undefined)} = {}} = {}) { return b; } f(); return calls.length;`,
+  `const calls = []; function f({a: {b = (calls.push('hit'), undefined)} = {}}) { return b; } f({a: {}}); return calls.length;`,
+  `function f({a: {b} = {b: 1}, c = 2, d: {e = 3} = {}}) { return [b, c, e].join(','); } return f({});`,
 ];
 
 // ════════════════════════════════════════════════════════════════════════════

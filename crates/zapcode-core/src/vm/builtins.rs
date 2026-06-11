@@ -3747,21 +3747,7 @@ fn call_promise_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<
                     return Ok(Some(make_resolved_promise(item.clone(), heap)));
                 }
             }
-            let errors_arr = Value::Array(heap.alloc_array(errors));
-            let mut agg = IndexMap::new();
-            // The `__error__` brand makes `e instanceof Error` true (Node:
-            // AggregateError extends Error).
-            agg.insert(Arc::from("__error__"), Value::Bool(true));
-            agg.insert(
-                Arc::from("name"),
-                Value::String(JsString::from("AggregateError")),
-            );
-            agg.insert(
-                Arc::from("message"),
-                Value::String(JsString::from("All promises were rejected")),
-            );
-            agg.insert(Arc::from("errors"), errors_arr);
-            let agg_obj = Value::Object(heap.alloc_object(agg));
+            let agg_obj = make_aggregate_error(errors, heap);
             let mut obj = IndexMap::new();
             obj.insert(Arc::from("__promise__"), Value::Bool(true));
             obj.insert(Arc::from("status"), Value::String(JsString::from("rejected")));
@@ -3770,6 +3756,25 @@ fn call_promise_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<
         }
         _ => Ok(None),
     }
+}
+
+/// Build the AggregateError-shaped object `Promise.any` rejects with when
+/// every element rejects. The `__error__` brand makes `e instanceof Error`
+/// true (Node: AggregateError extends Error).
+pub fn make_aggregate_error(errors: Vec<Value>, heap: &mut Heap) -> Value {
+    let errors_arr = Value::Array(heap.alloc_array(errors));
+    let mut agg = IndexMap::new();
+    agg.insert(Arc::from("__error__"), Value::Bool(true));
+    agg.insert(
+        Arc::from("name"),
+        Value::String(JsString::from("AggregateError")),
+    );
+    agg.insert(
+        Arc::from("message"),
+        Value::String(JsString::from("All promises were rejected")),
+    );
+    agg.insert(Arc::from("errors"), errors_arr);
+    Value::Object(heap.alloc_object(agg))
 }
 
 /// Build a built-in array-iterator object: `for…of`, spread, and `.next()`

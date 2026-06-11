@@ -542,7 +542,6 @@ impl Compiler {
                     // any inner field/element defaults.
                     nested => {
                         func_compiler.emit_pattern_param_default(&Self::param_temp_name(i), nested, default)?;
-                        func_compiler.emit_pattern_inner_defaults(nested)?;
                     }
                 },
                 ParamPattern::ObjectDestructure(_) | ParamPattern::ArrayDestructure(_) => {
@@ -550,7 +549,8 @@ impl Compiler {
                         func_compiler
                             .emit_field_level_defaults(&Self::param_temp_name(i), param)?;
                     }
-                    func_compiler.emit_pattern_inner_defaults(param)?;
+                    func_compiler
+                        .emit_pattern_inner_defaults(param, param.has_field_level_default())?;
                 }
                 _ => {}
             }
@@ -1693,15 +1693,27 @@ impl Compiler {
         self.emit(Instruction::LoadLocal(slot));
         self.emit(Instruction::Push(Constant::Undefined));
         self.emit(Instruction::StrictEq);
-        let skip = self.emit(Instruction::JumpIfFalse(0));
+        let to_else = self.emit(Instruction::JumpIfFalse(0));
         self.compile_expr(default)?;
         // Store the default's destructured pieces into the leaf slots. They were
         // already declared up-front as params (function-scoped), so store with
-        // Var semantics (reuse the existing slot) rather than re-declaring.
+        // Var semantics (reuse the existing slot) rather than re-declaring. The
+        // destructure applies every inner default itself, so this branch needs
+        // no repair pass (running one anyway would evaluate defaults twice).
         self.compile_destructure_pattern(pattern, VarKind::Var)?;
         self.emit(Instruction::Pop);
-        let after = self.current_offset();
-        self.patch_jump(skip, after);
+        let to_end = self.emit(Instruction::Jump(0));
+        let else_target = self.current_offset();
+        self.patch_jump(to_else, else_target);
+        // The argument was supplied: the VM bound the leaves positionally with
+        // no defaults applied, so repair them here — exactly like a destructure
+        // param without a whole-pattern default.
+        if pattern.has_field_level_default() {
+            self.emit_field_level_defaults(temp, pattern)?;
+        }
+        self.emit_pattern_inner_defaults(pattern, pattern.has_field_level_default())?;
+        let end = self.current_offset();
+        self.patch_jump(to_end, end);
         Ok(())
     }
 
@@ -1740,10 +1752,19 @@ impl Compiler {
     /// Apply the inner field/element defaults of a destructured parameter
     /// pattern, whose leaves were bound positionally by `bind_params`. Walks
     /// object fields (`{a = 5}`), array elements (`[a = 1]`), and nesting.
-    fn emit_pattern_inner_defaults(&mut self, pattern: &ParamPattern) -> Result<()> {
+    ///
+    /// `skip_repaired`: when the field-level repair prologue
+    /// (`emit_field_level_defaults`) already ran for this pattern, its
+    /// re-destructure applied every default inside the repaired subtrees —
+    /// descending into them again would evaluate those defaults twice.
+    fn emit_pattern_inner_defaults(
+        &mut self,
+        pattern: &ParamPattern,
+        skip_repaired: bool,
+    ) -> Result<()> {
         match pattern {
             ParamPattern::DefaultValue { pattern, .. } => {
-                self.emit_pattern_inner_defaults(pattern)
+                self.emit_pattern_inner_defaults(pattern, skip_repaired)
             }
             ParamPattern::ObjectDestructure(fields) => {
                 for field in fields {
@@ -1751,10 +1772,13 @@ impl Compiler {
                         continue;
                     }
                     if let Some(nested) = &field.nested {
+                        if skip_repaired && field.default.is_some() {
+                            continue;
+                        }
                         // Defaults applied directly to the field (`{a: [x] = []}`)
                         // are handled at the destructure site; here we only descend
                         // into the nested pattern's own leaf defaults.
-                        self.emit_pattern_inner_defaults(nested)?;
+                        self.emit_pattern_inner_defaults(nested, false)?;
                     } else {
                         let name = field.alias.as_ref().unwrap_or(&field.key);
                         if let (Some(def), Some(slot)) = (&field.default, self.resolve_local(name)) {
@@ -1773,11 +1797,11 @@ impl Compiler {
                                     self.emit_slot_default(slot, default)?;
                                 }
                             } else {
-                                self.emit_pattern_inner_defaults(pattern)?;
+                                self.emit_pattern_inner_defaults(pattern, false)?;
                             }
                         }
                         ParamPattern::ObjectDestructure(_) | ParamPattern::ArrayDestructure(_) => {
-                            self.emit_pattern_inner_defaults(elem)?;
+                            self.emit_pattern_inner_defaults(elem, false)?;
                         }
                         _ => {}
                     }
