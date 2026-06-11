@@ -635,3 +635,61 @@ fn destructuring_assignment_to_existing_targets() {
     assert_eq!(run_str("const o = {}; ({x: o.p} = {x: 7}); o.p"), "7");
     assert_eq!(run_str("let arr = []; [arr[0], arr[1]] = [1, 2]; JSON.stringify(arr)"), "[1,2]");
 }
+
+#[test]
+fn param_field_level_default_with_whole_pattern_default() {
+    // `{a: {b} = {b: 9}} = {}`: the FIELD-level default must apply on every
+    // call shape — argument omitted, argument supplied without the field, and
+    // argument supplying the field. (The supplied-argument case previously
+    // skipped the field-level repair entirely and bound `b` undefined.)
+    let code = "function f({a: {b} = {b: 9}} = {}) { return String(b); }";
+    assert_eq!(run_str(&format!("{code} f()")), "9");
+    assert_eq!(run_str(&format!("{code} f({{}})")), "9");
+    assert_eq!(run_str(&format!("{code} f({{a: {{b: 1}}}})")), "1");
+}
+
+#[test]
+fn param_nested_defaults_evaluate_exactly_once() {
+    // Node evaluates a destructure default exactly once per binding. The repair
+    // prologue used to re-run nested leaf defaults a second time (observable
+    // when the default has side effects), on BOTH the whole-pattern-default and
+    // plain-pattern paths.
+    assert_eq!(
+        run_str(
+            "const calls = []; \
+             function f({a: {b = (calls.push('hit'), undefined)} = {}} = {}) { return b; } \
+             f(); String(calls.length)"
+        ),
+        "1"
+    );
+    assert_eq!(
+        run_str(
+            "const calls = []; \
+             function f({a: {b = (calls.push('hit'), undefined)} = {}}) { return b; } \
+             f({}); String(calls.length)"
+        ),
+        "1"
+    );
+    // Field present but leaf missing: default applies once, not twice.
+    assert_eq!(
+        run_str(
+            "const calls = []; \
+             function f({a: {b = (calls.push('hit'), undefined)} = {}}) { return b; } \
+             f({a: {}}); String(calls.length)"
+        ),
+        "1"
+    );
+}
+
+#[test]
+fn param_mixed_fields_with_and_without_field_defaults() {
+    // A repaired field must not disturb the sibling fields' own defaults.
+    assert_eq!(
+        run_str(
+            "function f({a: {b} = {b: 1}, c = 2, d: {e = 3} = {}}) { \
+                 return [b, c, e].join(','); \
+             } f({})"
+        ),
+        "1,2,3"
+    );
+}

@@ -152,10 +152,13 @@ fn tool_call_inside_generator_body_suspends_durably() {
              const enriched = await callTool(a); \
              yield 'got:' + enriched; \
          } \
-         const it = steps(); \
-         const first = it.next().value; \
-         const second = it.next('arg').value; \
-         `${first}|${second}`"
+         async function main() { \
+             const it = steps(); \
+             const first = (await it.next()).value; \
+             const second = (await it.next('arg')).value; \
+             return `${first}|${second}`; \
+         } \
+         main();"
             .to_string(),
         Vec::new(),
         vec!["callTool".to_string()],
@@ -195,10 +198,13 @@ fn await_of_then_chain_inside_pulled_body() {
                  yield v; \
                  yield v + 10; \
              } \
-             const it = g(); \
-             const a = it.next().value; \
-             const b = it.next().value; \
-             `${a},${b}`"
+             async function main() { \
+                 const it = g(); \
+                 const a = (await it.next()).value; \
+                 const b = (await it.next()).value; \
+                 return `${a},${b}`; \
+             } \
+             main();"
         ),
         "2,12"
     );

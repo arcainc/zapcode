@@ -64,6 +64,22 @@ pub enum ParamPattern {
     },
 }
 
+impl ParamPattern {
+    /// True when this is an object pattern with a top-level field that has
+    /// BOTH a nested pattern and a default (`{b: {c} = {c: 9}}`). Such params
+    /// need the raw argument kept in a hidden temp so the compiler prologue
+    /// can re-destructure the field's default when it arrives undefined —
+    /// the VM's flat extraction cannot evaluate default expressions.
+    pub fn has_field_level_default(&self) -> bool {
+        match self {
+            ParamPattern::ObjectDestructure(fields) => fields
+                .iter()
+                .any(|f| f.nested.is_some() && f.default.is_some()),
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DestructureField {
     pub key: String,

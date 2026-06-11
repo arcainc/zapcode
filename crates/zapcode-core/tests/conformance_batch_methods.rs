@@ -12,9 +12,10 @@
 //! the method call, not deferred to a tick) — that is the documented N5
 //! contract for host calls, the durable-execution boundary.
 //!
-//! Batches that mix in microtask-pending chain elements keep the legacy
-//! pass-through pin (their chains can only settle in the main loop) —
-//! `await` the combinator instead.
+//! Batches over INTERNAL chains only (no host call to force) instead lower
+//! to a real pending promise — see `conformance_batch_lowering.rs`. Batches
+//! that MIX host calls with microtask-pending chains settle their chains by
+//! borrowing drain ticks at the call site, then force the host calls.
 
 use zapcode_core::compiler::instruction::BatchKind;
 use zapcode_core::vm::VmState;

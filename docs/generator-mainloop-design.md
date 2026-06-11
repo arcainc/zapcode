@@ -1,8 +1,9 @@
 # Design: Generators in the Main Loop
 
-Status: **in progress** — Stage 0 implemented on `generator-mainloop-stage0`
-(plus the latent yield-in-try fix in BOTH drivers, and tool-suspension
-inside `.next()`-pulled bodies arriving early). Stages 1–4 remain.
+Status: **complete** — Stage 0 (`generator-mainloop-stage0`), Stage 1
+(`generator-mainloop-stage1`, which also delivered Stage 2's capability),
+Stages 3–4 (`generator-mainloop-stage3`). Residuals listed under the Stage
+3 entry below.
 Author: conformance hardening effort
 Scope: drive generator bodies with the main `execute()` loop instead of the
 nested drive loop, so tool calls inside generators suspend durably and
@@ -122,13 +123,49 @@ test:e2e-full`.
    nested driver still serves `for…of`/spread/`yield*` until Stage 1.
 2. **Stage 1 — lazy `for…of`/`yield*`/spread.** Retire `drain_generator`;
    infinite generators with `break` start working.
+   **✅ Implemented** (`generator-mainloop-stage1`): `IteratorNext`'s
+   generator pull goes through `start_generator_pull` with a `for_of` shape
+   on `GeneratorNext` (answers the protocol pair `[triple, value]` instead
+   of an iterator-result object) — covering `for…of`, `for await`, and
+   `yield*` (which compiles to an IteratorNext loop) in one move. Tool
+   calls inside loop-driven generator bodies now suspend durably (tested
+   with dump/load hops at every suspension; the old pinned
+   "cannot suspend inside a generator" stress test is rewritten as a
+   capability test). Re-entrant loop pulls raise the running-generator
+   TypeError. Wire v10 → v11. NOTE: `for…of` was already *lazy* via
+   IteratorNext (the design doc's eager-drain concern applies only to
+   spread / `Array.from` / array destructuring, which consume the whole
+   sequence by definition and keep the nested driver — tool calls there
+   remain unsupported; documented).
 3. **Stage 2 — tool calls inside generator bodies.** Lift the
    "cannot suspend inside a generator" error; durable tests (dump/load with
    a generator frame live mid-body, and detached between pulls).
+   **✅ Arrived with Stages 0–1** for every `.next()`/loop-driven pull (the
+   capability is inherent to main-loop frames); covered by
+   `generator_mainloop.rs` and `generator_lazy_pulls.rs`. The remaining
+   carve-out is the eager spread/destructure path.
 4. **Stage 3 — async generators.** `next()` returns a promise; body `await`s
    park with full tick order.
+   **✅ Implemented (promise shape)** (`generator-mainloop-stage3`): an
+   async generator's `.next()` answers a *resolved Promise* of the iterator
+   result, so `it.next().then(...)` and `await it.next()` match Node
+   (for…of-shaped pulls keep the protocol pair; sync generators keep plain
+   objects). **Deliberately deferred residual**: body `await`s between
+   yields run with in-place drains rather than parking the body as a task,
+   so cross-task tick *interleaving* during a pull can run ahead of other
+   queued jobs — data flows and results match Node (the full parked-body
+   redesign buys only interleaving order, at the cost of re-entrant
+   continuation surgery; revisit if real agent code surfaces an ordering
+   dependency).
 5. **Stage 4 — durable hardening.** Replay-determinism sweep (the
    `durable_async_state.rs` harness) over generator-heavy programs.
+   **✅ Implemented** (`tests/durable_generator_state.rs`): dump→load at
+   every suspension is trace- and result-identical across tool calls inside
+   pulls with OTHER generators suspended (stashed try-frames riding the
+   snapshot), try/catch bodies, two-layer `yield*` tool fan-outs, and
+   manual `next()` with promise answers; snapshot bytes are double-dump
+   deterministic and dump→load→dump idempotent with generator state in
+   flight.
 
 ## 5. Risks & mitigations
 

@@ -11,9 +11,12 @@ use std::sync::Arc;
 /// `SIGSEGV`/`SIGABRT` across the napi boundary). Capping the recursion well
 /// below the native-stack budget turns "deep or cyclic value" into a bounded,
 /// catchable condition. Far above the 64-deep JSON parse cap and any realistic
-/// data shape, yet well under native-stack exhaustion (each frame here is small,
-/// unlike the interpreter-loop frames the VM's `max_stack_depth` governs).
-pub const MAX_RENDER_DEPTH: usize = 256;
+/// data shape — but the budget must hold for the FATTEST walker in a debug
+/// build: `Vm::serialize_json_dynamic` allocates ~7.5 KB of stack per frame
+/// unoptimized, so 256 levels (~1.9 MB) overran the 2 MiB default test-thread
+/// stack before the depth guard could fire. 128 keeps the worst case under
+/// ~1 MB with room for the frames beneath it.
+pub const MAX_RENDER_DEPTH: usize = 128;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Value {

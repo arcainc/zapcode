@@ -61,9 +61,16 @@ list's promise items:
 
 Remaining known divergences after round 10 (and the batch-methods
 follow-up):
-- Awaits inside async *generator* bodies run inline (no tick) — full task
-  semantics for generators would mean running generator frames in the main
-  loop; dedicated project (see `docs/generator-mainloop-design.md`).
+- Generator-mainloop Stages 0–1 landed: `.next()` and loop pulls run the
+  body in the main loop — tool calls inside generator bodies suspend
+  durably (the old "cannot suspend inside a generator" pin is gone), the
+  yield-in-try leak is fixed, and re-entrant pulls raise Node's TypeError.
+  Stage 3 made async-generator `next()` answer a Promise of the iterator
+  result (`it.next().then(...)` works). Remaining pins: body awaits
+  between yields run with in-place drains (cross-task tick interleaving
+  during a pull can run ahead; results match Node), and
+  spread/`Array.from`/destructure still materialize eagerly via the nested
+  driver (no tool calls there).
 - (FIXED in the batch-methods follow-up) `.then`/`.catch`/`.finally` on a
   *batch* promise now force the batch like the single-call N5 path and run
   the method on the assembled result (`conformance_batch_methods.rs`);
@@ -72,6 +79,72 @@ follow-up):
 - `Promise.race([])`/`any([])` settle-never pins and `Symbol.toPrimitive`
   non-dispatch are unchanged (documented in `conformance_async.rs` and the
   ToPrimitive notes below).
+
+**Round 11 (branch `parity-differential-harness`) — the differential gate.**
+`packages/zapcode-ai/tests/differential.mjs` runs a 130-snippet corpus
+through BOTH zapcode and real Node in the same process and deep-compares the
+results (normalized for the documented host-marshalling rules). It is wired
+into `test:e2e-full`, so parity is now checked mechanically on every run;
+documented pins are asserted as pins (and fail loudly if they start agreeing
+with Node, forcing promotion into the corpus). Its FIRST run found five real
+divergences, all fixed in this round:
+- **`arr.map(String)` / conversion globals as callbacks** — `String`/
+  `Number`/`Boolean` marker objects are now callable through every internal
+  callback path (with the same ToPrimitive shaping as a direct call).
+- **`entries()`/`keys()`/`values()`** now return real iterator objects:
+  manual `.next()` stepping works alongside spread/for-of (the old
+  plain-array pin in `conformance_iterators.rs` is rewritten as a
+  capability test).
+- **`JSON.parse(text, reviver)` over arrays** — the reviver walk read every
+  array element as `undefined` (the holder-read arm only handled objects).
+- **Param destructuring field-level defaults** (`({a, b: {c} = {c: 9}})`) —
+  the raw argument now rides a hidden temp so the compiler prologue can
+  re-destructure the default when the field arrives undefined (mirrors the
+  whole-pattern-default mechanism).
+- **`Promise.all([p.then(f), …]).then(cb)`** — a batch holding
+  microtask-pending chain elements now settles them (one drained job per
+  re-dispatch of the method call) before the method forces the batch,
+  closing the carve-out from the batch-methods round.
+
+**Round 12 (branch `parity-differential-harness`, second pass) — PR-review
+fixes.** Worked the valid findings from the PR #35/#37 review comments (one —
+the claimed array-destructure local-slot misalignment — was a false positive:
+the hidden-temp push is gated on `has_field_level_default()`, which is
+identically false for array patterns in both VM and compiler):
+- **`Promise.all([pending]).then(cb)` with an EMPTY microtask queue dropped
+  `cb`.** The round-11 fix borrowed a drained job per re-dispatch, so it only
+  worked while the queue was non-empty; with nothing queued, the method fell
+  through to the legacy pass-through (returning the batch itself — Node 11
+  vs zapcode `[1]` on the gate repro). A combinator whose every element is
+  internal (settled / plain / microtask-pending — no host call to force) now
+  LOWERS to a real pending promise: each pending element gets a `"combine"`
+  reaction carrying the batch + index, per-kind progress lives on the batch
+  object itself (plain heap data — snapshots for free), and the method runs
+  through the ordinary pending-promise path. All four kinds implemented
+  (all / race / any incl. AggregateError / allSettled); mixed host+chain
+  batches keep the drain-borrowing path. `conformance_batch_lowering.rs`
+  (12 tests incl. a snapshot-hop) + 7 differential snippets.
+- **Nested destructure defaults evaluated TWICE** (and, worse, field-level
+  defaults under a whole-pattern default never applied when the argument was
+  supplied: `f({})` against `{a: {b} = {b: 9}} = {}` bound `b` undefined).
+  The repair prologue re-destructures the nested subtree — which applies its
+  inner defaults — and the inner-defaults pass then descended the same
+  subtree again. Fix: the whole-pattern-default path gained a proper
+  defined-argument else-branch running the same repair as plain patterns,
+  and the inner pass skips fields the repair already covered. Side-effecting
+  defaults now run exactly once on every call shape (Node-verified).
+- **`gen_iter_triple` allocated without resource accounting** — every
+  loop-driven generator pull allocated an untracked 3-slot protocol array;
+  now charged against the limits like every other allocation site.
+- **Guest JSON.stringify could ABORT THE HOST** (pre-existing, surfaced by
+  this round's test runs): `Vm::serialize_json_dynamic` uses ~7.5 KB of
+  stack per frame unoptimized, so the 256-level `MAX_RENDER_DEPTH` budget
+  (~1.9 MB) overran a default 2 MiB thread stack *before the depth guard
+  could fire* — a sandbox hole (`security.rs` only passed by margin).
+  `MAX_RENDER_DEPTH` is now 128, keeping the fattest walker's worst case
+  under ~1 MB.
+- Hygiene: the duplicate `make_array_iterator` in `vm/mod.rs` now delegates
+  to the `builtins` copy.
 
 **Round 8 (branch `arca/conformance-fixes`) — cluster wrap-up + reflection / RegExp / coercion-builtin edges.**
 

@@ -220,6 +220,11 @@ pub(crate) enum Continuation {
         gen_obj: GeneratorObject,
         caller_frame_depth: usize,
         callback_frame_index: usize,
+        /// How the pull's answer is shaped: `false` → an iterator-result
+        /// object (the `.next()` method); `true` → the `IteratorNext`
+        /// protocol pair `[ ["__gen__", id, done], value ]` (for…of /
+        /// for-await / `yield*` loops).
+        for_of: bool,
     },
     /// Running a `new Promise(executor)` executor synchronously. When its
     /// frame pops, the executor's return value is DISCARDED and the new
@@ -1094,6 +1099,20 @@ impl Vm {
             if matches!(map.get("mode"), Some(Value::String(s)) if s.as_ref() == "sink") {
                 continue;
             }
+            // A "combine" record feeds this settlement into a lowered
+            // combinator (`lower_internal_batch`) — the job carries the
+            // record itself as its handler; the drain applies it.
+            if matches!(map.get("mode"), Some(Value::String(s)) if s.as_ref() == "combine") {
+                self.microtasks.push_back(Microtask {
+                    handler: Value::Object(rh),
+                    value: outcome.clone(),
+                    is_rejection,
+                    mode: PromiseCallbackMode::WrapResult,
+                    result_promise: Value::Undefined,
+                    task: None,
+                });
+                continue;
+            }
             // A "task" record parks no handler — it resumes the AsyncTask
             // awaiting this promise (microtask-design Stage 3, ResumeAsync).
             if matches!(map.get("mode"), Some(Value::String(s)) if s.as_ref() == "task") {
@@ -1215,6 +1234,227 @@ impl Vm {
         Ok(())
     }
 
+    /// Register a *combine* reaction on a pending internal promise: when it
+    /// settles, the outcome feeds element `index` of the lowered combinator
+    /// `batch` (see [`Self::lower_internal_batch`]).
+    fn register_combine_reaction(&mut self, receiver: Handle, batch: Value, index: usize) -> Result<()> {
+        self.tracker.track_allocation(&self.limits)?;
+        let mut record = IndexMap::new();
+        record.insert(Arc::from("mode"), Value::String(JsString::from("combine")));
+        record.insert(Arc::from("batch"), batch);
+        record.insert(Arc::from("index"), Value::Int(index as i64));
+        let rec = Value::Object(self.heap.alloc_object(record));
+        let reactions = match self.heap.object(receiver).and_then(|m| m.get("__reactions__")) {
+            Some(Value::Array(a)) => *a,
+            _ => {
+                return Err(ZapcodeError::RuntimeError(
+                    "internal error: pending promise has no reaction list".to_string(),
+                ))
+            }
+        };
+        self.heap
+            .array_mut(reactions)
+            .ok_or_else(|| {
+                ZapcodeError::RuntimeError(
+                    "internal error: promise reaction list is not an array".to_string(),
+                )
+            })?
+            .push(rec);
+        Ok(())
+    }
+
+    /// True for a `pending_all` batch every element of which is *internal* —
+    /// already settled, a plain value, or a microtask-pending chain — with at
+    /// least one of the latter. Such a batch holds no host call to force, so
+    /// `.then`/`.catch`/`.finally` on it must lower it to a real pending
+    /// promise ([`Self::lower_internal_batch`]) instead of suspending.
+    fn batch_all_internal(&self, v: &Value) -> bool {
+        let Value::Object(h) = v else { return false };
+        let Some(map) = self.heap.object(*h) else {
+            return false;
+        };
+        if !matches!(map.get("status"), Some(Value::String(s)) if s.as_ref() == "pending_all") {
+            return false;
+        }
+        let items = match map.get("items") {
+            Some(Value::Array(a)) => self.heap.array_vec(*a),
+            _ => return false,
+        };
+        items.iter().any(|i| self.is_internal_pending(i))
+            && items
+                .iter()
+                .all(|i| self.is_internal_pending(i) || self.batch_element_outcome(i).is_some())
+    }
+
+    /// Lower a combinator over internal elements only into a REAL pending
+    /// promise: settled elements record their outcome now, each pending
+    /// element gets a "combine" reaction, and per-kind progress lives on the
+    /// promise object (`__combine_kind__`/`__combine_values__`/
+    /// `__combine_remaining__` — plain heap data, so it snapshots for free).
+    /// This is what makes `Promise.all([chain]).then(cb)` work even with an
+    /// empty microtask queue: there is no host call to force and no queued
+    /// job to borrow a tick from, so the batch must settle from the drain
+    /// like any other promise.
+    fn lower_internal_batch(&mut self, promise: &Value) -> Result<()> {
+        let Value::Object(h) = promise else {
+            return Ok(());
+        };
+        let map = self.heap.object_map(*h);
+        let items = match map.get("items") {
+            Some(Value::Array(a)) => self.heap.array_vec(*a),
+            _ => Vec::new(),
+        };
+        let kind = match map.get("__batch_kind__") {
+            Some(Value::String(k)) => k.to_string(),
+            _ => "all".to_string(),
+        };
+        let n = items.len();
+        self.track_array_capacity(n)?;
+        self.tracker.track_allocation(&self.limits)?;
+        let values_h = self.heap.alloc_array(vec![Value::Undefined; n]);
+        self.tracker.track_allocation(&self.limits)?;
+        let reactions_h = self.heap.alloc_array(Vec::new());
+        {
+            let m = self.heap.object_mut(*h).ok_or_else(|| {
+                ZapcodeError::RuntimeError(
+                    "internal error: lower_internal_batch on a dangling handle".to_string(),
+                )
+            })?;
+            m.insert(
+                Arc::from("status"),
+                Value::String(JsString::from("pending")),
+            );
+            m.insert(Arc::from("__reactions__"), Value::Array(reactions_h));
+            m.insert(
+                Arc::from("__combine_kind__"),
+                Value::String(JsString::from(kind.as_str())),
+            );
+            m.insert(Arc::from("__combine_values__"), Value::Array(values_h));
+            m.insert(Arc::from("__combine_remaining__"), Value::Int(n as i64));
+            m.shift_remove("items");
+            m.shift_remove("__batch_kind__");
+        }
+        for (i, item) in items.iter().enumerate() {
+            if self.is_internal_pending(item) {
+                if let Value::Object(eh) = item {
+                    self.register_combine_reaction(*eh, promise.clone(), i)?;
+                }
+            } else if let Some((v, rej)) = self.batch_element_outcome(item) {
+                // Already settled: fold it in now. This can decide the batch
+                // early (a rejected `all` element, a `race`/`any` winner);
+                // later combine reactions then absorb silently.
+                self.combine_apply(promise, i, v, rej)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Run one drained combine job: the reaction `record` carries the lowered
+    /// batch and the element's index; apply the element's outcome to it.
+    fn combine_step(&mut self, record: Handle, value: Value, is_rejection: bool) -> Result<()> {
+        let rec = self.heap.object_map(record);
+        let batch = rec.get("batch").cloned().unwrap_or(Value::Undefined);
+        let index = match rec.get("index") {
+            Some(Value::Int(i)) => *i as usize,
+            _ => 0,
+        };
+        self.combine_apply(&batch, index, value, is_rejection)
+    }
+
+    /// Feed one element outcome into a lowered combinator promise. A batch
+    /// that already settled (decided `race`/`any`, rejected `all`) absorbs
+    /// the outcome silently, exactly like a sink reaction.
+    fn combine_apply(
+        &mut self,
+        batch: &Value,
+        index: usize,
+        value: Value,
+        is_rejection: bool,
+    ) -> Result<()> {
+        let Value::Object(bh) = batch else {
+            return Ok(());
+        };
+        let map = self.heap.object_map(*bh);
+        if !matches!(map.get("status"), Some(Value::String(s)) if s.as_ref() == "pending") {
+            return Ok(()); // already decided — absorb
+        }
+        let kind = match map.get("__combine_kind__") {
+            Some(Value::String(s)) => s.to_string(),
+            _ => return Ok(()),
+        };
+        let values_h = match map.get("__combine_values__") {
+            Some(Value::Array(a)) => *a,
+            _ => return Ok(()),
+        };
+        let remaining = match map.get("__combine_remaining__") {
+            Some(Value::Int(n)) => *n,
+            _ => 0,
+        };
+        let mut store = |vm: &mut Self, slot_value: Value| {
+            if let Some(slot) = vm
+                .heap
+                .array_mut(values_h)
+                .and_then(|a| a.get_mut(index))
+            {
+                *slot = slot_value;
+            }
+            if let Some(m) = vm.heap.object_mut(*bh) {
+                m.insert(
+                    Arc::from("__combine_remaining__"),
+                    Value::Int(remaining - 1),
+                );
+            }
+        };
+        match kind.as_str() {
+            "race" => self.settle_promise(batch, value, is_rejection),
+            "any" => {
+                if !is_rejection {
+                    return self.settle_promise(batch, value, false);
+                }
+                store(self, value);
+                if remaining - 1 == 0 {
+                    let errors = self.heap.array_vec(values_h);
+                    let agg = builtins::make_aggregate_error(errors, &mut self.heap);
+                    return self.settle_promise(batch, agg, true);
+                }
+                Ok(())
+            }
+            "allSettled" => {
+                self.tracker.track_allocation(&self.limits)?;
+                let mut entry = IndexMap::new();
+                if is_rejection {
+                    entry.insert(
+                        Arc::from("status"),
+                        Value::String(JsString::from("rejected")),
+                    );
+                    entry.insert(Arc::from("reason"), value);
+                } else {
+                    entry.insert(
+                        Arc::from("status"),
+                        Value::String(JsString::from("fulfilled")),
+                    );
+                    entry.insert(Arc::from("value"), value);
+                }
+                let entry = Value::Object(self.heap.alloc_object(entry));
+                store(self, entry);
+                if remaining - 1 == 0 {
+                    return self.settle_promise(batch, Value::Array(values_h), false);
+                }
+                Ok(())
+            }
+            _ /* all */ => {
+                if is_rejection {
+                    return self.settle_promise(batch, value, true);
+                }
+                store(self, value);
+                if remaining - 1 == 0 {
+                    return self.settle_promise(batch, Value::Array(values_h), false);
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Clear an unhandled-rejection mark: a reject handler attached to the
     /// promise, or its rejection was consumed (`await` rethrow, host boundary).
     fn mark_rejection_handled(&mut self, h: Handle) {
@@ -1236,6 +1476,23 @@ impl Vm {
         false
     }
 
+    /// True for a `pending_all` batch promise holding at least one
+    /// microtask-pending chain element (which only the drain can settle).
+    fn batch_has_pending_chains(&self, v: &Value) -> bool {
+        let Value::Object(h) = v else { return false };
+        let Some(map) = self.heap.object(*h) else {
+            return false;
+        };
+        if !matches!(map.get("status"), Some(Value::String(s)) if s.as_ref() == "pending_all") {
+            return false;
+        }
+        let items = match map.get("items") {
+            Some(Value::Array(a)) => self.heap.array_vec(*a),
+            _ => return false,
+        };
+        items.iter().any(|i| self.is_internal_pending(i))
+    }
+
     /// Begin running a drained microtask. A callable handler gets a frame plus
     /// a [`Continuation::MicrotaskReaction`] — the main loop drives it, so a
     /// tool call inside the handler suspends normally. A non-callable handler
@@ -1245,6 +1502,17 @@ impl Vm {
     fn start_microtask(&mut self, m: Microtask) -> Result<()> {
         if let Some(task_id) = m.task {
             return self.resume_async_task(task_id, m.value, m.is_rejection);
+        }
+        // A combine job: the handler slot carries the reaction record itself
+        // (guest handlers can never collide — non-callables are sanitized to
+        // `Undefined` at registration).
+        if let Value::Object(rh) = &m.handler {
+            if matches!(
+                self.heap.object(*rh).and_then(|r| r.get("mode")),
+                Some(Value::String(s)) if s.as_ref() == "combine"
+            ) {
+                return self.combine_step(*rh, m.value, m.is_rejection);
+            }
         }
         if let Value::Function(closure) = &m.handler {
             let closure = closure.clone();
@@ -2329,9 +2597,15 @@ impl Vm {
                     }
                 }
                 // Destructuring params bind multiple locals in declaration order;
-                // extract the fields from the argument into those slots.
+                // extract the fields from the argument into those slots. A
+                // pattern with a field-level default keeps the raw argument in
+                // a hidden temp first, so the compiler prologue can repair the
+                // leaves when the field arrives undefined.
                 ParamPattern::ObjectDestructure(_) | ParamPattern::ArrayDestructure(_) => {
                     let arg = args.get(i).cloned().unwrap_or(Value::Undefined);
+                    if param.has_field_level_default() {
+                        locals.push(arg.clone());
+                    }
                     extract_pattern(param, &arg, &mut locals, heap);
                 }
             }
@@ -2949,11 +3223,26 @@ impl Vm {
                 }
                 Ok(None)
             }
-            Continuation::GeneratorNext { gen_obj, .. } => {
+            Continuation::GeneratorNext { gen_obj, for_of, .. } => {
                 // The body returned (or fell off the end): the generator is
-                // done; answer the pull with {value, done: true}.
-                let res = self.finish_generator(gen_obj, callback_result);
-                self.push(res)?;
+                // done; answer the pull with {value, done: true} — or, for a
+                // for…of pull, the protocol pair [done-triple, return-value].
+                let gen_id = gen_obj.id;
+                let is_async_gen = self.current_function(gen_obj.func_ref).is_async;
+                if for_of {
+                    let _ = self.finish_generator(gen_obj, Value::Undefined);
+                    let triple = self.gen_iter_triple(gen_id, true)?;
+                    self.push(triple)?;
+                    self.push(callback_result)?;
+                } else {
+                    let res = self.finish_generator(gen_obj, callback_result);
+                    let res = if is_async_gen {
+                        builtins::make_resolved_promise(res, &mut self.heap)
+                    } else {
+                        res
+                    };
+                    self.push(res)?;
+                }
                 Ok(None)
             }
             Continuation::PromiseExecutor { promise, .. } => {
@@ -3071,6 +3360,36 @@ impl Vm {
     /// Call a function value with the given arguments and run it to completion.
     /// Returns the function's return value.
     fn call_function_internal(&mut self, callee: &Value, args: Vec<Value>) -> Result<Value> {
+        // Bare conversion globals (`String`/`Number`/`Boolean`, marker
+        // objects) are callable as callbacks too — `arr.map(String)` etc. —
+        // with the same ToPrimitive shaping the Call instruction applies.
+        if let Value::Object(h) = callee {
+            let kind = self
+                .heap
+                .object(*h)
+                .and_then(|m| m.get("__global_fn__"))
+                .and_then(|v| match v {
+                    Value::String(s) => Some(s.to_string()),
+                    _ => None,
+                });
+            if let Some(kind) = kind {
+                let mut args = args;
+                match kind.as_str() {
+                    "String" => {
+                        if let Some(first) = args.first().cloned() {
+                            args[0] = self.to_primitive(&first, ToPrimitiveHint::String)?;
+                        }
+                    }
+                    "Number" => {
+                        if let Some(first) = args.first().cloned() {
+                            args[0] = self.to_primitive(&first, ToPrimitiveHint::Number)?;
+                        }
+                    }
+                    _ => {}
+                }
+                return builtins::call_global_fn(&kind, &args, &mut self.heap);
+            }
+        }
         self.call_closure_internal(callee, args, None)
     }
 
@@ -3597,6 +3916,13 @@ impl Vm {
                 .and_then(|m| m.get(key))
                 .cloned()
                 .unwrap_or(Value::Undefined),
+            // An ARRAY holder reads its element by index — without this, every
+            // element of a revived array was visited as `undefined`.
+            Value::Array(h) => key
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| self.heap.array(*h).get(i).cloned())
+                .unwrap_or(Value::Undefined),
             _ => Value::Undefined,
         };
         match &value {
@@ -3997,6 +4323,15 @@ impl Vm {
             // supports a tool call inside the callback (N4). A *rejection* is
             // delivered via `resume_with_error`, which raises at the call site and
             // is shaped into a rejected promise there.
+            // A combinator over internal elements only (no host call to
+            // force): lower it to a real pending promise — combine reactions
+            // settle it from the drain — and re-run the method through the
+            // ordinary pending/settled paths. Without this, `.then` on such a
+            // batch hits the legacy pass-through below and drops its handler.
+            if status == "pending_all" && self.batch_all_internal(&promise) {
+                self.lower_internal_batch(&promise)?;
+                return self.execute_promise_method(promise.clone(), method, args);
+            }
             if status == "pending_call" {
                 let id = match map.get("__call_id__") {
                     Some(Value::Int(n)) => *n as u64,
@@ -4406,10 +4741,26 @@ impl Vm {
     /// tool call inside it suspends the whole VM durably. A done generator
     /// answers `{value: undefined, done: true}` immediately; a re-entrant
     /// pull (`g.next()` inside g's own body) is a TypeError, as in Node.
-    fn start_generator_pull(&mut self, mut gen_obj: GeneratorObject, arg: Value) -> Result<()> {
+    fn start_generator_pull(
+        &mut self,
+        mut gen_obj: GeneratorObject,
+        arg: Value,
+        for_of: bool,
+    ) -> Result<()> {
         if gen_obj.done {
-            let res = self.make_iterator_result(Value::Undefined, true);
-            self.push(res)?;
+            if for_of {
+                let triple = self.gen_iter_triple(gen_obj.id, true)?;
+                self.push(triple)?;
+                self.push(Value::Undefined)?;
+            } else {
+                let res = self.make_iterator_result(Value::Undefined, true);
+                let res = if self.current_function(gen_obj.func_ref).is_async {
+                    builtins::make_resolved_promise(res, &mut self.heap)
+                } else {
+                    res
+                };
+                self.push(res)?;
+            }
             return Ok(());
         }
         if self.continuations.iter().any(
@@ -4502,8 +4853,22 @@ impl Vm {
             gen_obj,
             caller_frame_depth,
             callback_frame_index: self.frames.len() - 1,
+            for_of,
         });
         Ok(())
+    }
+
+    /// The `IteratorNext` protocol's generator-iterator marker:
+    /// `["__gen__", id, done]`.
+    fn gen_iter_triple(&mut self, gen_id: u64, done: bool) -> Result<Value> {
+        self.track_array_capacity(3)?;
+        self.tracker.track_allocation(&self.limits)?;
+        let h = self.heap.alloc_array(vec![
+            Value::String(JsString::from("__gen__")),
+            Value::Int(gen_id as i64),
+            Value::Bool(done),
+        ]);
+        Ok(Value::Array(h))
     }
 
     fn run_generator_until_yield_or_return(
@@ -6041,7 +6406,7 @@ impl Vm {
                                                 // body frame runs like any call
                                                 // — tool calls inside it can
                                                 // suspend the VM durably.
-                                                self.start_generator_pull(g, arg)?;
+                                                self.start_generator_pull(g, arg, false)?;
                                                 return Ok(None);
                                             } else if self.continuations.iter().any(|c| {
                                                 matches!(c, Continuation::GeneratorNext { gen_obj: g, .. }
@@ -6054,12 +6419,22 @@ impl Vm {
                                                     "Generator is already running".to_string(),
                                                 ));
                                             } else {
-                                                Some(
-                                                    self.make_iterator_result(
-                                                        Value::Undefined,
-                                                        true,
-                                                    ),
-                                                )
+                                                let res = self.make_iterator_result(
+                                                    Value::Undefined,
+                                                    true,
+                                                );
+                                                let res = if self
+                                                    .current_function(gen_obj.func_ref)
+                                                    .is_async
+                                                {
+                                                    builtins::make_resolved_promise(
+                                                        res,
+                                                        &mut self.heap,
+                                                    )
+                                                } else {
+                                                    res
+                                                };
+                                                Some(res)
                                             }
                                         }
                                         "return" => {
@@ -6083,6 +6458,31 @@ impl Vm {
                             }
                             "__promise__" => {
                                 if let Some(promise) = receiver {
+                                    // A combinator batch holding microtask-pending
+                                    // chain elements: settle them first — one
+                                    // drained job per re-dispatch of this Call —
+                                    // so the method can force the batch with every
+                                    // chain element settled. This is what makes
+                                    // `Promise.all([p.then(f), …]).then(cb)` work.
+                                    if self.batch_has_pending_chains(&promise)
+                                        && !self.batch_all_internal(&promise)
+                                    {
+                                        if let Some(m) = self.microtasks.pop_front() {
+                                            let callee = Value::BuiltinMethod {
+                                                object_name: object_name.clone(),
+                                                method_name: method_name.clone(),
+                                                recv: Some(Box::new(promise.clone())),
+                                                place: place.clone(),
+                                            };
+                                            self.push(callee)?;
+                                            for a in &args {
+                                                self.push(a.clone())?;
+                                            }
+                                            self.current_frame_mut().ip -= 1;
+                                            self.start_microtask(m)?;
+                                            return Ok(None);
+                                        }
+                                    }
                                     match self
                                         .execute_promise_method(promise, &method_name, args)?
                                     {
@@ -6715,36 +7115,21 @@ impl Vm {
                                 _ => return Err(ZapcodeError::RuntimeError("bad gen iter".into())),
                             };
                             let gen_key = format!("__gen_{}", gen_id);
-                            let gen_obj = if let Some(Value::Generator(g)) =
-                                self.globals.remove(&gen_key)
-                            {
-                                g
+                            if let Some(Value::Generator(g)) = self.globals.remove(&gen_key) {
+                                // Main-loop pull (Stage 1): the body frame
+                                // runs like any call — tool calls inside a
+                                // for…of-driven generator suspend durably.
+                                self.start_generator_pull(g, Value::Undefined, true)?;
+                            } else if self.continuations.iter().any(|c| {
+                                matches!(c, Continuation::GeneratorNext { gen_obj: g, .. }
+                                    if g.id == gen_id)
+                            }) {
+                                return Err(ZapcodeError::TypeError(
+                                    "Generator is already running".to_string(),
+                                ));
                             } else {
-                                let done_iter = self.heap.alloc_array(vec![
-                                    Value::String(JsString::from("__gen__")),
-                                    Value::Int(gen_id as i64),
-                                    Value::Bool(true),
-                                ]);
-                                self.push(Value::Array(done_iter))?;
-                                self.push(Value::Undefined)?;
-                                return Ok(None);
-                            };
-                            let result = self.generator_next(gen_obj, Value::Undefined)?;
-                            if let Value::Object(obj_h) = &result {
-                                let obj = self.heap.object_map(*obj_h);
-                                let done = obj
-                                    .get("done")
-                                    .is_some_and(|v| matches!(v, Value::Bool(true)));
-                                let value = obj.get("value").cloned().unwrap_or(Value::Undefined);
-                                let new_iter = self.heap.alloc_array(vec![
-                                    Value::String(JsString::from("__gen__")),
-                                    Value::Int(gen_id as i64),
-                                    Value::Bool(done),
-                                ]);
-                                self.push(Value::Array(new_iter))?;
-                                self.push(value)?;
-                            } else {
-                                self.push(iter)?;
+                                let done_iter = self.gen_iter_triple(gen_id, true)?;
+                                self.push(done_iter)?;
                                 self.push(Value::Undefined)?;
                             }
                             return Ok(None);
@@ -7038,8 +7423,11 @@ impl Vm {
                         "yield can only be used inside a generator function".to_string(),
                     ));
                 }
-                let Some(Continuation::GeneratorNext { mut gen_obj, .. }) =
-                    self.continuations.pop()
+                let Some(Continuation::GeneratorNext {
+                    mut gen_obj,
+                    for_of,
+                    ..
+                }) = self.continuations.pop()
                 else {
                     unreachable!("checked above");
                 };
@@ -7051,6 +7439,8 @@ impl Vm {
                 self.stash_generator_try_frames(gen_obj.id, below, frame.stack_base);
                 // dispatch() pre-incremented ip, so the frame resumes just
                 // past this Yield.
+                let gen_id = gen_obj.id;
+                let is_async_gen = self.current_function(gen_obj.func_ref).is_async;
                 gen_obj.suspended = Some(SuspendedFrame {
                     ip: frame.ip,
                     locals: frame.locals,
@@ -7059,8 +7449,22 @@ impl Vm {
                 });
                 gen_obj.done = false;
                 self.store_generator(gen_obj);
-                let res = self.make_iterator_result(yielded, false);
-                self.push(res)?;
+                if for_of {
+                    let triple = self.gen_iter_triple(gen_id, false)?;
+                    self.push(triple)?;
+                    self.push(yielded)?;
+                } else {
+                    let res = self.make_iterator_result(yielded, false);
+                    // An async generator's next() answers a Promise of the
+                    // iterator result (Node), so `it.next().then(...)` and
+                    // `await it.next()` both work.
+                    let res = if is_async_gen {
+                        builtins::make_resolved_promise(res, &mut self.heap)
+                    } else {
+                        res
+                    };
+                    self.push(res)?;
+                }
             }
 
             Instruction::Await => {
@@ -8756,19 +9160,6 @@ fn is_set_method(name: &str) -> bool {
     )
 }
 
-/// Build a JS-visible iterator object over `items` (what `Map`/`Set`/array
-/// `.keys()/.values()/.entries()` return). It carries `.next()` and is consumed
-/// by `for...of` / spread via the iteration machinery. Stateful: `.next()`
-/// advances `__cursor__`.
-fn make_array_iterator(items: Vec<Value>, heap: &mut Heap) -> Value {
-    let items_arr = Value::Array(heap.alloc_array(items));
-    let mut obj = IndexMap::new();
-    obj.insert(Arc::from("__array_iterator__"), Value::Bool(true));
-    obj.insert(Arc::from("__items__"), items_arr);
-    obj.insert(Arc::from("__cursor__"), Value::Int(0));
-    Value::Object(heap.alloc_object(obj))
-}
-
 fn is_array_iterator(value: &Value, heap: &Heap) -> bool {
     matches!(
         value,
@@ -8842,14 +9233,14 @@ fn execute_set_method(
             heap.set_array(items_handle, Vec::new());
             Some(Value::Undefined)
         }
-        "values" | "keys" => Some(make_array_iterator(items, heap)),
+        "values" | "keys" => Some(builtins::make_array_iterator(items, heap)),
         "entries" => {
             // Set entries are [value, value] pairs (the value doubles as key).
             let pairs: Vec<Value> = items
                 .into_iter()
                 .map(|v| Value::Array(heap.alloc_array(vec![v.clone(), v])))
                 .collect();
-            Some(make_array_iterator(pairs, heap))
+            Some(builtins::make_array_iterator(pairs, heap))
         }
         _ => None,
     }
@@ -8962,7 +9353,7 @@ fn execute_map_method(
                     _ => None,
                 })
                 .collect();
-            Some(make_array_iterator(keys, heap))
+            Some(builtins::make_array_iterator(keys, heap))
         }
         "values" => {
             let vals: Vec<Value> = entries
@@ -8972,7 +9363,7 @@ fn execute_map_method(
                     _ => None,
                 })
                 .collect();
-            Some(make_array_iterator(vals, heap))
+            Some(builtins::make_array_iterator(vals, heap))
         }
         "entries" => {
             let pairs: Vec<(Value, Value)> = entries
@@ -8991,7 +9382,7 @@ fn execute_map_method(
                 .into_iter()
                 .map(|(k, v)| Value::Array(heap.alloc_array(vec![k, v])))
                 .collect();
-            Some(make_array_iterator(out, heap))
+            Some(builtins::make_array_iterator(out, heap))
         }
         _ => None,
     }
