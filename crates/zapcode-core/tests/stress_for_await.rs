@@ -278,13 +278,11 @@ fn for_await_consumes_async_generator() {
 }
 
 #[test]
-fn async_generator_external_suspension_is_the_documented_gap() {
-    // GAP (STRESS-PASS-BUGS.md): an async generator that suspends on an *external*
-    // host call mid-iteration is not supported — generators run synchronously via
-    // generator_next, so a suspending CallExternal inside one errors. Internal
-    // promise awaits and yielding promises both work; only host-call suspension
-    // inside the generator body is unsupported. Pin the behavior so a future fix
-    // is a deliberate change.
+fn async_generator_external_suspension_now_works() {
+    // FIXED (generator-mainloop Stage 1): an async generator suspending on a
+    // host call mid-iteration used to error ("cannot suspend inside a
+    // generator"); loop pulls now run the body in the main loop, so the VM
+    // suspends durably and the iteration continues after resume.
     let code = r#"
         async function* gen() {
             const a = await fetchVal();
@@ -297,19 +295,28 @@ fn async_generator_external_suspension_is_the_documented_gap() {
         }
         main();
     "#;
-    let result = ZapcodeRun::new(
+    let state = ZapcodeRun::new(
         code.to_string(),
         Vec::new(),
         vec!["fetchVal".to_string()],
         ResourceLimits::default(),
     )
     .unwrap()
-    .start(Vec::new());
-    match result {
-        Err(e) => assert!(
-            e.to_string().contains("cannot suspend inside a generator"),
-            "expected generator-suspension error, got: {e}"
-        ),
-        Ok(state) => panic!("expected suspension error, got state: {state:?}"),
+    .start(Vec::new())
+    .unwrap();
+    let snapshot = match state {
+        VmState::Suspended {
+            function_name,
+            snapshot,
+            ..
+        } => {
+            assert_eq!(function_name, "fetchVal");
+            snapshot
+        }
+        other => panic!("expected suspension on fetchVal, got {other:?}"),
+    };
+    match snapshot.resume(Value::Int(32)).unwrap().state {
+        VmState::Complete(v) => assert_eq!(v, Value::Int(32)),
+        other => panic!("expected completion, got {other:?}"),
     }
 }

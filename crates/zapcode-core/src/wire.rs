@@ -56,7 +56,9 @@ const MAGIC: &[u8; 4] = b"ZPC1";
 /// shifted discriminants, incompatible with v8.
 /// v10: generator-mainloop Stage 0 — `Continuation::GeneratorNext` and the
 /// `generator_try_frames` snapshot field, incompatible with v9.
-pub(crate) const FORMAT_VERSION: u16 = 10;
+/// v11: generator-mainloop Stage 1 — `GeneratorNext.for_of` (shaped pulls
+/// for for…of / `yield*`), incompatible with v10.
+pub(crate) const FORMAT_VERSION: u16 = 11;
 
 const HEADER_LEN: usize = 4 + 2 + 1 + 1 + 32;
 

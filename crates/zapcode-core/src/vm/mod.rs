@@ -220,6 +220,11 @@ pub(crate) enum Continuation {
         gen_obj: GeneratorObject,
         caller_frame_depth: usize,
         callback_frame_index: usize,
+        /// How the pull's answer is shaped: `false` → an iterator-result
+        /// object (the `.next()` method); `true` → the `IteratorNext`
+        /// protocol pair `[ ["__gen__", id, done], value ]` (for…of /
+        /// for-await / `yield*` loops).
+        for_of: bool,
     },
     /// Running a `new Promise(executor)` executor synchronously. When its
     /// frame pops, the executor's return value is DISCARDED and the new
@@ -2949,11 +2954,20 @@ impl Vm {
                 }
                 Ok(None)
             }
-            Continuation::GeneratorNext { gen_obj, .. } => {
+            Continuation::GeneratorNext { gen_obj, for_of, .. } => {
                 // The body returned (or fell off the end): the generator is
-                // done; answer the pull with {value, done: true}.
-                let res = self.finish_generator(gen_obj, callback_result);
-                self.push(res)?;
+                // done; answer the pull with {value, done: true} — or, for a
+                // for…of pull, the protocol pair [done-triple, return-value].
+                let gen_id = gen_obj.id;
+                if for_of {
+                    let _ = self.finish_generator(gen_obj, Value::Undefined);
+                    let triple = self.gen_iter_triple(gen_id, true);
+                    self.push(triple)?;
+                    self.push(callback_result)?;
+                } else {
+                    let res = self.finish_generator(gen_obj, callback_result);
+                    self.push(res)?;
+                }
                 Ok(None)
             }
             Continuation::PromiseExecutor { promise, .. } => {
@@ -4406,10 +4420,21 @@ impl Vm {
     /// tool call inside it suspends the whole VM durably. A done generator
     /// answers `{value: undefined, done: true}` immediately; a re-entrant
     /// pull (`g.next()` inside g's own body) is a TypeError, as in Node.
-    fn start_generator_pull(&mut self, mut gen_obj: GeneratorObject, arg: Value) -> Result<()> {
+    fn start_generator_pull(
+        &mut self,
+        mut gen_obj: GeneratorObject,
+        arg: Value,
+        for_of: bool,
+    ) -> Result<()> {
         if gen_obj.done {
-            let res = self.make_iterator_result(Value::Undefined, true);
-            self.push(res)?;
+            if for_of {
+                let triple = self.gen_iter_triple(gen_obj.id, true);
+                self.push(triple)?;
+                self.push(Value::Undefined)?;
+            } else {
+                let res = self.make_iterator_result(Value::Undefined, true);
+                self.push(res)?;
+            }
             return Ok(());
         }
         if self.continuations.iter().any(
@@ -4502,8 +4527,20 @@ impl Vm {
             gen_obj,
             caller_frame_depth,
             callback_frame_index: self.frames.len() - 1,
+            for_of,
         });
         Ok(())
+    }
+
+    /// The `IteratorNext` protocol's generator-iterator marker:
+    /// `["__gen__", id, done]`.
+    fn gen_iter_triple(&mut self, gen_id: u64, done: bool) -> Value {
+        let h = self.heap.alloc_array(vec![
+            Value::String(JsString::from("__gen__")),
+            Value::Int(gen_id as i64),
+            Value::Bool(done),
+        ]);
+        Value::Array(h)
     }
 
     fn run_generator_until_yield_or_return(
@@ -6041,7 +6078,7 @@ impl Vm {
                                                 // body frame runs like any call
                                                 // — tool calls inside it can
                                                 // suspend the VM durably.
-                                                self.start_generator_pull(g, arg)?;
+                                                self.start_generator_pull(g, arg, false)?;
                                                 return Ok(None);
                                             } else if self.continuations.iter().any(|c| {
                                                 matches!(c, Continuation::GeneratorNext { gen_obj: g, .. }
@@ -6715,36 +6752,21 @@ impl Vm {
                                 _ => return Err(ZapcodeError::RuntimeError("bad gen iter".into())),
                             };
                             let gen_key = format!("__gen_{}", gen_id);
-                            let gen_obj = if let Some(Value::Generator(g)) =
-                                self.globals.remove(&gen_key)
-                            {
-                                g
+                            if let Some(Value::Generator(g)) = self.globals.remove(&gen_key) {
+                                // Main-loop pull (Stage 1): the body frame
+                                // runs like any call — tool calls inside a
+                                // for…of-driven generator suspend durably.
+                                self.start_generator_pull(g, Value::Undefined, true)?;
+                            } else if self.continuations.iter().any(|c| {
+                                matches!(c, Continuation::GeneratorNext { gen_obj: g, .. }
+                                    if g.id == gen_id)
+                            }) {
+                                return Err(ZapcodeError::TypeError(
+                                    "Generator is already running".to_string(),
+                                ));
                             } else {
-                                let done_iter = self.heap.alloc_array(vec![
-                                    Value::String(JsString::from("__gen__")),
-                                    Value::Int(gen_id as i64),
-                                    Value::Bool(true),
-                                ]);
-                                self.push(Value::Array(done_iter))?;
-                                self.push(Value::Undefined)?;
-                                return Ok(None);
-                            };
-                            let result = self.generator_next(gen_obj, Value::Undefined)?;
-                            if let Value::Object(obj_h) = &result {
-                                let obj = self.heap.object_map(*obj_h);
-                                let done = obj
-                                    .get("done")
-                                    .is_some_and(|v| matches!(v, Value::Bool(true)));
-                                let value = obj.get("value").cloned().unwrap_or(Value::Undefined);
-                                let new_iter = self.heap.alloc_array(vec![
-                                    Value::String(JsString::from("__gen__")),
-                                    Value::Int(gen_id as i64),
-                                    Value::Bool(done),
-                                ]);
-                                self.push(Value::Array(new_iter))?;
-                                self.push(value)?;
-                            } else {
-                                self.push(iter)?;
+                                let done_iter = self.gen_iter_triple(gen_id, true);
+                                self.push(done_iter)?;
                                 self.push(Value::Undefined)?;
                             }
                             return Ok(None);
@@ -7038,8 +7060,11 @@ impl Vm {
                         "yield can only be used inside a generator function".to_string(),
                     ));
                 }
-                let Some(Continuation::GeneratorNext { mut gen_obj, .. }) =
-                    self.continuations.pop()
+                let Some(Continuation::GeneratorNext {
+                    mut gen_obj,
+                    for_of,
+                    ..
+                }) = self.continuations.pop()
                 else {
                     unreachable!("checked above");
                 };
@@ -7051,6 +7076,7 @@ impl Vm {
                 self.stash_generator_try_frames(gen_obj.id, below, frame.stack_base);
                 // dispatch() pre-incremented ip, so the frame resumes just
                 // past this Yield.
+                let gen_id = gen_obj.id;
                 gen_obj.suspended = Some(SuspendedFrame {
                     ip: frame.ip,
                     locals: frame.locals,
@@ -7059,8 +7085,14 @@ impl Vm {
                 });
                 gen_obj.done = false;
                 self.store_generator(gen_obj);
-                let res = self.make_iterator_result(yielded, false);
-                self.push(res)?;
+                if for_of {
+                    let triple = self.gen_iter_triple(gen_id, false);
+                    self.push(triple)?;
+                    self.push(yielded)?;
+                } else {
+                    let res = self.make_iterator_result(yielded, false);
+                    self.push(res)?;
+                }
             }
 
             Instruction::Await => {
