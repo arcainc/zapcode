@@ -769,6 +769,7 @@ impl<'a> AstLowerer<'a> {
         };
         Ok(Statement::TryCatch {
             try_body,
+            has_catch: try_stmt.handler.is_some(),
             catch_param,
             catch_body,
             finally_body,

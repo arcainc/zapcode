@@ -188,6 +188,43 @@ async fan-out) — which immediately caught two real bugs no torture-test had:
 Differential corpus after this round: 176 snippets agree with Node (29 of
 them whole realistic programs), 1 pin held.
 
+**Round 14 (branch `perf-template-globals`, third pass) — realistic corpus
+round 2: 65 more whole programs, 7 real bugs.** The corpus now also surfaces
+both-engine throws (a both-throw "agreement" usually means the snippet is
+broken — three round-13 snippets were silently degenerate that way and are
+fixed). The new programs (concurrency-limited batching, memoized lookups,
+middleware chains, circuit breakers, pivots, LRU caches, semver sorting,
+word-wrap, dependency resolution, …) caught:
+- **`catch {}` + `finally` lost the catch entirely.** The compiler treated a
+  bare empty catch block as NO handler (`has_catch` was inferred from
+  `!catch_body.is_empty() || catch_param.is_some()`); the throw escaped
+  `try { … } catch {} finally { … }`. The IR now carries an explicit
+  `has_catch` from the parser.
+- **`(o[k] = o[k] || {}).x = v` — "compile error: invalid assignment
+  target".** Member stores demanded a nameable parent for the write-back,
+  rejecting the grouping-accumulator idiom AND `getObj().x = v` and
+  `(cond ? a : b).x = v`. Since `SetProperty`/`SetIndex` mutate the shared
+  heap slot in place, an arbitrary object expression now just drops the
+  pushed-back reference instead of failing to compile.
+- **`setTimeout`/`clearTimeout`/`queueMicrotask` did not exist** — the
+  canonical `await new Promise(r => setTimeout(r, ms))` sleep failed. Timers
+  are now DETERMINISTIC macrotasks: delay is an ordering key (smaller fires
+  first, creation order on ties — no wall clock, replay-stable); they fire
+  at the top-level drain after microtasks empty and the per-tick
+  unhandled-rejection check passes, preserving every relative ordering real
+  JS guarantees. Timers serialize in snapshots (wire v13) and survive hops;
+  a capability handed to the scheduler (`setTimeout(resolve, ms)`) is
+  invoked, not pass-through'd.
+- **`Object.groupBy` / `Map.groupBy` missing** — grouped in the VM (the key
+  callback is a guest closure, run through the internal drive like a JSON
+  replacer). `Map.groupBy` keys by SameValueZero.
+- **`btoa`/`atob` missing** — WHATWG latin-1 base64, catchable
+  InvalidCharacterError on bad input.
+
+Differential corpus after this round: **241 snippets agree with Node**
+(~95 of them whole realistic programs), 1 pin held, 0 both-throw
+degenerates.
+
 **Round 8 (branch `arca/conformance-fixes`) — cluster wrap-up + reflection / RegExp / coercion-builtin edges.**
 
 This round confirms the earlier-landed clusters are GREEN-by-construction (asserting

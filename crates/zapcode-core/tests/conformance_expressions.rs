@@ -432,3 +432,27 @@ fn symbol_for_global_registry() {
     // A registered symbol works as a computed property key.
     assert_eq!(run_str("(function(){ const s = Symbol.for('k'); const o = { [s]: 1 }; return o[s]; })()"), "1");
 }
+
+#[test]
+fn member_store_through_arbitrary_object_expressions() {
+    // The accumulator idiom: the parenthesized assignment's RESULT is the
+    // store target. (Used to be "compile error: invalid assignment target".)
+    assert_eq!(
+        run_str("const p = {}; (p.a = p.a || {}).b = 1; JSON.stringify(p)"),
+        "{\"a\":{\"b\":1}}"
+    );
+    assert_eq!(
+        run_str("const p = {}; (p['x'] = p['x'] || {})['y'] = 2; JSON.stringify(p)"),
+        "{\"x\":{\"y\":2}}"
+    );
+    // A call result as the store target mutates the shared reference.
+    assert_eq!(
+        run_str("const o = { inner: {} }; function get() { return o.inner; } get().v = 7; o.inner.v"),
+        "7"
+    );
+    // Ternary-selected target.
+    assert_eq!(
+        run_str("const a = {}, b = {}; (true ? a : b).hit = 'yes'; a.hit + ',' + (b.hit ?? 'no')"),
+        "yes,no"
+    );
+}

@@ -61,7 +61,9 @@ const MAGIC: &[u8; 4] = b"ZPC1";
 /// v12: snapshot heap may elide the builtin-template prefix
 /// (`VmSnapshot::{builtin_base, heap_template_elided, template_fingerprint}`),
 /// incompatible with v11.
-pub(crate) const FORMAT_VERSION: u16 = 12;
+/// v13: deterministic timers (`VmSnapshot::{timers, next_timer_id}` for
+/// `setTimeout`), incompatible with v12.
+pub(crate) const FORMAT_VERSION: u16 = 13;
 
 const HEADER_LEN: usize = 4 + 2 + 1 + 1 + 32;
 

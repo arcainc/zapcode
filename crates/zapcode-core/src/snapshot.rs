@@ -89,6 +89,12 @@ pub(crate) struct VmSnapshot {
     pub(crate) heap_template_elided: bool,
     #[serde(default)]
     pub(crate) template_fingerprint: u64,
+    /// Pending `setTimeout` callbacks — carried so a suspension with timers
+    /// in flight fires them on resume (deterministic macrotask ordering).
+    #[serde(default)]
+    pub(crate) timers: Vec<crate::vm::TimerEntry>,
+    #[serde(default)]
+    pub(crate) next_timer_id: u64,
 }
 
 /// Postcard bytes + FNV-1a fingerprint of the builtin-template heap, built
@@ -179,6 +185,8 @@ impl VmSnapshot {
             builtin_base: vm.builtin_base as u64,
             heap_template_elided,
             template_fingerprint,
+            timers: vm.timers.clone(),
+            next_timer_id: vm.next_timer_id,
         }
     }
 
@@ -236,6 +244,8 @@ impl VmSnapshot {
         vm.async_tasks = self.async_tasks;
         vm.next_async_task_id = self.next_async_task_id;
         vm.generator_try_frames = self.generator_try_frames;
+        vm.timers = self.timers;
+        vm.next_timer_id = self.next_timer_id;
         Ok(vm)
     }
 }

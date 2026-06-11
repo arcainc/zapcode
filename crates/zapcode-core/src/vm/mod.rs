@@ -266,6 +266,21 @@ pub(crate) struct Microtask {
     pub(crate) task: Option<u64>,
 }
 
+/// A pending `setTimeout` callback. The VM has no clock — `delay` is a
+/// deterministic ORDERING key (smaller fires first, ties broken by creation
+/// order), which preserves real-JS relative timer ordering without wall
+/// time. Timers fire as macrotasks: at the top-level drain, after the
+/// microtask queue empties (and the per-tick unhandled-rejection check
+/// passes), the earliest timer's callback runs as a job. Serialized so a
+/// suspension with timers in flight resumes them.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct TimerEntry {
+    pub(crate) id: u64,
+    pub(crate) delay: f64,
+    pub(crate) seq: u64,
+    pub(crate) callback: Value,
+}
+
 /// What a [`Continuation::PromiseCallback`] does with the callback's return value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum PromiseCallbackMode {
@@ -409,6 +424,9 @@ pub struct Vm {
     /// snapshots elide the template prefix and restores skip re-registration.
     /// Zero for heaps seeded with caller data (builtins appended on top).
     pub(crate) builtin_base: usize,
+    /// Pending `setTimeout` callbacks (see [`TimerEntry`]).
+    pub(crate) timers: Vec<TimerEntry>,
+    pub(crate) next_timer_id: u64,
 }
 
 /// The builtin globals and the heap slots backing them, built once. Every
@@ -608,6 +626,8 @@ impl Vm {
             next_async_task_id: 0,
             generator_try_frames: BTreeMap::new(),
             builtin_base,
+            timers: Vec::new(),
+            next_timer_id: 0,
         }
     }
 
@@ -634,6 +654,12 @@ impl Vm {
         "decodeURIComponent",
         "encodeURI",
         "decodeURI",
+        "btoa",
+        "atob",
+        "setTimeout",
+        "clearTimeout",
+        "clearInterval",
+        "queueMicrotask",
         "Set",
         "Error",
         "TypeError",
@@ -722,6 +748,8 @@ impl Vm {
             next_async_task_id: 0,
             generator_try_frames: BTreeMap::new(),
             builtin_base: restored_base,
+            timers: Vec::new(),
+            next_timer_id: 0,
         }
     }
 
@@ -1507,6 +1535,81 @@ impl Vm {
         }
     }
 
+    /// Dispatch the timer/microtask scheduling globals — they mutate VM
+    /// state, so the pure `builtins::call_global_fn` cannot host them.
+    /// Returns `None` for any other global (the caller falls through).
+    fn call_scheduler_global(&mut self, kind: &str, args: &[Value]) -> Option<Result<Value>> {
+        match kind {
+            "setTimeout" => {
+                let callback = args.first().cloned().unwrap_or(Value::Undefined);
+                let delay = args.get(1).map(|v| v.to_number()).unwrap_or(0.0);
+                let delay = if delay.is_finite() && delay > 0.0 { delay } else { 0.0 };
+                let id = self.next_timer_id;
+                self.next_timer_id += 1;
+                self.timers.push(TimerEntry {
+                    id,
+                    delay,
+                    seq: id,
+                    callback,
+                });
+                Some(Ok(Value::Int(id as i64)))
+            }
+            "clearTimeout" | "clearInterval" => {
+                if let Some(Value::Int(id)) = args.first() {
+                    let id = *id as u64;
+                    self.timers.retain(|t| t.id != id);
+                }
+                Some(Ok(Value::Undefined))
+            }
+            "queueMicrotask" => {
+                let callback = args.first().cloned().unwrap_or(Value::Undefined);
+                let result_promise = builtins::make_pending_promise(&mut self.heap);
+                self.microtasks.push_back(Microtask {
+                    handler: callback,
+                    value: Value::Undefined,
+                    is_rejection: false,
+                    mode: PromiseCallbackMode::WrapResult,
+                    result_promise,
+                    task: None,
+                });
+                Some(Ok(Value::Undefined))
+            }
+            _ => None,
+        }
+    }
+
+    /// Remove and return the next due timer: smallest delay, creation order
+    /// breaking ties — the deterministic analogue of the timer wheel.
+    fn pop_due_timer(&mut self) -> Option<TimerEntry> {
+        let idx = self
+            .timers
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                a.delay
+                    .partial_cmp(&b.delay)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.seq.cmp(&b.seq))
+            })
+            .map(|(i, _)| i)?;
+        Some(self.timers.remove(idx))
+    }
+
+    /// Run a fired timer's callback as a job (the macrotask body): a frame
+    /// driven by the main loop via the microtask machinery, so a tool call
+    /// inside the callback suspends normally.
+    fn start_timer_job(&mut self, t: TimerEntry) -> Result<()> {
+        let result_promise = builtins::make_pending_promise(&mut self.heap);
+        self.start_microtask(Microtask {
+            handler: t.callback,
+            value: Value::Undefined,
+            is_rejection: false,
+            mode: PromiseCallbackMode::WrapResult,
+            result_promise,
+            task: None,
+        })
+    }
+
     /// Clear an unhandled-rejection mark: a reject handler attached to the
     /// promise, or its rejection was consumed (`await` rethrow, host boundary).
     fn mark_rejection_handled(&mut self, h: Handle) {
@@ -1564,6 +1667,25 @@ impl Vm {
                 Some(Value::String(s)) if s.as_ref() == "combine"
             ) {
                 return self.combine_step(*rh, m.value, m.is_rejection);
+            }
+            // A capability handed straight to the scheduler —
+            // `setTimeout(resolve, ms)` / `queueMicrotask(reject)` — is a
+            // callable marker, not a Function: invoke it (settle its
+            // promise with the job's value).
+            let capability = {
+                let map = self.heap.object_map(*rh);
+                map.contains_key("__promise_capability__").then(|| {
+                    (
+                        map.get("__promise_capability__")
+                            .cloned()
+                            .unwrap_or(Value::Undefined),
+                        matches!(map.get("__capability_reject__"), Some(Value::Bool(true))),
+                    )
+                })
+            };
+            if let Some((promise, is_reject)) = capability {
+                self.settle_capability(&promise, m.value, is_reject)?;
+                return Ok(());
             }
         }
         if let Value::Function(closure) = &m.handler {
@@ -2776,9 +2898,16 @@ impl Vm {
                         continue;
                     }
                     // End of drain: a rejection nobody handled fails the run
-                    // deterministically (JS's unhandled-rejection event).
+                    // deterministically (JS's unhandled-rejection event). Like
+                    // Node, this fires per-MACROTASK — before the next timer.
                     if let Some(err) = self.unhandled_rejection_error() {
                         return Err(err);
+                    }
+                    // Microtasks done: fire the next due timer (a macrotask),
+                    // then drain whatever it queued.
+                    if let Some(t) = self.pop_due_timer() {
+                        self.start_timer_job(t)?;
+                        continue;
                     }
                     // Top-level: return last value on stack or undefined
                     let result = if self.stack.is_empty() {
@@ -3388,6 +3517,9 @@ impl Vm {
                     _ => None,
                 });
             if let Some(kind) = kind {
+                if let Some(result) = self.call_scheduler_global(&kind, &args) {
+                    return result;
+                }
                 let mut args = args;
                 match kind.as_str() {
                     "String" => {
@@ -6692,6 +6824,69 @@ impl Vm {
                                     &mut self.heap,
                                 )?
                             }
+                            // Object.groupBy / Map.groupBy take a guest key
+                            // callback, so they group here (the pure builtin
+                            // layer cannot call closures). The callback runs
+                            // through the internal drive, like a JSON
+                            // replacer — a tool call inside it cannot suspend.
+                            "Object" | "Map" if method_name.as_ref() == "groupBy" => {
+                                let items = match args.first() {
+                                    Some(Value::Array(h)) => self.heap.array_vec(*h),
+                                    _ => Vec::new(),
+                                };
+                                let callback =
+                                    args.get(1).cloned().unwrap_or(Value::Undefined);
+                                let mut keyed = Vec::with_capacity(items.len());
+                                for (i, item) in items.iter().enumerate() {
+                                    let key = self.call_function_internal(
+                                        &callback,
+                                        vec![item.clone(), Value::Int(i as i64)],
+                                    )?;
+                                    keyed.push((key, item.clone()));
+                                }
+                                let value = if object_name.as_ref() == "Object" {
+                                    // Plain object keyed by ToPropertyKey; group
+                                    // order is first-occurrence, like Node.
+                                    let mut groups: IndexMap<Arc<str>, Vec<Value>> =
+                                        IndexMap::new();
+                                    for (key, item) in keyed {
+                                        let k = key.to_js_string(&self.heap);
+                                        groups.entry(Arc::from(k.as_str())).or_default().push(item);
+                                    }
+                                    self.tracker.track_allocation(&self.limits)?;
+                                    let mut obj = IndexMap::new();
+                                    for (k, group) in groups {
+                                        self.track_array_capacity(group.len())?;
+                                        let h = self.heap.alloc_array(group);
+                                        obj.insert(k, Value::Array(h));
+                                    }
+                                    Some(Value::Object(self.heap.alloc_object(obj)))
+                                } else {
+                                    // Map keyed by SameValueZero identity.
+                                    let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
+                                    for (key, item) in keyed {
+                                        match groups.iter_mut().find(|(k, _)| {
+                                            builtins::same_value_zero(k, &key)
+                                        }) {
+                                            Some((_, g)) => g.push(item),
+                                            None => groups.push((key, vec![item])),
+                                        }
+                                    }
+                                    self.tracker.track_allocation(&self.limits)?;
+                                    let entries = groups
+                                        .into_iter()
+                                        .map(|(k, g)| {
+                                            let gh = self.heap.alloc_array(g);
+                                            let mut em = IndexMap::new();
+                                            em.insert(Arc::from("key"), k);
+                                            em.insert(Arc::from("value"), Value::Array(gh));
+                                            Value::Object(self.heap.alloc_object(em))
+                                        })
+                                        .collect();
+                                    Some(make_map_object(entries, &mut self.heap))
+                                };
+                                value
+                            }
                             // JSON.stringify must honor a user `toJSON()` on plain
                             // objects and a FUNCTION replacer; JSON.parse must invoke a
                             // reviver. All three need the guest-closure call path, so
@@ -6843,6 +7038,13 @@ impl Vm {
                             Some(Value::String(s)) => Arc::<str>::from(s.as_str()),
                             _ => Arc::from(""),
                         };
+                        // setTimeout/clearTimeout/queueMicrotask mutate VM
+                        // scheduling state — dispatch here, not in builtins.
+                        if let Some(result) = self.call_scheduler_global(kind.as_ref(), &args) {
+                            let value = result?;
+                            self.push(value)?;
+                            return Ok(None);
+                        }
                         // String(x)/Number(x) run ToPrimitive on their argument so
                         // a user valueOf/toString hook is honored (String -> string
                         // hint, Number -> number hint).
@@ -7619,6 +7821,15 @@ impl Vm {
                                     self.push(val)?;
                                     self.current_frame_mut().ip -= 1;
                                     self.start_microtask(m)?;
+                                } else if let Some(t) = self.pop_due_timer() {
+                                    // Microtasks dry but timers pending: a
+                                    // top-level await on a timer-settled
+                                    // promise (`await new Promise(r =>
+                                    // setTimeout(r, ms))`) fires the next
+                                    // macrotask and re-awaits.
+                                    self.push(val)?;
+                                    self.current_frame_mut().ip -= 1;
+                                    self.start_timer_job(t)?;
                                 } else {
                                     // Queue is dry and the promise can never
                                     // settle (e.g. `Promise.race([])`) — pass

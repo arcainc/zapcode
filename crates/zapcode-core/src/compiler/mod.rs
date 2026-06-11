@@ -838,6 +838,7 @@ impl Compiler {
             }
             Statement::TryCatch {
                 try_body,
+                has_catch,
                 catch_param,
                 catch_body,
                 finally_body,
@@ -845,6 +846,7 @@ impl Compiler {
             } => {
                 self.compile_try_catch_finally(
                     try_body,
+                    *has_catch,
                     catch_param.as_deref(),
                     catch_body,
                     finally_body.as_deref(),
@@ -1077,6 +1079,7 @@ impl Compiler {
             }
             Statement::TryCatch {
                 try_body,
+                has_catch,
                 catch_param,
                 catch_body,
                 finally_body,
@@ -1089,6 +1092,7 @@ impl Compiler {
                 // completion inside finally still supersedes via EndFinally.
                 self.compile_try_catch_finally(
                     try_body,
+                    *has_catch,
                     catch_param.as_deref(),
                     catch_body,
                     finally_body.as_deref(),
@@ -1141,12 +1145,12 @@ impl Compiler {
     fn compile_try_catch_finally(
         &mut self,
         try_body: &[Statement],
+        has_catch: bool,
         catch_param: Option<&str>,
         catch_body: &[Statement],
         finally_body: Option<&[Statement]>,
         completion: Option<()>,
     ) -> Result<()> {
-        let has_catch = !catch_body.is_empty() || catch_param.is_some();
 
         // ---- No finally: the classic catch-only lowering. ----
         let Some(finally) = finally_body else {
@@ -2856,6 +2860,16 @@ impl Compiler {
         self.compile_store_inner(target, true)
     }
 
+    /// True for expressions that name a storable place (an identifier or a
+    /// member/index chain rooted in one) — the targets `compile_store_inner`
+    /// accepts.
+    fn is_store_target(expr: &Expr) -> bool {
+        matches!(
+            expr,
+            Expr::Ident(_) | Expr::Member { .. } | Expr::ComputedMember { .. }
+        )
+    }
+
     /// Compile a store to `target`. When `check_const` is true (a direct
     /// assignment), assigning to a `const` binding throws. The member/index
     /// write-back paths pass `false`: `const o = {}; o.x = 1` mutates the object
@@ -2884,9 +2898,17 @@ impl Compiler {
             } => {
                 self.compile_expr(object)?;
                 self.emit(Instruction::SetProperty(property.clone()));
-                // SetProperty pushes the modified object back — store it to the
-                // parent (a write-back of the same reference, never a const rebind).
-                self.compile_store_inner(object, false)?;
+                // SetProperty mutates the shared heap slot in place and pushes
+                // the same reference back. A nameable parent gets the formal
+                // write-back; an arbitrary object expression — a call result,
+                // a parenthesized assignment (`(o[k] = o[k] || {}).x = v`), a
+                // ternary — has no place to write to, and the mutation is
+                // already visible through every alias: drop the reference.
+                if Self::is_store_target(object) {
+                    self.compile_store_inner(object, false)?;
+                } else {
+                    self.emit(Instruction::Pop);
+                }
             }
             Expr::ComputedMember {
                 object, property, ..
@@ -2894,8 +2916,12 @@ impl Compiler {
                 self.compile_expr(object)?;
                 self.compile_expr(property)?;
                 self.emit(Instruction::SetIndex);
-                // SetIndex pushes the modified object back — write it to the parent.
-                self.compile_store_inner(object, false)?;
+                // Same write-back rule as `Expr::Member` above.
+                if Self::is_store_target(object) {
+                    self.compile_store_inner(object, false)?;
+                } else {
+                    self.emit(Instruction::Pop);
+                }
             }
             _ => {
                 return Err(ZapcodeError::CompileError(

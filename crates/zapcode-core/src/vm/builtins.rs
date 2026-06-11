@@ -153,6 +153,12 @@ pub fn register_globals(globals: &mut HashMap<String, Value>, heap: &mut Heap) {
         "decodeURIComponent",
         "encodeURI",
         "decodeURI",
+        "btoa",
+        "atob",
+        "setTimeout",
+        "clearTimeout",
+        "clearInterval",
+        "queueMicrotask",
     ] {
         let v = global_fn(name, heap);
         globals.insert(name.to_string(), v);
@@ -751,6 +757,33 @@ pub fn call_global_fn(kind: &str, args: &[Value], heap: &mut Heap) -> Result<Val
         "decodeURI" => Value::String(JsString::from(
             uri_decode(&arg.to_js_string(heap), "#$&+,/:;=?@")?.as_str(),
         )),
+        // Base64 codecs over latin-1 strings (the WHATWG btoa/atob Node also
+        // ships). A code point above U+00FF raises, like Node.
+        "btoa" => {
+            let s = arg.to_js_string(heap);
+            let mut bytes = Vec::with_capacity(s.len());
+            for ch in s.chars() {
+                let c = ch as u32;
+                if c > 0xff {
+                    return Err(ZapcodeError::RuntimeError(
+                        "InvalidCharacterError: btoa accepts latin-1 only".to_string(),
+                    ));
+                }
+                bytes.push(c as u8);
+            }
+            Value::String(JsString::from(base64_encode(&bytes).as_str()))
+        }
+        "atob" => {
+            let s = arg.to_js_string(heap);
+            let bytes = base64_decode(&s).ok_or_else(|| {
+                ZapcodeError::RuntimeError(
+                    "InvalidCharacterError: atob input is not valid base64".to_string(),
+                )
+            })?;
+            Value::String(JsString::from(
+                bytes.iter().map(|b| *b as char).collect::<String>().as_str(),
+            ))
+        }
         "Number" => finite_number(arg.to_number_heap(heap)),
         // BigInt(x): integers/booleans/numeric strings -> BigInt; a non-integer
         // Number or unparseable string is a RangeError/SyntaxError, like JS.
@@ -2608,7 +2641,7 @@ fn array_from_index(arg: Option<&Value>, len: usize) -> usize {
 }
 
 /// SameValueZero comparison: like `===` but `NaN` equals `NaN`.
-fn same_value_zero(a: &Value, b: &Value) -> bool {
+pub(crate) fn same_value_zero(a: &Value, b: &Value) -> bool {
     if a.strict_eq(b) {
         return true;
     }
@@ -3822,6 +3855,60 @@ fn uri_decode(s: &str, keep_encoded: &str) -> Result<String> {
         }
     }
     String::from_utf8(out).map_err(|_| malformed())
+}
+
+const B64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(B64_ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(B64_ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { B64_ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { B64_ALPHABET[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let cleaned: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let trimmed = match cleaned.len() % 4 {
+        0 => &cleaned[..],
+        _ => return None,
+    };
+    let val = |b: u8| -> Option<u32> {
+        B64_ALPHABET.iter().position(|a| *a == b).map(|i| i as u32)
+    };
+    let mut out = Vec::with_capacity(trimmed.len() / 4 * 3);
+    for chunk in trimmed.chunks(4) {
+        let pad = chunk.iter().rev().take_while(|b| **b == b'=').count();
+        if pad > 2 {
+            return None;
+        }
+        let mut n: u32 = 0;
+        for (i, b) in chunk.iter().enumerate() {
+            let v = if *b == b'=' {
+                if i < chunk.len() - pad {
+                    return None; // '=' only at the end
+                }
+                0
+            } else {
+                val(*b)?
+            };
+            n = (n << 6) | v;
+        }
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
 }
 
 /// Build the AggregateError-shaped object `Promise.any` rejects with when

@@ -295,7 +295,7 @@ const realistic = [
      lines.push("- **" + k + "**: " + v);
    }
    lines.push("", "Total: " + (stats.passed + stats.failed + stats.skipped));
-   return lines.join("\n");`,
+   return lines.join("\\n");`,
 
   // chunk a list into pages
   `const ids = Array.from({ length: 11 }, (_, i) => i + 1);
@@ -339,8 +339,8 @@ const realistic = [
    return JSON.stringify(state);`,
 
   // extract structured data from text
-  `const log = "ERROR db timeout after 30s\nINFO retrying\nERROR api 503\nINFO done";
-   const errors = log.split("\n").filter(l => l.startsWith("ERROR")).map(l => l.slice(6));
+  `const log = "ERROR db timeout after 30s\\nINFO retrying\\nERROR api 503\\nINFO done";
+   const errors = log.split("\\n").filter(l => l.startsWith("ERROR")).map(l => l.slice(6));
    return errors.length + ":" + errors.join(";");`,
 
   // regex capture over semi-structured text
@@ -376,8 +376,8 @@ const realistic = [
    return JSON.stringify(flatten({ db: { host: "x", pool: { max: 5 } }, debug: false }));`,
 
   // CSV-ish parsing into records
-  `const csv = "name,qty,price\nwidget,2,9.99\ngadget,1,19.5";
-   const [header, ...rows] = csv.split("\n").map(l => l.split(","));
+  `const csv = "name,qty,price\\nwidget,2,9.99\\ngadget,1,19.5";
+   const [header, ...rows] = csv.split("\\n").map(l => l.split(","));
    const records = rows.map(r => Object.fromEntries(r.map((v, i) => [header[i], v])));
    const total = records.reduce((s, r) => s + Number(r.qty) * Number(r.price), 0);
    return records.length + ":" + total.toFixed(2);`,
@@ -499,6 +499,375 @@ const realistic = [
      trace.push(state);
    }
    return trace.join(">");`,
+
+  // ── round 2: orchestration patterns ───────────────────────────────────
+  // concurrency-limited batches, order preserved
+  `async function work(n) { return n * n; }
+   const ids = [1, 2, 3, 4, 5, 6, 7];
+   const out = [];
+   for (let i = 0; i < ids.length; i += 3) {
+     out.push(...await Promise.all(ids.slice(i, i + 3).map(work)));
+   }
+   return out.join(',');`,
+
+  // memoized async lookup
+  `const cache = new Map();
+   let misses = 0;
+   async function lookup(key) {
+     if (cache.has(key)) return cache.get(key);
+     misses += 1;
+     const value = key.toUpperCase();
+     cache.set(key, value);
+     return value;
+   }
+   const got = [];
+   for (const k of ['a', 'b', 'a', 'c', 'b', 'a']) got.push(await lookup(k));
+   return got.join('') + '|misses:' + misses;`,
+
+  // middleware composition
+  `const middleware = [
+     next => async req => next({ ...req, auth: true }),
+     next => async req => next({ ...req, traced: req.auth ? 'yes' : 'no' }),
+   ];
+   const handler = middleware.reduceRight((next, mw) => mw(next), async req => JSON.stringify(req));
+   return await handler({ path: '/x' });`,
+
+  // sync event emitter
+  `class Emitter {
+     constructor() { this.handlers = {}; }
+     on(ev, fn) { (this.handlers[ev] = this.handlers[ev] || []).push(fn); return this; }
+     emit(ev, data) { for (const fn of this.handlers[ev] || []) fn(data); }
+   }
+   const log = [];
+   const bus = new Emitter().on('job', d => log.push('a:' + d)).on('job', d => log.push('b:' + d));
+   bus.emit('job', 1); bus.emit('other', 9); bus.emit('job', 2);
+   return log.join(',');`,
+
+  // retry with recorded backoff schedule
+  `let calls = 0;
+   async function flaky() { calls += 1; if (calls < 4) throw new Error('nope'); return 'ok'; }
+   const waits = [];
+   let result;
+   for (let attempt = 0; attempt < 6; attempt++) {
+     try { result = await flaky(); break; }
+     catch { waits.push(2 ** attempt * 100); }
+   }
+   return result + '|' + waits.join(',');`,
+
+  // circuit-breaker counter
+  `let failures = 0, state = 'closed';
+   const trace = [];
+   async function call(shouldFail) {
+     if (state === 'open') { trace.push('skipped'); return; }
+     if (shouldFail) { failures += 1; trace.push('fail' + failures); if (failures >= 3) state = 'open'; }
+     else { failures = 0; trace.push('ok'); }
+   }
+   for (const f of [true, false, true, true, true, false]) await call(f);
+   return state + '|' + trace.join(',');`,
+
+  // queue drain with requeue
+  `const queue = [['t1', 0], ['t2', 1], ['t3', 0]];
+   const done = [];
+   while (queue.length) {
+     const [name, fails] = queue.shift();
+     if (fails > 0) queue.push([name, fails - 1]);
+     else done.push(name);
+   }
+   return done.join(',');`,
+
+  // ── round 2: data munging ─────────────────────────────────────────────
+  // pivot rows into columns
+  `const rows = [
+     { metric: 'cpu', host: 'a', v: 10 }, { metric: 'cpu', host: 'b', v: 20 },
+     { metric: 'mem', host: 'a', v: 30 }, { metric: 'mem', host: 'b', v: 40 },
+   ];
+   const pivot = {};
+   for (const r of rows) (pivot[r.metric] = pivot[r.metric] || {})[r.host] = r.v;
+   return JSON.stringify(pivot);`,
+
+  // merge records by id (last write wins per field)
+  `const a = [{ id: 1, name: 'Ana' }, { id: 2, name: 'Bo', city: 'Oslo' }];
+   const b = [{ id: 2, city: 'Bergen' }, { id: 3, name: 'Cy' }];
+   const byId = new Map();
+   for (const rec of [...a, ...b]) byId.set(rec.id, { ...byId.get(rec.id), ...rec });
+   return JSON.stringify([...byId.values()]);`,
+
+  // interval merging
+  `const spans = [[1, 3], [2, 6], [8, 10], [9, 12], [15, 16]];
+   spans.sort((x, y) => x[0] - y[0]);
+   const merged = [];
+   for (const [lo, hi] of spans) {
+     const last = merged[merged.length - 1];
+     if (last && lo <= last[1]) last[1] = Math.max(last[1], hi);
+     else merged.push([lo, hi]);
+   }
+   return merged.map(s => s.join('-')).join(',');`,
+
+  // partition + summarize
+  `const txns = [12.5, -3, 40, -7.25, 0, 18];
+   const credits = txns.filter(t => t > 0), debits = txns.filter(t => t < 0);
+   const sum = arr => arr.reduce((a, b) => a + b, 0);
+   return 'in:' + sum(credits).toFixed(2) + ' out:' + sum(debits).toFixed(2) + ' net:' + sum(txns).toFixed(2);`,
+
+  // deep defaults merge
+  `function mergeDefaults(cfg, defaults) {
+     const out = { ...defaults, ...cfg };
+     for (const k of Object.keys(defaults)) {
+       if (cfg[k] && typeof cfg[k] === 'object' && !Array.isArray(cfg[k])) {
+         out[k] = mergeDefaults(cfg[k], defaults[k] || {});
+       }
+     }
+     return out;
+   }
+   return JSON.stringify(mergeDefaults({ db: { port: 6432 } }, { db: { host: 'x', port: 5432 }, debug: false }));`,
+
+  // pick / omit helpers
+  `const pick = (o, keys) => Object.fromEntries(Object.entries(o).filter(([k]) => keys.includes(k)));
+   const omit = (o, keys) => Object.fromEntries(Object.entries(o).filter(([k]) => !keys.includes(k)));
+   const user = { id: 7, name: 'Ana', password: 'hunter2', role: 'admin' };
+   return JSON.stringify(pick(user, ['id', 'name'])) + '|' + JSON.stringify(omit(user, ['password']));`,
+
+  // top-N with ties broken alphabetically
+  `const scores = { ana: 9, bo: 7, cy: 9, di: 3, ed: 7 };
+   const top3 = Object.entries(scores)
+     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+     .slice(0, 3);
+   return top3.map(([n, s]) => n + '=' + s).join(',');`,
+
+  // frequency histogram into buckets
+  `const values = [3, 12, 7, 25, 18, 4, 9, 31, 15];
+   const buckets = { '0-9': 0, '10-19': 0, '20+': 0 };
+   for (const v of values) {
+     if (v < 10) buckets['0-9'] += 1;
+     else if (v < 20) buckets['10-19'] += 1;
+     else buckets['20+'] += 1;
+   }
+   return Object.entries(buckets).map(([k, n]) => k + ':' + n).join(' ');`,
+
+  // moving average
+  `const series = [10, 12, 11, 15, 20, 18];
+   const window = 3;
+   const avgs = [];
+   for (let i = window - 1; i < series.length; i++) {
+     const slice = series.slice(i - window + 1, i + 1);
+     avgs.push((slice.reduce((a, b) => a + b, 0) / window).toFixed(1));
+   }
+   return avgs.join(',');`,
+
+  // running totals
+  `const deltas = [5, -2, 7, -1, 3];
+   let total = 0;
+   return deltas.map(d => (total += d)).join(',');`,
+
+  // cents-safe money math
+  `const prices = [19.99, 4.5, 0.1, 0.2];
+   const cents = prices.map(p => Math.round(p * 100));
+   const totalCents = cents.reduce((a, b) => a + b, 0);
+   return (totalCents / 100).toFixed(2);`,
+
+  // safe JSON parse with fallback
+  `function safeParse(text, fallback) {
+     try { return JSON.parse(text); } catch { return fallback; }
+   }
+   return JSON.stringify([safeParse('{"a":1}', {}), safeParse('{bad', { error: true })]);`,
+
+  // binary search over sorted ids
+  `const sorted = [2, 5, 8, 12, 16, 23, 38, 56, 72, 91];
+   function bsearch(arr, target) {
+     let lo = 0, hi = arr.length - 1;
+     while (lo <= hi) {
+       const mid = (lo + hi) >> 1;
+       if (arr[mid] === target) return mid;
+       if (arr[mid] < target) lo = mid + 1; else hi = mid - 1;
+     }
+     return -1;
+   }
+   return [bsearch(sorted, 23), bsearch(sorted, 2), bsearch(sorted, 91), bsearch(sorted, 7)].join(',');`,
+
+  // diff lists: added / removed
+  `const before = ['a', 'b', 'c', 'd'];
+   const after = ['b', 'c', 'e'];
+   const added = after.filter(x => !before.includes(x));
+   const removed = before.filter(x => !after.includes(x));
+   return '+' + added.join('+') + ' -' + removed.join('-');`,
+
+  // dependency-order resolution
+  `const deps = { app: ['db', 'cache'], db: ['net'], cache: ['net'], net: [] };
+   const ordered = [];
+   const visit = (name) => {
+     if (ordered.includes(name)) return;
+     for (const d of deps[name]) visit(d);
+     ordered.push(name);
+   };
+   for (const name of Object.keys(deps)) visit(name);
+   return ordered.join(',');`,
+
+  // LRU-ish cache with Map insertion order
+  `const lru = new Map();
+   const MAX = 3;
+   function put(k, v) {
+     if (lru.has(k)) lru.delete(k);
+     lru.set(k, v);
+     if (lru.size > MAX) lru.delete(lru.keys().next().value);
+   }
+   for (const [k, v] of [['a', 1], ['b', 2], ['c', 3], ['a', 9], ['d', 4]]) put(k, v);
+   return [...lru.entries()].map(([k, v]) => k + v).join(',');`,
+
+  // tree node count + max depth
+  `const tree = { v: 1, kids: [{ v: 2, kids: [{ v: 4, kids: [] }] }, { v: 3, kids: [] }] };
+   function walk(node, depth) {
+     return node.kids.reduce(
+       (acc, k) => { const r = walk(k, depth + 1); return { n: acc.n + r.n, d: Math.max(acc.d, r.d) }; },
+       { n: 1, d: depth }
+     );
+   }
+   return JSON.stringify(walk(tree, 1));`,
+
+  // ── round 2: text & formatting ────────────────────────────────────────
+  // aligned text table
+  `const rows = [['name', 'qty'], ['widget', '2'], ['gizmo', '110']];
+   const w0 = Math.max(...rows.map(r => r[0].length));
+   return rows.map(r => r[0].padEnd(w0 + 2) + r[1].padStart(4)).join(';');`,
+
+  // pluralize + title case
+  `const titleCase = s => s.split(' ').map(w => w[0].toUpperCase() + w.slice(1)).join(' ');
+   const plural = (n, word) => n + ' ' + word + (n === 1 ? '' : 's');
+   return titleCase('weekly status report') + ': ' + plural(1, 'error') + ', ' + plural(4, 'warning');`,
+
+  // extract mentions and tags
+  `const post = 'Thanks @ana and @bo for #launch help! cc @ana #launch #q3';
+   const mentions = [...new Set(post.match(/@\\w+/g))];
+   const tags = [...new Set(post.match(/#\\w+/g))];
+   return mentions.join(',') + '|' + tags.join(',');`,
+
+  // markdown link extraction with named groups
+  `const md = 'See [docs](https://d.io/a) and [api](https://d.io/b).';
+   const links = [...md.matchAll(/\\[(?<label>[^\\]]+)\\]\\((?<url>[^)]+)\\)/g)]
+     .map(m => m.groups.label + '=>' + m.groups.url);
+   return links.join(',');`,
+
+  // word wrap
+  `function wrap(text, width) {
+     const words = text.split(' ');
+     const lines = [''];
+     for (const w of words) {
+       const cur = lines[lines.length - 1];
+       if (cur && (cur + ' ' + w).length > width) lines.push(w);
+       else lines[lines.length - 1] = cur ? cur + ' ' + w : w;
+     }
+     return lines;
+   }
+   return wrap('the quick brown fox jumps over the lazy dog', 12).join('/');`,
+
+  // truncate with ellipsis, replaceAll cleanup
+  `const raw = '  Spaced   out   draft\\ttitle  ';
+   const clean = raw.replaceAll('\\t', ' ').trim().replace(/\\s+/g, ' ');
+   const truncate = (s, n) => s.length <= n ? s : s.slice(0, n - 1) + '…';
+   return clean + '|' + truncate(clean, 12);`,
+
+  // semver compare
+  `function cmp(a, b) {
+     const pa = a.split('.').map(Number), pb = b.split('.').map(Number);
+     for (let i = 0; i < 3; i++) { if (pa[i] !== pb[i]) return pa[i] < pb[i] ? -1 : 1; }
+     return 0;
+   }
+   const vs = ['1.2.10', '1.10.0', '1.2.9', '0.9.9'];
+   return vs.sort(cmp).join(' < ');`,
+
+  // key=value config parsing with comments
+  `const conf = ['# main', 'host=db.local', 'port=5432', '', '# tuning', 'pool = 8'];
+   const parsed = {};
+   for (const line of conf) {
+     const t = line.trim();
+     if (!t || t.startsWith('#')) continue;
+     const [k, v] = t.split('=').map(x => x.trim());
+     parsed[k] = /^\\d+$/.test(v) ? Number(v) : v;
+   }
+   return JSON.stringify(parsed);`,
+
+  // ── round 2: dates & ids ──────────────────────────────────────────────
+  // day-of-week + range iteration (UTC, deterministic)
+  `const start = new Date(Date.UTC(2026, 5, 8));
+   const names = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+   const days = [];
+   for (let i = 0; i < 5; i++) {
+     const d = new Date(start.getTime() + i * 86400000);
+     days.push(names[d.getUTCDay()] + d.getUTCDate());
+   }
+   return days.join(',');`,
+
+  // duration formatting
+  `function fmt(ms) {
+     const s = Math.floor(ms / 1000), m = Math.floor(s / 60), h = Math.floor(m / 60);
+     return h + 'h' + String(m % 60).padStart(2, '0') + 'm' + String(s % 60).padStart(2, '0') + 's';
+   }
+   return [fmt(45000), fmt(3725000), fmt(86400000)].join(' ');`,
+
+  // month bucketing by date string
+  `const events = ['2026-03-02', '2026-03-05', '2026-04-11', '2026-04-12'];
+   const byMonth = {};
+   for (const e of events) {
+     const key = e.slice(0, 7);
+     byMonth[key] = (byMonth[key] ?? 0) + 1;
+   }
+   return JSON.stringify(byMonth);`,
+
+  // sequential id factory via closure + generator
+  `function* idGen(prefix) { let n = 0; while (true) yield prefix + '-' + (++n); }
+   const ids = idGen('task');
+   const made = [ids.next().value, ids.next().value, ids.next().value];
+   return made.join(',');`,
+
+  // ── round 2: language-surface probes agents rely on ──────────────────
+  `return [[1, [2, [3, [4]]]].flat(Infinity).join(''), [[1, 2], [3]].flatMap(x => x).join('')].join('|');`,
+  `const a = [5, 12, 8, 130, 44]; return [a.at(-1), a.findLast(x => x < 50), a.findLastIndex(x => x < 50)].join(',');`,
+  `return ['9'.padStart(3, '0'), 'ab'.padEnd(5, '.'), 'abc'.at(-1)].join('|');`,
+  `const o = structuredClone({ a: [1, { b: 2 }], s: 'x' }); o.a[1].b = 99; return JSON.stringify(o);`,
+  `const grouped = Object.groupBy([6.1, 4.2, 6.3], n => Math.floor(n)); return JSON.stringify(grouped);`,
+  `const m = Map.groupBy(['apple', 'avocado', 'beet'], w => w[0]); return [...m.keys()].join(',') + '|' + m.get('a').length;`,
+  `return btoa('hello world') + '|' + atob('aGk=');`,
+  `await new Promise(resolve => setTimeout(resolve, 1)); return 'slept';`,
+  `const order = []; setTimeout(() => order.push('timeout'), 0); await Promise.resolve().then(() => order.push('micro')); await new Promise(r => setTimeout(r, 1)); return order.join(',');`,
+  `class Resource { #open = true; close() { this.#open = false; } get open() { return this.#open; } } const r = new Resource(); try { throw new Error('boom'); } catch {} finally { r.close(); } return r.open;`,
+  `const obj = { _n: 5, get double() { return this._n * 2; }, set n(v) { this._n = v; } }; obj.n = 21; return obj.double;`,
+  `const range = { from: 1, to: 4, [Symbol.iterator]() { let c = this.from; const end = this.to; return { next: () => c <= end ? { value: c++, done: false } : { value: undefined, done: true } }; } }; return [...range].join(',') + '|' + Math.max(...range);`,
+  `const wm = new WeakMap(); const k1 = {}, k2 = {}; wm.set(k1, 'one'); return [wm.has(k1), wm.has(k2), wm.get(k1)].join(',');`,
+  `let i = 0; const out = []; do { out.push(i); i += 2; } while (i < 7); return out.join(',');`,
+  `outer: for (const x of [1, 2, 3]) { for (const y of [10, 20]) { if (x * y === 40) break outer; } } return 'done';`,
+  `try { null.x; } catch (e) { const wrapped = new Error('ctx', { cause: e }); return wrapped.message + '|' + (wrapped.cause instanceof TypeError); }`,
+  `return [Number.parseFloat('3.14abc'), parseInt('1f', 16), Number.isNaN(Number('42px')), (255).toString(16)].join('|');`,
+  `return [(1234.5678).toFixed(2), (0.000001234).toPrecision(2)].join('|');`,
+  `return [[NaN].includes(NaN), [NaN].indexOf(NaN), Array.from(new Set([0, -0])).length].join(',');`,
+  `const stable = [{k:'b',i:1},{k:'a',i:2},{k:'b',i:3},{k:'a',i:4}]; stable.sort((x,y)=>x.k.localeCompare(y.k)); return stable.map(e=>e.k+e.i).join(',');`,
+  `const fns = { greet: n => 'hi ' + n }; return (fns.greet?.('ana') ?? 'none') + '|' + (fns.missing?.('x') ?? 'none');`,
+  `const s = new Set('mississippi'); return [...s].join('') + '|' + s.size;`,
+  `const m1 = new Map([['a', 1], ['b', 2]]); const m2 = new Map([...m1].map(([k, v]) => [k, v * 10])); return JSON.stringify(Object.fromEntries(m2));`,
+  `function clamp(n, lo, hi) { return Math.min(hi, Math.max(lo, n)); } return [clamp(5, 0, 10), clamp(-3, 0, 10), clamp(99, 0, 10)].join(',');`,
+  `const seen = {}; const path = 'a.b.c'; let cur = seen; for (const part of path.split('.')) cur = cur[part] = cur[part] ?? {}; cur.value = 42; return JSON.stringify(seen);`,
+  `function get(obj, path, dflt) { return path.split('.').reduce((o, k) => (o ?? {})[k], obj) ?? dflt; } const cfg = { a: { b: { c: 7 } } }; return [get(cfg, 'a.b.c', 0), get(cfg, 'a.x.c', -1)].join(',');`,
+
+  // ── round 2: async generators over "tool pages" ───────────────────────
+  `async function* fetchPages() {
+     const pages = [{ items: ['a', 'b'], next: true }, { items: ['c'], next: true }, { items: [], next: false }];
+     for (const p of pages) { yield p.items; if (!p.next) return; }
+   }
+   const all = [];
+   for await (const items of fetchPages()) all.push(...items);
+   return all.join(',');`,
+
+  `async function* numbers() { for (let i = 1; i <= 7; i++) yield i; }
+   async function take(gen, n) { const out = []; for await (const v of gen) { out.push(v); if (out.length === n) break; } return out; }
+   return (await take(numbers(), 4)).join(',');`,
+
+  `async function* source() { for (const v of [5, 3, 8, 1, 9, 2, 7]) yield v; }
+   const batches = [];
+   let cur = [];
+   for await (const v of source()) {
+     cur.push(v);
+     if (cur.length === 3) { batches.push(cur); cur = []; }
+   }
+   if (cur.length) batches.push(cur);
+   return batches.map(b => Math.max(...b)).join(',');`,
 ];
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -520,6 +889,7 @@ const pinned = [
 let passed = 0;
 let failed = 0;
 const failures = [];
+const bothThrew = [];
 
 for (const body of [...corpus, ...realistic]) {
   let nodeResult, nodeErr, zapResult, zapErr;
@@ -538,6 +908,10 @@ for (const body of [...corpus, ...realistic]) {
     // differ between engines.
     if ((nodeErr === undefined) === (zapErr === undefined)) {
       passed++;
+      // A both-throw "agreement" usually means the SNIPPET is broken (Node
+      // is ground truth for validity) — surface it so it gets fixed rather
+      // than silently counting as parity.
+      bothThrew.push({ body, node: nodeErr });
     } else {
       failed++;
       failures.push({ body, node: nodeErr ?? nodeResult, zapcode: zapErr ?? zapResult });
@@ -579,4 +953,10 @@ if (failures.length > 0) {
   process.exit(1);
 }
 
+if (bothThrew.length > 0) {
+  console.log(`note: ${bothThrew.length} snippet(s) threw in BOTH engines (counted as parity, but check the snippets):`);
+  for (const t of bothThrew) {
+    console.log("  node error:", t.node, "\n  snippet:", t.body.slice(0, 100).replace(/\n/g, " "));
+  }
+}
 console.log(`differential parity: ${passed} snippets agree with Node (${pinned.length} documented pins held)`);

@@ -919,13 +919,27 @@ fn test_new_function_constructor() {
 }
 
 #[test]
-fn test_settimeout_blocked() {
-    let result = eval_ts(r#"setTimeout(() => {}, 0)"#);
-    assert!(result.is_err(), "VULN: setTimeout available in sandbox");
+fn test_settimeout_is_deterministic_not_wall_clock() {
+    // setTimeout EXISTS (agents sleep with it constantly) but the sandbox
+    // contract is determinism: the delay is an ordering key, never a wall
+    // clock. The same program must produce the same firing order on every
+    // run — there is no way to observe real time through a timer.
+    let result = eval_ts(
+        r#"
+        const order = [];
+        setTimeout(() => order.push('b'), 5);
+        setTimeout(() => order.push('a'), 0);
+        await new Promise(r => setTimeout(r, 9));
+        order.join(',')
+    "#,
+    );
+    assert_eq!(format!("{result:?}"), "Ok(String(Valid(\"a,b\")))");
 }
 
 #[test]
 fn test_setinterval_blocked() {
+    // setInterval stays unavailable: an unbounded repeating schedule has no
+    // deterministic end and would let guest code monopolize every drain.
     let result = eval_ts(r#"setInterval(() => {}, 100)"#);
     assert!(result.is_err(), "VULN: setInterval available in sandbox");
 }

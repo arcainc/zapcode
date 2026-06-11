@@ -146,6 +146,10 @@ pub enum Statement {
     },
     TryCatch {
         try_body: Vec<Statement>,
+        /// True when the source has a catch clause AT ALL — `catch {}` with
+        /// no binding and an empty block still swallows the exception, which
+        /// `catch_param`/`catch_body` alone cannot represent.
+        has_catch: bool,
         catch_param: Option<String>,
         catch_body: Vec<Statement>,
         finally_body: Option<Vec<Statement>>,
