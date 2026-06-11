@@ -146,6 +146,48 @@ identically false for array patterns in both VM and compiler):
 - Hygiene: the duplicate `make_array_iterator` in `vm/mod.rs` now delegates
   to the `builtins` copy.
 
+**Round 13 (branch `perf-template-globals`) — snapshot efficiency + the
+realistic-programs corpus.** The performance pass (first-execution template
+clone, 9.8 µs → 3.9 µs) extended into snapshot economics, and the differential
+corpus gained a section of REALISTIC programs (the shapes agent code actually
+takes: transform tool results, group/aggregate, format reports, retry loops,
+async fan-out) — which immediately caught two real bugs no torture-test had:
+- **Snapshots grew every suspend/resume hop.** `from_snapshot` re-registered
+  builtins, appending ~40 duplicate objects per resume (905 → 1215 bytes over
+  5 hops, unbounded; worse, the re-registration silently RESET guest-visible
+  builtin state, so a hopped run could diverge from the in-memory run). A
+  restored heap that still starts with this build's template now reuses its
+  handles — nothing is appended, and a guest-mutated builtin survives the hop.
+- **The heap was 67% of every snapshot — and ~40 of its 48 objects were the
+  deterministic builtin template.** Snapshots now ELIDE the template prefix
+  (wire v12): serialize only the guest tail plus an FNV fingerprint; restore
+  splices this build's template back in and refuses (catchable error) on a
+  fingerprint mismatch. A mutated prefix or a caller-seeded heap falls back
+  to full serialization. Typical agent snapshot: 1081 → 478 bytes; round-trip
+  69 → 48 µs. `ZapcodeSnapshot::heap()/heap_mut()` materialize the full heap
+  so host-allocated resume values keep valid handles.
+- **Driver callbacks eagerly unwrapped/propagated internal promises** (found
+  by the realistic corpus): `arr.map(async cb)` returned VALUES, and a
+  rejecting callback ABORTED the map with an unhandled-rejection error —
+  `Promise.allSettled(items.map(task))` could not even run. Node shape now:
+  the driver stores each callback's result promise as-is; combinators mark
+  consumed element rejections handled at dispatch; an unconsumed rejection
+  still fails the run at end-of-drain (the deterministic analogue of Node's
+  unhandledRejection event).
+- **`encodeURIComponent`/`decodeURIComponent`/`encodeURI`/`decodeURI` were
+  missing entirely** (also caught by the realistic corpus — agents build
+  query strings constantly). Spec-faithful safe sets; malformed sequences
+  raise a catchable URIError.
+- **Pin closed:** `typeof resolve` inside a `new Promise(executor)` now
+  reports `"function"` (capability markers join the callable-marker set in
+  `TypeOf`). The `Promise.any([])` → AggregateError behavior turned out to
+  already match Node and is now asserted in the corpus. Remaining pins: ONE
+  (`Symbol.toPrimitive` non-dispatch), plus the documented race([])
+  hang-vs-pending and generator-interleaving notes.
+
+Differential corpus after this round: 176 snippets agree with Node (29 of
+them whole realistic programs), 1 pin held.
+
 **Round 8 (branch `arca/conformance-fixes`) — cluster wrap-up + reflection / RegExp / coercion-builtin edges.**
 
 This round confirms the earlier-landed clusters are GREEN-by-construction (asserting

@@ -280,3 +280,30 @@ mod tests {
         ));
     }
 }
+
+impl Heap {
+    /// A heap holding clones of the first `n` slots (the builtin-template
+    /// prefix) — used by the snapshot layer to byte-compare the prefix
+    /// against the template before eliding it.
+    pub(crate) fn prefix(&self, n: usize) -> Heap {
+        Heap {
+            slots: self.slots[..n.min(self.slots.len())].to_vec(),
+        }
+    }
+
+    /// A heap holding clones of the slots from `n` on (everything past the
+    /// builtin-template prefix).
+    pub(crate) fn tail_from(&self, n: usize) -> Heap {
+        Heap {
+            slots: self.slots[n.min(self.slots.len())..].to_vec(),
+        }
+    }
+
+    /// Rebuild a full heap from the builtin template plus a serialized tail
+    /// (the inverse of `tail_from` after a template-elided snapshot load).
+    pub(crate) fn with_template_prefix(template: &Heap, tail: Heap) -> Heap {
+        let mut slots = template.slots.clone();
+        slots.extend(tail.slots);
+        Heap { slots }
+    }
+}

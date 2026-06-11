@@ -149,6 +149,10 @@ pub fn register_globals(globals: &mut HashMap<String, Value>, heap: &mut Heap) {
         // Minimal Symbol factory (O8): callable, typeof === "function", and
         // `Symbol()` yields a unique marker value.
         "Symbol",
+        "encodeURIComponent",
+        "decodeURIComponent",
+        "encodeURI",
+        "decodeURI",
     ] {
         let v = global_fn(name, heap);
         globals.insert(name.to_string(), v);
@@ -732,6 +736,21 @@ pub fn call_global_fn(kind: &str, args: &[Value], heap: &mut Heap) -> Result<Val
     let arg = args.first().cloned().unwrap_or(Value::Undefined);
     Ok(match kind {
         "String" => Value::String(JsString::from(arg.to_js_string(heap).as_str())),
+        // URI codecs (spec-faithful safe sets; agents build query strings
+        // constantly). Malformed percent-sequences raise a catchable
+        // URIError, like Node.
+        "encodeURIComponent" => Value::String(JsString::from(
+            uri_encode(&arg.to_js_string(heap), "-_.!~*'()").as_str(),
+        )),
+        "encodeURI" => Value::String(JsString::from(
+            uri_encode(&arg.to_js_string(heap), "-_.!~*'()#$&+,/:;=?@").as_str(),
+        )),
+        "decodeURIComponent" => {
+            Value::String(JsString::from(uri_decode(&arg.to_js_string(heap), "")?.as_str()))
+        }
+        "decodeURI" => Value::String(JsString::from(
+            uri_decode(&arg.to_js_string(heap), "#$&+,/:;=?@")?.as_str(),
+        )),
         "Number" => finite_number(arg.to_number_heap(heap)),
         // BigInt(x): integers/booleans/numeric strings -> BigInt; a non-integer
         // Number or unparseable string is a RangeError/SyntaxError, like JS.
@@ -3756,6 +3775,53 @@ fn call_promise_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<
         }
         _ => Ok(None),
     }
+}
+
+/// Percent-encode `s` for a URI: ASCII alphanumerics and the characters in
+/// `safe` pass through; everything else becomes uppercase %XX UTF-8 bytes.
+fn uri_encode(s: &str, safe: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() || safe.contains(ch) {
+            out.push(ch);
+        } else {
+            let mut buf = [0u8; 4];
+            for b in ch.encode_utf8(&mut buf).bytes() {
+                out.push('%');
+                out.push(char::from_digit(u32::from(b >> 4), 16).unwrap().to_ascii_uppercase());
+                out.push(char::from_digit(u32::from(b & 0xf), 16).unwrap().to_ascii_uppercase());
+            }
+        }
+    }
+    out
+}
+
+/// Decode %XX sequences in `s`. A decoded single-byte character listed in
+/// `keep_encoded` stays as its original %XX text (`decodeURI` preserves the
+/// URI's reserved separators). Malformed sequences raise a URIError, like JS.
+fn uri_decode(s: &str, keep_encoded: &str) -> Result<String> {
+    let malformed = || ZapcodeError::RuntimeError("URIError: URI malformed".to_string());
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes.get(i + 1..i + 3).ok_or_else(malformed)?;
+            let hi = (hex[0] as char).to_digit(16).ok_or_else(malformed)?;
+            let lo = (hex[1] as char).to_digit(16).ok_or_else(malformed)?;
+            let byte = (hi * 16 + lo) as u8;
+            if byte < 0x80 && keep_encoded.contains(byte as char) {
+                out.extend_from_slice(&bytes[i..i + 3]);
+            } else {
+                out.push(byte);
+            }
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| malformed())
 }
 
 /// Build the AggregateError-shaped object `Promise.any` rejects with when

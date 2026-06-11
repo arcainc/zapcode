@@ -404,6 +404,26 @@ pub struct Vm {
     /// Without this, a `yield` inside `try` leaked the try-frame onto
     /// `try_stack` pointing at a popped frame (latent, pre-main-loop bug).
     pub(crate) generator_try_frames: BTreeMap<u64, Vec<TryInfo>>,
+    /// When non-zero, `heap[0..builtin_base)` is this build's builtin template
+    /// (see [`builtin_template`]) and `globals` reuses its handles. Lets
+    /// snapshots elide the template prefix and restores skip re-registration.
+    /// Zero for heaps seeded with caller data (builtins appended on top).
+    pub(crate) builtin_base: usize,
+}
+
+/// The builtin globals and the heap slots backing them, built once. Every
+/// fresh-heap VM starts as a clone of this template, so its layout (slot
+/// order and handles) is identical across VMs and across processes of the
+/// same build — which is what lets snapshots elide the prefix.
+pub(crate) fn builtin_template() -> &'static (HashMap<String, Value>, Heap) {
+    static TEMPLATE: std::sync::OnceLock<(HashMap<String, Value>, Heap)> =
+        std::sync::OnceLock::new();
+    TEMPLATE.get_or_init(|| {
+        let mut globals = HashMap::new();
+        let mut heap = Heap::new();
+        builtins::register_globals(&mut globals, &mut heap);
+        (globals, heap)
+    })
 }
 
 /// Deferred action applied to the value the host delivers when resuming a
@@ -544,22 +564,14 @@ impl Vm {
         // order), so snapshot determinism is unaffected. A non-empty seeded
         // heap (session chunks, compound inputs) must keep registering on
         // top so the caller's existing handles stay valid.
-        let (globals, heap) = if heap.is_empty() {
-            static TEMPLATE: std::sync::OnceLock<(HashMap<String, Value>, Heap)> =
-                std::sync::OnceLock::new();
-            TEMPLATE
-                .get_or_init(|| {
-                    let mut globals = HashMap::new();
-                    let mut heap = Heap::new();
-                    builtins::register_globals(&mut globals, &mut heap);
-                    (globals, heap)
-                })
-                .clone()
+        let (globals, heap, builtin_base) = if heap.is_empty() {
+            let (g, h) = builtin_template();
+            (g.clone(), h.clone(), h.len())
         } else {
             let mut globals = HashMap::new();
             let mut heap = heap;
             builtins::register_globals(&mut globals, &mut heap);
-            (globals, heap)
+            (globals, heap, 0)
         };
 
         Self {
@@ -595,6 +607,7 @@ impl Vm {
             async_tasks: BTreeMap::new(),
             next_async_task_id: 0,
             generator_try_frames: BTreeMap::new(),
+            builtin_base,
         }
     }
 
@@ -617,6 +630,10 @@ impl Vm {
         "parseFloat",
         "isNaN",
         "isFinite",
+        "encodeURIComponent",
+        "decodeURIComponent",
+        "encodeURI",
+        "decodeURI",
         "Set",
         "Error",
         "TypeError",
@@ -646,12 +663,27 @@ impl Vm {
         last_global_name: Option<String>,
         last_load_source: Option<ReceiverSource>,
         heap: Heap,
+        builtin_base: usize,
     ) -> Self {
-        let mut globals = HashMap::new();
-        let mut heap = heap;
-        // Re-register builtins first (appended to the restored heap).
-        builtins::register_globals(&mut globals, &mut heap);
-        // Then overlay user globals (user globals take precedence if names collide)
+        // A heap that still starts with this build's builtin template reuses
+        // its handles: the template globals point straight into the restored
+        // prefix, so nothing is appended. This keeps snapshot size constant
+        // across suspend/resume hops (re-registration used to append ~40
+        // duplicate builtin objects per resume) and preserves any guest
+        // mutation of a builtin object across the hop, matching the
+        // in-memory run. Heaps without the prefix (seeded with caller data)
+        // keep the append path so their handles stay valid.
+        let (template_globals, template_heap) = builtin_template();
+        let (mut globals, heap, restored_base) =
+            if builtin_base == template_heap.len() && heap.len() >= builtin_base {
+                (template_globals.clone(), heap, builtin_base)
+            } else {
+                let mut globals = HashMap::new();
+                let mut heap = heap;
+                builtins::register_globals(&mut globals, &mut heap);
+                (globals, heap, 0)
+            };
+        // Overlay user globals (user globals take precedence if names collide)
         for (k, v) in user_globals {
             globals.insert(k, v);
         }
@@ -689,6 +721,7 @@ impl Vm {
             async_tasks: BTreeMap::new(),
             next_async_task_id: 0,
             generator_try_frames: BTreeMap::new(),
+            builtin_base: restored_base,
         }
     }
 
@@ -3010,50 +3043,13 @@ impl Vm {
         // so an empty stack here indicates a VM bug.
         let callback_result = self.pop()?;
 
-        // `MicrotaskReaction` continuations adopt the callback's return value
-        // into the chain's dependent promise themselves, so we must NOT
-        // eagerly unwrap/error on internal promises here — that is the
-        // reaction arm's job. Array continuations, by contrast, expect a plain
-        // value per element, so they unwrap a resolved promise and treat a
-        // rejected one as an unhandled rejection.
-        let is_promise_cont = matches!(
-            self.continuations.last(),
-            Some(Continuation::MicrotaskReaction { .. })
-                | Some(Continuation::PromiseExecutor { .. })
-                | Some(Continuation::GeneratorNext { .. })
-        );
-
-        // Unwrap internal promise values: async callbacks return
-        // {__promise__: true, status: "resolved", value: X} or {status: "rejected", ...}.
-        // Only unwrap objects with the __promise__ marker to avoid mangling user objects.
-        let callback_result = if is_promise_cont {
-            callback_result
-        } else if let Value::Object(h) = &callback_result {
-            let map = self.heap.object_map(*h);
-            if !matches!(map.get("__promise__"), Some(Value::Bool(true))) {
-                // Not an internal promise — leave untouched
-                callback_result
-            } else {
-                match map.get("status") {
-                    Some(Value::String(s)) if s.as_ref() == "resolved" => {
-                        map.get("value").cloned().unwrap_or(Value::Undefined)
-                    }
-                    Some(Value::String(s)) if s.as_ref() == "rejected" => {
-                        let reason = map.get("reason").cloned().unwrap_or(Value::Undefined);
-                        let reason = reason.to_js_string(&self.heap);
-                        // Clean up the continuation before returning error
-                        self.continuations.pop();
-                        return Err(ZapcodeError::RuntimeError(format!(
-                            "Unhandled promise rejection: {}",
-                            reason
-                        )));
-                    }
-                    _ => callback_result,
-                }
-            }
-        } else {
-            callback_result
-        };
+        // The callback's result is collected AS-IS — an async callback hands
+        // its result promise to the driver, exactly as in Node:
+        // `arr.map(async cb)` yields an array of PROMISES (consume them with
+        // `Promise.all`/`allSettled`/`await`), never eagerly-unwrapped values.
+        // A rejected result stays an unhandled-marked promise until something
+        // consumes it; if nothing ever does, the end-of-drain check surfaces
+        // it — the deterministic analogue of Node's unhandledRejection event.
 
         // Pop the continuation, take ownership to avoid cloning results
         let cont = self.continuations.pop().unwrap();
@@ -6669,6 +6665,33 @@ impl Vm {
                                 let h = self.heap.alloc_array(out);
                                 Some(Value::Array(h))
                             }
+                            // Handing a promise to a combinator attaches a
+                            // reaction to it in real JS, so an already-rejected
+                            // element's rejection is CONSUMED by the combinator
+                            // (`Promise.allSettled([rejected])` reports it; it
+                            // must not surface as an unhandled rejection).
+                            // Clear the marks, then run the normal builtin.
+                            "Promise"
+                                if matches!(
+                                    method_name.as_ref(),
+                                    "all" | "allSettled" | "race" | "any"
+                                ) =>
+                            {
+                                if let Some(Value::Array(h)) = args.first() {
+                                    for item in self.heap.array_vec(*h) {
+                                        if let Value::Object(eh) = item {
+                                            self.mark_rejection_handled(eh);
+                                        }
+                                    }
+                                }
+                                builtins::call_global_method(
+                                    "Promise",
+                                    &method_name,
+                                    &args,
+                                    &mut self.stdout,
+                                    &mut self.heap,
+                                )?
+                            }
                             // JSON.stringify must honor a user `toJSON()` on plain
                             // objects and a FUNCTION replacer; JSON.parse must invoke a
                             // reviver. All three need the guest-closure call path, so
@@ -7341,6 +7364,9 @@ impl Vm {
                                 // A user class value is callable (constructor), so
                                 // `typeof Class === "function"` like JS.
                                 || m.contains_key("__class_name__")
+                                // The resolve/reject capabilities handed to a
+                                // `new Promise(executor)` are callable markers.
+                                || m.contains_key("__promise_capability__")
                         }) =>
                     {
                         "function"

@@ -352,7 +352,7 @@ impl ZapcodeSessionSnapshot {
             }
         };
 
-        let mut vm = suspended.vm.restore_vm();
+        let mut vm = suspended.vm.restore_vm()?;
         let state = run(&mut vm)?;
         let top_level_bindings: HashMap<String, TopLevelBindingKind> =
             suspended.top_level_bindings.into_iter().collect();

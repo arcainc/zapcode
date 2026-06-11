@@ -404,3 +404,101 @@ fn test_snapshot_multi_await_with_let_and_console() {
         _ => panic!("expected completion"),
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Builtin-template elision (wire v12): snapshots stay small and STAY small
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn snapshot_size_constant_across_hops() {
+    // Re-registration used to append ~40 duplicate builtin objects per
+    // resume, growing every subsequent snapshot. With the template prefix
+    // reused on restore, only the guest's own state can grow a snapshot.
+    let code = "async function main() { \
+                    let n = 0; \
+                    for (const id of ['a', 'b', 'c', 'd', 'e']) { \
+                        await callTool(id); n += 1; \
+                    } \
+                    return n; \
+                } \
+                main();";
+    let runner = ZapcodeRun::new(
+        code.to_string(),
+        Vec::new(),
+        vec!["callTool".to_string()],
+        ResourceLimits::default(),
+    )
+    .unwrap();
+    let mut sizes = Vec::new();
+    let mut state = runner.start(Vec::new()).unwrap();
+    loop {
+        match state {
+            VmState::Suspended { snapshot, .. } => {
+                let bytes = snapshot.dump().unwrap();
+                sizes.push(bytes.len());
+                state = ZapcodeSnapshot::load(&bytes)
+                    .unwrap()
+                    .resume(Value::Int(1))
+                    .unwrap()
+                    .state;
+            }
+            VmState::Complete(v) => {
+                assert_eq!(v, Value::Int(5));
+                break;
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(sizes.len(), 5);
+    // Each iteration leaves a few dead heap slots (the arena has no GC), so
+    // a couple of bytes per hop is inherent. The re-registration leak this
+    // guards against appended ~40 builtin objects (~70 deflated bytes) per
+    // hop — assert growth stays an order of magnitude below that.
+    let per_hop = (sizes[4] - sizes[1]) / 3;
+    assert!(
+        per_hop < 10,
+        "snapshot grew {per_hop} bytes/hop: {sizes:?} (builtin re-registration leak?)"
+    );
+    // And the whole snapshot stays comfortably under the 2 KB target.
+    assert!(sizes.iter().all(|s| *s < 2048), "sizes: {sizes:?}");
+}
+
+#[test]
+fn mutated_builtin_object_survives_hop_and_disables_elision() {
+    // Guest code CAN write to a builtin object. The mutation must survive a
+    // dump/load (the restored heap keeps the mutated prefix slot — the run
+    // behaves exactly like the in-memory run), which forces the snapshot to
+    // carry the full heap instead of eliding the template.
+    let code = "Math.tag = 41; \
+                async function main() { \
+                    Math.tag += 1; \
+                    await callTool('x'); \
+                    return Math.tag; \
+                } \
+                main();";
+    let drive = |hop: bool| {
+        let runner = ZapcodeRun::new(
+            code.to_string(),
+            Vec::new(),
+            vec!["callTool".to_string()],
+            ResourceLimits::default(),
+        )
+        .unwrap();
+        match runner.start(Vec::new()).unwrap() {
+            VmState::Suspended { snapshot, .. } => {
+                let snapshot = if hop {
+                    ZapcodeSnapshot::load(&snapshot.dump().unwrap()).unwrap()
+                } else {
+                    snapshot
+                };
+                match snapshot.resume(Value::Int(0)).unwrap().state {
+                    VmState::Complete(v) => v,
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            other => panic!("expected suspension, got {other:?}"),
+        }
+    };
+    assert_eq!(drive(false), Value::Int(42));
+    assert_eq!(drive(true), Value::Int(42), "hop diverged from in-memory run");
+}

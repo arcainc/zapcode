@@ -221,11 +221,284 @@ const corpus = [
   `let resolve; const gate = new Promise(r => { resolve = r; }); async function w() { await gate; return 7; } const log = []; const c = Promise.all([w()]).finally(() => log.push('fin')).then(v => v[0] + ':' + log.join(',')); resolve(0); return await c;`,
   `let resolve; const gate = new Promise(r => { resolve = r; }); async function w() { await gate; return 3; } const batch = Promise.all([w()]); const c = batch.then(v => v[0] * 2); resolve(0); const direct = await batch; return (await c) + ':' + direct.join(',');`,
 
+  `return await new Promise(r => { const t = typeof r; r(t); });`,
+  `let t; new Promise((resolve, reject) => { t = typeof resolve + ',' + typeof reject; resolve(1); }); return t;`,
+  `try { await Promise.any([]); return 'settled'; } catch (e) { return e.name + ':' + e.errors.length; }`,
+  `const r = await Promise.allSettled([]); return Array.isArray(r) + ':' + r.length;`,
+
   // ── destructure-default repair (single evaluation, all call shapes) ───
   `function f({a: {b} = {b: 9}} = {}) { return b; } return [f(), f({}), f({a: {b: 1}})].join(',');`,
   `const calls = []; function f({a: {b = (calls.push('hit'), undefined)} = {}} = {}) { return b; } f(); return calls.length;`,
   `const calls = []; function f({a: {b = (calls.push('hit'), undefined)} = {}}) { return b; } f({a: {}}); return calls.length;`,
   `function f({a: {b} = {b: 1}, c = 2, d: {e = 3} = {}}) { return [b, c, e].join(','); } return f({});`,
+];
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Realistic programs — the shapes agent code actually takes: transform tool
+//  results, aggregate, format reports, orchestrate async steps. Not edge
+//  cases; whole little programs.
+// ════════════════════════════════════════════════════════════════════════════
+
+const realistic = [
+  // filter → map → aggregate over records
+  `const orders = [
+     { id: 1, status: "shipped", total: 41.5, items: 3 },
+     { id: 2, status: "pending", total: 12.0, items: 1 },
+     { id: 3, status: "shipped", total: 99.99, items: 7 },
+     { id: 4, status: "cancelled", total: 5.25, items: 1 },
+   ];
+   const shipped = orders.filter(o => o.status === "shipped");
+   const revenue = shipped.reduce((sum, o) => sum + o.total, 0);
+   return shipped.map(o => o.id).join(",") + "|" + revenue.toFixed(2);`,
+
+  // group-by into an object
+  `const events = [
+     { type: "click", page: "home" }, { type: "view", page: "home" },
+     { type: "click", page: "about" }, { type: "click", page: "home" },
+   ];
+   const byType = {};
+   for (const e of events) {
+     (byType[e.type] = byType[e.type] || []).push(e.page);
+   }
+   return Object.entries(byType).map(([k, v]) => k + ":" + v.length).join(",");`,
+
+  // index-by-id, then join two datasets
+  `const users = [{ id: "u1", name: "Ana" }, { id: "u2", name: "Bo" }];
+   const purchases = [{ user: "u2", sku: "A" }, { user: "u1", sku: "B" }, { user: "u2", sku: "C" }];
+   const byId = Object.fromEntries(users.map(u => [u.id, u.name]));
+   return purchases.map(p => byId[p.user] + ">" + p.sku).join(",");`,
+
+  // multi-key sort (stable shape agents write)
+  `const rows = [
+     { team: "b", score: 2 }, { team: "a", score: 2 }, { team: "a", score: 9 },
+   ];
+   rows.sort((x, y) => y.score - x.score || x.team.localeCompare(y.team));
+   return rows.map(r => r.team + r.score).join(",");`,
+
+  // dedup by key, keep first
+  `const seen = new Set();
+   const items = [{ sku: "x" }, { sku: "y" }, { sku: "x" }, { sku: "z" }, { sku: "y" }];
+   const unique = items.filter(i => !seen.has(i.sku) && seen.add(i.sku));
+   return unique.map(i => i.sku).join("");`,
+
+  // parse a JSON "API response", transform, re-stringify
+  `const body = '{"results":[{"name":"alpha","ok":true},{"name":"beta","ok":false}],"next":null}';
+   const data = JSON.parse(body);
+   const names = data.results.filter(r => r.ok).map(r => r.name.toUpperCase());
+   return JSON.stringify({ names, hasMore: data.next !== null });`,
+
+  // build a small markdown report
+  `const stats = { passed: 12, failed: 2, skipped: 1 };
+   const lines = ["# Test Report", ""];
+   for (const [k, v] of Object.entries(stats)) {
+     lines.push("- **" + k + "**: " + v);
+   }
+   lines.push("", "Total: " + (stats.passed + stats.failed + stats.skipped));
+   return lines.join("\n");`,
+
+  // chunk a list into pages
+  `const ids = Array.from({ length: 11 }, (_, i) => i + 1);
+   const pages = [];
+   for (let i = 0; i < ids.length; i += 4) pages.push(ids.slice(i, i + 4));
+   return pages.map(p => p.join("-")).join("|");`,
+
+  // tolerant field access over incomplete data
+  `const profiles = [
+     { name: "Ana", contact: { email: "a@x.io" } },
+     { name: "Bo" },
+     { name: "Cy", contact: {} },
+   ];
+   return profiles.map(p => p.contact?.email ?? "no-email").join(",");`,
+
+  // retry loop with simulated flaky step
+  `let attempts = 0;
+   async function flaky() {
+     attempts += 1;
+     if (attempts < 3) throw new Error("transient");
+     return "ok";
+   }
+   let result = null, lastErr = null;
+   for (let i = 0; i < 5; i++) {
+     try { result = await flaky(); break; }
+     catch (e) { lastErr = e.message; }
+   }
+   return result + ":" + attempts + ":" + lastErr;`,
+
+  // fan-out async steps, merge results
+  `async function fetchScore(name) { return { name, score: name.length * 10 }; }
+   const names = ["ada", "grace", "alan"];
+   const scores = await Promise.all(names.map(fetchScore));
+   const best = scores.reduce((a, b) => (b.score > a.score ? b : a));
+   return best.name + "@" + best.score;`,
+
+  // sequential pipeline with intermediate state
+  `async function step(state, n) { return { ...state, total: state.total + n, steps: state.steps + 1 }; }
+   let state = { total: 0, steps: 0 };
+   for (const n of [5, 10, 15]) state = await step(state, n);
+   return JSON.stringify(state);`,
+
+  // extract structured data from text
+  `const log = "ERROR db timeout after 30s\nINFO retrying\nERROR api 503\nINFO done";
+   const errors = log.split("\n").filter(l => l.startsWith("ERROR")).map(l => l.slice(6));
+   return errors.length + ":" + errors.join(";");`,
+
+  // regex capture over semi-structured text
+  `const text = "Deployed v2.3.1 to prod; previously v2.2.9 on staging";
+   const versions = [...text.matchAll(/v(\d+)\.(\d+)\.(\d+)/g)].map(m => m[1] + m[2] + m[3]);
+   return versions.join(",");`,
+
+  // query-string building + parsing round trip
+  `function toQuery(params) {
+     return Object.entries(params).map(([k, v]) => k + "=" + encodeURIComponent(String(v))).join("&");
+   }
+   const q = toQuery({ page: 2, tag: "a b", active: true });
+   const parsed = Object.fromEntries(q.split("&").map(kv => kv.split("=").map(decodeURIComponent)));
+   return q + "|" + parsed.tag + "|" + parsed.page;`,
+
+  // basic stats over a series
+  `const latencies = [120, 85, 240, 95, 130, 88];
+   const sorted = [...latencies].sort((a, b) => a - b);
+   const avg = latencies.reduce((a, b) => a + b, 0) / latencies.length;
+   const p50 = sorted[Math.floor(sorted.length / 2)];
+   return Math.round(avg) + ":" + p50 + ":" + sorted[0] + ":" + sorted[sorted.length - 1];`,
+
+  // flatten a nested config into dotted keys
+  `function flatten(obj, prefix = "") {
+     const out = {};
+     for (const [k, v] of Object.entries(obj)) {
+       const key = prefix ? prefix + "." + k : k;
+       if (v && typeof v === "object" && !Array.isArray(v)) Object.assign(out, flatten(v, key));
+       else out[key] = v;
+     }
+     return out;
+   }
+   return JSON.stringify(flatten({ db: { host: "x", pool: { max: 5 } }, debug: false }));`,
+
+  // CSV-ish parsing into records
+  `const csv = "name,qty,price\nwidget,2,9.99\ngadget,1,19.5";
+   const [header, ...rows] = csv.split("\n").map(l => l.split(","));
+   const records = rows.map(r => Object.fromEntries(r.map((v, i) => [header[i], v])));
+   const total = records.reduce((s, r) => s + Number(r.qty) * Number(r.price), 0);
+   return records.length + ":" + total.toFixed(2);`,
+
+  // counting with a Map
+  `const words = "the quick the lazy the quick fox".split(" ");
+   const counts = new Map();
+   for (const w of words) counts.set(w, (counts.get(w) ?? 0) + 1);
+   const top = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+   return top.map(([w, n]) => w + ":" + n).join(",");`,
+
+  // small class model
+  `class Cart {
+     constructor() { this.items = []; }
+     add(name, price, qty = 1) { this.items.push({ name, price, qty }); return this; }
+     get total() { return this.items.reduce((s, i) => s + i.price * i.qty, 0); }
+   }
+   const cart = new Cart().add("pen", 2.5, 4).add("pad", 7);
+   return cart.items.length + ":" + cart.total.toFixed(2);`,
+
+  // validation returning an error list
+  `function validate(user) {
+     const errors = [];
+     if (!user.name) errors.push("name required");
+     if (!/^[^@]+@[^@]+$/.test(user.email ?? "")) errors.push("email invalid");
+     if ((user.age ?? -1) < 0) errors.push("age invalid");
+     return errors;
+   }
+   const results = [
+     { name: "Ana", email: "a@x.io", age: 33 },
+     { email: "nope", age: 5 },
+   ].map(u => validate(u).length);
+   return results.join(",");`,
+
+  // shape an error report from mixed failures
+  `function describe(e) {
+     if (e instanceof TypeError) return "type:" + e.message;
+     if (e instanceof Error) return "err:" + e.message;
+     return "thrown:" + String(e);
+   }
+   const out = [];
+   for (const thrower of [
+     () => { throw new TypeError("bad arg"); },
+     () => { throw new Error("io"); },
+     () => { throw "raw"; },
+   ]) {
+     try { thrower(); } catch (e) { out.push(describe(e)); }
+   }
+   return out.join("|");`,
+
+  // date math (deterministic UTC)
+  `const start = new Date(Date.UTC(2026, 0, 15));
+   const due = new Date(start.getTime() + 14 * 86400000);
+   const days = Math.round((due - start) / 86400000);
+   return days + ":" + due.toISOString().slice(0, 10);`,
+
+  // exponential backoff schedule
+  `const delays = Array.from({ length: 5 }, (_, i) => Math.min(30, 2 ** i));
+   return delays.join(",") + "|total:" + delays.reduce((a, b) => a + b, 0);`,
+
+  // build a tree from a flat parent/child list
+  `const flat = [
+     { id: 1, parent: null }, { id: 2, parent: 1 }, { id: 3, parent: 1 }, { id: 4, parent: 2 },
+   ];
+   const children = {};
+   for (const n of flat) {
+     if (n.parent !== null) (children[n.parent] = children[n.parent] || []).push(n.id);
+   }
+   function render(id) {
+     const kids = children[id] || [];
+     return kids.length ? id + "(" + kids.map(render).join(",") + ")" : String(id);
+   }
+   return render(1);`,
+
+  // diff two config objects
+  `const before = { region: "us", retries: 3, debug: true };
+   const after = { region: "eu", retries: 3, timeout: 30 };
+   const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
+   const changes = [];
+   for (const k of [...keys].sort()) {
+     if (!(k in after)) changes.push("-" + k);
+     else if (!(k in before)) changes.push("+" + k);
+     else if (before[k] !== after[k]) changes.push("~" + k);
+   }
+   return changes.join(",");`,
+
+  // paginate via an async generator (a common tool-cursor shape)
+  `async function* pages() {
+     const all = [["a", "b"], ["c", "d"], ["e"]];
+     for (const page of all) yield page;
+   }
+   const collected = [];
+   for await (const page of pages()) collected.push(page.join(""));
+   return collected.join("|");`,
+
+  // slugify + truncate (formatting helpers agents write constantly)
+  `function slug(s, max = 20) {
+     const out = s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+     return out.length > max ? out.slice(0, max).replace(/-$/, "") : out;
+   }
+   return [slug("Hello, World!"), slug("  Multi   Space  "), slug("A Very Long Title That Keeps Going", 12)].join("|");`,
+
+  // accumulate a summary across mixed-outcome async tasks
+  `async function task(n) {
+     if (n % 3 === 0) throw new Error("fail-" + n);
+     return n * 2;
+   }
+   const outcomes = await Promise.allSettled([1, 2, 3, 4, 5, 6].map(task));
+   const ok = outcomes.filter(o => o.status === "fulfilled").map(o => o.value);
+   const failed = outcomes.filter(o => o.status === "rejected").map(o => o.reason.message);
+   return ok.join(",") + "|" + failed.join(",");`,
+
+  // state machine over events
+  `const transitions = { idle: { start: "running" }, running: { pause: "paused", stop: "idle" }, paused: { start: "running" } };
+   let state = "idle";
+   const trace = [state];
+   for (const ev of ["start", "pause", "start", "stop", "pause"]) {
+     state = transitions[state]?.[ev] ?? state;
+     trace.push(state);
+   }
+   return trace.join(">");`,
 ];
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -234,12 +507,6 @@ const corpus = [
 // ════════════════════════════════════════════════════════════════════════════
 
 const pinned = [
-  {
-    reason:
-      "Promise-executor capabilities are marker objects (a Value-enum variant would ripple through every binding crate)",
-    body: `return await new Promise(r => { const t = typeof r; r(t); });`,
-    zapcode: "object", // Node: "function"
-  },
   {
     reason:
       "Symbol.toPrimitive is not dispatched (Symbol support is a stub; see STRESS-PASS-BUGS.md ToPrimitive notes)",
@@ -254,7 +521,7 @@ let passed = 0;
 let failed = 0;
 const failures = [];
 
-for (const body of corpus) {
+for (const body of [...corpus, ...realistic]) {
   let nodeResult, nodeErr, zapResult, zapErr;
   try {
     nodeResult = await runNode(body);
