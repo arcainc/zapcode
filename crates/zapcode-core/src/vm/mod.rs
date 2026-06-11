@@ -208,6 +208,19 @@ pub(crate) enum Continuation {
         caller_frame_depth: usize,
         callback_frame_index: usize,
     },
+    /// Driving one `gen.next(arg)` pull in the MAIN loop (generator-mainloop
+    /// Stage 0): the generator's body frame runs like any call, so a tool
+    /// call inside it suspends the whole VM durably. `Yield` detaches the
+    /// frame back into the generator object and answers the pull inline
+    /// (popping this continuation); a `return`/fall-off pops the frame
+    /// normally and this continuation shapes `{value, done: true}`. The
+    /// in-flight generator object rides here (it was removed from the
+    /// registry for the pull, exactly like the legacy nested driver).
+    GeneratorNext {
+        gen_obj: GeneratorObject,
+        caller_frame_depth: usize,
+        callback_frame_index: usize,
+    },
     /// Running a `new Promise(executor)` executor synchronously. When its
     /// frame pops, the executor's return value is DISCARDED and the new
     /// promise is pushed as the `new` expression's value. A throw escaping
@@ -380,6 +393,12 @@ pub struct Vm {
     pub(crate) async_tasks: BTreeMap<u64, AsyncTask>,
     /// Id source for [`AsyncTask`]s (like `next_call_id`).
     pub(crate) next_async_task_id: u64,
+    /// Try-frames covering a suspended generator body, keyed by generator id
+    /// and stashed at `yield` (depths stored relative; rebased on resume).
+    /// Kept out of `SuspendedFrame` so `value.rs` need not know `TryInfo`.
+    /// Without this, a `yield` inside `try` leaked the try-frame onto
+    /// `try_stack` pointing at a popped frame (latent, pre-main-loop bug).
+    pub(crate) generator_try_frames: BTreeMap<u64, Vec<TryInfo>>,
 }
 
 /// Deferred action applied to the value the host delivers when resuming a
@@ -551,6 +570,7 @@ impl Vm {
             unhandled_rejections: Vec::new(),
             async_tasks: BTreeMap::new(),
             next_async_task_id: 0,
+            generator_try_frames: BTreeMap::new(),
         }
     }
 
@@ -644,6 +664,7 @@ impl Vm {
             unhandled_rejections: Vec::new(),
             async_tasks: BTreeMap::new(),
             next_async_task_id: 0,
+            generator_try_frames: BTreeMap::new(),
         }
     }
 
@@ -2611,6 +2632,27 @@ impl Vm {
                             }
                         }
                     }
+                    // A throw that unwound out of a main-loop generator pull
+                    // leaves its continuation stale: the generator becomes
+                    // done (Node) and the exception IS the pull's answer.
+                    while let Some(Continuation::GeneratorNext {
+                        caller_frame_depth,
+                        ..
+                    }) = self.continuations.last()
+                    {
+                        if self.frames.len() > *caller_frame_depth {
+                            break;
+                        }
+                        let Some(Continuation::GeneratorNext { mut gen_obj, .. }) =
+                            self.continuations.pop()
+                        else {
+                            unreachable!("checked above");
+                        };
+                        gen_obj.done = true;
+                        gen_obj.suspended = None;
+                        self.generator_try_frames.remove(&gen_obj.id);
+                        self.store_generator(gen_obj);
+                    }
                 }
             }
         }
@@ -2652,6 +2694,11 @@ impl Vm {
                 caller_frame_depth,
                 ..
             } => (*callback_frame_index, *caller_frame_depth),
+            Continuation::GeneratorNext {
+                callback_frame_index,
+                caller_frame_depth,
+                ..
+            } => (*callback_frame_index, *caller_frame_depth),
         };
 
         // The callback frame is still active — not done yet
@@ -2680,6 +2727,7 @@ impl Vm {
             self.continuations.last(),
             Some(Continuation::MicrotaskReaction { .. })
                 | Some(Continuation::PromiseExecutor { .. })
+                | Some(Continuation::GeneratorNext { .. })
         );
 
         // Unwrap internal promise values: async callbacks return
@@ -2899,6 +2947,13 @@ impl Vm {
                         )?;
                     }
                 }
+                Ok(None)
+            }
+            Continuation::GeneratorNext { gen_obj, .. } => {
+                // The body returned (or fell off the end): the generator is
+                // done; answer the pull with {value, done: true}.
+                let res = self.finish_generator(gen_obj, callback_result);
+                self.push(res)?;
                 Ok(None)
             }
             Continuation::PromiseExecutor { promise, .. } => {
@@ -4272,6 +4327,7 @@ impl Vm {
                     self.push(val.clone())?;
                 }
                 self.push(arg)?;
+                self.restore_generator_try_frames(gen_obj.id, self.frames.len(), stack_base);
                 let env: BTreeMap<String, u64> = gen_obj.env.iter().cloned().collect();
                 self.frames.push(CallFrame {
                     program_index: func_ref.program_id,
@@ -4306,8 +4362,148 @@ impl Vm {
     fn finish_generator(&mut self, mut gen_obj: GeneratorObject, value: Value) -> Value {
         gen_obj.done = true;
         gen_obj.suspended = None;
+        self.generator_try_frames.remove(&gen_obj.id);
         self.store_generator(gen_obj);
         self.make_iterator_result(value, true)
+    }
+
+    /// Stash the try-frames covering a suspending generator body (frames
+    /// remaining below it = `below`), depths stored relative for rebasing.
+    /// Without this a `yield` inside `try` left entries on `try_stack`
+    /// pointing at the popped frame.
+    fn stash_generator_try_frames(&mut self, gen_id: u64, below: usize, stack_base: usize) {
+        let mut entries = Vec::new();
+        while matches!(self.try_stack.last(), Some(t) if t.frame_depth > below) {
+            let mut t = self.try_stack.pop().unwrap();
+            t.frame_depth -= below;
+            t.stack_depth = t.stack_depth.saturating_sub(stack_base);
+            entries.push(t);
+        }
+        entries.reverse();
+        if entries.is_empty() {
+            self.generator_try_frames.remove(&gen_id);
+        } else {
+            self.generator_try_frames.insert(gen_id, entries);
+        }
+    }
+
+    /// Restore a generator's stashed try-frames for a resumed pull. Call with
+    /// the frame count *below* the about-to-run body frame and its stack base.
+    fn restore_generator_try_frames(&mut self, gen_id: u64, below: usize, stack_base: usize) {
+        if let Some(entries) = self.generator_try_frames.remove(&gen_id) {
+            for mut t in entries {
+                t.frame_depth += below;
+                t.stack_depth += stack_base;
+                self.try_stack.push(t);
+            }
+        }
+    }
+
+    /// Begin one `gen.next(arg)` pull driven by the MAIN loop
+    /// (generator-mainloop Stage 0): push the body frame — fresh, or restored
+    /// from the suspended state with its try-frames — plus a
+    /// [`Continuation::GeneratorNext`]. The main loop drives the body, so a
+    /// tool call inside it suspends the whole VM durably. A done generator
+    /// answers `{value: undefined, done: true}` immediately; a re-entrant
+    /// pull (`g.next()` inside g's own body) is a TypeError, as in Node.
+    fn start_generator_pull(&mut self, mut gen_obj: GeneratorObject, arg: Value) -> Result<()> {
+        if gen_obj.done {
+            let res = self.make_iterator_result(Value::Undefined, true);
+            self.push(res)?;
+            return Ok(());
+        }
+        if self.continuations.iter().any(
+            |c| matches!(c, Continuation::GeneratorNext { gen_obj: g, .. } if g.id == gen_obj.id),
+        ) {
+            return Err(ZapcodeError::TypeError(
+                "Generator is already running".to_string(),
+            ));
+        }
+        for (name, val) in &gen_obj.captured {
+            if !self.globals.contains_key(name) {
+                self.globals.insert(name.clone(), val.clone());
+            }
+        }
+        let func_ref = gen_obj.func_ref;
+        let caller_frame_depth = self.frames.len();
+        match gen_obj.suspended.take() {
+            None => {
+                let params = self.current_function(func_ref).params.clone();
+                self.tracker.push_frame();
+                let mut locals = Vec::with_capacity(params.len());
+                for (i, param) in params.iter().enumerate() {
+                    match param {
+                        ParamPattern::Ident(name) => {
+                            let val = gen_obj
+                                .captured
+                                .iter()
+                                .find(|(n, _)| n == name)
+                                .map(|(_, v)| v.clone())
+                                .unwrap_or(Value::Undefined);
+                            locals.push(val);
+                        }
+                        ParamPattern::Rest(name) => {
+                            let val = gen_obj
+                                .captured
+                                .iter()
+                                .find(|(n, _)| n == name)
+                                .map(|(_, v)| v.clone())
+                                .unwrap_or_else(|| {
+                                    Value::Array(self.heap.alloc_array(Vec::new()))
+                                });
+                            let _ = i;
+                            locals.push(val);
+                        }
+                        _ => locals.push(Value::Undefined),
+                    }
+                }
+                let stack_base = self.stack.len();
+                let env: BTreeMap<String, u64> = gen_obj.env.iter().cloned().collect();
+                self.frames.push(CallFrame {
+                    program_index: func_ref.program_id,
+                    func_index: Some(func_ref.function_id),
+                    ip: 0,
+                    locals,
+                    stack_base,
+                    this_value: None,
+                    receiver_source: None,
+                    boxed: BTreeMap::new(),
+                    env,
+                    is_field_init: false,
+                    async_result: None,
+                });
+            }
+            Some(suspended) => {
+                self.tracker.push_frame();
+                let stack_base = self.stack.len();
+                for val in &suspended.stack {
+                    self.push(val.clone())?;
+                }
+                // The `.next(arg)` value becomes the yield expression's value.
+                self.push(arg)?;
+                self.restore_generator_try_frames(gen_obj.id, caller_frame_depth, stack_base);
+                let env: BTreeMap<String, u64> = gen_obj.env.iter().cloned().collect();
+                self.frames.push(CallFrame {
+                    program_index: func_ref.program_id,
+                    func_index: Some(func_ref.function_id),
+                    ip: suspended.ip,
+                    locals: suspended.locals,
+                    stack_base,
+                    this_value: None,
+                    receiver_source: None,
+                    boxed: suspended.boxed,
+                    env,
+                    is_field_init: false,
+                    async_result: None,
+                });
+            }
+        }
+        self.continuations.push(Continuation::GeneratorNext {
+            gen_obj,
+            caller_frame_depth,
+            callback_frame_index: self.frames.len() - 1,
+        });
+        Ok(())
     }
 
     fn run_generator_until_yield_or_return(
@@ -4352,12 +4548,20 @@ impl Vm {
                 return Ok(result);
             }
             let instr = instructions[frame.ip].clone();
-            if matches!(instr, Instruction::Yield) {
+            // Intercept Yield only for THIS generator's body frame. A deeper
+            // frame's Yield belongs to a main-loop pull of another generator
+            // running inside the body (`it.next()`), handled by dispatch via
+            // its GeneratorNext continuation.
+            if matches!(instr, Instruction::Yield)
+                && self.frames.len() == target_frame_depth + 1
+            {
                 self.current_frame_mut().ip += 1;
                 let yielded_value = self.pop()?;
                 let frame = self.frames.pop().unwrap();
                 self.tracker.pop_frame();
                 let frame_stack: Vec<Value> = self.stack.drain(frame.stack_base..).collect();
+                let below = self.frames.len();
+                self.stash_generator_try_frames(gen_obj.id, below, frame.stack_base);
                 gen_obj.suspended = Some(SuspendedFrame {
                     ip: frame.ip,
                     locals: frame.locals,
@@ -5833,8 +6037,22 @@ impl Vm {
                                             if let Some(Value::Generator(g)) =
                                                 self.globals.remove(&gen_key)
                                             {
-                                                let result = self.generator_next(g, arg)?;
-                                                Some(result)
+                                                // Main-loop pull (Stage 0): the
+                                                // body frame runs like any call
+                                                // — tool calls inside it can
+                                                // suspend the VM durably.
+                                                self.start_generator_pull(g, arg)?;
+                                                return Ok(None);
+                                            } else if self.continuations.iter().any(|c| {
+                                                matches!(c, Continuation::GeneratorNext { gen_obj: g, .. }
+                                                    if g.id == gen_obj.id)
+                                            }) {
+                                                // The registry entry is out
+                                                // because THIS generator is
+                                                // mid-pull: re-entrant next().
+                                                return Err(ZapcodeError::TypeError(
+                                                    "Generator is already running".to_string(),
+                                                ));
                                             } else {
                                                 Some(
                                                     self.make_iterator_result(
@@ -6807,11 +7025,42 @@ impl Vm {
                 // Generator creation is handled at Call time via is_generator check.
             }
             Instruction::Yield => {
-                // Yield is handled in run_generator_until_yield_or_return.
-                // Reaching here means yield outside a generator function.
-                return Err(ZapcodeError::RuntimeError(
-                    "yield can only be used inside a generator function".to_string(),
-                ));
+                // A main-loop pull (Continuation::GeneratorNext) detaches the
+                // body frame back into the generator object and answers the
+                // pull inline. (The legacy nested driver intercepts Yield
+                // before dispatch, so reaching here with no pull in flight is
+                // yield outside a generator.)
+                if !matches!(
+                    self.continuations.last(),
+                    Some(Continuation::GeneratorNext { .. })
+                ) {
+                    return Err(ZapcodeError::RuntimeError(
+                        "yield can only be used inside a generator function".to_string(),
+                    ));
+                }
+                let Some(Continuation::GeneratorNext { mut gen_obj, .. }) =
+                    self.continuations.pop()
+                else {
+                    unreachable!("checked above");
+                };
+                let yielded = self.pop()?;
+                let frame = self.frames.pop().unwrap();
+                self.tracker.pop_frame();
+                let below = self.frames.len();
+                let stack_tail: Vec<Value> = self.stack.drain(frame.stack_base..).collect();
+                self.stash_generator_try_frames(gen_obj.id, below, frame.stack_base);
+                // dispatch() pre-incremented ip, so the frame resumes just
+                // past this Yield.
+                gen_obj.suspended = Some(SuspendedFrame {
+                    ip: frame.ip,
+                    locals: frame.locals,
+                    stack: stack_tail,
+                    boxed: frame.boxed,
+                });
+                gen_obj.done = false;
+                self.store_generator(gen_obj);
+                let res = self.make_iterator_result(yielded, false);
+                self.push(res)?;
             }
 
             Instruction::Await => {

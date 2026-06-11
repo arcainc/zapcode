@@ -54,7 +54,9 @@ const MAGIC: &[u8; 4] = b"ZPC1";
 /// map across yields), incompatible with v7.
 /// v9: `Continuation::PromiseExecutor` (`new Promise(executor)` support) —
 /// shifted discriminants, incompatible with v8.
-pub(crate) const FORMAT_VERSION: u16 = 9;
+/// v10: generator-mainloop Stage 0 — `Continuation::GeneratorNext` and the
+/// `generator_try_frames` snapshot field, incompatible with v9.
+pub(crate) const FORMAT_VERSION: u16 = 10;
 
 const HEADER_LEN: usize = 4 + 2 + 1 + 1 + 32;
 
