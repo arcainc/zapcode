@@ -537,11 +537,30 @@ impl Vm {
         external_functions: HashSet<String>,
         heap: Heap,
     ) -> Self {
-        let mut globals = HashMap::new();
-        let mut heap = heap;
-
-        // Register built-in globals
-        builtins::register_globals(&mut globals, &mut heap);
+        // Registering the builtin globals dominates first-execution latency
+        // (~50 heap objects + marker allocations), so the fresh-heap path
+        // clones a once-built template instead of rebuilding. The clone is
+        // layout-identical to a direct registration (same handles in the same
+        // order), so snapshot determinism is unaffected. A non-empty seeded
+        // heap (session chunks, compound inputs) must keep registering on
+        // top so the caller's existing handles stay valid.
+        let (globals, heap) = if heap.is_empty() {
+            static TEMPLATE: std::sync::OnceLock<(HashMap<String, Value>, Heap)> =
+                std::sync::OnceLock::new();
+            TEMPLATE
+                .get_or_init(|| {
+                    let mut globals = HashMap::new();
+                    let mut heap = Heap::new();
+                    builtins::register_globals(&mut globals, &mut heap);
+                    (globals, heap)
+                })
+                .clone()
+        } else {
+            let mut globals = HashMap::new();
+            let mut heap = heap;
+            builtins::register_globals(&mut globals, &mut heap);
+            (globals, heap)
+        };
 
         Self {
             programs,
