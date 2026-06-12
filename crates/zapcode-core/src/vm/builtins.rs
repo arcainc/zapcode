@@ -18,6 +18,13 @@ use crate::value::{Value, MAX_RENDER_DEPTH};
 /// (real `Symbol.iterator` is a non-enumerable symbol, not an own string key).
 pub const SYMBOL_ITERATOR_KEY: &str = "__@@iterator";
 
+/// Stable string property key standing in for the well-known
+/// `Symbol.toPrimitive` (same sentinel scheme as [`SYMBOL_ITERATOR_KEY`]).
+/// A `[Symbol.toPrimitive](hint)` method — on an object literal or a class —
+/// is stored under this key and consulted by `Vm::to_primitive` ahead of
+/// `valueOf`/`toString`.
+pub const SYMBOL_TO_PRIMITIVE_KEY: &str = "__@@toPrimitive";
+
 /// EXACT allowlist of reserved internal marker keys. These are VM bookkeeping
 /// properties (brands, class metadata, accessor tables, collection backing
 /// stores, promise/batch plumbing) that live in the same heap object map as
@@ -31,9 +38,11 @@ pub const SYMBOL_ITERATOR_KEY: &str = "__@@iterator";
 /// `entries`, object spread, `getOwnPropertyNames`, and `JSON.stringify`
 /// because all of them filter ONLY the keys in this list.
 const INTERNAL_MARKER_KEYS: &[&str] = &[
-    // Symbol brand and the synthetic `Symbol.iterator` key.
+    // Symbol brand and the synthetic well-known-symbol keys.
     "__symbol__",
     SYMBOL_ITERATOR_KEY,
+    SYMBOL_TO_PRIMITIVE_KEY,
+    "__sym_key__",
     // Error brands.
     "__error__",
     "__error_base__",
@@ -223,6 +232,23 @@ fn global_fn(name: &str, heap: &mut Heap) -> Value {
         obj.insert(
             Arc::from("iterator"),
             Value::Object(heap.alloc_object(iter_sym)),
+        );
+        // Well-known `Symbol.toPrimitive`, same sentinel scheme: a computed
+        // key `{ [Symbol.toPrimitive]() {} }` stringifies to this key, and
+        // `Vm::to_primitive` consults it ahead of valueOf/toString.
+        let mut to_prim_sym = IndexMap::new();
+        to_prim_sym.insert(Arc::from("__symbol__"), Value::Bool(true));
+        to_prim_sym.insert(
+            Arc::from("__sym_key__"),
+            Value::String(JsString::from(SYMBOL_TO_PRIMITIVE_KEY)),
+        );
+        to_prim_sym.insert(
+            Arc::from("description"),
+            Value::String(JsString::from("Symbol.toPrimitive")),
+        );
+        obj.insert(
+            Arc::from("toPrimitive"),
+            Value::Object(heap.alloc_object(to_prim_sym)),
         );
         // Global symbol registry: Symbol.for(key) / Symbol.keyFor(sym).
         obj.insert(Arc::from("for"), global_fn_marker("Symbol.for", heap));

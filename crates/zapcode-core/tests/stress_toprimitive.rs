@@ -1,8 +1,9 @@
 //! Regression tests for user-defined ToPrimitive hooks (O4): when an object
 //! defines a callable `valueOf` / `toString`, the VM honors it when coercing the
 //! object to a primitive at the operator and `String()`/`Number()` coercion
-//! points. Symbol.toPrimitive is NOT covered (the crate's Symbol support is a
-//! stub — see STRESS-PASS-BUGS.md); only the common valueOf/toString cases are.
+//! points. `Symbol.toPrimitive` is also honored (it takes precedence over
+//! valueOf/toString and is the sole conversion path when present) — see the
+//! `symbol_to_primitive_*` tests at the end.
 
 use zapcode_core::vm::VmState;
 use zapcode_core::{ResourceLimits, ZapcodeRun};
@@ -135,5 +136,61 @@ fn hook_used_in_array_join_via_string_concat() {
     assert_eq!(
         run_str("let o = {valueOf(){return 7}}; let s = `${o + 3}`; s"),
         "10"
+    );
+}
+
+// ── Symbol.toPrimitive (well-known-symbol sentinel; takes precedence) ──────
+
+#[test]
+fn symbol_to_primitive_hint_aware() {
+    // The hook receives the coercion hint and is the SOLE path when present.
+    let o = "const o = { [Symbol.toPrimitive](h) { return h === 'number' ? 42 : h; } };";
+    assert_eq!(run_str(&format!("{o} String(o + '')")), "default"); // `+` -> default
+    assert_eq!(run_str(&format!("{o} o * 1")), "42"); // arithmetic -> number
+    assert_eq!(run_str(&format!("{o} `${{o}}`")), "string"); // template -> string
+    assert_eq!(run_str(&format!("{o} String(Number(o))")), "42"); // Number() -> number
+}
+
+#[test]
+fn symbol_to_primitive_precedes_valueof_and_tostring() {
+    assert_eq!(
+        run_str(
+            "const o = { [Symbol.toPrimitive]() { return 9; }, \
+                        valueOf() { return 7; }, toString() { return 's'; } }; \
+             o + 1"
+        ),
+        "10"
+    );
+}
+
+#[test]
+fn symbol_to_primitive_on_a_class_method() {
+    assert_eq!(
+        run_str(
+            "class Money { constructor(c) { this.c = c; } \
+                 [Symbol.toPrimitive](h) { return h === 'number' ? this.c : '$' + this.c; } } \
+             const m = new Money(42); (m * 2) + '|' + `${m}`"
+        ),
+        "84|$42"
+    );
+}
+
+#[test]
+fn symbol_to_primitive_returning_object_is_a_type_error() {
+    // JS throws (it does NOT fall through to valueOf/toString).
+    let out = run_str(
+        "let msg = 'no-throw'; \
+         try { const o = { [Symbol.toPrimitive]() { return {}; } }; o + 1; } \
+         catch (e) { msg = e.constructor.name; } msg",
+    );
+    assert_eq!(out, "TypeError");
+}
+
+#[test]
+fn symbol_to_primitive_key_is_hidden_from_reflection() {
+    // The sentinel key must not leak as an own enumerable property.
+    assert_eq!(
+        run_str("const o = { [Symbol.toPrimitive]() { return 1; }, a: 2 }; Object.keys(o).join(',')"),
+        "a"
     );
 }

@@ -49,6 +49,9 @@ const corpus = [
   `return ['Ab'.localeCompare('ab') === 0, 'abc'.charCodeAt(1), String.fromCharCode(72, 105)].join(',');`,
   `return [\`\${1 + 1}x\${'y'.toUpperCase()}\`, \`a\\nb\`.split('\\n').length].join('|');`,
   `return JSON.stringify('he said "hi"\\n');`,
+  // Symbol.toPrimitive: hint-aware coercion, precedence over valueOf/toString
+  `const o = { [Symbol.toPrimitive](h) { return h === 'number' ? 42 : h; }, valueOf() { return 7; } }; return [o + '', o * 1, \`\${o}\`].join(',');`,
+  `class Money { constructor(c) { this.c = c; } [Symbol.toPrimitive](h) { return h === 'number' ? this.c : '$' + this.c; } } const m = new Money(42); return (m * 2) + '|' + \`\${m}\`;`,
 
   // ── numbers & Math ────────────────────────────────────────────────────
   `return [Math.max(1, 5, 3), Math.min(...[4, 2, 8]), Math.abs(-7), Math.sign(-3)].join(',');`,
@@ -998,14 +1001,9 @@ const realistic = [
 //  If zapcode starts agreeing with Node, the pin fails so it gets promoted.
 // ════════════════════════════════════════════════════════════════════════════
 
-const pinned = [
-  {
-    reason:
-      "Symbol.toPrimitive is not dispatched (Symbol support is a stub; see STRESS-PASS-BUGS.md ToPrimitive notes)",
-    body: `const o = { [Symbol.toPrimitive]() { return 42; }, valueOf() { return 7; } }; return o + 1;`,
-    zapcode: 8, // Node: 43
-  },
-];
+// No pins held: Symbol.toPrimitive (the last one) is now dispatched and the
+// case is promoted into the corpus above.
+const pinned = [];
 
 // ════════════════════════════════════════════════════════════════════════════
 
