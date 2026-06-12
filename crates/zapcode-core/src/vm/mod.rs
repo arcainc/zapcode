@@ -958,6 +958,13 @@ impl Vm {
         }
     }
 
+    /// Build a real `Error` heap object (`name`/`message`, `__error__`-branded
+    /// so `e instanceof Error` holds). Used to raise a host tool's failure as
+    /// an Error into the guest, not as a bare string.
+    pub(crate) fn make_error_value(&mut self, name: &str, message: &str) -> Value {
+        make_error_object(name, message, &mut self.heap)
+    }
+
     /// Resume a suspended external call by making it *throw* `error` instead of
     /// returning a value. The error surfaces inside guest code at the await/call
     /// site: if it is inside a `try`, the `catch` block runs (receiving `error`);

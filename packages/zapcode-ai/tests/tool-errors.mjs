@@ -58,6 +58,32 @@ await test("agent code can try/catch a failing tool and retry", async () => {
   assert.equal(result.toolCalls[1].result, "a-ok");
 });
 
+await test("a caught tool failure is a real Error (message/name/instanceof) in the guest", async () => {
+  // Idiomatic agent code inspects `e.message` and branches on `e.name`; a thrown
+  // tool must surface as a real Error, and the host error's subclass name (here
+  // RangeError) must survive the boundary.
+  const result = await execute(
+    `
+    try {
+      await boom("x");
+      "no-throw"
+    } catch (e) {
+      [e instanceof Error, e.name, e.message].join("|")
+    }
+    `,
+    {
+      boom: {
+        description: "always throws a RangeError",
+        parameters: { key: { type: "string" } },
+        execute: async () => {
+          throw new RangeError("out of range");
+        },
+      },
+    }
+  );
+  assert.equal(result.output, "true|RangeError|out of range");
+});
+
 await test("an uncaught tool failure aborts execution", async () => {
   await assert.rejects(
     () =>

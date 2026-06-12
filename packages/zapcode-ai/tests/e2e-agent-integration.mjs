@@ -5,9 +5,9 @@
  * path: tool-call recording (name/args/input/result), async/await + Promise
  * combinators driven by the host bridge, tool-error handling, deferred-promise
  * `.then`/`.catch`/`.finally`, and multi-tool agent workflows. Asserts the actual
- * contract of this interpreter (e.g. a caught tool error surfaces as a string, not
- * an Error instance — see `tool_error_is_a_string`), verified against the built
- * local binding.
+ * contract of this interpreter (e.g. a caught tool error surfaces as a real Error
+ * object with name/message — see `tool_error_is_a_real_error`), verified against
+ * the built local binding.
  */
 import assert from "node:assert/strict";
 import { execute } from "../dist/index.js";
@@ -150,15 +150,15 @@ await test("Promise.any resolves with the first fulfilled tool", async () => {
 // Tool errors
 // ---------------------------------------------------------------------------
 
-await test("tool_error_is_a_string: a caught tool error preserves the message as a string", async () => {
-  // CONTRACT: when a tool throws, the value caught in the guest is the error
-  // MESSAGE STRING (not an Error instance), so `String(e)` is the message and
-  // `typeof e === 'string'`. Asserting zapcode's actual behavior.
+await test("tool_error_is_a_real_error: a caught tool error is an Error with name/message", async () => {
+  // CONTRACT: when a tool throws, the value caught in the guest is a real Error
+  // object — `e instanceof Error` holds, `e.message` is the message, and the
+  // host error's subclass name (e.g. TypeError) is preserved.
   const r = await execute(
-    `let out; try { await boom({}); out = 'no'; } catch (e) { out = typeof e + ':' + String(e); } out`,
-    { boom: tool(async () => { throw new Error("kaboom"); }) }
+    `let out; try { await boom({}); out = 'no'; } catch (e) { out = [e instanceof Error, e.name, e.message].join(':'); } out`,
+    { boom: tool(async () => { throw new TypeError("kaboom"); }) }
   );
-  assert.equal(r.output, "string:kaboom");
+  assert.equal(r.output, "true:TypeError:kaboom");
 });
 
 await test("a tool error short-circuits the program when uncaught", async () => {

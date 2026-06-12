@@ -145,12 +145,10 @@ await test("effects before a thrown tool persist; catch continues effects", asyn
       throw new Error("kaboom");
     },
   };
-  // NB: a tool error surfaces in-guest as a STRING (documented L4 residual,
-  // see e2e-tool-contract), so `String(e)` is the message; `e.message` would
-  // be undefined.
+  // A thrown tool now surfaces in-guest as a real Error (e.message works).
   const r = await execute(
     "await emit('before'); let caught = ''; \
-     try { await boom(); await emit('unreached'); } catch (e) { caught = String(e); } \
+     try { await boom(); await emit('unreached'); } catch (e) { caught = e.message; } \
      await emit('after'); caught",
     tools
   );
@@ -249,6 +247,173 @@ await test("an agent orchestrates a real CRUD workflow; host DB ends correct", a
     "get",
     "get",
   ]);
+});
+
+// ── tool-error fidelity: a thrown tool is a real Error in the guest ────────
+
+await test("a thrown tool is caught as a real Error (instanceof, name, message)", async () => {
+  const tools = {
+    fail: {
+      description: "throws a TypeError",
+      parameters: {},
+      execute: async () => {
+        throw new TypeError("nope");
+      },
+    },
+  };
+  const r = await execute(
+    "let info = ''; try { await fail(); } catch (e) { \
+       info = [e instanceof Error, e.name, e.message].join('|'); } info",
+    tools
+  );
+  // The host's TypeError subclass name is preserved.
+  assert.equal(r.output, "true|TypeError|nope");
+});
+
+await test("a caught tool error can be rethrown and re-caught with fidelity", async () => {
+  const tools = {
+    fail: {
+      description: "throws",
+      parameters: {},
+      execute: async () => {
+        throw new Error("original");
+      },
+    },
+  };
+  const r = await execute(
+    "function wrap(e) { return new Error('wrapped: ' + e.message); } \
+     let out = ''; \
+     try { try { await fail(); } catch (e) { throw wrap(e); } } \
+     catch (e2) { out = e2.message + '|' + (e2 instanceof Error); } out",
+    tools
+  );
+  assert.equal(r.output, "wrapped: original|true");
+});
+
+await test("an uncaught tool error fails the run with the message (autoFix report)", async () => {
+  const tools = {
+    fail: {
+      description: "throws",
+      parameters: {},
+      execute: async () => {
+        throw new Error("boom-uncaught");
+      },
+    },
+  };
+  const r = await execute("await fail(); 'unreached'", tools, { autoFix: true });
+  assert.equal(r.report.completed, false);
+  assert.match(r.report.error.message, /boom-uncaught/);
+});
+
+// ── saga / compensation: a failing step triggers a rollback effect ─────────
+
+await test("saga: a failed step triggers a compensating side effect", async () => {
+  const { world, tools } = makeWorld();
+  tools.charge = {
+    description: "charge a payment — fails for amount > 100",
+    parameters: { amount: { type: "number" } },
+    execute: async ({ amount }) => {
+      if (amount > 100) throw new Error("declined");
+      world.log.push(`charge:${amount}`);
+      return { ok: true };
+    },
+  };
+  // The agent inserts a row, tries to charge, and on failure compensates by
+  // removing the row — a realistic transactional pattern over host state.
+  const r = await execute(
+    "await insert({ id: 1, value: 'order' }); \
+     let status; \
+     try { await charge({ amount: 250 }); status = 'charged'; } \
+     catch (e) { await remove({ id: 1 }); status = 'rolled-back:' + e.message; } \
+     status",
+    tools
+  );
+  assert.equal(r.output, "rolled-back:declined");
+  // The insert happened, then was compensated; the DB is empty again.
+  assert.equal(world.db.size, 0);
+  assert.deepEqual(world.log, ["insert:1=order", "remove:1"]);
+});
+
+// ── nested tool calls inside a helper function ─────────────────────────────
+
+await test("tool calls inside a helper function still drive host effects", async () => {
+  const { world, tools } = makeWorld();
+  const r = await execute(
+    "async function store(id) { await insert({ id, value: 'n' + id }); return id; } \
+     const ids = []; \
+     for (const id of [1, 2, 3]) ids.push(await store(id)); \
+     ids.join(',')",
+    tools
+  );
+  assert.equal(r.output, "1,2,3");
+  assert.equal(world.db.size, 3);
+  assert.deepEqual(world.log, ["insert:1=n1", "insert:2=n2", "insert:3=n3"]);
+});
+
+// ── complex tool result drives a derived side effect ───────────────────────
+
+await test("a structured tool result drives a derived side effect", async () => {
+  const world = { log: [], db: new Map() };
+  const tools = {
+    fetchOrder: {
+      description: "fetch an order with line items",
+      parameters: { id: { type: "number" } },
+      returns: "{ id: number; items: { sku: string; qty: number }[] }",
+      execute: async ({ id }) => ({
+        id,
+        items: [
+          { sku: "A", qty: 2 },
+          { sku: "B", qty: 5 },
+        ],
+      }),
+    },
+    record: {
+      description: "record a computed total",
+      parameters: { total: { type: "number" } },
+      execute: async ({ total }) => {
+        world.log.push(`total:${total}`);
+        world.db.set("total", total);
+        return null;
+      },
+    },
+  };
+  const r = await execute(
+    "const order = await fetchOrder({ id: 7 }); \
+     const total = order.items.reduce((s, it) => s + it.qty, 0); \
+     await record({ total }); total",
+    tools
+  );
+  assert.equal(r.output, 7);
+  assert.equal(world.db.get("total"), 7);
+  assert.deepEqual(world.log, ["total:7"]);
+});
+
+// ── batch with one failing call: allSettled keeps the others' effects ──────
+
+await test("Promise.allSettled over tools keeps successful effects when one fails", async () => {
+  const { world, tools } = makeWorld();
+  tools.maybe = {
+    description: "succeeds for even ids, throws for odd",
+    parameters: { id: { type: "number" } },
+    execute: async ({ id }) => {
+      if (id % 2 === 1) throw new Error("odd:" + id);
+      world.log.push(`ok:${id}`);
+      return id;
+    },
+  };
+  // NB: a BATCH (Promise.all/allSettled) rejection reason is still surfaced
+  // as the message STRING (it travels through resumeMany, which marshals
+  // plain values) — unlike a direct `await tool()` rejection, which is now a
+  // real Error. Making batch reasons real Errors too is a documented
+  // follow-up. `String(x.reason)` reads the message either way.
+  const r = await execute(
+    "const rs = await Promise.allSettled([maybe({ id: 2 }), maybe({ id: 3 }), maybe({ id: 4 })]); \
+     rs.map(x => x.status === 'fulfilled' ? 'f' + x.value : 'r:' + String(x.reason)).join(',')",
+    tools
+  );
+  // The two even calls performed their effect; the odd one rejected.
+  assert.equal(r.output, "f2,r:odd:3,f4");
+  assert.deepEqual(world.log.filter((l) => l.startsWith("ok:")).sort(), ["ok:2", "ok:4"]);
 });
 
 console.log(`\n${passed} tool side-effect checks passed.`);

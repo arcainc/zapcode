@@ -183,7 +183,7 @@ await test("host tool errors resume into agent try/catch after a dump/load bound
         audit.push("ok:" + customer.id);
         return customer.owner;
       } catch (e) {
-        audit.push("error:" + customerId + ":" + e);
+        audit.push("error:" + customerId + ":" + e.message);
         return "fallback-owner";
       }
     }

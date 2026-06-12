@@ -336,6 +336,20 @@ impl ZapcodeSessionSnapshot {
         })
     }
 
+    /// Resume by raising a real `Error` object (`name`/`message`,
+    /// `e instanceof Error` true) — the faithful shape of a host tool that
+    /// threw (see `ZapcodeSnapshot::resume_with_error_object`).
+    pub fn resume_with_error_object(
+        &self,
+        name: &str,
+        message: &str,
+    ) -> Result<ZapcodeSessionState> {
+        self.drive_resume(|vm| {
+            let err = vm.make_error_value(name, message);
+            vm.resume_with_error(err)
+        })
+    }
+
     /// Resume a session suspended on a `Promise.all` batch with one result per
     /// call, in order. Use when the host ran the batched calls in parallel.
     pub fn resume_many(&self, results: Vec<Value>) -> Result<ZapcodeSessionState> {

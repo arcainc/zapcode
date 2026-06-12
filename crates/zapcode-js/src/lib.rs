@@ -237,6 +237,30 @@ impl ZapcodeSnapshotHandle {
         let result = snapshot
             .resume_with_error(value)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        Self::error_resume_either(result)
+    }
+
+    /// Resume by raising a real `Error` object (`name`/`message`, with
+    /// `e instanceof Error` true) at the suspended call — the faithful shape
+    /// of a host tool that threw, so guest `catch (e) { e.message }` works.
+    /// `name` defaults to `"Error"`.
+    #[napi(ts_return_type = "ZapcodeResult | ZapcodeSuspension | ZapcodeBatchSuspension")]
+    pub fn resume_error_object(
+        &self,
+        message: String,
+        name: Option<String>,
+    ) -> napi::Result<Either3<ZapcodeResult, ZapcodeSuspension, ZapcodeBatchSuspension>> {
+        let result = self
+            .inner
+            .clone()
+            .resume_with_error_object(name.as_deref().unwrap_or("Error"), &message)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        Self::error_resume_either(result)
+    }
+
+    fn error_resume_either(
+        result: RunResult,
+    ) -> napi::Result<Either3<ZapcodeResult, ZapcodeSuspension, ZapcodeBatchSuspension>> {
         let trace = ExecutionTrace {
             root: TraceSpan {
                 name: "resume_error".to_string(),
@@ -368,6 +392,24 @@ impl ZapcodeSessionHandle {
             .resume_with_error_in_heap(value, value_heap)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
+        session_state_to_either(state)
+    }
+
+    /// Resume a session by raising a real `Error` object (`name`/`message`,
+    /// `e instanceof Error` true) — the faithful shape of a host tool that
+    /// threw. `name` defaults to `"Error"`.
+    #[napi(
+        ts_return_type = "ZapcodeSessionResult | ZapcodeSessionSuspension | ZapcodeSessionBatchSuspension"
+    )]
+    pub fn resume_error_object(
+        &self,
+        message: String,
+        name: Option<String>,
+    ) -> napi::Result<SessionEither> {
+        let state = self
+            .inner
+            .resume_with_error_object(name.as_deref().unwrap_or("Error"), &message)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
         session_state_to_either(state)
     }
 

@@ -71,13 +71,15 @@ await test("a failing call in Promise.all is catchable in guest code", async () 
       await Promise.all([fetchOne("a"), fetchOne("bad")]);
       out = "no-error";
     } catch (e) {
-      out = "caught:" + e;
+      // A Promise.all rejection from a thrown tool is a real Error in the
+      // guest, so e.message reads the message and e instanceof Error holds.
+      out = "caught:" + e.message + ":" + (e instanceof Error);
     }
     out
   `,
     tools
   );
-  assert.equal(result.output, "caught:boom");
+  assert.equal(result.output, "caught:boom:true");
 });
 
 await test("session batch survives dump/load and resumeMany", () => {
@@ -141,7 +143,8 @@ await test("Promise.race rejection of the first-to-settle is catchable", async (
       ]);
       "value:" + r
     } catch (e) {
-      "caught:" + e
+      // A Promise.race rejection from a thrown tool is a real Error in-guest.
+      "caught:" + e.message
     }
   `,
     tools

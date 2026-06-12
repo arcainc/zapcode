@@ -989,7 +989,7 @@ async function executeCode(
     // Throws on a *malformed* call (a code bug → abort/autoFix). Returns a
     // discriminated outcome for a *runtime* tool failure so the caller can raise
     // it back into the sandbox as a catchable error.
-    type ToolOutcome = { ok: true; result: unknown } | { ok: false; message: string };
+    type ToolOutcome = { ok: true; result: unknown } | { ok: false; message: string; name: string };
     const invokeTool = async (name: string, rawArgs: unknown[]): Promise<ToolOutcome> => {
       const toolDef = toolDefs[name];
       if (!toolDef) {
@@ -1037,6 +1037,7 @@ async function executeCode(
         return { ok: true, result };
       } catch (err: any) {
         const message = err?.message ?? String(err);
+        const errName = (typeof err?.name === "string" && err.name) || "Error";
         toolCalls.push({
           name,
           args: rawArgs,
@@ -1050,7 +1051,7 @@ async function executeCode(
           endSpan(toolSpan, "error");
           execSpan!.children.push(toolSpan);
         }
-        return { ok: false, message };
+        return { ok: false, message, name: errName };
       }
     };
 
@@ -1069,7 +1070,9 @@ async function executeCode(
 
       // Single external call.
       const outcome = await invokeTool(state.functionName, state.args);
-      state = outcome.ok ? snapshot.resume(outcome.result) : snapshot.resumeError(outcome.message);
+      state = outcome.ok
+        ? snapshot.resume(outcome.result)
+        : snapshot.resumeErrorObject(outcome.message, outcome.name);
     }
 
     if (state.stdout) {
@@ -1575,7 +1578,7 @@ export function prepare(
 // ---------------------------------------------------------------------------
 
 /** Outcome of resolving a single tool call inside a session driver. */
-type ToolOutcome = { ok: true; result: unknown } | { ok: false; message: string };
+type ToolOutcome = { ok: true; result: unknown } | { ok: false; message: string; name: string };
 
 /**
  * Validate + run one tool call, recording a toolCalls entry. Throws on a
@@ -1609,6 +1612,7 @@ async function invokeToolCall(
     return { ok: true, result };
   } catch (err: any) {
     const message = err?.message ?? String(err);
+    const errName = (typeof err?.name === "string" && err.name) || "Error";
     toolCalls.push({
       name,
       args: rawArgs,
@@ -1617,7 +1621,7 @@ async function invokeToolCall(
       error: message,
       durationMs: Date.now() - startedAt,
     });
-    return { ok: false, message };
+    return { ok: false, message, name: errName };
   }
 }
 
@@ -1631,6 +1635,7 @@ type BatchCall = { name: string; args: unknown[] };
 interface BatchResumable<S> {
   resumeMany(results: unknown[]): S;
   resumeError(error: unknown): S;
+  resumeErrorObject(message: string, name?: string): S;
 }
 
 /**
@@ -1717,7 +1722,10 @@ async function settleBatch<S>(
   } catch (err) {
     if (sawFatal) throw fatal; // malformed call — abort
     // A catchable tool rejection (all/race) or an all-rejected any.
-    return handle.resumeError(batchErrorMessage(err));
+    // Batch rejection: raise as an Error object (message preserved); the
+    // combinator-specific name (AggregateError for `any`) is folded into the
+    // message by batchErrorMessage.
+    return handle.resumeErrorObject(batchErrorMessage(err));
   }
   if (sawFatal) throw fatal; // fatal lost the race but must still abort
   return resume();
@@ -1805,7 +1813,9 @@ function makeSession(
         );
       } else {
         const outcome = await invokeToolCall(toolDefs, toolNames, state.functionName, state.args, toolCalls);
-        state = outcome.ok ? handle.resume(outcome.result) : handle.resumeError(outcome.message);
+        state = outcome.ok
+          ? handle.resume(outcome.result)
+          : handle.resumeErrorObject(outcome.message, outcome.name);
       }
     }
 
