@@ -88,3 +88,62 @@ await test("autoFix returns the type error as a structured result", async () => 
 });
 
 console.log(`\n${passed} type-check checks passed.`);
+
+// ── structured typecheck() API (tsgo-preferred, tsc fallback) ─────────────
+import { typecheck, formatDiagnosticsForModel } from "../dist/index.js";
+
+const typedTools = {
+  getWeather: {
+    description: "Weather.",
+    parameters: { city: { type: "string" } },
+    returns: "{ temp: number; city: string }",
+    execute: async ({ city }) => ({ temp: 26, city }),
+  },
+  ping: { description: "Ping.", parameters: {}, execute: async () => "pong" },
+};
+
+for (const engine of ["typescript", "tsgo"]) {
+  let available = true;
+  if (engine === "tsgo") {
+    try { await import("@typescript/native-preview/package.json", { with: { type: "json" } }); }
+    catch { available = false; }
+  }
+  if (!available) { console.log(`  - skipping ${engine} (not installed)`); continue; }
+
+  await test(`[${engine}] structured diagnostics with agent-relative positions`, async () => {
+    const code = 'const w = await getWeather({ city: 42 });\nreturn w.temp.toUpperCase();';
+    const r = await typecheck(code, typedTools, { engine });
+    assert.equal(r.engine, engine);
+    assert.equal(r.ok, false);
+    assert.equal(r.diagnostics.length, 2);
+    assert.equal(r.diagnostics[0].line, 1);
+    assert.equal(r.diagnostics[0].severity, "error");
+    assert.match(r.diagnostics[0].message, /not assignable/);
+    // The typed return makes downstream misuse a pre-execution failure.
+    assert.equal(r.diagnostics[1].line, 2);
+    assert.match(r.diagnostics[1].message, /toUpperCase/);
+  });
+
+  await test(`[${engine}] both call shapes type-check for single-param tools`, async () => {
+    for (const call of ['getWeather({ city: "sf" })', 'getWeather("sf")', "ping()", "ping({})"]) {
+      const r = await typecheck(`const x = await ${call}; return 1;`, typedTools, { engine });
+      assert.equal(r.ok, true, `${call}: ${JSON.stringify(r.diagnostics)}`);
+    }
+  });
+
+  await test(`[${engine}] unknown tool fails the type pass`, async () => {
+    const r = await typecheck("return await dropTables();", typedTools, { engine });
+    assert.equal(r.ok, false);
+  });
+}
+
+await test("formatDiagnosticsForModel cites the offending line with a caret", async () => {
+  const code = 'const w = await getWeather({ city: 42 });\nreturn w;';
+  const r = await typecheck(code, typedTools);
+  const text = formatDiagnosticsForModel(r, code);
+  assert.match(text, /Type error at line 1, column \d+/);
+  assert.match(text, /getWeather\(\{ city: 42 \}\)/);
+  assert.match(text, /\^/);
+});
+
+console.log(`\n${passed} type-check tests passed.`);

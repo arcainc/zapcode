@@ -44,6 +44,14 @@ export interface ToolDefinition {
   description: string;
   /** Parameter schema — keys are parameter names. */
   parameters: Record<string, ParamDef>;
+  /**
+   * Optional TypeScript type expression for the tool's RESOLVED value, e.g.
+   * `"{ temp: number; city: string }"` or `"string[]"`. Used in the system
+   * prompt's declared signature and by `typecheck()`, so agent code that
+   * mis-uses a tool result fails the type pass instead of at runtime.
+   * Defaults to `unknown` in prompts and `any` in the typechecker.
+   */
+  returns?: string;
   /** The actual implementation. Called when guest code invokes this tool. */
   execute: (args: Record<string, unknown>) => unknown | Promise<unknown>;
 }
@@ -570,58 +578,276 @@ function shouldTreatSingleObjectArgAsNamed(
  * access on results isn't flagged — the goal is to catch unknown tool names and
  * wrong argument types/shapes before running, not to police result usage. */
 function declarationForTypeCheck(name: string, def: ToolDefinition): string {
+  // A declared return type makes downstream misuse a type error; without
+  // one, `any` keeps unannotated agent code from false-positive noise.
+  const ret = def.returns ? `Promise<${def.returns}>` : "Promise<any>";
   const entries = Object.entries(def.parameters);
   if (entries.length > 1) {
     const fields = entries
       .map(([p, d]) => `${p}${d.optional ? "?" : ""}: ${d.type}`)
       .join("; ");
-    return `declare function ${name}(input: { ${fields} }): Promise<any>;`;
+    return `declare function ${name}(input: { ${fields} }): ${ret};`;
   }
-  const params = entries.map(([p, d]) => `${p}${d.optional ? "?" : ""}: ${d.type}`).join(", ");
-  return `declare function ${name}(${params}): Promise<any>;`;
+  if (entries.length === 0) {
+    // The runtime tolerates `tool({})` for a no-arg tool (a common LLM
+    // habit) — the checker must too.
+    return `declare function ${name}(input?: Record<string, never>): ${ret};`;
+  }
+  // Single-param tools accept BOTH shapes at runtime (positional value or a
+  // one-key named object) — declare both as overloads so neither flags.
+  const [p, d] = entries[0];
+  const positional = `${p}${d.optional ? "?" : ""}: ${d.type}`;
+  return (
+    `declare function ${name}(${positional}): ${ret};\n` +
+    `declare function ${name}(input: { ${positional} }): ${ret};`
+  );
 }
 
 /**
- * Type-check the generated TypeScript against the tool stubs before running it,
- * so a malformed call (unknown tool, wrong argument type, missing argument)
- * fails fast with a compile error the model can self-correct — cheaper than a
- * runtime trap. Returns a list of human-readable diagnostics (empty if clean).
- * Requires the optional `typescript` dependency.
+ * A single diagnostic from {@link typecheck}, positioned in the AGENT'S code
+ * (1-based line/column; the internal wrapper offset is already subtracted).
  */
-async function typeCheckGeneratedCode(
+export interface TypeDiagnostic {
+  line: number;
+  column: number;
+  message: string;
+  /** TypeScript error code (e.g. 2345), when the engine reports one. */
+  code?: number;
+  severity: "error" | "warning";
+}
+
+/** Result of {@link typecheck}. */
+export interface TypecheckResult {
+  /** True when no error-severity diagnostics were produced. */
+  ok: boolean;
+  diagnostics: TypeDiagnostic[];
+  /** Which engine ran: tsgo (native preview) or the in-process tsc API. */
+  engine: "tsgo" | "typescript";
+  /** The ambient declarations the agent code was checked against. */
+  toolDeclarations: string;
+}
+
+export interface TypecheckOptions {
+  /**
+   * Engine selection. "auto" (default) prefers `@typescript/native-preview`
+   * (tsgo, the native TypeScript compiler — ~10x faster) when it is
+   * installed, falling back to the in-process `typescript` API.
+   */
+  engine?: "auto" | "tsgo" | "typescript";
+  /**
+   * Strict checking (default true). Maps to `strict: true` with
+   * `noImplicitAny: false` — agent code rarely annotates callback
+   * parameters, and contextual inference covers most of them; implicit-any
+   * noise would drown the real findings. Set false for the legacy loose
+   * check (only blatant errors).
+   */
+  strict?: boolean;
+}
+
+const TYPECHECK_LIB_DECLS =
+  '\ndeclare const console: { log(...args: any[]): void; error(...args: any[]): void; warn(...args: any[]): void };\n';
+
+function buildToolDeclarations(toolDefs: Record<string, ToolDefinition>): string {
+  return (
+    Object.entries(toolDefs)
+      .map(([name, def]) => declarationForTypeCheck(name, def))
+      .join("\n") + TYPECHECK_LIB_DECLS
+  );
+}
+
+/** Lines the wrapper prepends before the agent's first line in __main__.ts. */
+const TYPECHECK_WRAPPER_LINES = 2; // "export {};" + "async function __zapcode_main__() {"
+
+function wrapAgentCode(code: string): string {
+  return `export {};\nasync function __zapcode_main__() {\n${code}\n}\n`;
+}
+
+/**
+ * Typecheck agent-generated code against the registered tools' signatures
+ * WITHOUT running it. A type error handed back to the model before execution
+ * is the cheapest self-correction signal there is — declare `returns` on
+ * your tools and misuse of their results becomes a pre-execution failure.
+ *
+ * Engines: prefers `@typescript/native-preview` (tsgo — Microsoft's native
+ * TypeScript compiler) when installed; otherwise uses the in-process
+ * `typescript` API. Install one of them; with neither, this throws.
+ */
+export async function typecheck(
   code: string,
-  toolDefs: Record<string, ToolDefinition>
-): Promise<string[]> {
+  toolDefs: Record<string, ToolDefinition>,
+  options: TypecheckOptions = {}
+): Promise<TypecheckResult> {
+  const engine = options.engine ?? "auto";
+  const strict = options.strict ?? true;
+  const toolDeclarations = buildToolDeclarations(toolDefs);
+  const main = wrapAgentCode(code);
+
+  if (engine === "tsgo" || engine === "auto") {
+    const tsgo = await resolveTsgo();
+    if (tsgo) {
+      const diagnostics = await runTsgo(tsgo, toolDeclarations, main, strict);
+      return {
+        ok: !diagnostics.some((d) => d.severity === "error"),
+        diagnostics,
+        engine: "tsgo",
+        toolDeclarations,
+      };
+    }
+    if (engine === "tsgo") {
+      throw new Error(
+        "engine 'tsgo' requested but '@typescript/native-preview' is not installed (npm i -D @typescript/native-preview)"
+      );
+    }
+  }
+
+  const diagnostics = await runTscApi(toolDeclarations, main, strict);
+  return {
+    ok: !diagnostics.some((d) => d.severity === "error"),
+    diagnostics,
+    engine: "typescript",
+    toolDeclarations,
+  };
+}
+
+/**
+ * Render diagnostics as a compact, line-anchored report for the MODEL —
+ * each finding cites the offending source line with a caret so the agent
+ * can self-correct without re-deriving positions.
+ */
+export function formatDiagnosticsForModel(result: TypecheckResult, code: string): string {
+  if (result.ok && result.diagnostics.length === 0) return "";
+  const lines = code.split("\n");
+  const parts: string[] = [];
+  for (const d of result.diagnostics.slice(0, 10)) {
+    const src = lines[d.line - 1];
+    let block = `${d.severity === "error" ? "Type error" : "Type warning"} at line ${d.line}, column ${d.column}${d.code ? ` (TS${d.code})` : ""}: ${d.message}`;
+    if (src !== undefined) {
+      block += `\n    ${src}\n    ${" ".repeat(Math.max(0, d.column - 1))}^`;
+    }
+    parts.push(block);
+  }
+  if (result.diagnostics.length > 10) {
+    parts.push(`…and ${result.diagnostics.length - 10} more`);
+  }
+  return parts.join("\n");
+}
+
+/** Locate the tsgo launcher from `@typescript/native-preview`, if installed. */
+async function resolveTsgo(): Promise<string | null> {
+  try {
+    const { createRequire } = await import("node:module");
+    const path = await import("node:path");
+    const fs = await import("node:fs/promises");
+    const req = createRequire(import.meta.url);
+    const pkgPath = req.resolve("@typescript/native-preview/package.json");
+    const pkg = JSON.parse(await fs.readFile(pkgPath, "utf8"));
+    const bin = typeof pkg.bin === "string" ? pkg.bin : pkg.bin?.tsgo;
+    return bin ? path.join(path.dirname(pkgPath), bin) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Run tsgo over a temp project and parse its tsc-style diagnostics. */
+async function runTsgo(
+  tsgoBin: string,
+  toolDecls: string,
+  main: string,
+  strict: boolean
+): Promise<TypeDiagnostic[]> {
+  const fs = await import("node:fs/promises");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const { execFile } = await import("node:child_process");
+
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "zapcode-typecheck-"));
+  try {
+    await fs.writeFile(path.join(dir, "__tools__.d.ts"), toolDecls);
+    await fs.writeFile(path.join(dir, "__main__.ts"), main);
+    await fs.writeFile(
+      path.join(dir, "tsconfig.json"),
+      JSON.stringify({
+        compilerOptions: {
+          noEmit: true,
+          strict,
+          noImplicitAny: false,
+          skipLibCheck: true,
+          target: "es2022",
+          lib: ["es2022"],
+          types: [],
+        },
+        files: ["__tools__.d.ts", "__main__.ts"],
+      })
+    );
+    const output = await new Promise<string>((resolve) => {
+      execFile(
+        process.execPath,
+        [tsgoBin, "--project", dir, "--pretty", "false"],
+        { cwd: dir, timeout: 30_000 },
+        (_err, stdout, stderr) => resolve(`${stdout}\n${stderr}`)
+      );
+    });
+    return parseTscOutput(output);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+}
+
+/** Parse `--pretty false` tsc/tsgo output lines into agent-positioned diagnostics. */
+function parseTscOutput(output: string): TypeDiagnostic[] {
+  const diagnostics: TypeDiagnostic[] = [];
+  const re = /^(.*?)\((\d+),(\d+)\): (error|warning) TS(\d+): (.*)$/;
+  for (const line of output.split("\n")) {
+    const m = re.exec(line.trim());
+    if (!m) {
+      // Continuation lines of a multi-line message attach to the previous one.
+      if (diagnostics.length > 0 && /^\s+\S/.test(line)) {
+        diagnostics[diagnostics.length - 1].message += `\n${line.trim()}`;
+      }
+      continue;
+    }
+    const [, file, lineStr, colStr, sev, codeStr, message] = m;
+    if (!file.endsWith("__main__.ts")) continue; // tool-decl noise is ours, not the agent's
+    const agentLine = Number(lineStr) - TYPECHECK_WRAPPER_LINES;
+    if (agentLine < 1) continue;
+    diagnostics.push({
+      line: agentLine,
+      column: Number(colStr),
+      message,
+      code: Number(codeStr),
+      severity: sev === "warning" ? "warning" : "error",
+    });
+  }
+  return diagnostics;
+}
+
+/** In-process fallback: the `typescript` compiler API over a virtual FS. */
+async function runTscApi(
+  toolDecls: string,
+  main: string,
+  strict: boolean
+): Promise<TypeDiagnostic[]> {
   let ts: any;
   try {
     const mod: any = await import("typescript");
     ts = mod.default ?? mod;
   } catch {
     throw new Error(
-      "Type-checking requires the optional 'typescript' dependency. " +
-        "Install it (npm i typescript) or disable the typeCheck option."
+      "Type-checking requires '@typescript/native-preview' (preferred) or the 'typescript' dependency. " +
+        "Install one (npm i -D @typescript/native-preview) or disable the typeCheck option."
     );
   }
 
-  const stub =
-    Object.entries(toolDefs)
-      .map(([name, def]) => declarationForTypeCheck(name, def))
-      .join("\n") +
-    "\ndeclare const console: { log(...args: any[]): void; error(...args: any[]): void };\n";
-  // Wrap in an async function so top-level await is allowed and a trailing
-  // expression (the sandbox's "return value") is a valid statement.
-  const main = `export {};\nasync function __zapcode_main__() {\n${code}\n}\n`;
-
   const options = {
     noEmit: true,
-    strict: false,
+    strict,
     noImplicitAny: false,
     skipLibCheck: true,
-    target: ts.ScriptTarget.ES2020,
-    lib: ["lib.es2020.d.ts"],
+    target: ts.ScriptTarget.ES2022,
+    lib: ["lib.es2022.d.ts"],
     moduleDetection: ts.ModuleDetectionKind?.Force,
   };
-  const virtual: Record<string, string> = { "__tools__.d.ts": stub, "__main__.ts": main };
+  const virtual: Record<string, string> = { "__tools__.d.ts": toolDecls, "__main__.ts": main };
   const host = ts.createCompilerHost(options);
   const origGetSourceFile = host.getSourceFile.bind(host);
   host.getSourceFile = (name: string, langVersion: any, ...rest: any[]) =>
@@ -634,21 +860,44 @@ async function typeCheckGeneratedCode(
   host.fileExists = (name: string) => virtual[name] !== undefined || origFileExists(name);
 
   const program = ts.createProgram(Object.keys(virtual), options, host);
-  const diagnostics = ts
+  const raw = ts
     .getPreEmitDiagnostics(program)
     .filter((d: any) => d.file && d.file.fileName === "__main__.ts");
 
-  return diagnostics.map((d: any) => {
+  const out: TypeDiagnostic[] = [];
+  for (const d of raw) {
     const message = ts.flattenDiagnosticMessageText(d.messageText, "\n");
-    if (d.file && typeof d.start === "number") {
-      const { line, character } = d.file.getLineAndColumnOfPosition
-        ? d.file.getLineAndColumnOfPosition(d.start)
-        : d.file.getLineAndCharacterOfPosition(d.start);
-      // Subtract the wrapper line so positions map to the agent's code.
-      return `line ${line}, col ${character + 1}: ${message}`;
+    if (typeof d.start !== "number") {
+      out.push({ line: 1, column: 1, message, code: d.code, severity: "error" });
+      continue;
     }
-    return message;
-  });
+    const { line, character } = d.file.getLineAndCharacterOfPosition(d.start);
+    const agentLine = line + 1 - TYPECHECK_WRAPPER_LINES;
+    if (agentLine < 1) continue;
+    out.push({
+      line: agentLine,
+      column: character + 1,
+      message,
+      code: d.code,
+      severity: d.category === ts.DiagnosticCategory.Warning ? "warning" : "error",
+    });
+  }
+  return out;
+}
+
+/**
+ * Legacy string-list adapter used by the `typeCheck` execute option.
+ */
+async function typeCheckGeneratedCode(
+  code: string,
+  toolDefs: Record<string, ToolDefinition>
+): Promise<string[]> {
+  // The execute pre-pass keeps the historical loose profile; the standalone
+  // typecheck() defaults to strict.
+  const result = await typecheck(code, toolDefs, { strict: false });
+  return result.diagnostics.map(
+    (d) => `line ${d.line}, col ${d.column}: ${d.message}`
+  );
 }
 
 // ---------------------------------------------------------------------------
