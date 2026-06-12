@@ -85,7 +85,7 @@ impl ZapcodeSessionState {
     /// Borrow the object heap that resolves the array/object handles in this
     /// state's `output` / `args` / `calls`. Hosts need it to marshal those
     /// results out to JSON.
-    pub fn heap(&self) -> &crate::heap::Heap {
+    pub fn heap(&mut self) -> &crate::heap::Heap {
         match self {
             ZapcodeSessionState::Complete { session, .. }
             | ZapcodeSessionState::Suspended { session, .. }
@@ -173,10 +173,15 @@ impl ZapcodeSessionSnapshot {
     /// the session's globals — or returned in a [`ZapcodeSessionState`]'s
     /// `output`/`args`/`calls` — carry `Handle`s into this heap, so a host needs
     /// it to read their elements / fields when marshalling results out.
-    pub fn heap(&self) -> &crate::heap::Heap {
-        match &self.data {
+    pub fn heap(&mut self) -> &crate::heap::Heap {
+        match &mut self.data {
             SessionSnapshotData::Idle(idle) => &idle.heap,
-            SessionSnapshotData::Suspended(s) => &s.vm.heap,
+            SessionSnapshotData::Suspended(s) => {
+                // The captured VM heap is template-elided; hand out the
+                // materialized layout the suspension's args/handles index.
+                s.vm.materialize_heap();
+                &s.vm.heap
+            }
         }
     }
 
@@ -429,36 +434,41 @@ fn build_session_state(
         VmState::Suspended {
             function_name,
             args,
-            snapshot: _,
+            snapshot,
         } => Ok(ZapcodeSessionState::Suspended {
-            function_name,
-            args,
-            stdout,
             session: ZapcodeSessionSnapshot {
                 data: SessionSnapshotData::Suspended(Box::new(SuspendedSessionState {
-                    vm: VmSnapshot::capture(&vm),
+                    // REUSE the capture taken at suspension time: the
+                    // host-facing `args` are already remapped against its
+                    // compacted heap, and the VM has not executed since.
+                    // Re-capturing here would compact AGAIN and leave the
+                    // args pointing into the wrong layout.
+                    vm: snapshot.into_vm_snapshot(),
                     stdout_len: vm.stdout.len(),
                     top_level_bindings: sorted_bindings(top_level_bindings),
                     transient_input_names,
                 })),
             },
+            function_name,
+            args,
+            stdout,
         }),
         VmState::SuspendedMany {
             calls,
             combinator,
-            snapshot: _,
+            snapshot,
         } => Ok(ZapcodeSessionState::SuspendedMany {
-            calls,
-            combinator,
-            stdout,
             session: ZapcodeSessionSnapshot {
                 data: SessionSnapshotData::Suspended(Box::new(SuspendedSessionState {
-                    vm: VmSnapshot::capture(&vm),
+                    vm: snapshot.into_vm_snapshot(),
                     stdout_len: vm.stdout.len(),
                     top_level_bindings: sorted_bindings(top_level_bindings),
                     transient_input_names,
                 })),
             },
+            calls,
+            combinator,
+            stdout,
         }),
     }
 }

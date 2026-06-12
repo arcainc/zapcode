@@ -246,11 +246,14 @@ fn in_operator_after_mutation() {
 }
 
 #[test]
-fn in_operator_does_not_walk_prototype_documented_divergence() {
-    // DIVERGENCE asserted as actual: JS returns true (Object.prototype.toString);
-    // zapcode's `in` checks own keys only.
-    assert_eq!(run_str("'toString' in {}"), "false");
-    assert_eq!(run_str("'hasOwnProperty' in {}"), "false");
+fn in_operator_reports_inherited_object_prototype_members() {
+    // Promoted from a documented divergence: every object inherits
+    // Object.prototype's members, so `in` reports them even though the
+    // object model stores no prototype chain (Node truth).
+    assert_eq!(run_str("'toString' in {}"), "true");
+    assert_eq!(run_str("'hasOwnProperty' in {}"), "true");
+    assert_eq!(run_str("'valueOf' in [1]"), "true");
+    assert_eq!(run_str("'nope' in {}"), "false");
 }
 
 // ============================================================================

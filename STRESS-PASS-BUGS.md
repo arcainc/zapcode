@@ -225,6 +225,63 @@ Differential corpus after this round: **241 snippets agree with Node**
 (~95 of them whole realistic programs), 1 pin held, 0 both-throw
 degenerates.
 
+**Round 15 (branch `perf-dispatch-hotpath2`) — dispatch perf, snapshot GC,
+batch-3 corpus + the stdlib sweep.** Three workstreams, each finding real
+bugs:
+
+*Dispatch hot path* (memory-first, per the optimization policy):
+- The per-instruction wall-clock read (`check_time` called `Instant::elapsed`
+  on EVERY dispatch) was ~30 ns of a ~70 ns instruction budget — now
+  amortized to one read per 1024 instructions (worst-case overshoot tens of
+  microseconds against millisecond limits). Tight loops −34%, call-heavy
+  code −21%.
+- `Instruction` shrank 96 → 40 bytes (`Arc<str>` payloads, boxed
+  `CreateClass`): every compiled program's bytecode is ~58% smaller and the
+  per-dispatch clone no longer allocates. Post-fix profile is FLAT (top leaf
+  4.7%) — the remaining cost is the dispatch match itself.
+
+*Snapshot-time heap compaction* (wire v14) — the arena never frees, so a
+churning agent persisted every dead temporary in every snapshot forever
+(3.4 → 12.2 KB over 8 hops in the probe; unbounded). Capture now
+mark-compacts from every serialized handle (order-preserving, so bytes stay
+deterministic; the template prefix is retained for elision). Probe snapshots
+now FLAT. Two corruption hazards found and fixed on the way:
+- Host-facing suspension `args`/`calls` ride OUTSIDE the snapshot and were
+  cloned before capture — compaction could move or even DROP their slots.
+  They are now extra compaction roots, remapped to the compacted layout, and
+  all three bindings marshal them against the SNAPSHOT's materialized heap
+  (the core contract) instead of the live VM heap.
+- The session layer re-captured (and re-compacted) after the suspension
+  already had, double-remapping the args into garbage. Sessions now REUSE
+  the suspension's capture.
+
+*Conformance round 3 + the stdlib sweep* (330 snippets agree with Node; the
+sweep probes every commonly-used method BY NAME):
+- **Methods returning `undefined` returned `this`** — and worse, the
+  value-semantics-era receiver write-back let `new T()` inside a static
+  method OVERWRITE the global class binding. Only constructors substitute
+  `this` now (`CallFrame.is_constructor`); the write-back is gone (heap
+  handles made it a no-op in every legitimate case).
+- **Generator methods** (`*method()`, `*[Symbol.iterator]()`) did not
+  compile as generators (class methods dropped `func.generator`; computed
+  `[Symbol.iterator]` class keys were skipped entirely; generator objects
+  had no `this`). All fixed — `[...new Range(2,5)]` with a generator
+  iterator and live `this` works.
+- **`Date.setUTC*` setters missing** (all of them; `setTime` too).
+- **`'toString' in obj` was false** — `in` now reports inherited
+  Object.prototype members and array prototype methods.
+- **`String.raw` missing** — statically desugared to raw-text concatenation.
+- **Builtins as callbacks failed**: `Object.groupBy(xs, Math.floor)` — the
+  internal call path now dispatches `BuiltinMethod` callees.
+- `typeof Symbol.iterator` now "symbol" (branded well-known symbol object
+  that stringifies to the protocol key).
+- Pre-existing: zapcode-py / zapcode-wasm did not COMPILE (`Value::BigInt`
+  unhandled in their marshalling) — fixed; BigInt marshals to native
+  int/BigInt.
+
+Three stale pins promoted to Node-truth tests (`in` prototype membership ×2,
+class generator methods).
+
 **Round 8 (branch `arca/conformance-fixes`) — cluster wrap-up + reflection / RegExp / coercion-builtin edges.**
 
 This round confirms the earlier-landed clusters are GREEN-by-construction (asserting
