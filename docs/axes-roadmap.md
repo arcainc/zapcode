@@ -84,7 +84,7 @@ generator-body await tick interleaving, eager spread over generators.
 **Direction**: the per-method sweep is done; the next class of bugs hides in
 *combinations*. The fuzzer now threads effect logs (order/laziness/counts
 diffed against Node) and generates classes/Map/Set/switch/optional-chaining/
-custom-iterables — 4,500 programs clean. Next: tagged-template custom tags
+custom-iterables — 4,500 programs clean; Symbol.toPrimitive now dispatched, so the differential gate holds ZERO pins. Next: tagged-template custom tags
 (probe the `strings.raw` residual), deeper combinatorial nesting, a nightly
 multi-seed sweep.
 
@@ -118,7 +118,7 @@ session chunks):
   the bindings: `prepare(code) -> Program`, `program.run(inputs, tools)`.
 - **stdout/stderr split** — DONE (cycle 2, wire v16): `console.error`/`warn`
   write to a separate `stderr` stream through core, snapshots, sessions, and
-  the JS binding (py/wasm exposure is a follow-up).
+  the JS, Python, and WASM bindings.
 - **Prepare-once API** — DONE (cycle 2): `ZapcodeProgramHandle` napi class
   exposes compile-once / run-many + dump/load through the binding (a
   zapcode-ai `prepare()` wrapper around it is the remaining follow-up).

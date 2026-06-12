@@ -319,29 +319,32 @@ fn trace_span_to_js(span: &CoreTraceSpan) -> Result<JsValue, JsError> {
 /// Marshal a whole [`RunResult`] (state + heap + stdout + optional trace) into a
 /// JS object.
 fn run_result_to_js(result: RunResult, include_trace: bool) -> Result<JsValue, JsError> {
-    // stderr is not yet surfaced through the WASM binding (follow-up); ignore
-    // the new RunResult.stderr field here.
     let RunResult {
         state,
         heap,
         stdout,
+        stderr,
         trace,
         ..
     } = result;
     let trace_ref = if include_trace { Some(&trace) } else { None };
-    vm_state_to_js(state, &heap, &stdout, trace_ref)
+    vm_state_to_js(state, &heap, &stdout, &stderr, trace_ref)
 }
 
-/// Convert a `VmState` (+ heap + optional stdout + trace) to a JS object. `heap`
-/// resolves the array/object handles in the completed output or a suspension's
-/// args/calls.
+/// Convert a `VmState` (+ heap + stdout/stderr + optional trace) to a JS
+/// object. `heap` resolves the array/object handles in the completed output
+/// or a suspension's args/calls.
 fn vm_state_to_js(
     state: VmState,
     heap: &Heap,
     stdout: &str,
+    stderr: &str,
     trace: Option<&ExecutionTrace>,
 ) -> Result<JsValue, JsError> {
     let obj = Object::new();
+    // Captured console.error/warn output, separate from stdout.
+    Reflect::set(&obj, &JsValue::from_str("stderr"), &JsValue::from_str(stderr))
+        .map_err(|_| JsError::new("failed to set stderr"))?;
     match state {
         VmState::Complete(value) => {
             Reflect::set(&obj, &JsValue::from_str("output"), &value_to_js(&value, heap)?)
