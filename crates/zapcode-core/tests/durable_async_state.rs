@@ -372,7 +372,9 @@ fn session_chunks_hop_with_async_state_in_flight() {
         .unwrap();
     let session = match state {
         ZapcodeSessionState::Complete {
-            session, output, ..
+            mut session,
+            output,
+            ..
         } => {
             assert_eq!(output.to_js_string(session.heap()), "ready");
             ZapcodeSessionSnapshot::load(&session.dump().unwrap()).unwrap()
@@ -403,7 +405,9 @@ fn session_chunks_hop_with_async_state_in_flight() {
                 n += 1;
             }
             ZapcodeSessionState::Complete {
-                session, output, ..
+                mut session,
+                output,
+                ..
             } => {
                 assert_eq!(output.to_js_string(session.heap()), "v0v0|v1v1");
                 break;

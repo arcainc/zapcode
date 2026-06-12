@@ -204,14 +204,25 @@ fn global_fn(name: &str, heap: &mut Heap) -> Value {
     let mut obj = IndexMap::new();
     obj.insert(Arc::from("__global_fn__"), Value::String(JsString::from(name)));
     if name == "Symbol" {
-        // Well-known `Symbol.iterator`. Real JS exposes a unique symbol; this
-        // crate has no symbol-keyed property storage, so the well-known iterator
-        // resolves to a stable sentinel STRING. A computed key
-        // `{ [Symbol.iterator]() {} }` then stores the method under this string
-        // key, and `for...of`/spread/destructure look it up to run the protocol.
+        // Well-known `Symbol.iterator`. Real JS exposes a unique symbol;
+        // this crate has no symbol-keyed property storage, so the well-known
+        // iterator is a SYMBOL-BRANDED object (`typeof` reports "symbol")
+        // whose stringification is a stable sentinel key. A computed key
+        // `{ [Symbol.iterator]() {} }` stores the method under that string
+        // key, and `for...of`/spread/destructure look it up for the protocol.
+        let mut iter_sym = IndexMap::new();
+        iter_sym.insert(Arc::from("__symbol__"), Value::Bool(true));
+        iter_sym.insert(
+            Arc::from("__sym_key__"),
+            Value::String(JsString::from(SYMBOL_ITERATOR_KEY)),
+        );
+        iter_sym.insert(
+            Arc::from("description"),
+            Value::String(JsString::from("Symbol.iterator")),
+        );
         obj.insert(
             Arc::from("iterator"),
-            Value::String(JsString::from(SYMBOL_ITERATOR_KEY)),
+            Value::Object(heap.alloc_object(iter_sym)),
         );
         // Global symbol registry: Symbol.for(key) / Symbol.keyFor(sym).
         obj.insert(Arc::from("for"), global_fn_marker("Symbol.for", heap));

@@ -707,9 +707,11 @@ fn run_result_to_either(
         VmState::Suspended {
             function_name,
             args,
-            snapshot,
+            mut snapshot,
         } => {
-            let js_args = values_to_json(&args, &heap)?;
+            // Suspension args index the SNAPSHOT's heap (compacted at
+            // capture), not the live VM heap — marshal against it.
+            let js_args = values_to_json(&args, snapshot.heap())?;
             let snap_bytes = snapshot
                 .dump()
                 .map_err(|e| napi::Error::from_reason(e.to_string()))?;
@@ -724,9 +726,9 @@ fn run_result_to_either(
         VmState::SuspendedMany {
             calls,
             combinator,
-            snapshot,
+            mut snapshot,
         } => {
-            let js_calls = external_calls_to_js(&calls, &heap)?;
+            let js_calls = external_calls_to_js(&calls, snapshot.heap())?;
             let snap_bytes = snapshot
                 .dump()
                 .map_err(|e| napi::Error::from_reason(e.to_string()))?;
@@ -763,9 +765,11 @@ fn run_result_to_either_with_stdout(
         VmState::Suspended {
             function_name,
             args,
-            snapshot,
+            mut snapshot,
         } => {
-            let js_args = values_to_json(&args, &heap)?;
+            // Suspension args index the SNAPSHOT's heap (compacted at
+            // capture), not the live VM heap — marshal against it.
+            let js_args = values_to_json(&args, snapshot.heap())?;
             let snap_bytes = snapshot
                 .dump()
                 .map_err(|e| napi::Error::from_reason(e.to_string()))?;
@@ -780,9 +784,9 @@ fn run_result_to_either_with_stdout(
         VmState::SuspendedMany {
             calls,
             combinator,
-            snapshot,
+            mut snapshot,
         } => {
-            let js_calls = external_calls_to_js(&calls, &heap)?;
+            let js_calls = external_calls_to_js(&calls, snapshot.heap())?;
             let snap_bytes = snapshot
                 .dump()
                 .map_err(|e| napi::Error::from_reason(e.to_string()))?;
@@ -828,9 +832,10 @@ fn values_to_json(values: &[Value], heap: &Heap) -> napi::Result<Vec<serde_json:
 type SessionEither =
     Either3<ZapcodeSessionResult, ZapcodeSessionSuspension, ZapcodeSessionBatchSuspension>;
 
-fn session_state_to_either(state: ZapcodeSessionState) -> napi::Result<SessionEither> {
-    // Clone the session's heap up front: it resolves the handles in
-    // `output`/`args`/`calls` and is moved into the dumped session below.
+fn session_state_to_either(mut state: ZapcodeSessionState) -> napi::Result<SessionEither> {
+    // Clone the session's MATERIALIZED heap up front: it resolves the
+    // handles in `output`/`args`/`calls` (which the capture compacted and
+    // remapped against it); the session itself is dumped below.
     let heap = state.heap().clone();
     match state {
         ZapcodeSessionState::Complete {

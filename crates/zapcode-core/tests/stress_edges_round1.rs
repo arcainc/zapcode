@@ -59,9 +59,11 @@ fn in_operator_array_membership() {
     // Numeric-string keys behave like indices.
     assert_eq!(run_str(r#""0" in [1,2]"#), "true");
     assert_eq!(run_str(r#""2" in [1,2]"#), "false");
-    // Own-key membership only: inherited prototype keys stay absent.
-    assert_eq!(run_str(r#""toString" in {a:1}"#), "false");
-    assert_eq!(run_str(r#""push" in [1,2]"#), "false");
+    // Inherited prototype members are reported, matching real JS (promoted
+    // from an own-keys-only divergence).
+    assert_eq!(run_str(r#""toString" in {a:1}"#), "true");
+    assert_eq!(run_str(r#""push" in [1,2]"#), "true");
+    assert_eq!(run_str(r#""nope" in [1,2]"#), "false");
 }
 
 // ---------------------------------------------------------------------------

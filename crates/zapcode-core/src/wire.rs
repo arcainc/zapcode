@@ -63,7 +63,9 @@ const MAGIC: &[u8; 4] = b"ZPC1";
 /// incompatible with v11.
 /// v13: deterministic timers (`VmSnapshot::{timers, next_timer_id}` for
 /// `setTimeout`), incompatible with v12.
-pub(crate) const FORMAT_VERSION: u16 = 13;
+/// v14: `CallFrame.is_constructor` (constructor-only implicit-`this` return)
+/// and snapshot-time heap compaction, incompatible with v13.
+pub(crate) const FORMAT_VERSION: u16 = 14;
 
 const HEADER_LEN: usize = 4 + 2 + 1 + 1 + 32;
 

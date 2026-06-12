@@ -926,7 +926,19 @@ impl<'a> AstLowerer<'a> {
                         // `#method` -> stored under a "#"-prefixed key (hidden
                         // from reflection); `this.#method()` reads the same key.
                         ast::PropertyKey::PrivateIdentifier(id) => format!("#{}", id.name),
-                        _ => continue, // skip computed method names
+                        // `[Symbol.iterator]` is statically recognizable:
+                        // store the method under the well-known key the
+                        // iteration protocol reads (`drain_custom_iterator`
+                        // via `builtins::SYMBOL_ITERATOR_KEY`), exactly like
+                        // the object-literal lowering.
+                        ast::PropertyKey::StaticMemberExpression(sm)
+                            if matches!(&sm.object,
+                                ast::Expression::Identifier(o) if o.name == "Symbol")
+                                && sm.property.name == "iterator" =>
+                        {
+                            "__@@iterator".to_string()
+                        }
+                        _ => continue, // other computed method names unsupported
                     };
 
                     let func = &method.value;
@@ -941,7 +953,7 @@ impl<'a> AstLowerer<'a> {
                         params,
                         body: body_stmts,
                         is_async: func.r#async,
-                        is_generator: false,
+                        is_generator: func.generator,
                         is_arrow: false,
                         span: self.span(func.span),
                     };
@@ -1411,6 +1423,40 @@ impl<'a> AstLowerer<'a> {
                 // `strings[i]` / `.join` / `.map` / `.reduce`). Its `.raw`
                 // companion property is NOT provided yet — `String.raw` and tags
                 // that read `strings.raw` are a documented residual.
+                // `String.raw` is recognized statically and desugared to a
+                // concatenation of the RAW quasi texts with the interpolated
+                // values — the overwhelmingly common use (custom tags reading
+                // `strings.raw` remain a documented residual: the strings
+                // array carries only the cooked texts).
+                if let ast::Expression::StaticMemberExpression(sm) = &s.tag {
+                    let is_string_raw = matches!(&sm.object,
+                        ast::Expression::Identifier(o) if o.name == "String")
+                        && sm.property.name == "raw";
+                    if is_string_raw {
+                        let mut acc: Option<Expr> = None;
+                        let mut push = |e: Expr, acc: &mut Option<Expr>| {
+                            *acc = Some(match acc.take() {
+                                None => e,
+                                Some(prev) => Expr::Binary {
+                                    op: BinOp::Add,
+                                    left: Box::new(prev),
+                                    right: Box::new(e),
+                                },
+                            });
+                        };
+                        for (i, q) in s.quasi.quasis.iter().enumerate() {
+                            push(Expr::StringLit(q.value.raw.to_string()), &mut acc);
+                            if let Some(e) = s.quasi.expressions.get(i) {
+                                let lowered = self.lower_expr(e)?;
+                                // Force string concatenation even when the
+                                // first quasi is empty and both operands are
+                                // numbers.
+                                push(lowered, &mut acc);
+                            }
+                        }
+                        return Ok(acc.unwrap_or(Expr::StringLit(String::new())));
+                    }
+                }
                 let tag = self.lower_expr(&s.tag)?;
                 let cooked: Vec<Option<Expr>> = s
                     .quasi

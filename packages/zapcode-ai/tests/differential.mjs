@@ -868,6 +868,139 @@ const realistic = [
    }
    if (cur.length) batches.push(cur);
    return batches.map(b => Math.max(...b)).join(',');`,
+
+  // ── round 3: modern array & object surface ───────────────────────────
+  `const base = [3, 1, 2]; const sorted = base.toSorted(); const rev = base.toReversed(); const w = base.with(1, 9); return JSON.stringify({ base, sorted, rev, w });`,
+  `const log = [5, 2, 9, 1]; return [log.some(x => x > 8), log.every(x => x > 0), log.reduceRight((a, b) => a + '-' + b)].join('|');`,
+  `const buf = new Array(6).fill(0).map((_, i) => i); buf.copyWithin(0, 3); return buf.join(',');`,
+  `const o = Object.assign({}, { a: 1, b: 2 }, { b: 3, c: 4 }, null, { d: 5 }); return JSON.stringify(o);`,
+  `const mixed = { b: 1, 2: 'two', a: 3, 1: 'one' }; return Object.keys(mixed).join(',');`,
+  `const user = { name: 'ana' }; return [('name' in user), user.hasOwnProperty('name'), ('toString' in user), user.hasOwnProperty('toString')].join(',');`,
+  `const defaults = { retries: 3, debug: false }; const override = { debug: true }; return JSON.stringify({ ...defaults, ...override, source: 'env' });`,
+  `return [Number.isInteger(5.0), Number.isSafeInteger(2 ** 53), Number.MAX_SAFE_INTEGER === 2 ** 53 - 1, Math.abs(0.1 + 0.2 - 0.3) < Number.EPSILON].join(',');`,
+  `return [Math.hypot(3, 4), Math.cbrt(27), Math.sign(-5), Math.trunc(-4.7), Math.log2(1024), Math.log10(1000)].join(',');`,
+  `return [(12345.6789).toExponential(2), (0.5).toFixed(0), (1.005).toFixed(2)].join('|');`,
+
+  // ── round 3: string surface agents actually hit ──────────────────────
+  `const s = 'Hello, World'; return [s.startsWith('Hello'), s.endsWith('World'), s.startsWith('World', 7), s.includes('lo, W')].join(',');`,
+  `return ['  pad  '.trimStart() + '|', '|' + '  pad  '.trimEnd(), 'ab'.repeat(3), 'a-b-c-d'.split('-', 2).join('+')].join(' ');`,
+  `const path = '/api/v2/users/42/orders'; const parts = path.split('/').filter(Boolean); return parts.at(-2) + ':' + parts.lastIndexOf('users');`,
+  `return ['café'.normalize('NFC').length, 'cafe\\u0301'.normalize('NFC').length, 'x'.codePointAt(0)].join(',');`,
+  `const csvField = 'said "hi", left'; const quoted = '"' + csvField.replaceAll('"', '""') + '"'; return quoted;`,
+
+  // ── round 3: regex replacement patterns ────────────────────────────────
+  `return 'john smith'.replace(/(\\w+) (\\w+)/, '$2, $1');`,
+  `return '2026-06-11'.replace(/(?<y>\\d{4})-(?<m>\\d{2})-(?<d>\\d{2})/, '$<d>/$<m>/$<y>');`,
+  `return 'price: 42'.replace(/\\d+/, m => String(Number(m) * 2)) + '|' + 'aaa'.replace(/a/g, '$&$&');`,
+  `const re = /t(e)(st(\\d?))/g; const out = []; let m; while ((m = re.exec('test1test2')) !== null) { out.push(m[0] + ':' + m[3] + '@' + m.index); } return out.join(',');`,
+  `const r = /ab+c/gi; return [r.source, r.flags, r.global, r.ignoreCase].join('|');`,
+
+  // ── round 3: classes & closures in agent shapes ───────────────────────
+  `class Tool {
+     static registry = [];
+     static register(name) { Tool.registry.push(name); return new Tool(name); }
+     constructor(name) { this.name = name; }
+     describe() { return 'tool:' + this.name; }
+   }
+   const t1 = Tool.register('search'); Tool.register('fetch');
+   return t1.describe() + '|' + Tool.registry.join(',');`,
+  `class Base { greet() { return 'base'; } } class Mid extends Base { greet() { return 'mid>' + super.greet(); } } class Leaf extends Mid { greet() { return 'leaf>' + super.greet(); } } const l = new Leaf(); return l.greet() + '|' + (l instanceof Base) + ',' + (l instanceof Mid);`,
+  `class Money { constructor(cents) { this.cents = cents; } toString() { return '$' + (this.cents / 100).toFixed(2); } } const m = new Money(1999); return \`total: \${m}\`;`,
+  `const counters = []; for (let i = 0; i < 3; i++) { counters.push(() => i * 10); } return counters.map(f => f()).join(',');`,
+  `function makeCounter() { let n = 0; return { inc: () => ++n, get: () => n }; } const c1 = makeCounter(), c2 = makeCounter(); c1.inc(); c1.inc(); c2.inc(); return c1.get() + ',' + c2.get();`,
+  `const config = (() => { const secret = 'abc'; return { masked: () => secret.replace(/./g, '*') }; })(); return config.masked();`,
+
+  // ── round 3: collections depth ────────────────────────────────────────
+  `const m = new Map(); const kObj = { id: 1 }; m.set(kObj, 'by-ref'); m.set(NaN, 'nan-key'); m.set(1, 'int'); m.set('1', 'str'); return [m.get(kObj), m.get(NaN), m.get(1), m.get('1'), m.has({ id: 1 })].join('|');`,
+  `const a = new Set([1, 2, 3, 4]); const b = new Set([3, 4, 5]); const inter = [...a].filter(x => b.has(x)); const union = new Set([...a, ...b]); return inter.join(',') + '|' + union.size;`,
+  `const m = new Map([['b', 2], ['a', 1]]); const out = []; m.forEach((v, k) => out.push(k + '=' + v)); return out.join(',') + '|' + [...m.entries()].flat().join('');`,
+  `const visits = new Map(); for (const page of ['a', 'b', 'a', 'c', 'a']) { visits.set(page, (visits.get(page) ?? 0) + 1); } const top = [...visits].sort((x, y) => y[1] - x[1])[0]; return top.join(':');`,
+
+  // ── round 3: generators & iterator protocol ───────────────────────────
+  `function* chunks(arr, size) { for (let i = 0; i < arr.length; i += size) yield arr.slice(i, i + size); } return [...chunks([1,2,3,4,5], 2)].map(c => c.join('')).join('|');`,
+  `function* infinite() { let i = 0; while (true) yield i++; } const it = infinite(); const first = [it.next().value, it.next().value]; const r = it.return('stop'); return first.join(',') + '|' + r.done + ',' + it.next().done;`,
+  `function* gen() { yield 1; yield 2; yield 3; } const [first, ...rest] = gen(); return first + '|' + rest.join(',');`,
+  `class Range { constructor(a, b) { this.a = a; this.b = b; } *[Symbol.iterator]() { for (let i = this.a; i <= this.b; i++) yield i; } } return [...new Range(2, 5)].join(',');`,
+
+  // ── round 3: async patterns, one more pass ────────────────────────────
+  `const results = []; for await (const v of [Promise.resolve('a'), 'plain', Promise.resolve('c')]) { results.push(v); } return results.join(',');`,
+  `const fetchUser = async id => ({ id, name: 'u' + id }); const fetchOrders = async user => [user.id * 10, user.id * 10 + 1]; const user = await fetchUser(7); const orders = await fetchOrders(user); return user.name + ':' + orders.join(',');`,
+  `async function risky(n) { if (n > 2) throw new RangeError('too big: ' + n); return n; } const settled = await Promise.allSettled([1, 2, 3, 4].map(risky)); return settled.map(s => s.status === 'fulfilled' ? s.value : s.reason.name).join(',');`,
+  `let timeline = []; async function step(name) { timeline.push('start:' + name); await Promise.resolve(); timeline.push('end:' + name); } await Promise.all([step('a'), step('b')]); return timeline.join(',');`,
+  `const cache = {}; async function once(key, fn) { if (!(key in cache)) cache[key] = await fn(); return cache[key]; } let calls = 0; const f = async () => { calls++; return 'val'; }; await once('k', f); await once('k', f); return calls;`,
+
+  // ── round 3: JSON depth ───────────────────────────────────────────────
+  `const payload = { user: { id: 7 }, tags: ['a', 'b'] }; return JSON.stringify(payload, null, 2).split('\\n').length;`,
+  `return JSON.stringify({ a: 1, b: 2, c: 3 }, ['a', 'c']);`,
+  `const inv = { date: new Date(Date.UTC(2026, 0, 5)), total: 99 }; const s = JSON.stringify(inv); return s.includes('2026-01-05') + '|' + JSON.parse(s).total;`,
+  `class Temp { constructor(c) { this.c = c; } toJSON() { return { celsius: this.c, f: this.c * 9 / 5 + 32 }; } } return JSON.stringify({ reading: new Temp(20) });`,
+  `return JSON.stringify(JSON.parse('{ "a" : [ 1 , 2 ] , "b" : null }'));`,
+
+  // ── round 3: control flow & operators in real shapes ──────────────────
+  `function category(code) { switch (true) { case code < 200: return 'info'; case code < 300: return 'ok'; case code < 400: return 'redirect'; default: return 'error'; } } return [101, 204, 301, 503].map(category).join(',');`,
+  `function level(n) { switch (n) { case 0: case 1: return 'low'; case 2: return 'mid'; default: return 'high'; } } return [0, 1, 2, 5].map(level).join(',');`,
+  `let attempts = 0, result = null; while (result === null && attempts < 5) { attempts += 1; if (attempts === 3) result = 'found'; } return result + '@' + attempts;`,
+  `const flags = 0b1010; return [(flags & 0b10) !== 0, (flags | 0b1) === 11, flags >> 1, (flags ^ 0b1111)].join(',');`,
+  `const score = 77; const grade = score >= 90 ? 'A' : score >= 80 ? 'B' : score >= 70 ? 'C' : 'F'; return grade;`,
+  `let a = 5; a += 2; a **= 2; a %= 30; a ||= 99; let b = null; b ??= 'filled'; let c = 'keep'; c ??= 'no'; return [a, b, c].join(',');`,
+  `const ids = []; for (const [i, ch] of [...'abc'].entries()) ids.push(i + ch); return ids.join(',');`,
+
+  // ── round 3: tagged templates & misc surface ──────────────────────────
+  `const esc = (strings, ...vals) => strings.reduce((acc, s, i) => acc + s + (i < vals.length ? String(vals[i]).replaceAll("'", "''") : ''), ''); const name = "O'Brien"; return esc\`SELECT * WHERE name = '\${name}'\`;`,
+  `return [void 0 === undefined, (1, 2, 3), typeof void 'x'].join('|');`,
+  `const cloned = structuredClone(new Map([['a', [1, 2]]])); return cloned instanceof Map ? cloned.get('a').join(',') : 'not-map';`,
+  `const big = 9007199254740993n; return (big + 1n).toString() + '|' + (typeof big);`,
+  `const d = new Date(Date.UTC(2026, 11, 31, 23, 59)); d.setUTCDate(d.getUTCDate() + 1); return d.toISOString().slice(0, 16);`,
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  stdlib surface sweep — every commonly-used method, probed by name so a
+  //  missing one fails loudly here rather than deep inside an agent program.
+  // ════════════════════════════════════════════════════════════════════════
+
+  // Array.prototype (mutators)
+  `const a = [1, 2, 3]; a.push(4, 5); const p = a.pop(); a.unshift(0); const sh = a.shift(); a.splice(1, 2, 'x'); return JSON.stringify({ a, p, sh });`,
+  `const a = [3, 1, 2]; a.sort(); a.reverse(); a.fill(0, 2); a.copyWithin(0, 1); return a.join(',');`,
+  // Array.prototype (readers)
+  `const a = [1, 2, 3, 4]; return [a.slice(1, 3).join(''), a.concat([5]).length, a.indexOf(3), a.lastIndexOf(2), a.includes(9), a.at(-2)].join('|');`,
+  `const a = [5, 12, 8, 130]; return [a.find(x => x > 10), a.findIndex(x => x > 10), a.findLast(x => x > 10), a.findLastIndex(x => x > 10)].join(',');`,
+  `const a = [1, 2, 3]; return [a.some(x => x > 2), a.every(x => x > 0), a.filter(x => x % 2).join(''), a.map(x => x * 2).join(''), a.reduce((s, x) => s + x, 0), a.reduceRight((s, x) => s + x)].join('|');`,
+  `return [[1, [2, [3]]].flat().length, [1, 2].flatMap(x => [x, x]).join(''), [...[1, 2].keys()].join(''), [...[1, 2].values()].join(''), [...['a'].entries()][0].join(':')].join('|');`,
+  `const a = [3, 1]; return [a.toSorted().join(''), a.toReversed().join(''), a.with(0, 9).join(''), a.toSpliced(0, 1).join(''), a.join('-')].join('|');`,
+  `return [Array.isArray([]), Array.from('ab').join(''), Array.from({ length: 3 }, (_, i) => i).join(''), Array.of(1, 2).join('')].join('|');`,
+  // String.prototype
+  `const s = 'Hello World'; return [s.charAt(1), s.charCodeAt(0), s.codePointAt(0), s.at(-1), s.indexOf('o'), s.lastIndexOf('o'), s.includes('World')].join('|');`,
+  `const s = 'Hello'; return [s.startsWith('He'), s.endsWith('lo'), s.slice(1, 3), s.substring(1, 3), s.toUpperCase(), s.toLowerCase()].join('|');`,
+  `return ['  x  '.trim(), ' x '.trimStart(), ' x '.trimEnd(), '5'.padStart(3, '0'), '5'.padEnd(3, '!'), 'ab'.repeat(2), 'a,b,c'.split(',').length].join('|');`,
+  `return ['a-b'.replace('-', '+'), 'a-b-c'.replaceAll('-', '+'), 'x1y2'.match(/\\d/g).join(''), 'abc'.search(/b/), 'a'.concat('b'), 'a'.localeCompare('b') < 0, 'caf\\u00e9'.normalize().length, String.fromCharCode(72, 105)].join('|');`,
+  `return [[...'hi'].join('-'), 'abc'[1], \`\${1}\${'x'}\`, String.raw\`a\\nb\`.length].join('|');`,
+  // Object statics
+  `const o = { b: 2, a: 1 }; return [Object.keys(o).join(''), Object.values(o).join(''), Object.entries(o).flat().join(''), Object.assign({}, o, { c: 3 }).c, Object.fromEntries([['x', 1]]).x].join('|');`,
+  `const o = Object.freeze({ a: 1 }); return [Object.isFrozen(o), Object.hasOwn({ a: 1 }, 'a'), Object.hasOwn({}, 'a'), Object.getOwnPropertyNames({ a: 1, b: 2 }).join('')].join('|');`,
+  `return JSON.stringify(Object.groupBy([1.1, 2.2, 1.9], Math.floor));`,
+  // Number + Math
+  `return [Number.parseFloat('1.5x'), Number.parseInt('ff', 16), Number.isNaN(NaN), Number.isFinite(1 / 0), Number.isInteger(2.0), Number.isSafeInteger(2 ** 53)].join('|');`,
+  `return [(3.14159).toFixed(2), (1234.5).toPrecision(3), (0.00001).toExponential(1), (255).toString(2).length, Number.MAX_SAFE_INTEGER > 0, Number.EPSILON > 0].join('|');`,
+  `return [Math.abs(-2), Math.ceil(1.1), Math.floor(1.9), Math.round(2.5), Math.trunc(-1.7), Math.sign(-9), Math.sqrt(16), Math.cbrt(8), Math.pow(2, 5), 2 ** 6].join(',');`,
+  `return [Math.min(3, 1, 2), Math.max(3, 1, 2), Math.hypot(3, 4), Math.exp(0), Math.log(1), Math.log2(8), Math.log10(100), Math.atan2(0, 1), typeof Math.random()].join(',');`,
+  // JSON
+  `return [JSON.stringify({ a: [1, null], b: 'x' }), JSON.parse('[1, 2]').length, JSON.stringify({ a: 1, b: 2 }, ['a']), JSON.stringify({ a: 1 }, null, 2).includes('  '), JSON.parse('"s"')].join('|');`,
+  // Map / Set
+  `const m = new Map([['a', 1]]); m.set('b', 2); const had = m.has('a'); m.delete('a'); return [had, m.size, m.get('b'), [...m.keys()].join(''), [...m.values()].join(''), [...m.entries()].flat().join('')].join('|');`,
+  `const s = new Set([1, 2, 2]); s.add(3); const had = s.has(1); s.delete(1); return [had, s.size, [...s].join(''), [...s.keys()].join('')].join('|');`,
+  `const m = new Map([['k', 1]]); m.clear(); const s = new Set([1]); s.clear(); return m.size + ',' + s.size;`,
+  `const m = Map.groupBy([1, 2, 3], n => n % 2 ? 'odd' : 'even'); return [...m.keys()].sort().join(',') + '|' + m.get('odd').join('');`,
+  // Promise statics + instance
+  `const r = await Promise.all([Promise.resolve(1), 2]); const s = await Promise.allSettled([Promise.reject('e')]); const rc = await Promise.race([Promise.resolve('w')]); const an = await Promise.any([Promise.reject('x'), Promise.resolve('y')]); return [r.join(''), s[0].status, rc, an].join('|');`,
+  `let out = []; await Promise.resolve(1).then(v => out.push('t' + v)).finally(() => out.push('f')); await Promise.reject('e').catch(e => out.push('c' + e)); return out.join(',');`,
+  // Date (UTC surface)
+  `const d = new Date(Date.UTC(2026, 2, 15, 10, 30, 45, 500)); return [d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), d.getUTCDay(), d.getUTCHours(), d.getUTCMinutes(), d.getUTCSeconds(), d.getUTCMilliseconds()].join(',');`,
+  `const d = new Date(0); d.setUTCFullYear(2030, 5, 20); d.setUTCHours(8, 15, 30, 250); return d.toISOString();`,
+  `const d = new Date('2026-04-01T12:00:00Z'); d.setTime(d.getTime() + 86400000); return [d.toISOString().slice(0, 10), d.getTime() > 0, typeof Date.now(), Date.parse('2026-01-01T00:00:00Z') > 0].join('|');`,
+  // RegExp surface
+  `const re = /(\\w+)@(\\w+)/; const m = 'user@host'.match(re); return [re.test('a@b'), m[1], m[2], m.index, re.exec('x@y')[0], re.source.length > 0, re.flags].join('|');`,
+  // globals
+  `return [parseInt('42px'), parseFloat('3.5kg'), isNaN('x'), isFinite('5'), encodeURIComponent('a b'), decodeURIComponent('a%20b'), btoa('ok'), atob('b2s=')].join('|');`,
+  `return [typeof structuredClone({}), typeof queueMicrotask, typeof setTimeout, typeof clearTimeout, typeof Symbol(), typeof Symbol.iterator].join('|');`,
 ];
 
 // ════════════════════════════════════════════════════════════════════════════

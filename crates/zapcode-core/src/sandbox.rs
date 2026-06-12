@@ -55,6 +55,9 @@ pub struct ResourceTracker {
     pub current_stack_depth: usize,
     pub peak_stack_depth: usize,
     start_time: Option<std::time::Instant>,
+    /// Instructions dispatched since the last wall-clock read (see
+    /// [`Self::check_time`]).
+    time_check_counter: u32,
 }
 
 impl ResourceTracker {
@@ -62,7 +65,18 @@ impl ResourceTracker {
         self.start_time = Some(std::time::Instant::now());
     }
 
-    pub fn check_time(&self, limits: &ResourceLimits) -> crate::error::Result<()> {
+    /// Enforce the wall-clock limit. Called once per dispatched instruction,
+    /// so the actual clock read is AMORTIZED: it happens every 1024 calls
+    /// (reading the clock dominates the dispatch loop otherwise — ~30 ns per
+    /// instruction on a ~70 ns instruction budget). The worst-case overshoot
+    /// is 1024 instructions ≈ tens of microseconds, noise against
+    /// millisecond-scale `time_limit_ms` values; per-operation work between
+    /// checks stays bounded by the memory/allocation limits.
+    pub fn check_time(&mut self, limits: &ResourceLimits) -> crate::error::Result<()> {
+        self.time_check_counter = self.time_check_counter.wrapping_add(1);
+        if self.time_check_counter & 0x3ff != 0 {
+            return Ok(());
+        }
         if let Some(start) = self.start_time {
             if start.elapsed().as_millis() as u64 > limits.time_limit_ms {
                 return Err(crate::ZapcodeError::TimeLimitExceeded);

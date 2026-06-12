@@ -122,6 +122,19 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 
 impl VmSnapshot {
     pub(crate) fn capture(vm: &Vm) -> Self {
+        Self::capture_with(vm, &mut |_| {})
+    }
+
+    /// Like [`Self::capture`], but `extra` walks host-facing values that ride
+    /// OUTSIDE the snapshot (the `args`/`calls` of a `VmState::Suspended*`).
+    /// They are added as compaction roots and remapped to the compacted
+    /// layout — without this, the host would read them against a heap whose
+    /// slots moved (or were dropped: a pending call's args are removed from
+    /// `pending_calls` before capture, so nothing else roots them).
+    pub(crate) fn capture_with(
+        vm: &Vm,
+        extra: &mut dyn FnMut(&mut dyn FnMut(&mut crate::heap::Handle)),
+    ) -> Self {
         // Filter out builtin globals — they'll be re-registered on resume.
         // Sort by name: globals live in a HashMap whose iteration order is
         // randomized per-instance, so without sorting two captures of the same
@@ -139,21 +152,7 @@ impl VmSnapshot {
         let mut external_functions: Vec<String> = vm.external_functions.iter().cloned().collect();
         external_functions.sort();
 
-        // Elide the builtin-template prefix when it is still byte-identical
-        // to the template (the overwhelmingly common case — guest code rarely
-        // mutates builtin objects). A mutated prefix, or a heap seeded with
-        // caller data (builtin_base == 0), serializes in full.
-        let template = template_heap_bytes();
-        let (heap, heap_template_elided, template_fingerprint) = if vm.builtin_base > 0
-            && postcard::to_allocvec(&vm.heap.prefix(vm.builtin_base)).as_deref()
-                == Ok(template.0.as_slice())
-        {
-            (vm.heap.tail_from(vm.builtin_base), true, template.1)
-        } else {
-            (vm.heap.clone(), false, 0)
-        };
-
-        Self {
+        let mut snapshot = Self {
             programs: vm.programs.clone(),
             stack: vm.stack.clone(),
             frames: vm.frames.clone(),
@@ -176,17 +175,189 @@ impl VmSnapshot {
             resume_action: vm.resume_action.clone(),
             allocations: vm.tracker.allocations,
             rng_state: vm.rng_state,
-            heap,
+            heap: vm.heap.clone(),
             microtasks: vm.microtasks.clone(),
             unhandled_rejections: vm.unhandled_rejections.clone(),
             async_tasks: vm.async_tasks.clone(),
             next_async_task_id: vm.next_async_task_id,
             generator_try_frames: vm.generator_try_frames.clone(),
             builtin_base: vm.builtin_base as u64,
-            heap_template_elided,
-            template_fingerprint,
+            heap_template_elided: false,
+            template_fingerprint: 0,
             timers: vm.timers.clone(),
             next_timer_id: vm.next_timer_id,
+        };
+        // Drop dead heap slots first (the arena never frees during
+        // execution, so a churning agent otherwise persists every dead
+        // temporary in every snapshot, forever), THEN elide the template
+        // prefix the compactor deliberately retained.
+        snapshot.compact_heap(extra);
+        snapshot.elide_template();
+        snapshot
+    }
+
+    /// Visit every heap handle the snapshot serializes OUTSIDE the heap
+    /// itself — the compactor's roots and rewrite targets. Every Value- or
+    /// Handle-bearing field must be walked here; missing one corrupts that
+    /// field on restore (its handle would dangle or point at the wrong
+    /// slot), so additions to `VmSnapshot` carrying values belong here too.
+    fn for_each_handle_mut(&mut self, f: &mut dyn FnMut(&mut crate::heap::Handle)) {
+        fn walk_frame(fr: &mut CallFrame, f: &mut dyn FnMut(&mut crate::heap::Handle)) {
+            for v in &mut fr.locals {
+                v.for_each_handle_mut(f);
+            }
+            if let Some(v) = &mut fr.this_value {
+                v.for_each_handle_mut(f);
+            }
+            if let Some(v) = &mut fr.async_result {
+                v.for_each_handle_mut(f);
+            }
+        }
+        for v in &mut self.stack {
+            v.for_each_handle_mut(f);
+        }
+        for fr in &mut self.frames {
+            walk_frame(fr, f);
+        }
+        for v in &mut self.cells {
+            v.for_each_handle_mut(f);
+        }
+        for (_, v) in &mut self.globals {
+            v.for_each_handle_mut(f);
+        }
+        for c in &mut self.continuations {
+            match c {
+                Continuation::ArrayMap {
+                    callback,
+                    source,
+                    results,
+                    ..
+                } => {
+                    callback.for_each_handle_mut(f);
+                    for v in source.iter_mut().chain(results.iter_mut()) {
+                        v.for_each_handle_mut(f);
+                    }
+                }
+                Continuation::ArrayForEach {
+                    callback, source, ..
+                } => {
+                    callback.for_each_handle_mut(f);
+                    for v in source.iter_mut() {
+                        v.for_each_handle_mut(f);
+                    }
+                }
+                Continuation::MicrotaskReaction {
+                    result_promise,
+                    original_value,
+                    ..
+                } => {
+                    result_promise.for_each_handle_mut(f);
+                    original_value.for_each_handle_mut(f);
+                }
+                Continuation::GeneratorNext { gen_obj, .. } => {
+                    gen_obj.for_each_handle_mut(f);
+                }
+                Continuation::PromiseExecutor { promise, .. } => {
+                    promise.for_each_handle_mut(f);
+                }
+            }
+        }
+        if let Some(v) = &mut self.last_receiver {
+            v.for_each_handle_mut(f);
+        }
+        for pc in &mut self.pending_calls {
+            for v in &mut pc.args {
+                v.for_each_handle_mut(f);
+            }
+        }
+        for v in self.resolved.values_mut() {
+            v.for_each_handle_mut(f);
+        }
+        if let Some(b) = &mut self.pending_batch {
+            for v in &mut b.items {
+                v.for_each_handle_mut(f);
+            }
+        }
+        match &mut self.resume_action {
+            Some(ResumeAction::PromiseMethod { args, .. }) => {
+                for v in args {
+                    v.for_each_handle_mut(f);
+                }
+            }
+            Some(ResumeAction::SettleResult {
+                result_promise,
+                pass_original,
+            }) => {
+                result_promise.for_each_handle_mut(f);
+                if let Some((v, _)) = pass_original {
+                    v.for_each_handle_mut(f);
+                }
+            }
+            Some(ResumeAction::CacheValue { .. }) | None => {}
+        }
+        for m in &mut self.microtasks {
+            m.handler.for_each_handle_mut(f);
+            m.value.for_each_handle_mut(f);
+            m.result_promise.for_each_handle_mut(f);
+        }
+        for h in &mut self.unhandled_rejections {
+            f(h);
+        }
+        for t in self.async_tasks.values_mut() {
+            walk_frame(&mut t.frame, f);
+            for v in &mut t.stack {
+                v.for_each_handle_mut(f);
+            }
+        }
+        for t in &mut self.timers {
+            t.callback.for_each_handle_mut(f);
+        }
+    }
+
+    /// Snapshot-time GC: mark from every serialized handle, compact the heap
+    /// (template prefix always retained), rewrite all handles to the new
+    /// layout. Order-preserving, so bytes stay deterministic.
+    fn compact_heap(&mut self, extra: &mut dyn FnMut(&mut dyn FnMut(&mut crate::heap::Handle))) {
+        let mut roots: Vec<crate::heap::Handle> = Vec::new();
+        self.for_each_handle_mut(&mut |h| roots.push(*h));
+        extra(&mut |h| roots.push(*h));
+        let remap = self
+            .heap
+            .compact_retaining(self.builtin_base as usize, &roots);
+        let mut rewrite = |h: &mut crate::heap::Handle| {
+            let new = remap[*h as usize];
+            debug_assert_ne!(new, crate::heap::Handle::MAX, "compactor dropped a rooted slot");
+            *h = new;
+        };
+        self.for_each_handle_mut(&mut rewrite);
+        extra(&mut rewrite);
+    }
+
+    /// Splice the template back in front of an elided heap so handles in the
+    /// serialized state resolve against `self.heap` directly. The inverse of
+    /// [`Self::elide_template`]; idempotent.
+    pub(crate) fn materialize_heap(&mut self) {
+        if self.heap_template_elided {
+            let tail = std::mem::take(&mut self.heap);
+            self.heap = Heap::with_template_prefix(&crate::vm::builtin_template().1, tail);
+            self.heap_template_elided = false;
+            self.template_fingerprint = 0;
+        }
+    }
+
+    /// Elide the builtin-template prefix when it is still byte-identical to
+    /// the template (the overwhelmingly common case — guest code rarely
+    /// mutates builtin objects). A mutated prefix, or a heap seeded with
+    /// caller data (`builtin_base == 0`), serializes in full.
+    fn elide_template(&mut self) {
+        let template = template_heap_bytes();
+        if self.builtin_base > 0
+            && postcard::to_allocvec(&self.heap.prefix(self.builtin_base as usize)).as_deref()
+                == Ok(template.0.as_slice())
+        {
+            self.heap = self.heap.tail_from(self.builtin_base as usize);
+            self.heap_template_elided = true;
+            self.template_fingerprint = template.1;
         }
     }
 
@@ -267,6 +438,37 @@ impl ZapcodeSnapshot {
         })
     }
 
+    /// Unwrap into the inner [`VmSnapshot`] — used by the session layer to
+    /// REUSE the capture taken at suspension time (whose compaction the
+    /// suspension's `args`/`calls` are already remapped against) instead of
+    /// re-capturing and double-remapping.
+    pub(crate) fn into_vm_snapshot(self) -> VmSnapshot {
+        *self.snapshot
+    }
+
+    /// Capture with a caller-supplied walk over host-facing values that must
+    /// survive compaction (see [`VmSnapshot::capture_with`]).
+    pub(crate) fn capture_with(
+        vm: &Vm,
+        extra: &mut dyn FnMut(&mut dyn FnMut(&mut crate::heap::Handle)),
+    ) -> Result<Self> {
+        Ok(Self {
+            snapshot: Box::new(VmSnapshot::capture_with(vm, extra)),
+        })
+    }
+
+    /// Capture, treating `values` (the host-facing suspension args) as extra
+    /// compaction roots and remapping them to the compacted heap layout.
+    pub(crate) fn capture_with_values(vm: &Vm, values: &mut [Value]) -> Result<Self> {
+        Ok(Self {
+            snapshot: Box::new(VmSnapshot::capture_with(vm, &mut |f| {
+                for v in values.iter_mut() {
+                    v.for_each_handle_mut(f);
+                }
+            })),
+        })
+    }
+
     /// Serialize the snapshot to bytes for storage / transport.
     ///
     /// The bytes are wrapped in a versioned, integrity-checked, compressed frame
@@ -307,13 +509,7 @@ impl ZapcodeSnapshot {
     /// would otherwise be tail-relative and dangle after reconstruction.
     /// Capture re-elides the (unchanged) prefix on the next dump.
     fn materialize_heap(&mut self) {
-        if self.snapshot.heap_template_elided {
-            let tail = std::mem::take(&mut self.snapshot.heap);
-            self.snapshot.heap =
-                Heap::with_template_prefix(&crate::vm::builtin_template().1, tail);
-            self.snapshot.heap_template_elided = false;
-            self.snapshot.template_fingerprint = 0;
-        }
+        self.snapshot.materialize_heap();
     }
 
     /// Borrow the snapshot's object heap. A `Value::Array`/`Value::Object`
