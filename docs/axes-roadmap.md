@@ -129,6 +129,10 @@ session chunks):
   smoke-executes against side-effect-free stub tools under a tight budget,
   reporting reached-completion / error-site / the tool-call sequence it would
   make. The "does agent code instantly error" pre-flight.
+- **prepare()** — DONE (cycle 3.5): `prepare(code, tools) -> PreparedProgram`
+  compiles once and `run()`s many times through the same execute loop (tool
+  validation + trace + report), starting from the cycle-1 program cache
+  instead of recompiling — the package-level prepare-once surface.
 - **Forking** — DONE (cycle 3): `forkSnapshot(bytes)` names the proven
   snapshot-fork primitive (load the same suspension bytes N times → N
   independent, deterministic, program-sharing continuations) for agent
