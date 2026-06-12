@@ -454,7 +454,7 @@ fn snapshot_size_constant_across_hops() {
     // a couple of bytes per hop is inherent. The re-registration leak this
     // guards against appended ~40 builtin objects (~70 deflated bytes) per
     // hop — assert growth stays an order of magnitude below that.
-    let per_hop = (sizes[4] - sizes[1]) / 3;
+    let per_hop = sizes[4].saturating_sub(sizes[1]) / 3;
     assert!(
         per_hop < 10,
         "snapshot grew {per_hop} bytes/hop: {sizes:?} (builtin re-registration leak?)"

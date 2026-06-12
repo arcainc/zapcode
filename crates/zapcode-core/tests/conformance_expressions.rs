@@ -459,3 +459,32 @@ fn member_store_through_arbitrary_object_expressions() {
         "yes,no"
     );
 }
+
+#[test]
+fn member_store_chain_rooted_in_call_evaluates_root_once() {
+    // `foo().bar.baz = v` names no storable place above the call: the chain
+    // is evaluated once and the mutation lands through the shared reference.
+    // The root expression must NOT be re-evaluated for a write-back (it used
+    // to run twice, duplicating its side effects).
+    assert_eq!(
+        run_str(
+            "let calls = 0; \
+             const obj = { bar: { baz: 0 } }; \
+             function foo() { calls++; return obj; } \
+             foo().bar.baz = 1; \
+             calls + ':' + obj.bar.baz"
+        ),
+        "1:1"
+    );
+    // Same through a computed link.
+    assert_eq!(
+        run_str(
+            "let calls = 0; \
+             const obj = { bar: [0] }; \
+             function foo() { calls++; return obj; } \
+             foo().bar[0] = 9; \
+             calls + ':' + obj.bar[0]"
+        ),
+        "1:9"
+    );
+}

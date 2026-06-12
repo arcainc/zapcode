@@ -1554,6 +1554,11 @@ impl Vm {
     fn call_scheduler_global(&mut self, kind: &str, args: &[Value]) -> Option<Result<Value>> {
         match kind {
             "setTimeout" => {
+                // A queued timer is an allocation the guest controls — charge
+                // it like any other before creating the entry.
+                if let Err(e) = self.tracker.track_allocation(&self.limits) {
+                    return Some(Err(e));
+                }
                 let callback = args.first().cloned().unwrap_or(Value::Undefined);
                 let delay = args.get(1).map(|v| v.to_number()).unwrap_or(0.0);
                 let delay = if delay.is_finite() && delay > 0.0 { delay } else { 0.0 };
@@ -1575,6 +1580,10 @@ impl Vm {
                 Some(Ok(Value::Undefined))
             }
             "queueMicrotask" => {
+                // Charge the queued job and its hidden result promise.
+                if let Err(e) = self.tracker.track_allocation(&self.limits) {
+                    return Some(Err(e));
+                }
                 let callback = args.first().cloned().unwrap_or(Value::Undefined);
                 let result_promise = builtins::make_pending_promise(&mut self.heap);
                 self.microtasks.push_back(Microtask {
@@ -1612,6 +1621,8 @@ impl Vm {
     /// driven by the main loop via the microtask machinery, so a tool call
     /// inside the callback suspends normally.
     fn start_timer_job(&mut self, t: TimerEntry) -> Result<()> {
+        // The job's hidden result promise is a heap allocation.
+        self.tracker.track_allocation(&self.limits)?;
         let result_promise = builtins::make_pending_promise(&mut self.heap);
         self.start_microtask(Microtask {
             handler: t.callback,
@@ -6906,11 +6917,16 @@ impl Vm {
                                 Some(Value::Array(h))
                             }
                             // Handing a promise to a combinator attaches a
-                            // reaction to it in real JS, so an already-rejected
-                            // element's rejection is CONSUMED by the combinator
+                            // reaction to it in real JS, so an element's
+                            // rejection is CONSUMED by the combinator
                             // (`Promise.allSettled([rejected])` reports it; it
                             // must not surface as an unhandled rejection).
-                            // Clear the marks, then run the normal builtin.
+                            // Clear the marks of already-settled elements, and
+                            // give each still-pending element a sink reaction
+                            // so a LATER settle doesn't mark either — the
+                            // batch reads element status directly, so the sink
+                            // only has to swallow the unhandled-mark.
+                            // Then run the normal builtin.
                             "Promise"
                                 if matches!(
                                     method_name.as_ref(),
@@ -6919,8 +6935,11 @@ impl Vm {
                             {
                                 if let Some(Value::Array(h)) = args.first() {
                                     for item in self.heap.array_vec(*h) {
-                                        if let Value::Object(eh) = item {
-                                            self.mark_rejection_handled(eh);
+                                        if let Value::Object(eh) = &item {
+                                            self.mark_rejection_handled(*eh);
+                                            if self.is_internal_pending(&item) {
+                                                self.register_sink_reaction(*eh)?;
+                                            }
                                         }
                                     }
                                 }
@@ -7933,6 +7952,12 @@ impl Vm {
                                     self.push(val)?;
                                     self.current_frame_mut().ip -= 1;
                                     self.start_microtask(m)?;
+                                } else if let Some(err) = self.unhandled_rejection_error() {
+                                    // Microtasks dry with a rejection nobody
+                                    // handled: fail before firing the next
+                                    // macrotask — the same per-macrotask rule
+                                    // the end-of-drain in `execute()` enforces.
+                                    return Err(err);
                                 } else if let Some(t) = self.pop_due_timer() {
                                     // Microtasks dry but timers pending: a
                                     // top-level await on a timer-settled
