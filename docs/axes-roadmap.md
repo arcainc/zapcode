@@ -58,11 +58,22 @@ high.
 
 ## 3. Conformance
 
-**Current state**: differential gate = 334 snippets + a seeded fuzzer
+**Current state**: differential gate = 339 snippets + a seeded fuzzer
 (`test:fuzz`, auto-minimizing; its first run found a host-aborting slice
-panic and three negative-zero bugs) + an evaluation-count suite (the RMW
-double-eval class). Previously: 330 snippets (whole realistic
-programs + a by-name stdlib sweep), 1 deliberate pin (`Symbol.toPrimitive`).
+panic and three negative-zero bugs) + an evaluation-count suite (RMW
+double-eval) + a side-effect suite (`conformance_side_effects.rs`: order,
+laziness, conversion/iterator/callback/getter counts — the classes
+output-only tests cannot see). That suite's first run caught two real
+divergences, now fixed: plain assignment to a member/index target
+evaluated the VALUE before the object/key (`obj[f()] = g()` ran g before
+f), and `for…of` over a custom `[Symbol.iterator]()` drained the iterator
+eagerly (over-pulling past an early `break`; now a lazy `__custom__`
+marker pulls one `next()` per iteration, calling `[Symbol.iterator]()`
+exactly once per loop). One documented structural residual: array
+DESTRUCTURING still drains eagerly (`const [a,b]=iter` pulls to done, not
+k) — `iterator_destructure_pulls_exactly_k` is `#[ignore]`. Previously:
+330 snippets (whole realistic programs + a by-name stdlib sweep), 1
+deliberate pin (`Symbol.toPrimitive`).
 Known residuals: tagged-template `strings.raw` companion,
 deeper-than-top-level param field defaults, `Promise.race([])` hang-vs-pend,
 generator-body await tick interleaving, eager spread over generators.

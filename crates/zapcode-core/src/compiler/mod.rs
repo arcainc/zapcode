@@ -2242,9 +2242,25 @@ impl Compiler {
             Expr::Assignment { op, target, value } => {
                 match op {
                     AssignOp::Assign => {
-                        self.compile_expr(value)?;
-                        self.emit(Instruction::Dup);
-                        self.compile_store(target)?;
+                        // JS evaluates the target REFERENCE first — object,
+                        // then computed key — and only THEN the right-hand
+                        // side: `obj[f()] = g()` must call f before g.
+                        // `prepare_rmw_target` parks object/key in scratch
+                        // slots (in that order); the value is evaluated after,
+                        // then the store runs from the temps. A plain
+                        // identifier target has no reference to pre-evaluate,
+                        // so it keeps the simple value-then-store lowering.
+                        match self.prepare_rmw_target(target)? {
+                            Some(r) => {
+                                self.compile_expr(value)?;
+                                self.emit_rmw_store(&r);
+                            }
+                            None => {
+                                self.compile_expr(value)?;
+                                self.emit(Instruction::Dup);
+                                self.compile_store(target)?;
+                            }
+                        }
                     }
                     // Logical assignments short-circuit: the right-hand side is
                     // only evaluated (and stored) when the current value fails the

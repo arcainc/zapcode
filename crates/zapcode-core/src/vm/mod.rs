@@ -5215,6 +5215,23 @@ impl Vm {
         Ok(Value::Array(h))
     }
 
+    /// The `IteratorNext` protocol's lazy CUSTOM-iterator marker:
+    /// `["__custom__", iterator_object, done]`. The iterator object is the
+    /// value a user `[Symbol.iterator]()` returned; each `IteratorNext` calls
+    /// its `next()` exactly once, so an early `break` does not over-pull (the
+    /// observable difference from eagerly draining the iterator up front).
+    /// Plain `Value`s only — snapshot-safe with no wire change.
+    fn custom_iter_triple(&mut self, iterator: Value, done: bool) -> Result<Value> {
+        self.track_array_capacity(3)?;
+        self.tracker.track_allocation(&self.limits)?;
+        let h = self.heap.alloc_array(vec![
+            Value::String(JsString::from("__custom__")),
+            iterator,
+            Value::Bool(done),
+        ]);
+        Ok(Value::Array(h))
+    }
+
     fn run_generator_until_yield_or_return(
         &mut self,
         mut gen_obj: GeneratorObject,
@@ -7560,19 +7577,46 @@ impl Vm {
                         self.push(iter_obj)?;
                     }
                     // A plain object exposing a custom `[Symbol.iterator]()`:
-                    // run the iterator protocol to materialize its elements, then
-                    // hand `for...of` a normal array-iterator over them.
-                    Value::Object(_) => {
-                        match self.drain_custom_iterator(&val)? {
-                            Some(items) => {
-                                let iter_obj = iter_from_items(items, &mut self.heap);
-                                self.push(iter_obj)?;
+                    // call the method ONCE (real JS calls it exactly once per
+                    // loop) and hand the loop a LAZY iterator marker, so
+                    // `next()` is pulled one element per iteration. Draining
+                    // the iterator up front (as `drain_custom_iterator` does)
+                    // would over-pull on an early `break`.
+                    Value::Object(h) => {
+                        let iter_fn = self
+                            .heap
+                            .object(h)
+                            .and_then(|m| m.get(builtins::SYMBOL_ITERATOR_KEY).cloned());
+                        let Some(iter_fn @ Value::Function(_)) = iter_fn else {
+                            return Err(ZapcodeError::TypeError(format!(
+                                "{} is not iterable",
+                                val.type_name()
+                            )));
+                        };
+                        let iterator = self.call_method_internal(&iter_fn, val.clone(), vec![])?;
+                        match iterator {
+                            // `*[Symbol.iterator]() { … }` returns a generator:
+                            // reuse the lazy generator marker (main-loop pulls).
+                            Value::Generator(gen_obj) => {
+                                let triple = self.gen_iter_triple(gen_obj.id, false)?;
+                                self.push(triple)?;
                             }
-                            None => {
-                                return Err(ZapcodeError::TypeError(format!(
-                                    "{} is not iterable",
-                                    val.type_name()
-                                )));
+                            Value::Object(ih) => {
+                                let has_next = self.heap.object(ih).is_some_and(|m| {
+                                    matches!(m.get("next"), Some(Value::Function(_)))
+                                });
+                                if !has_next {
+                                    return Err(ZapcodeError::TypeError(
+                                        "iterator has no next() method".into(),
+                                    ));
+                                }
+                                let triple = self.custom_iter_triple(iterator, false)?;
+                                self.push(triple)?;
+                            }
+                            _ => {
+                                return Err(ZapcodeError::TypeError(
+                                    "[Symbol.iterator]() did not return an object".into(),
+                                ));
                             }
                         }
                     }
@@ -7618,6 +7662,47 @@ impl Vm {
                             }
                             return Ok(None);
                         }
+                        // Lazy custom-iterator sentinel: pull exactly ONE
+                        // element by calling the user iterator's next().
+                        if s.as_ref() == "__custom__" {
+                            if matches!(&items[2], Value::Bool(true)) {
+                                // Already exhausted — JS never pulls past the
+                                // first done:true.
+                                self.push(iter)?;
+                                self.push(Value::Undefined)?;
+                                return Ok(None);
+                            }
+                            let iterator = items[1].clone();
+                            let next_fn = match &iterator {
+                                Value::Object(ih) => {
+                                    self.heap.object(*ih).and_then(|m| m.get("next").cloned())
+                                }
+                                _ => None,
+                            };
+                            let Some(next_fn @ Value::Function(_)) = next_fn else {
+                                return Err(ZapcodeError::TypeError(
+                                    "iterator has no next() method".into(),
+                                ));
+                            };
+                            let result =
+                                self.call_method_internal(&next_fn, iterator.clone(), vec![])?;
+                            let (value, done) = match &result {
+                                Value::Object(rh) => {
+                                    let m = self.heap.object_map(*rh);
+                                    (
+                                        m.get("value").cloned().unwrap_or(Value::Undefined),
+                                        m.get("done").is_some_and(|v| v.is_truthy()),
+                                    )
+                                }
+                                // Mirror `drain_custom_iterator`: a non-object
+                                // step result terminates iteration leniently.
+                                _ => (Value::Undefined, true),
+                            };
+                            let new_iter = self.custom_iter_triple(iterator, done)?;
+                            self.push(new_iter)?;
+                            self.push(if done { Value::Undefined } else { value })?;
+                            return Ok(None);
+                        }
                     }
                 }
                 if items.len() == 2 {
@@ -7650,10 +7735,11 @@ impl Vm {
                         return Ok(None);
                     }
                 };
-                // Check for generator iterator first
+                // Check for generator / lazy custom iterators first (both carry
+                // their done flag in the marker's third element).
                 if items.len() == 3 {
                     if let Value::String(s) = &items[0] {
-                        if s.as_ref() == "__gen__" {
+                        if s.as_ref() == "__gen__" || s.as_ref() == "__custom__" {
                             let done = matches!(&items[2], Value::Bool(true));
                             if !done {
                                 self.push(value)?;
