@@ -43,15 +43,17 @@ Object keys are interned per-VM (3,069 → 96 distinct allocations for ~49
 unique keys; pure runtime accelerator, off the wire). Remaining lead:
 in-run arena reuse (still no free during a run).
 
-**Direction**: the arena still never frees *during* a run — compaction
-happens only at snapshot capture. In-run pressure is bounded by
-`memory_limit_bytes`, but long synchronous loops over big temporaries peak
-high.
+**Direction**: in-run heap reuse is now DONE (see
+`docs/in-run-memory-design.md`): the top-level dispatch loop mark-compacts
+the live heap at safe instruction boundaries on a growth / byte-high-water
+trigger, and resets `memory_bytes` to the surviving live estimate — so
+`memory_limit_bytes` is a LIVE ceiling (24 MB churned through an 8 MiB limit
+in `profile_inrun`), not cumulative-allocation. `max_allocations` (count)
+stays the cumulative DoS guard. Validated by `gc_stress.rs` (force-compact
+every instruction across diverse program shapes). No wire change. The
+remaining memory ideas are lower-value:
 
-- **In-run heap reuse**: a free-list or periodic in-place compaction at
-  safe points (e.g. piggyback on the amortized 1024-instruction tick when
-  allocation pressure is high). Must preserve handle stability — likely a
-  remap at loop-safe points only; design doc first.
+- **Key interning** — already shipped (cycle 2).
 - **Key interning**: object keys are `Arc<str>` per-insert; a per-VM (or
   template-level) intern pool for hot keys (`status`, `value`, `id`, …)
   would dedupe thousands of tiny allocations. Measure first.
