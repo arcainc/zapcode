@@ -202,3 +202,58 @@ fn snapshot_bytes_deterministic_with_timers_in_flight() {
     let reloaded = ZapcodeSnapshot::load(&a).unwrap().dump().unwrap();
     assert_eq!(a, reloaded);
 }
+
+/// Run `code` expecting the program itself to fail; return the error text.
+fn run_err(code: &str) -> String {
+    ZapcodeRun::new(
+        code.to_string(),
+        Vec::new(),
+        Vec::new(),
+        ResourceLimits::default(),
+    )
+    .unwrap()
+    .run(Vec::new())
+    .expect_err("expected the program to fail")
+    .to_string()
+}
+
+#[test]
+fn unhandled_rejection_fails_before_next_timer_fires() {
+    // The per-macrotask rule holds on the top-level-await path too: once the
+    // microtask queue runs dry, a rejection nobody handled fails the run
+    // BEFORE the next timer fires — a later timer callback cannot
+    // retroactively attach the handler (Node crashes with
+    // ERR_UNHANDLED_REJECTION before that timer ever runs).
+    let err = run_err(
+        "const p = Promise.resolve(1).then(() => { throw new Error('boom'); }); \
+         await new Promise(r => setTimeout(() => { p.catch(() => {}); r(); }, 1)); \
+         'survived'",
+    );
+    assert!(err.contains("Unhandled promise rejection"), "got: {err}");
+    assert!(err.contains("boom"), "got: {err}");
+}
+
+#[test]
+fn combinator_consumes_element_rejection_that_settles_later() {
+    // A combinator attaches to its elements at CALL time, like JS: an element
+    // chain that rejects on a later tick is the combinator's to absorb, even
+    // when the batch itself is never awaited (Node: allSettled never
+    // surfaces element rejections).
+    assert_eq!(
+        run_main(
+            "Promise.allSettled([Promise.resolve(1).then(() => { throw new Error('x'); })]); \
+             await new Promise(r => setTimeout(r, 1)); \
+             return 'done';"
+        ),
+        "done"
+    );
+    // The awaited shape still reports the rejection in its results.
+    assert_eq!(
+        run_main(
+            "const r = await Promise.allSettled([ \
+               Promise.resolve(1).then(() => { throw new Error('x'); })]); \
+             return r[0].status;"
+        ),
+        "rejected"
+    );
+}

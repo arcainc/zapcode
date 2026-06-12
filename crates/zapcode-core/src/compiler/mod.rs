@@ -2868,12 +2868,17 @@ impl Compiler {
 
     /// True for expressions that name a storable place (an identifier or a
     /// member/index chain rooted in one) — the targets `compile_store_inner`
-    /// accepts.
+    /// accepts. The chain must be walked to its root: `foo().bar` is a Member
+    /// node but names no storable place, and write-back would re-evaluate
+    /// `foo()`, duplicating its side effects.
     fn is_store_target(expr: &Expr) -> bool {
-        matches!(
-            expr,
-            Expr::Ident(_) | Expr::Member { .. } | Expr::ComputedMember { .. }
-        )
+        match expr {
+            Expr::Ident(_) => true,
+            Expr::Member { object, .. } | Expr::ComputedMember { object, .. } => {
+                Self::is_store_target(object)
+            }
+            _ => false,
+        }
     }
 
     /// Compile a store to `target`. When `check_const` is true (a direct

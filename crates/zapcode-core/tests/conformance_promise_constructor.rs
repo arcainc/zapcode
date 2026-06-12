@@ -10,9 +10,10 @@
 //!
 //! All assertions ground-truthed against real Node.
 //!
-//! Pinned divergence: `typeof resolve` inside the executor is `"object"`
-//! (the capabilities are marker objects, not function values — a Value-enum
-//! variant would ripple through every binding crate). Calling them works.
+//! The capabilities are marker objects internally (not function values — a
+//! Value-enum variant would ripple through every binding crate), but they
+//! join the callable-marker set in `TypeOf`, so `typeof resolve` reports
+//! `"function"` like Node. Calling them works.
 
 use zapcode_core::vm::VmState;
 use zapcode_core::{ResourceLimits, Value, ZapcodeRun};

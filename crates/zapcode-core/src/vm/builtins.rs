@@ -3884,38 +3884,37 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// WHATWG forgiving-base64-decode (what `atob` specifies, Node included):
+/// strip ASCII whitespace; a length that is a multiple of 4 may carry one or
+/// two trailing `=`; after that, a remaining length of 1 (mod 4) is invalid
+/// and `=` may not appear at all. A short final chunk (2 or 3 digits — i.e.
+/// unpadded input) decodes as if implicitly padded.
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    let cleaned: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    let trimmed = match cleaned.len() % 4 {
-        0 => &cleaned[..],
-        _ => return None,
-    };
+    let mut data: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if data.len() % 4 == 0 {
+        let pad = data.iter().rev().take_while(|b| **b == b'=').take(2).count();
+        data.truncate(data.len() - pad);
+    }
+    if data.len() % 4 == 1 {
+        return None;
+    }
     let val = |b: u8| -> Option<u32> {
         B64_ALPHABET.iter().position(|a| *a == b).map(|i| i as u32)
     };
-    let mut out = Vec::with_capacity(trimmed.len() / 4 * 3);
-    for chunk in trimmed.chunks(4) {
-        let pad = chunk.iter().rev().take_while(|b| **b == b'=').count();
-        if pad > 2 {
-            return None;
-        }
+    let mut out = Vec::with_capacity(data.len() / 4 * 3 + 2);
+    for chunk in data.chunks(4) {
         let mut n: u32 = 0;
-        for (i, b) in chunk.iter().enumerate() {
-            let v = if *b == b'=' {
-                if i < chunk.len() - pad {
-                    return None; // '=' only at the end
-                }
-                0
-            } else {
-                val(*b)?
-            };
-            n = (n << 6) | v;
+        for b in chunk {
+            n = (n << 6) | val(*b)?; // '=' is not in the alphabet → None
         }
+        // Left-justify a short final chunk to a full 24-bit group; the
+        // surplus low bits are the implicit-padding bits and are dropped.
+        n <<= 6 * (4 - chunk.len() as u32);
         out.push((n >> 16) as u8);
-        if pad < 2 {
+        if chunk.len() > 2 {
             out.push((n >> 8) as u8);
         }
-        if pad < 1 {
+        if chunk.len() > 3 {
             out.push(n as u8);
         }
     }

@@ -1417,3 +1417,30 @@ fn small_string_builders_still_work_under_tight_limit() {
         Value::Int(3)
     );
 }
+
+#[test]
+fn test_timer_and_microtask_queues_are_allocation_limited() {
+    // Every queued timer/microtask is allocation-tracked: guest code cannot
+    // grow the scheduler queues unboundedly while staying under the VM's
+    // tracked limits (default max_allocations is 100k).
+    let result = eval_ts(
+        r#"
+        const f = () => {};
+        for (let i = 0; i < 200000; i++) setTimeout(f, i);
+    "#,
+    );
+    assert!(
+        matches!(result, Err(ZapcodeError::AllocationLimitExceeded)),
+        "Expected AllocationLimitExceeded, got: {result:?}"
+    );
+    let result = eval_ts(
+        r#"
+        const f = () => {};
+        for (let i = 0; i < 200000; i++) queueMicrotask(f);
+    "#,
+    );
+    assert!(
+        matches!(result, Err(ZapcodeError::AllocationLimitExceeded)),
+        "Expected AllocationLimitExceeded, got: {result:?}"
+    );
+}
