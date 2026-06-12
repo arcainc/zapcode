@@ -1047,6 +1047,26 @@ fn call_console_method(
             sink.push('\n');
             Ok(Some(Value::Undefined))
         }
+        // `console.assert(cond, ...msg)` — when `cond` is falsy, write
+        // "Assertion failed[: <msg>]" to STDERR; does NOT throw (WHATWG
+        // console spec). A cheap self-verification affordance for agent
+        // code: a failed invariant surfaces in stderr (separate from stdout)
+        // without aborting the run.
+        "assert" => {
+            let cond = args.first().map(|v| v.is_truthy()).unwrap_or(false);
+            if !cond {
+                let rest = args.get(1..).unwrap_or(&[]);
+                let msg: Vec<String> = rest.iter().map(|v| v.to_js_string(heap)).collect();
+                if msg.is_empty() {
+                    stderr.push_str("Assertion failed\n");
+                } else {
+                    stderr.push_str("Assertion failed: ");
+                    stderr.push_str(&msg.join(" "));
+                    stderr.push('\n');
+                }
+            }
+            Ok(Some(Value::Undefined))
+        }
         _ => Ok(None),
     }
 }

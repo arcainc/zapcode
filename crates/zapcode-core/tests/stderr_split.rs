@@ -87,3 +87,22 @@ fn stderr_survives_snapshot_dump_load_resume() {
     assert_eq!(result.stdout, "before-out\nafter-out\n");
     assert_eq!(result.stderr, "before-err\nafter-warn\n");
 }
+
+#[test]
+fn console_assert_writes_to_stderr_only_on_failure() {
+    let (out, err) = run(
+        "console.assert(1 > 2, 'x exceeds y'); \
+         console.assert(2 > 1, 'never shown'); \
+         console.log('after'); 0",
+    );
+    // Passing assert is silent; failing one lands in stderr (not stdout),
+    // and execution continues (no throw).
+    assert_eq!(out, "after\n");
+    assert_eq!(err, "Assertion failed: x exceeds y\n");
+}
+
+#[test]
+fn console_assert_without_message_uses_default_text() {
+    let (_out, err) = run("console.assert(false); 0");
+    assert_eq!(err, "Assertion failed\n");
+}

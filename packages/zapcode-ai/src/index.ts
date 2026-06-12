@@ -133,11 +133,39 @@ export interface ExecutionResult {
      * (catchable by guest `try`/`catch`); `result` is undefined in that case.
      */
     error?: string;
+    /** Wall-clock the host spent resolving this call (suspension → resume). */
+    durationMs: number;
   }>;
   /** Present when autoFix is enabled and execution failed. */
   error?: string;
+  /**
+   * Structured, host-loggable summary of the run — the "execution receipt".
+   * Always present, so a caller (or an agent in a retry loop) can branch on
+   * `report.completed` / `report.error` without parsing strings.
+   */
+  report: RunReport;
   /** Execution trace. Present when debug or autoFix is enabled. */
   trace?: TraceSpan;
+}
+
+/** A structured summary of one execution — see {@link ExecutionResult.report}. */
+export interface RunReport {
+  /** True when the code ran to completion; false when it threw. */
+  completed: boolean;
+  /** Total wall-clock of the run (compile + execute + tool round-trips). */
+  durationMs: number;
+  /** Number of tool calls the code made. */
+  toolCallCount: number;
+  /** When the run failed: the message plus the source location, when the
+   * core attached one (`at line:col` in the error). */
+  error?: { message: string; line?: number; column?: number };
+}
+
+/** Pull `at <line>:<col>` out of a core error message, when present. */
+function parseErrorLocation(message: string): { line?: number; column?: number } {
+  const m = /\bat (\d+):(\d+)\b/.exec(message);
+  if (!m) return {};
+  return { line: Number(m[1]), column: Number(m[2]) };
 }
 
 const RESERVED_TOOL_NAMES = new Set([
@@ -925,6 +953,7 @@ async function executeCode(
   const tracing = debug || autoFix;
 
   const execSpan = tracing ? createSpan("execute", { "zapcode.code": code }) : undefined;
+  const runStartedAt = Date.now();
 
   try {
     // Optional type-check pre-pass: catch unknown tools / wrong argument types
@@ -980,9 +1009,16 @@ async function executeCode(
         toolSpan.attributes["zapcode.tool.input"] = JSON.stringify(namedArgs);
       }
 
+      const startedAt = Date.now();
       try {
         const result = sanitizeToolResult(await toolDef.execute(namedArgs));
-        toolCalls.push({ name, args: rawArgs, input: namedArgs, result });
+        toolCalls.push({
+          name,
+          args: rawArgs,
+          input: namedArgs,
+          result,
+          durationMs: Date.now() - startedAt,
+        });
         if (toolSpan) {
           toolSpan.attributes["zapcode.tool.result"] = JSON.stringify(result);
           endSpan(toolSpan);
@@ -991,7 +1027,14 @@ async function executeCode(
         return { ok: true, result };
       } catch (err: any) {
         const message = err?.message ?? String(err);
-        toolCalls.push({ name, args: rawArgs, input: namedArgs, result: undefined, error: message });
+        toolCalls.push({
+          name,
+          args: rawArgs,
+          input: namedArgs,
+          result: undefined,
+          error: message,
+          durationMs: Date.now() - startedAt,
+        });
         if (toolSpan) {
           toolSpan.attributes["zapcode.tool.error"] = message;
           endSpan(toolSpan, "error");
@@ -1043,6 +1086,11 @@ async function executeCode(
       stdout,
       stderr,
       toolCalls,
+      report: {
+        completed: true,
+        durationMs: Date.now() - runStartedAt,
+        toolCallCount: toolCalls.length,
+      },
       ...(execSpan ? { trace: execSpan } : {}),
     };
   } catch (err: any) {
@@ -1069,6 +1117,12 @@ async function executeCode(
       stderr: "",
       toolCalls,
       error: `Execution failed: ${errorMsg}. Please fix your code and try again.`,
+      report: {
+        completed: false,
+        durationMs: Date.now() - runStartedAt,
+        toolCallCount: toolCalls.length,
+        error: { message: errorMsg, ...parseErrorLocation(errorMsg) },
+      },
       ...(execSpan ? { trace: execSpan } : {}),
     };
   }
@@ -1162,6 +1216,12 @@ export function zapcode(options: ZapcodeAIOptions): ZapcodeAIResult {
         stderr: "",
         toolCalls: [],
         error: `Execution failed: ${message}. Please fix your code and try again.`,
+        report: {
+          completed: false,
+          durationMs: 0,
+          toolCallCount: 0,
+          error: { message },
+        },
         trace,
       };
     }
@@ -1359,6 +1419,93 @@ export async function execute(
 }
 
 // ---------------------------------------------------------------------------
+// dryRun — pre-flight: does agent code typecheck AND not instantly error?
+// ---------------------------------------------------------------------------
+
+/** Outcome of {@link dryRun}. */
+export interface DryRunResult {
+  /** True when the code typechecks AND ran to completion without throwing. */
+  ok: boolean;
+  /** Static type diagnostics (from {@link typecheck}). */
+  typeErrors: TypeDiagnostic[];
+  /** Did the (stubbed) execution reach completion without throwing? */
+  reachedCompletion: boolean;
+  /** Completion value under the stub tools (when it completed). */
+  output?: unknown;
+  /** The throw site, when execution failed (message + source location). */
+  error?: { message: string; line?: number; column?: number };
+  /** The sequence of tool calls the code WOULD make (names + validated input). */
+  toolCalls: Array<{ name: string; input: Record<string, unknown> }>;
+  stdout: string;
+  stderr: string;
+}
+
+/**
+ * Pre-flight agent-written code WITHOUT real side effects: static-typecheck it
+ * against the tool signatures, then execute it with auto-stubbed tools under a
+ * tight time budget. Answers the question that matters for write-once-run-
+ * immediately code — "does this instantly error, and what would it call?" —
+ * before any real tool runs.
+ *
+ * Tools are stubbed with a permissive empty object (member access yields
+ * `undefined` rather than throwing), so a reported error is a real signal
+ * (e.g. calling a method on an assumed-present field) rather than stub noise.
+ * The recorded `toolCalls` are the call sequence the code would make.
+ */
+export async function dryRun(
+  code: string,
+  toolDefs: Record<string, ToolDefinition>,
+  options?: { timeLimitMs?: number; memoryLimitMb?: number; engine?: TypecheckOptions["engine"] }
+): Promise<DryRunResult> {
+  const tc = await typecheck(code, toolDefs, { engine: options?.engine });
+
+  // Stub every tool: same schema (so argument validation still runs and the
+  // call is recorded), but a side-effect-free implementation returning a
+  // permissive empty object.
+  const stubs: Record<string, ToolDefinition> = {};
+  for (const [name, def] of Object.entries(toolDefs)) {
+    stubs[name] = { ...def, execute: async () => ({}) };
+  }
+
+  const result = await executeCode(code, stubs, {
+    autoFix: true, // capture failure as a structured result instead of throwing
+    timeLimitMs: options?.timeLimitMs ?? 2_000,
+    memoryLimitMb: options?.memoryLimitMb,
+  });
+
+  return {
+    ok: tc.ok && result.report.completed,
+    typeErrors: tc.diagnostics,
+    reachedCompletion: result.report.completed,
+    output: result.report.completed ? result.output : undefined,
+    error: result.report.error,
+    toolCalls: result.toolCalls.map((c) => ({ name: c.name, input: c.input })),
+    stdout: result.stdout,
+    stderr: result.stderr,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Forking — branch / checkpoint / rollback over VM state
+// ---------------------------------------------------------------------------
+
+/**
+ * Fork a suspended VM: load its snapshot bytes into an independent, runnable
+ * continuation. Loading the SAME bytes more than once yields multiple forks
+ * that diverge only by what you resume them with — each is deterministic, and
+ * (since compiled programs are shared) cheap. This is the primitive behind
+ * agent **checkpoint / rollback / speculative branching**: snapshot at a tool
+ * boundary, fork, try a branch, and discard or keep it.
+ *
+ * `snapshotBytes` come from a `suspended` execution state (its `snapshot`
+ * field). The returned handle is resumed with `resume(value)` /
+ * `resumeError(msg)` / `resumeMany(values)` exactly like the original.
+ */
+export function forkSnapshot(snapshotBytes: Buffer): ZapcodeSnapshotHandle {
+  return ZapcodeSnapshotHandle.load(snapshotBytes);
+}
+
+// ---------------------------------------------------------------------------
 // Durable sessions
 // ---------------------------------------------------------------------------
 
@@ -1384,13 +1531,27 @@ async function invokeToolCall(
     );
   }
   const namedArgs = buildNamedArgs(name, toolDef, rawArgs); // throws → abort
+  const startedAt = Date.now();
   try {
     const result = sanitizeToolResult(await toolDef.execute(namedArgs));
-    toolCalls.push({ name, args: rawArgs, input: namedArgs, result });
+    toolCalls.push({
+      name,
+      args: rawArgs,
+      input: namedArgs,
+      result,
+      durationMs: Date.now() - startedAt,
+    });
     return { ok: true, result };
   } catch (err: any) {
     const message = err?.message ?? String(err);
-    toolCalls.push({ name, args: rawArgs, input: namedArgs, result: undefined, error: message });
+    toolCalls.push({
+      name,
+      args: rawArgs,
+      input: namedArgs,
+      result: undefined,
+      error: message,
+      durationMs: Date.now() - startedAt,
+    });
     return { ok: false, message };
   }
 }
