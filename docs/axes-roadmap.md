@@ -36,9 +36,12 @@ with headroom). The remaining structural wins are *avoiding repeated work*:
 **Current state**: typical agent snapshot 472 B (template-elided,
 mark-compacted); per-hop snapshot growth is live-state-only; `Instruction`
 40 B; builtin template shared per-process via `OnceLock`. Measured (cycle
-1): parked-as-bytes ~2 KiB RSS/VM vs ~63 KiB live (park as bytes!); object
-keys have ZERO sharing today (3,069 occurrences → 3,069 Arc allocations) —
-interning is a GO; Arc-sharing `CompiledProgram` is the next density lead.
+2): the per-VM compiled-program clone is gone — `programs` is now
+`Vec<Arc<CompiledProgram>>`, so a prepare-once fleet shares ONE bytecode
+allocation (~19 KiB/VM → ~0 KiB/VM in `profile_density`; wire unchanged).
+Object keys are interned per-VM (3,069 → 96 distinct allocations for ~49
+unique keys; pure runtime accelerator, off the wire). Remaining lead:
+in-run arena reuse (still no free during a run).
 
 **Direction**: the arena still never frees *during* a run — compaction
 happens only at snapshot capture. In-run pressure is bounded by
@@ -79,7 +82,11 @@ deeper-than-top-level param field defaults, `Promise.race([])` hang-vs-pend,
 generator-body await tick interleaving, eager spread over generators.
 
 **Direction**: the per-method sweep is done; the next class of bugs hides in
-*combinations*.
+*combinations*. The fuzzer now threads effect logs (order/laziness/counts
+diffed against Node) and generates classes/Map/Set/switch/optional-chaining/
+custom-iterables — 4,500 programs clean. Next: tagged-template custom tags
+(probe the `strings.raw` residual), deeper combinatorial nesting, a nightly
+multi-seed sweep.
 
 - **Property-based differential fuzzing**: a small generator that composes
   random programs from the known-supported grammar (expressions, control
@@ -109,8 +116,12 @@ session chunks):
   the model sees.
 - **Prepare-once API**: expose compiled-program caching (axis 1) through
   the bindings: `prepare(code) -> Program`, `program.run(inputs, tools)`.
-- **stdout/stderr split**: `console.error`/`console.warn` currently mix
-  into stdout; agents (and hosts) want them separated.
+- **stdout/stderr split** — DONE (cycle 2, wire v16): `console.error`/`warn`
+  write to a separate `stderr` stream through core, snapshots, sessions, and
+  the JS binding (py/wasm exposure is a follow-up).
+- **Prepare-once API** — DONE (cycle 2): `ZapcodeProgramHandle` napi class
+  exposes compile-once / run-many + dump/load through the binding (a
+  zapcode-ai `prepare()` wrapper around it is the remaining follow-up).
 - **Tool-call introspection/trace**: a structured per-run trace (which
   tools, what args, how long suspended) the host can log or feed back.
 - Watch monty's roadmap: dataclass-style typed returns, pydantic-ai
