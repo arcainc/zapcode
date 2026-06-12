@@ -110,6 +110,17 @@ struct Compiler {
     /// method/constructor body. Lets `super`/`super.m()` resolve against the
     /// defining class's `__super__` regardless of the runtime receiver's class.
     current_class: Option<String>,
+    /// Counter for the hidden locals `prepare_rmw_target` allocates (one per
+    /// read-modify-write member target in this function).
+    rmw_temp_counter: usize,
+}
+
+/// A read-modify-write member reference whose object/index live in hidden
+/// locals — see [`Compiler::prepare_rmw_target`].
+struct RmwRef {
+    obj_slot: usize,
+    idx_slot: Option<usize>,
+    property: Option<Arc<str>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +152,7 @@ impl Compiler {
             labeled_blocks: Vec::new(),
             hoisted_funcs: std::collections::HashSet::new(),
             current_class: None,
+            rmw_temp_counter: 0,
         }
     }
 
@@ -163,6 +175,7 @@ impl Compiler {
             labeled_blocks: Vec::new(),
             hoisted_funcs: std::collections::HashSet::new(),
             current_class: None,
+            rmw_temp_counter: 0,
         }
     }
 
@@ -2096,8 +2109,13 @@ impl Compiler {
                 prefix,
                 operand,
             } => {
-                // Load current value
-                self.compile_expr(operand)?;
+                // A member operand's object/index evaluate ONCE (hidden
+                // temps): `f().n++` calls `f` once, like JS.
+                let rmw = self.prepare_rmw_target(operand)?;
+                match &rmw {
+                    Some(r) => self.emit_rmw_load(r),
+                    None => self.compile_expr(operand)?,
+                }
 
                 if !prefix {
                     self.emit(Instruction::Dup); // keep pre-value
@@ -2116,12 +2134,17 @@ impl Compiler {
                     self.emit(Instruction::Dup); // keep post-value
                 }
 
-                // Store back
-                self.compile_store(operand)?;
-
-                if !prefix {
-                    // Swap to get pre-value on top
-                    // Actually the dup before increment already has it
+                // Store back. The RMW store leaves its value on the stack
+                // (post-value for prefix); the dup'd pre-value sits below it
+                // for the postfix result — pop the stored value to expose it.
+                match &rmw {
+                    Some(r) => {
+                        self.emit_rmw_store(r);
+                        self.emit(Instruction::Pop);
+                    }
+                    None => {
+                        self.compile_store(operand)?;
+                    }
                 }
             }
             Expr::Logical { op, left, right } => match op {
@@ -2188,7 +2211,11 @@ impl Compiler {
                     // keep condition. `a ||= b` / `a &&= b` test truthiness;
                     // `a ??= b` tests nullishness.
                     AssignOp::OrAssign | AssignOp::AndAssign => {
-                        self.compile_expr(target)?;
+                        let rmw = self.prepare_rmw_target(target)?;
+                        match &rmw {
+                            Some(r) => self.emit_rmw_load(r),
+                            None => self.compile_expr(target)?,
+                        }
                         self.emit(Instruction::Dup);
                         let assign_b = match op {
                             AssignOp::OrAssign => self.emit(Instruction::JumpIfFalse(0)),
@@ -2200,13 +2227,22 @@ impl Compiler {
                         self.patch_jump(assign_b, bpos);
                         self.emit(Instruction::Pop);
                         self.compile_expr(value)?;
-                        self.emit(Instruction::Dup);
-                        self.compile_store(target)?;
+                        match &rmw {
+                            Some(r) => self.emit_rmw_store(r),
+                            None => {
+                                self.emit(Instruction::Dup);
+                                self.compile_store(target)?;
+                            }
+                        }
                         let after = self.current_offset();
                         self.patch_jump(end, after);
                     }
                     AssignOp::NullishAssign => {
-                        self.compile_expr(target)?;
+                        let rmw = self.prepare_rmw_target(target)?;
+                        match &rmw {
+                            Some(r) => self.emit_rmw_load(r),
+                            None => self.compile_expr(target)?,
+                        }
                         self.emit(Instruction::Dup);
                         // JumpIfNullish peeks (does not pop) the tested value.
                         let assign_b = self.emit(Instruction::JumpIfNullish(0));
@@ -2218,14 +2254,25 @@ impl Compiler {
                         self.emit(Instruction::Pop);
                         self.emit(Instruction::Pop);
                         self.compile_expr(value)?;
-                        self.emit(Instruction::Dup);
-                        self.compile_store(target)?;
+                        match &rmw {
+                            Some(r) => self.emit_rmw_store(r),
+                            None => {
+                                self.emit(Instruction::Dup);
+                                self.compile_store(target)?;
+                            }
+                        }
                         let after = self.current_offset();
                         self.patch_jump(end, after);
                     }
                     _ => {
-                        // Compound assignment: load, operate, store
-                        self.compile_expr(target)?;
+                        // Compound assignment: load, operate, store. A member
+                        // target's object/index evaluate ONCE (hidden temps) —
+                        // `f().x += 1` calls `f` once, like JS.
+                        let rmw = self.prepare_rmw_target(target)?;
+                        match &rmw {
+                            Some(r) => self.emit_rmw_load(r),
+                            None => self.compile_expr(target)?,
+                        }
                         self.compile_expr(value)?;
                         match op {
                             AssignOp::AddAssign => {
@@ -2266,8 +2313,13 @@ impl Compiler {
                             }
                             _ => {}
                         }
-                        self.emit(Instruction::Dup);
-                        self.compile_store(target)?;
+                        match &rmw {
+                            Some(r) => self.emit_rmw_store(r),
+                            None => {
+                                self.emit(Instruction::Dup);
+                                self.compile_store(target)?;
+                            }
+                        }
                     }
                 }
             }
@@ -2539,21 +2591,32 @@ impl Compiler {
                 match target.as_ref() {
                     Expr::Member {
                         object, property, ..
-                    } if is_place_expr(object) => {
+                    } => {
                         self.compile_expr(object)?;
                         self.emit(Instruction::DeleteProperty(Arc::from(property.as_str())));
-                        // Write-back of the same (mutated) reference, not a const
-                        // rebind — `delete` on a const object's key is allowed.
-                        self.compile_store_inner(object, false)?;
+                        // The mutation hits the shared heap slot in place; a
+                        // nameable parent gets the formal write-back, while an
+                        // arbitrary object expression (`delete f().x`) just
+                        // drops the pushed-back reference — same rule as
+                        // member stores.
+                        if Self::is_store_target(object) {
+                            self.compile_store_inner(object, false)?;
+                        } else {
+                            self.emit(Instruction::Pop);
+                        }
                         self.emit(Instruction::Push(Constant::Bool(true)));
                     }
                     Expr::ComputedMember {
                         object, property, ..
-                    } if is_place_expr(object) => {
+                    } => {
                         self.compile_expr(object)?;
                         self.compile_expr(property)?;
                         self.emit(Instruction::DeleteIndex);
-                        self.compile_store_inner(object, false)?;
+                        if Self::is_store_target(object) {
+                            self.compile_store_inner(object, false)?;
+                        } else {
+                            self.emit(Instruction::Pop);
+                        }
                         self.emit(Instruction::Push(Constant::Bool(true)));
                     }
                     // `delete` on a non-reference (or a non-place object) is a
@@ -2866,6 +2929,89 @@ impl Compiler {
         self.compile_store_inner(target, true)
     }
 
+    /// Prepare a read-modify-write reference to `target` whose object (and
+    /// computed index) expressions are evaluated EXACTLY ONCE into hidden
+    /// locals. The whole `op=`/`++`/`||=` family must not re-run the target's
+    /// side effects for its store leg (`f().x += 1` calls `f` once in JS);
+    /// compiling the target expression twice did. Returns `None` for plain
+    /// identifier targets (loads of those are pure — the simple lowering is
+    /// already correct).
+    fn prepare_rmw_target(&mut self, target: &Expr) -> Result<Option<RmwRef>> {
+        match target {
+            Expr::Member {
+                object, property, ..
+            } => {
+                let obj_slot = self.declare_rmw_temp();
+                self.compile_expr(object)?;
+                self.emit(Instruction::StoreLocal(obj_slot));
+                Ok(Some(RmwRef {
+                    obj_slot,
+                    idx_slot: None,
+                    property: Some(Arc::from(property.as_str())),
+                }))
+            }
+            Expr::ComputedMember {
+                object, property, ..
+            } => {
+                let obj_slot = self.declare_rmw_temp();
+                self.compile_expr(object)?;
+                self.emit(Instruction::StoreLocal(obj_slot));
+                let idx_slot = self.declare_rmw_temp();
+                self.compile_expr(property)?;
+                self.emit(Instruction::StoreLocal(idx_slot));
+                Ok(Some(RmwRef {
+                    obj_slot,
+                    idx_slot: Some(idx_slot),
+                    property: None,
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn declare_rmw_temp(&mut self) -> usize {
+        let n = self.rmw_temp_counter;
+        self.rmw_temp_counter += 1;
+        self.declare_local(&format!("__rmw_tmp_{n}"))
+    }
+
+    /// Push the referenced member's current value.
+    fn emit_rmw_load(&mut self, r: &RmwRef) {
+        self.emit(Instruction::LoadLocal(r.obj_slot));
+        match (&r.property, r.idx_slot) {
+            (Some(p), _) => {
+                self.emit(Instruction::GetProperty(p.clone()));
+            }
+            (None, Some(idx)) => {
+                self.emit(Instruction::LoadLocal(idx));
+                self.emit(Instruction::GetIndex);
+            }
+            (None, None) => unreachable!("RmwRef without property or index"),
+        }
+    }
+
+    /// Store the top-of-stack value into the referenced member, leaving the
+    /// value on the stack as the expression result. The receiver is a shared
+    /// heap handle, so the in-place mutation needs no write-back to the
+    /// object's source place.
+    fn emit_rmw_store(&mut self, r: &RmwRef) {
+        self.emit(Instruction::Dup);
+        self.emit(Instruction::LoadLocal(r.obj_slot));
+        match (&r.property, r.idx_slot) {
+            (Some(p), _) => {
+                self.emit(Instruction::SetProperty(p.clone()));
+            }
+            (None, Some(idx)) => {
+                self.emit(Instruction::LoadLocal(idx));
+                self.emit(Instruction::SetIndex);
+            }
+            (None, None) => unreachable!("RmwRef without property or index"),
+        }
+        // SetProperty/SetIndex push the (same) object reference back; the
+        // duplicated value below it is the expression result.
+        self.emit(Instruction::Pop);
+    }
+
     /// True for expressions that name a storable place (an identifier or a
     /// member/index chain rooted in one) — the targets `compile_store_inner`
     /// accepts. The chain must be walked to its root: `foo().bar` is a Member
@@ -2944,14 +3090,6 @@ impl Compiler {
     }
 }
 
-/// Whether an expression denotes a storable location (so a mutated copy can be
-/// written back). Used by `delete` to decide whether to persist the change.
-fn is_place_expr(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::Ident(_) | Expr::Member { .. } | Expr::ComputedMember { .. }
-    )
-}
 
 /// Whether an expression's access/call spine contains an optional (`?.`) link,
 /// i.e. it is the top of an optional chain and must short-circuit as a whole.

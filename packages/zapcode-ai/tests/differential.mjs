@@ -500,6 +500,15 @@ const realistic = [
    }
    return trace.join(">");`,
 
+
+  // ── evaluation counts: side effects run exactly as often as in JS ─────
+  // (double evaluation is invisible to value-only assertions — these thread
+  // call counters through the result)
+  `let calls = 0; const o = { a: { x: 10 } }; function f() { calls++; return o; } f().a.x = 1; f().a.x += 5; f().a.x++; return calls + ':' + o.a.x;`,
+  `let kc = 0, oc = 0; const o = { k: 5 }; const key = () => (kc++, 'k'); const obj = () => (oc++, o); obj()[key()] += 1; obj()[key()]++; return oc + ',' + kc + ':' + o.k;`,
+  `let calls = 0; const o = { v: 0, w: 1, m: null }; function f() { calls++; return o; } f().v ||= 9; f().w &&= 7; f().m ??= 3; return calls + ':' + [o.v, o.w, o.m].join(',');`,
+  `let calls = 0; const o = { x: 1, y: 2 }; function f() { calls++; return o; } const d1 = delete f().x; delete f()['y']; return calls + ':' + ('x' in o) + ',' + ('y' in o) + ':' + d1;`,
+
   // ── round 2: orchestration patterns ───────────────────────────────────
   // concurrency-limited batches, order preserved
   `async function work(n) { return n * n; }
