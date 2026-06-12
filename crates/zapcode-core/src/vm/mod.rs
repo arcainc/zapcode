@@ -453,6 +453,13 @@ pub struct Vm {
     /// NEVER serialized into snapshots (line/column come from the compiled
     /// line tables instead, so resumed runs still report correct lines).
     pub(crate) source: Option<String>,
+    /// Per-VM object-key interner (see [`crate::intern`]). A pure runtime
+    /// accelerator consulted at every key-insertion choke point so repeated
+    /// keys ("id", "name", …) share one `Arc<str>` instead of allocating a
+    /// fresh buffer per insert. NEVER serialized — it is simply absent from
+    /// `VmSnapshot` (postcard writes each key's bytes regardless, so wire
+    /// bytes are unchanged) and rebuilt on load via a re-intern pass.
+    pub(crate) key_interner: crate::intern::KeyInterner,
     /// Hand-off slot for a re-raised exception's ORIGINAL throw site: set by
     /// `resume_completion` immediately before its `Err`, consumed by the
     /// execute loop's `Err` arm on the very next iteration (so it can never
@@ -658,6 +665,7 @@ impl Vm {
             timers: Vec::new(),
             next_timer_id: 0,
             source: None,
+            key_interner: crate::intern::KeyInterner::new(),
             pending_throw_loc: None,
         }
     }
@@ -746,6 +754,15 @@ impl Vm {
             globals.insert(k, v);
         }
 
+        // Post-load intern pass: keys arrive as fresh per-occurrence `Arc<str>`
+        // (postcard deserializes each one independently), so a resumed VM would
+        // otherwise lose all key sharing the live VM had. Fold every heap key
+        // through the interner so repeated keys re-share one allocation, and so
+        // subsequent inserts on the resumed VM keep hitting the same pool.
+        let mut key_interner = crate::intern::KeyInterner::new();
+        let mut heap = heap;
+        key_interner.reintern(&mut heap);
+
         Self {
             programs,
             stack,
@@ -785,6 +802,7 @@ impl Vm {
             timers: Vec::new(),
             next_timer_id: 0,
             source: None,
+            key_interner,
             pending_throw_loc: None,
         }
     }
@@ -5991,15 +6009,15 @@ impl Vm {
                 }
                 entries.reverse();
                 for (key, val) in entries {
-                    match key {
-                        Value::String(k) => {
-                            obj.insert(Arc::from(k.as_str()), val);
-                        }
-                        _ => {
-                            let k: Arc<str> = Arc::from(key.to_js_string(&self.heap).as_str());
-                            obj.insert(k, val);
-                        }
-                    }
+                    // Intern the key so repeated object shapes (the common agent
+                    // pattern of building many uniform records) share one
+                    // backing `Arc<str>` per key string instead of allocating a
+                    // fresh buffer per object.
+                    let k = match key {
+                        Value::String(k) => self.key_interner.intern(k.as_str()),
+                        _ => self.key_interner.intern(&key.to_js_string(&self.heap)),
+                    };
+                    obj.insert(k, val);
                 }
                 let h = self.heap.alloc_object(obj);
                 self.push(Value::Object(h))?;
@@ -6104,10 +6122,14 @@ impl Vm {
                             .object(h)
                             .is_some_and(|m| builtins::marker_contains(m, "__non_writable__", &name));
                         if !is_frozen_object(h, &self.heap) && !non_writable {
+                            // Intern before the mut-borrow so a repeated property
+                            // name shares one backing `Arc<str>` across every
+                            // object it is written to.
+                            let key = self.key_interner.intern(&name);
                             // Mutate the heap slot in place; the handle is shared so the
                             // write is visible through every alias (reference semantics).
                             if let Some(obj) = self.heap.object_mut(h) {
-                                obj.insert(Arc::from(name), value);
+                                obj.insert(key, value);
                             }
                         }
                         // Push the (same) object handle back so compile_store can store it.
@@ -6254,7 +6276,7 @@ impl Vm {
                     Value::Object(h) => {
                         // Frozen objects ignore index writes too.
                         if !is_frozen_object(*h, &self.heap) {
-                            let key: Arc<str> = Arc::from(index.to_js_string(&self.heap).as_str());
+                            let key = self.key_interner.intern(&index.to_js_string(&self.heap));
                             if let Some(map) = self.heap.object_mut(*h) {
                                 map.insert(key, value);
                             }
@@ -6391,8 +6413,8 @@ impl Vm {
                     }
                 };
                 let key: Arc<str> = match key {
-                    Value::String(k) => Arc::from(k.as_str()),
-                    other => Arc::from(other.to_js_string(&self.heap).as_str()),
+                    Value::String(k) => self.key_interner.intern(k.as_str()),
+                    other => self.key_interner.intern(&other.to_js_string(&self.heap)),
                 };
                 if let Some(map) = self.heap.object_mut(acc) {
                     map.insert(key, value);
