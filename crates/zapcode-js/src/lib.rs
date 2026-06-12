@@ -6,8 +6,8 @@ use napi_derive::napi;
 
 use zapcode_core::heap::Heap;
 use zapcode_core::{
-    ExecutionTrace, ResourceLimits, RunResult, TraceSpan, TraceStatus, Value, VmState, ZapcodeRun,
-    ZapcodeSessionSnapshot, ZapcodeSessionState, ZapcodeSnapshot,
+    ExecutionTrace, ResourceLimits, RunResult, TraceSpan, TraceStatus, Value, VmState, ZapcodeProgram,
+    ZapcodeRun, ZapcodeSessionSnapshot, ZapcodeSessionState, ZapcodeSnapshot,
 };
 
 // ---------------------------------------------------------------------------
@@ -59,8 +59,10 @@ pub struct ZapcodeResult {
     pub completed: bool,
     /// The output value, converted to a JSON-compatible serde_json::Value.
     pub output: serde_json::Value,
-    /// Captured stdout output.
+    /// Captured stdout output (`console.log`/`info`/`debug`).
     pub stdout: String,
+    /// Captured stderr output (`console.error`/`console.warn`).
+    pub stderr: String,
     /// Execution trace (parse → compile → execute).
     pub trace: JsTraceSpan,
 }
@@ -115,6 +117,8 @@ pub struct ZapcodeSessionResult {
     pub output: serde_json::Value,
     /// Captured stdout output for this chunk/resume step.
     pub stdout: String,
+    /// Captured stderr output (`console.error`/`console.warn`) for this step.
+    pub stderr: String,
     /// Opaque session bytes -- pass to `ZapcodeSessionHandle.load()` to continue.
     pub session: Buffer,
 }
@@ -131,6 +135,8 @@ pub struct ZapcodeSessionSuspension {
     pub args: Vec<serde_json::Value>,
     /// Captured stdout output for this chunk/resume step.
     pub stdout: String,
+    /// Captured stderr output (`console.error`/`console.warn`) for this step.
+    pub stderr: String,
     /// Opaque session bytes -- pass to `ZapcodeSessionHandle.load()` to continue.
     pub session: Buffer,
 }
@@ -151,6 +157,8 @@ pub struct ZapcodeSessionBatchSuspension {
     pub calls: Vec<JsExternalCall>,
     /// Captured stdout output for this chunk/resume step.
     pub stdout: String,
+    /// Captured stderr output (`console.error`/`console.warn`) for this step.
+    pub stderr: String,
     /// Opaque session bytes -- pass to `ZapcodeSessionHandle.load()` to continue.
     pub session: Buffer,
 }
@@ -431,6 +439,7 @@ impl Zapcode {
             state,
             heap,
             stdout,
+            stderr,
             trace,
         } = result;
         match state {
@@ -439,6 +448,7 @@ impl Zapcode {
                 completed: true,
                 output: value_to_json(&v, &heap)?,
                 stdout,
+                stderr,
                 trace: trace_to_js(&trace),
             }),
             VmState::Suspended { function_name, .. } => Err(napi::Error::from_reason(format!(
@@ -463,6 +473,123 @@ impl Zapcode {
         let result = self
             .inner
             .run_with_input_heap(input_values, input_heap)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+        run_result_to_either_with_stdout(result)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Prepare-once compiled program
+// ---------------------------------------------------------------------------
+
+/// A parsed + compiled program, ready to run many times without re-paying
+/// parse + compile. Mirrors `zapcode_core::ZapcodeProgram`: `compile()` once,
+/// then `run()` / `start()` repeatedly with different inputs, and
+/// `dump()` / `load()` to persist the compiled bytecode across processes.
+///
+/// `limits` (memory / time) are baked in at compile time from the same options
+/// `Zapcode` accepts and applied to every run; a `dump()`ed blob carries only
+/// the bytecode, so a reloaded program uses default limits unless re-supplied
+/// at `load()`.
+#[napi]
+pub struct ZapcodeProgramHandle {
+    inner: ZapcodeProgram,
+    limits: ResourceLimits,
+}
+
+#[napi]
+impl ZapcodeProgramHandle {
+    /// Parse and compile `code` once. `options` accepts `externalFunctions`,
+    /// `memoryLimitMb`, and `timeLimitMs` (the `inputs` field is ignored — a
+    /// compiled program takes its inputs at `run`/`start` time).
+    #[napi(factory)]
+    pub fn compile(code: String, options: Option<ZapcodeOptions>) -> napi::Result<Self> {
+        let opts = options.unwrap_or(ZapcodeOptions {
+            inputs: None,
+            external_functions: None,
+            memory_limit_mb: None,
+            time_limit_ms: None,
+        });
+        let limits = resource_limits_from_options(&opts);
+        let inner = ZapcodeProgram::compile(&code, opts.external_functions.unwrap_or_default())
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        Ok(Self { inner, limits })
+    }
+
+    /// Serialize the compiled program to bytes for caching / transport.
+    #[napi]
+    pub fn dump(&self) -> napi::Result<Buffer> {
+        let bytes = self
+            .inner
+            .dump()
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        Ok(Buffer::from(bytes))
+    }
+
+    /// Load a compiled program from bytes produced by `dump()`. Optional
+    /// `options` re-supply the per-run limits (the blob carries only bytecode).
+    #[napi(factory)]
+    pub fn load(bytes: Buffer, options: Option<ZapcodeOptions>) -> napi::Result<Self> {
+        let inner =
+            ZapcodeProgram::load(&bytes).map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let limits = match options {
+            Some(opts) => resource_limits_from_options(&opts),
+            None => ResourceLimits::default(),
+        };
+        Ok(Self { inner, limits })
+    }
+
+    /// Run the compiled program to completion. Errors if the code suspends on an
+    /// external call — use `start()` for code that may suspend.
+    #[napi]
+    pub fn run(
+        &self,
+        inputs: Option<HashMap<String, serde_json::Value>>,
+    ) -> napi::Result<ZapcodeResult> {
+        let (input_values, input_heap) = inputs_to_vec(inputs);
+        let result = self
+            .inner
+            .run_with_input_heap(input_values, input_heap, self.limits.clone())
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+        let RunResult {
+            state,
+            heap,
+            stdout,
+            stderr,
+            trace,
+        } = result;
+        match state {
+            VmState::Complete(v) => Ok(ZapcodeResult {
+                kind: "complete".to_string(),
+                completed: true,
+                output: value_to_json(&v, &heap)?,
+                stdout,
+                stderr,
+                trace: trace_to_js(&trace),
+            }),
+            VmState::Suspended { function_name, .. } => Err(napi::Error::from_reason(format!(
+                "execution suspended on external function '{}' -- use start() instead",
+                function_name
+            ))),
+            VmState::SuspendedMany { .. } => Err(napi::Error::from_reason(
+                "execution suspended on a Promise.all batch -- use start() instead".to_string(),
+            )),
+        }
+    }
+
+    /// Start execution. Returns either a completed result or a suspension
+    /// (resumable via `ZapcodeSnapshotHandle`), exactly like `Zapcode.start()`.
+    #[napi(ts_return_type = "ZapcodeResult | ZapcodeSuspension | ZapcodeBatchSuspension")]
+    pub fn start(
+        &self,
+        inputs: Option<HashMap<String, serde_json::Value>>,
+    ) -> napi::Result<Either3<ZapcodeResult, ZapcodeSuspension, ZapcodeBatchSuspension>> {
+        let (input_values, input_heap) = inputs_to_vec(inputs);
+        let result = self
+            .inner
+            .run_with_input_heap(input_values, input_heap, self.limits.clone())
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
         run_result_to_either_with_stdout(result)
@@ -702,6 +829,7 @@ fn run_result_to_either(
             completed: true,
             output: value_to_json(&v, &heap)?,
             stdout: String::new(),
+            stderr: String::new(),
             trace: trace_to_js(&trace),
         })),
         VmState::Suspended {
@@ -752,6 +880,7 @@ fn run_result_to_either_with_stdout(
         state,
         heap,
         stdout,
+        stderr,
         trace,
     } = result;
     match state {
@@ -760,6 +889,7 @@ fn run_result_to_either_with_stdout(
             completed: true,
             output: value_to_json(&v, &heap)?,
             stdout,
+            stderr,
             trace: trace_to_js(&trace),
         })),
         VmState::Suspended {
@@ -841,6 +971,7 @@ fn session_state_to_either(mut state: ZapcodeSessionState) -> napi::Result<Sessi
         ZapcodeSessionState::Complete {
             output,
             stdout,
+            stderr,
             session,
         } => {
             let js_output = value_to_json(&output, &heap)?;
@@ -852,6 +983,7 @@ fn session_state_to_either(mut state: ZapcodeSessionState) -> napi::Result<Sessi
                 completed: true,
                 output: js_output,
                 stdout,
+                stderr,
                 session: Buffer::from(bytes),
             }))
         }
@@ -859,6 +991,7 @@ fn session_state_to_either(mut state: ZapcodeSessionState) -> napi::Result<Sessi
             function_name,
             args,
             stdout,
+            stderr,
             session,
         } => {
             let js_args = values_to_json(&args, &heap)?;
@@ -871,6 +1004,7 @@ fn session_state_to_either(mut state: ZapcodeSessionState) -> napi::Result<Sessi
                 function_name,
                 args: js_args,
                 stdout,
+                stderr,
                 session: Buffer::from(bytes),
             }))
         }
@@ -878,6 +1012,7 @@ fn session_state_to_either(mut state: ZapcodeSessionState) -> napi::Result<Sessi
             calls,
             combinator,
             stdout,
+            stderr,
             session,
         } => {
             let js_calls = external_calls_to_js(&calls, &heap)?;
@@ -890,6 +1025,7 @@ fn session_state_to_either(mut state: ZapcodeSessionState) -> napi::Result<Sessi
                 combinator: combinator.as_str().to_string(),
                 calls: js_calls,
                 stdout,
+                stderr,
                 session: Buffer::from(bytes),
             }))
         }

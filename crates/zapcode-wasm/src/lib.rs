@@ -319,11 +319,14 @@ fn trace_span_to_js(span: &CoreTraceSpan) -> Result<JsValue, JsError> {
 /// Marshal a whole [`RunResult`] (state + heap + stdout + optional trace) into a
 /// JS object.
 fn run_result_to_js(result: RunResult, include_trace: bool) -> Result<JsValue, JsError> {
+    // stderr is not yet surfaced through the WASM binding (follow-up); ignore
+    // the new RunResult.stderr field here.
     let RunResult {
         state,
         heap,
         stdout,
         trace,
+        ..
     } = result;
     let trace_ref = if include_trace { Some(&trace) } else { None };
     vm_state_to_js(state, &heap, &stdout, trace_ref)

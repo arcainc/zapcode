@@ -502,3 +502,75 @@ fn mutated_builtin_object_survives_hop_and_disables_elision() {
     assert_eq!(drive(false), Value::Int(42));
     assert_eq!(drive(true), Value::Int(42), "hop diverged from in-memory run");
 }
+
+/// Object-key interning is a pure runtime accelerator: it must not change
+/// snapshot wire bytes (postcard writes each key's bytes regardless of whether
+/// the backing `Arc` is shared) and must not introduce any nondeterminism.
+/// Two captures of the same object-heavy run must dump byte-identically, and a
+/// dump/load round-trip must be byte-stable.
+#[test]
+fn interned_keys_do_not_change_snapshot_bytes_or_determinism() {
+    let code = r#"
+        const records = [];
+        for (let i = 0; i < 50; i++) {
+            records.push({ id: i, name: "u" + i, status: "ok", meta: { source: "api" } });
+        }
+        async function main() { return records.length + ":" + (await callTool("x")); }
+        main();
+    "#;
+    let dump_once = || -> Vec<u8> {
+        match start_with_externals(code, vec!["callTool"], Vec::new()) {
+            VmState::Suspended { snapshot, .. } => snapshot.dump().unwrap(),
+            other => panic!("expected suspension, got {other:?}"),
+        }
+    };
+    // Two independent runs of the same program produce identical bytes (the
+    // interner introduces no ordering or pointer-dependent nondeterminism).
+    let a = dump_once();
+    let b = dump_once();
+    assert_eq!(a, b, "interning made snapshot bytes nondeterministic");
+
+    // Load (which runs the post-load reintern pass) then re-dump: byte-stable.
+    let loaded = ZapcodeSnapshot::load(&a).unwrap();
+    let c = loaded.dump().unwrap();
+    assert_eq!(a, c, "reintern pass perturbed snapshot bytes on load");
+}
+
+/// A parked->resumed VM must regain correct behavior after the post-load
+/// reintern pass — keys re-shared in place must still read back the right
+/// values and the resumed computation must produce the in-memory result.
+#[test]
+fn resume_after_reintern_preserves_object_behavior() {
+    let code = r#"
+        const rows = [];
+        for (let i = 0; i < 30; i++) {
+            rows.push({ id: i, tag: "t" + (i % 3) });
+        }
+        async function main() {
+            const extra = await callTool("x");
+            // Read back interned keys after resume; mutate via computed key too.
+            rows[0]["tag"] = "mutated";
+            return rows.length + ":" + rows[0].id + ":" + rows[0].tag + ":" + extra;
+        }
+        main();
+    "#;
+    let drive = |hop: bool| -> Value {
+        match start_with_externals(code, vec!["callTool"], Vec::new()) {
+            VmState::Suspended { snapshot, .. } => {
+                let snapshot = if hop {
+                    ZapcodeSnapshot::load(&snapshot.dump().unwrap()).unwrap()
+                } else {
+                    snapshot
+                };
+                match snapshot.resume(Value::String("done".into())).unwrap().state {
+                    VmState::Complete(v) => v,
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            other => panic!("expected suspension, got {other:?}"),
+        }
+    };
+    let expected = Value::String("30:0:mutated:done".into());
+    assert_eq!(drive(false), expected);
+    assert_eq!(drive(true), expected, "resume after reintern diverged");
+}

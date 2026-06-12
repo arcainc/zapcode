@@ -5,11 +5,27 @@
  * diff-harness-lib. Any divergence is auto-minimized (greedy statement drop,
  * then return-field shrink) and printed as a minimal repro.
  *
+ * Two bug classes value-only diffing misses are fuzzed here:
+ *   1. EFFECT ORDER + LAZINESS. Every program carries a deterministic preamble
+ *      `const __log = []; const __t = (v) => (__log.push(String(v)), v);` and
+ *      generated subexpressions are randomly wrapped in `__t(<expr>)`. `__t`
+ *      is value-identity-preserving, so wrapping never changes a value — it
+ *      only records that the expression was evaluated, and WHEN. `__log` is
+ *      then part of the program's returned object, so evaluation order,
+ *      short-circuit laziness (`&&`/`||`/`??`/`?:`), and call counts are
+ *      mechanically diffed against Node (Node is ground truth).
+ *   2. RICHER GRAMMAR: classes (ctor/methods/extends/super/get/set), Map/Set
+ *      construction + iteration, switch (with fallthrough), optional chaining +
+ *      nullish, object getters/setters, for-of over custom [Symbol.iterator]
+ *      iterables, labeled break/continue, try/catch/finally — all with their
+ *      own effect logs so order/laziness bugs surface inside them too.
+ *
  * Deterministic: program i is generated from mulberry32(FUZZ_SEED ^ mix(i)),
  * so a failure reproduces from (FUZZ_SEED, index) alone.
  *
  * Deliberately NOT generated: Date.now, Math.random, setTimeout/host races,
- * regex, unbounded loops, Symbol, var.
+ * regex, unbounded loops, Symbol-as-value, var. (Symbol.iterator is used only
+ * as a computed method key on a custom iterable, never as a first-class value.)
  *
  * Run: npm run test:fuzz            (300 programs, seed 1)
  *      FUZZ_SEED=7 FUZZ_COUNT=1000 node tests/fuzz-differential.mjs

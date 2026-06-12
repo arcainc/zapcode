@@ -15,7 +15,11 @@ use crate::wire::FrameKind;
 /// Internal serializable representation of VM state at a suspension point.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct VmSnapshot {
-    pub(crate) programs: Vec<crate::compiler::CompiledProgram>,
+    /// Compiled programs, shared behind `Arc` so capture clones a refcount
+    /// rather than the whole bytecode (a live snapshot used to own a full deep
+    /// copy of every program). `Arc<T>` serializes identically to `T`, so the
+    /// wire format is unchanged.
+    pub(crate) programs: Vec<std::sync::Arc<crate::compiler::CompiledProgram>>,
     pub(crate) stack: Vec<Value>,
     pub(crate) frames: Vec<CallFrame>,
     /// Shared upvalue cells (captured variables). Ids are indices; sharing is
@@ -27,6 +31,11 @@ pub(crate) struct VmSnapshot {
     pub(crate) try_stack: Vec<TryInfo>,
     pub(crate) continuations: Vec<Continuation>,
     pub(crate) stdout: String,
+    /// `console.error` / `console.warn` output, carried alongside `stdout` so a
+    /// suspension mid-run preserves both streams across resume. Added at wire
+    /// v16; v15 blobs are rejected by the version guard, so no positional
+    /// `#[serde(default)]` reconstruction is needed.
+    pub(crate) stderr: String,
     pub(crate) limits: ResourceLimits,
     pub(crate) external_functions: Vec<String>,
     pub(crate) next_generator_id: u64,
@@ -161,6 +170,7 @@ impl VmSnapshot {
             try_stack: vm.try_stack.clone(),
             continuations: vm.continuations.clone(),
             stdout: vm.stdout.clone(),
+            stderr: vm.stderr.clone(),
             limits: vm.limits.clone(),
             external_functions,
             next_generator_id: vm.next_generator_id,
@@ -391,6 +401,7 @@ impl VmSnapshot {
             self.try_stack,
             self.continuations,
             self.stdout,
+            self.stderr,
             self.limits,
             ext_set,
             self.next_generator_id,

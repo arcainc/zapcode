@@ -282,6 +282,28 @@ mod tests {
 }
 
 impl Heap {
+    /// Re-point every object key at the interner's canonical shared `Arc<str>`.
+    /// After a snapshot load each key is a fresh per-occurrence allocation; this
+    /// pass (O(total keys)) collapses all occurrences of a string back onto one
+    /// backing buffer. Order-preserving: an `IndexMap` rebuilt by draining and
+    /// reinserting in iteration order keeps the exact same key sequence, so no
+    /// observable behavior changes — only the keys' `Arc` identity.
+    pub(crate) fn reintern_keys(&mut self, interner: &mut crate::intern::KeyInterner) {
+        for slot in &mut self.slots {
+            if let HeapSlot::Object(map) = slot {
+                // Drain in order into a fresh map, interning each key. The cost
+                // is O(entries) refcount bumps plus at most one string
+                // allocation per first-seen key.
+                let old = std::mem::take(map);
+                let mut rebuilt: IndexMap<Arc<str>, Value> = IndexMap::with_capacity(old.len());
+                for (k, v) in old {
+                    rebuilt.insert(interner.intern_arc(k), v);
+                }
+                *map = rebuilt;
+            }
+        }
+    }
+
     /// A heap holding clones of the first `n` slots (the builtin-template
     /// prefix) — used by the snapshot layer to byte-compare the prefix
     /// against the template before eliding it.

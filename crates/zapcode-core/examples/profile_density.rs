@@ -17,7 +17,7 @@
 
 use std::process::Command;
 use zapcode_core::vm::VmState;
-use zapcode_core::{ResourceLimits, ZapcodeRun, ZapcodeSnapshot};
+use zapcode_core::{ResourceLimits, ZapcodeProgram, ZapcodeRun, ZapcodeSnapshot};
 
 /// Typical agent shape: some state built up, an async helper, suspension on
 /// a tool call mid-loop (mirrors profile_snapshot.rs).
@@ -88,6 +88,21 @@ fn suspended(code: &str) -> ZapcodeSnapshot {
     )
     .unwrap();
     match runner.start(Vec::new()).unwrap() {
+        VmState::Suspended { snapshot, .. } => snapshot,
+        other => panic!("expected suspension, got {other:?}"),
+    }
+}
+
+/// Suspend a VM spun up from an already-compiled, `Arc`-shared program. Every
+/// snapshot produced this way shares ONE `Arc<CompiledProgram>` allocation with
+/// the parent program and with each other (`VmSnapshot::programs` clones the
+/// refcount, not the bytecode), so holding N of them costs one bytecode copy,
+/// not N.
+fn suspended_from(program: &ZapcodeProgram) -> ZapcodeSnapshot {
+    match program
+        .start(Vec::new(), ResourceLimits::default())
+        .unwrap()
+    {
         VmState::Suspended { snapshot, .. } => snapshot,
         other => panic!("expected suspension, got {other:?}"),
     }
@@ -175,4 +190,35 @@ fn main() {
         churny_bytes.saturating_sub(base_bytes),
         churny_bytes as f64 / base_bytes as f64
     );
+
+    // Arc-shared program: a run-many host compiles ONCE and parks N suspended
+    // VMs against the shared bytecode. Each `VmSnapshot` clones the program's
+    // `Arc` refcount, so all N share a single `CompiledProgram` allocation
+    // instead of each owning a deep clone. Compare against the
+    // ZapcodeRun-per-VM path above (every VM re-compiles and owns its own copy)
+    // to read off the per-VM bytecode the sharing removes.
+    println!("\n== Arc-shared program: {n} suspended VMs sharing ONE compiled program ==");
+    let program =
+        ZapcodeProgram::compile(AGENT_CODE, vec!["callTool".to_string()]).unwrap();
+    // Warm: one throwaway run so any first-use allocation is out of the delta.
+    drop(suspended_from(&program));
+    let rss_before = rss_bytes();
+    let mut shared: Vec<ZapcodeSnapshot> = Vec::with_capacity(n);
+    for _ in 0..n {
+        shared.push(suspended_from(&program));
+    }
+    let rss_after = rss_bytes();
+    println!(
+        "RSS before {:.1} MiB, after {:.1} MiB, delta {:.1} MiB => ~{} KiB live per shared-program VM",
+        mib(rss_before),
+        mib(rss_after),
+        mib(rss_after.saturating_sub(rss_before)),
+        rss_after.saturating_sub(rss_before) / 1024 / n as u64
+    );
+    // Sanity: a live snapshot still resumes to an independent, runnable VM even
+    // though its program is shared (Arc is read-only; resume never mutates it).
+    let one = shared.pop().unwrap();
+    let resumed = one.resume(zapcode_core::Value::String("done".into())).unwrap();
+    assert!(matches!(resumed.state, VmState::Complete(_) | VmState::Suspended { .. }));
+    drop(shared);
 }

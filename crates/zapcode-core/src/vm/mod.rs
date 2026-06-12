@@ -333,7 +333,13 @@ struct CreateClassParts<'a> {
 
 /// The Zapcode VM.
 pub struct Vm {
-    pub(crate) programs: Vec<CompiledProgram>,
+    /// The compiled programs this VM runs against, shared behind `Arc` so that
+    /// constructing a VM and capturing a snapshot clone a refcount bump rather
+    /// than deep-copying the bytecode/constants/line-tables (the dominant live
+    /// cost of a parked VM). `Arc<CompiledProgram>` serializes identically to
+    /// `CompiledProgram`, so this is an in-memory-only change — the wire format
+    /// is unaffected.
+    pub(crate) programs: Vec<Arc<CompiledProgram>>,
     pub(crate) stack: Vec<Value>,
     pub(crate) frames: Vec<CallFrame>,
     pub(crate) globals: HashMap<String, Value>,
@@ -346,6 +352,10 @@ pub struct Vm {
     /// semantics. Serialized with the snapshot so identity survives resume.
     pub(crate) heap: Heap,
     pub(crate) stdout: String,
+    /// `console.error` / `console.warn` output, kept separate from `stdout`
+    /// (which carries `console.log`/`info`/`debug`), matching Node's stream
+    /// split. Threaded through the snapshot and resume path like `stdout`.
+    pub(crate) stderr: String,
     pub(crate) limits: ResourceLimits,
     pub(crate) tracker: ResourceTracker,
     pub(crate) external_functions: HashSet<String>,
@@ -443,6 +453,13 @@ pub struct Vm {
     /// NEVER serialized into snapshots (line/column come from the compiled
     /// line tables instead, so resumed runs still report correct lines).
     pub(crate) source: Option<String>,
+    /// Per-VM object-key interner (see [`crate::intern`]). A pure runtime
+    /// accelerator consulted at every key-insertion choke point so repeated
+    /// keys ("id", "name", …) share one `Arc<str>` instead of allocating a
+    /// fresh buffer per insert. NEVER serialized — it is simply absent from
+    /// `VmSnapshot` (postcard writes each key's bytes regardless, so wire
+    /// bytes are unchanged) and rebuilt on load via a re-intern pass.
+    pub(crate) key_interner: crate::intern::KeyInterner,
     /// Hand-off slot for a re-raised exception's ORIGINAL throw site: set by
     /// `resume_completion` immediately before its `Err`, consumed by the
     /// execute loop's `Err` arm on the very next iteration (so it can never
@@ -573,16 +590,8 @@ fn completion_escapes(completion: &Completion, info: &TryInfo) -> bool {
 }
 
 impl Vm {
-    fn new(
-        program: CompiledProgram,
-        limits: ResourceLimits,
-        external_functions: HashSet<String>,
-    ) -> Self {
-        Self::with_programs(vec![program], limits, external_functions)
-    }
-
     pub(crate) fn with_programs(
-        programs: Vec<CompiledProgram>,
+        programs: Vec<Arc<CompiledProgram>>,
         limits: ResourceLimits,
         external_functions: HashSet<String>,
     ) -> Self {
@@ -595,7 +604,7 @@ impl Vm {
     /// slots to the supplied heap — the same approach as [`from_snapshot`] — so
     /// user handles in the restored heap remain valid.
     pub(crate) fn with_programs_and_heap(
-        programs: Vec<CompiledProgram>,
+        programs: Vec<Arc<CompiledProgram>>,
         limits: ResourceLimits,
         external_functions: HashSet<String>,
         heap: Heap,
@@ -625,6 +634,7 @@ impl Vm {
             cells: Vec::new(),
             heap,
             stdout: String::new(),
+            stderr: String::new(),
             limits,
             tracker: ResourceTracker::default(),
             external_functions,
@@ -655,6 +665,7 @@ impl Vm {
             timers: Vec::new(),
             next_timer_id: 0,
             source: None,
+            key_interner: crate::intern::KeyInterner::new(),
             pending_throw_loc: None,
         }
     }
@@ -702,13 +713,14 @@ impl Vm {
     /// The return_value is pushed onto the stack (result of the external call).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_snapshot(
-        programs: Vec<CompiledProgram>,
+        programs: Vec<Arc<CompiledProgram>>,
         stack: Vec<Value>,
         frames: Vec<CallFrame>,
         user_globals: HashMap<String, Value>,
         try_stack: Vec<TryInfo>,
         continuations: Vec<Continuation>,
         stdout: String,
+        stderr: String,
         limits: ResourceLimits,
         external_functions: HashSet<String>,
         next_generator_id: u64,
@@ -742,6 +754,15 @@ impl Vm {
             globals.insert(k, v);
         }
 
+        // Post-load intern pass: keys arrive as fresh per-occurrence `Arc<str>`
+        // (postcard deserializes each one independently), so a resumed VM would
+        // otherwise lose all key sharing the live VM had. Fold every heap key
+        // through the interner so repeated keys re-share one allocation, and so
+        // subsequent inserts on the resumed VM keep hitting the same pool.
+        let mut key_interner = crate::intern::KeyInterner::new();
+        let mut heap = heap;
+        key_interner.reintern(&mut heap);
+
         Self {
             programs,
             stack,
@@ -750,6 +771,7 @@ impl Vm {
             cells: Vec::new(),
             heap,
             stdout,
+            stderr,
             limits,
             tracker: ResourceTracker::default(),
             external_functions,
@@ -780,6 +802,7 @@ impl Vm {
             timers: Vec::new(),
             next_timer_id: 0,
             source: None,
+            key_interner,
             pending_throw_loc: None,
         }
     }
@@ -3637,6 +3660,7 @@ impl Vm {
                 method_name,
                 &args,
                 &mut self.stdout,
+                &mut self.stderr,
                 &mut self.heap,
             )? {
                 return Ok(v);
@@ -5985,15 +6009,15 @@ impl Vm {
                 }
                 entries.reverse();
                 for (key, val) in entries {
-                    match key {
-                        Value::String(k) => {
-                            obj.insert(Arc::from(k.as_str()), val);
-                        }
-                        _ => {
-                            let k: Arc<str> = Arc::from(key.to_js_string(&self.heap).as_str());
-                            obj.insert(k, val);
-                        }
-                    }
+                    // Intern the key so repeated object shapes (the common agent
+                    // pattern of building many uniform records) share one
+                    // backing `Arc<str>` per key string instead of allocating a
+                    // fresh buffer per object.
+                    let k = match key {
+                        Value::String(k) => self.key_interner.intern(k.as_str()),
+                        _ => self.key_interner.intern(&key.to_js_string(&self.heap)),
+                    };
+                    obj.insert(k, val);
                 }
                 let h = self.heap.alloc_object(obj);
                 self.push(Value::Object(h))?;
@@ -6098,10 +6122,14 @@ impl Vm {
                             .object(h)
                             .is_some_and(|m| builtins::marker_contains(m, "__non_writable__", &name));
                         if !is_frozen_object(h, &self.heap) && !non_writable {
+                            // Intern before the mut-borrow so a repeated property
+                            // name shares one backing `Arc<str>` across every
+                            // object it is written to.
+                            let key = self.key_interner.intern(&name);
                             // Mutate the heap slot in place; the handle is shared so the
                             // write is visible through every alias (reference semantics).
                             if let Some(obj) = self.heap.object_mut(h) {
-                                obj.insert(Arc::from(name), value);
+                                obj.insert(key, value);
                             }
                         }
                         // Push the (same) object handle back so compile_store can store it.
@@ -6248,7 +6276,7 @@ impl Vm {
                     Value::Object(h) => {
                         // Frozen objects ignore index writes too.
                         if !is_frozen_object(*h, &self.heap) {
-                            let key: Arc<str> = Arc::from(index.to_js_string(&self.heap).as_str());
+                            let key = self.key_interner.intern(&index.to_js_string(&self.heap));
                             if let Some(map) = self.heap.object_mut(*h) {
                                 map.insert(key, value);
                             }
@@ -6385,8 +6413,8 @@ impl Vm {
                     }
                 };
                 let key: Arc<str> = match key {
-                    Value::String(k) => Arc::from(k.as_str()),
-                    other => Arc::from(other.to_js_string(&self.heap).as_str()),
+                    Value::String(k) => self.key_interner.intern(k.as_str()),
+                    other => self.key_interner.intern(&other.to_js_string(&self.heap)),
                 };
                 if let Some(map) = self.heap.object_mut(acc) {
                     map.insert(key, value);
@@ -7074,6 +7102,7 @@ impl Vm {
                                     &method_name,
                                     &args,
                                     &mut self.stdout,
+                                    &mut self.stderr,
                                     &mut self.heap,
                                 )?
                             }
@@ -7176,6 +7205,7 @@ impl Vm {
                                     &method_name,
                                     &args,
                                     &mut self.stdout,
+                                    &mut self.stderr,
                                     &mut self.heap,
                                 )?
                             }
@@ -7258,6 +7288,7 @@ impl Vm {
                                     "fromEntries",
                                     &[Value::Array(arr)],
                                     &mut self.stdout,
+                                    &mut self.stderr,
                                     &mut self.heap,
                                 )?
                             }
@@ -7266,6 +7297,7 @@ impl Vm {
                                 &method_name,
                                 &args,
                                 &mut self.stdout,
+                                &mut self.stderr,
                                 &mut self.heap,
                             )?,
                         };
@@ -10501,7 +10533,7 @@ fn is_promise_method(name: &str) -> bool {
 /// [`crate::program::ZapcodeProgram`] (which reuses cached bytecode).
 /// `root_span` carries any parse/compile child spans already recorded.
 pub(crate) fn execute_compiled(
-    compiled: CompiledProgram,
+    compiled: Arc<CompiledProgram>,
     ext_set: HashSet<String>,
     limits: ResourceLimits,
     input_values: Vec<(String, Value)>,
@@ -10511,9 +10543,11 @@ pub(crate) fn execute_compiled(
 ) -> Result<RunResult> {
     let execute_span = SpanBuilder::new("execute");
     // An empty input heap is the common case (primitive or no inputs); take
-    // the plain constructor so the seeded-heap path stays opt-in.
+    // the plain constructor so the seeded-heap path stays opt-in. The program
+    // arrives as an `Arc` so a `ZapcodeProgram` run-many host shares one
+    // bytecode allocation across every VM it spawns instead of deep-cloning it.
     let mut vm = if input_heap.is_empty() {
-        Vm::new(compiled, limits, ext_set)
+        Vm::with_programs(vec![compiled], limits, ext_set)
     } else {
         Vm::with_programs_and_heap(vec![compiled], limits, ext_set, input_heap)
     };
@@ -10544,6 +10578,7 @@ pub(crate) fn execute_compiled(
                     return Ok(RunResult {
                         state: s,
                         stdout: vm.stdout,
+                        stderr: vm.stderr,
                         heap: vm.heap,
                         trace,
                     });
@@ -10559,6 +10594,7 @@ pub(crate) fn execute_compiled(
                     return Ok(RunResult {
                         state: s,
                         stdout: vm.stdout,
+                        stderr: vm.stderr,
                         heap: vm.heap,
                         trace,
                     });
@@ -10583,6 +10619,7 @@ pub(crate) fn execute_compiled(
     Ok(RunResult {
         state,
         stdout: vm.stdout,
+        stderr: vm.stderr,
         heap: vm.heap,
         trace,
     })
@@ -10666,7 +10703,7 @@ impl ZapcodeRun {
         // original source rides along (transient) for the one-line code
         // frame on uncaught errors.
         let program = crate::program::ZapcodeProgram {
-            compiled,
+            compiled: Arc::new(compiled),
             external_functions: self.external_functions.clone(),
             source: self.source.clone(),
         };
@@ -10701,6 +10738,9 @@ impl ZapcodeRun {
 pub struct RunResult {
     pub state: VmState,
     pub stdout: String,
+    /// `console.error` / `console.warn` output, separate from `stdout`. For a
+    /// suspended run it is the stderr accumulated up to the suspension point.
+    pub stderr: String,
     /// The object heap at the end of the run. Needed to resolve the `Handle`s in
     /// `Value::Array`/`Value::Object` returned in `state` — e.g. to read array
     /// elements or coerce a returned array/object to a string. For a suspended
@@ -10720,6 +10760,7 @@ impl RunResult {
         RunResult {
             state,
             stdout: vm.stdout,
+            stderr: vm.stderr,
             heap: vm.heap,
             trace: ExecutionTrace {
                 root: root.finish_ok(),

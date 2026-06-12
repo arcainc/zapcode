@@ -42,6 +42,7 @@
 pub mod compiler;
 pub mod error;
 pub mod heap;
+pub(crate) mod intern;
 pub mod jsstring;
 pub mod parser;
 pub mod program;

@@ -68,7 +68,10 @@ const MAGIC: &[u8; 4] = b"ZPC1";
 /// v15: runtime error fidelity — `CompiledProgram.line_table`/`line_starts`
 /// and `CompiledFunction.line_table` (source-location side tables for
 /// "at line:col" on uncaught errors), incompatible with v14.
-pub(crate) const FORMAT_VERSION: u16 = 15;
+/// v16: stdout/stderr split — `VmSnapshot.stderr` (a new trailing field
+/// carrying the `console.error`/`console.warn` stream alongside stdout so a
+/// suspension mid-run preserves both), incompatible with v15.
+pub(crate) const FORMAT_VERSION: u16 = 16;
 
 const HEADER_LEN: usize = 4 + 2 + 1 + 1 + 32;
 
