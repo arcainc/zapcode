@@ -3606,6 +3606,38 @@ impl Vm {
             ));
         }
 
+        // `Symbol.toPrimitive` takes precedence over valueOf/toString (spec
+        // ToPrimitive): when present it is the SOLE conversion path, called
+        // with the hint string and required to return a primitive.
+        let to_prim = match self
+            .heap
+            .object(handle)
+            .and_then(|m| m.get(builtins::SYMBOL_TO_PRIMITIVE_KEY))
+        {
+            Some(Value::Function(c)) => Some(Value::Function(c.clone())),
+            _ => None,
+        };
+        if let Some(hook) = to_prim {
+            let hint_str = match hint {
+                ToPrimitiveHint::Number => "number",
+                ToPrimitiveHint::String => "string",
+                ToPrimitiveHint::Default => "default",
+            };
+            let arg = Value::String(JsString::from(hint_str));
+            self.to_primitive_depth += 1;
+            let called = self.call_method_internal(&hook, value.clone(), vec![arg]);
+            self.to_primitive_depth -= 1;
+            let result = called?;
+            // A `Symbol.toPrimitive` that returns an object is a TypeError in
+            // JS (it does NOT fall through to valueOf/toString).
+            if matches!(result, Value::Object(_) | Value::Array(_)) {
+                return Err(ZapcodeError::TypeError(
+                    "Cannot convert object to primitive value".to_string(),
+                ));
+            }
+            return Ok(result);
+        }
+
         for name in methods {
             // Read the hook out of the object (clone-out to avoid borrowing the
             // heap across the guest call). Only an own callable field counts.

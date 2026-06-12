@@ -940,19 +940,23 @@ impl<'a> AstLowerer<'a> {
                         // `#method` -> stored under a "#"-prefixed key (hidden
                         // from reflection); `this.#method()` reads the same key.
                         ast::PropertyKey::PrivateIdentifier(id) => format!("#{}", id.name),
-                        // `[Symbol.iterator]` is statically recognizable:
-                        // store the method under the well-known key the
-                        // iteration protocol reads (`drain_custom_iterator`
-                        // via `builtins::SYMBOL_ITERATOR_KEY`), exactly like
-                        // the object-literal lowering.
+                        // Well-known `[Symbol.X]` keys are statically
+                        // recognizable: store the method under the sentinel
+                        // key the runtime reads (iteration protocol /
+                        // `Vm::to_primitive`), exactly like the object-literal
+                        // lowering. Only the symbols the VM actually honors
+                        // are mapped; others fall through to unsupported.
                         ast::PropertyKey::StaticMemberExpression(sm)
                             if matches!(&sm.object,
-                                ast::Expression::Identifier(o) if o.name == "Symbol")
-                                && sm.property.name == "iterator" =>
+                                ast::Expression::Identifier(o) if o.name == "Symbol") =>
                         {
-                            "__@@iterator".to_string()
+                            match sm.property.name.as_str() {
+                                "iterator" => "__@@iterator".to_string(),
+                                "toPrimitive" => "__@@toPrimitive".to_string(),
+                                _ => continue,
+                            }
                         }
-                        _ => continue, // other computed method names unsupported
+                        _ => continue, // truly dynamic computed names unsupported
                     };
 
                     let func = &method.value;
