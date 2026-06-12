@@ -1,5 +1,6 @@
 pub mod instruction;
 
+use std::sync::Arc;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -297,7 +298,7 @@ impl Compiler {
 
     fn top_level_store_instruction(&self, name: &str, idx: usize) -> Instruction {
         if self.is_session_chunk() {
-            Instruction::StoreGlobal(name.to_string())
+            Instruction::StoreGlobal(Arc::from(name))
         } else {
             Instruction::StoreLocal(idx)
         }
@@ -838,6 +839,7 @@ impl Compiler {
             }
             Statement::TryCatch {
                 try_body,
+                has_catch,
                 catch_param,
                 catch_body,
                 finally_body,
@@ -845,6 +847,7 @@ impl Compiler {
             } => {
                 self.compile_try_catch_finally(
                     try_body,
+                    *has_catch,
                     catch_param.as_deref(),
                     catch_body,
                     finally_body.as_deref(),
@@ -959,13 +962,13 @@ impl Compiler {
                 )?;
                 if self.is_session_chunk() {
                     self.record_top_level_binding(name, TopLevelBindingKind::Class)?;
-                    self.emit(Instruction::StoreGlobal(name.clone()));
+                    self.emit(Instruction::StoreGlobal(Arc::from(name.as_str())));
                 } else {
                     // Store the class as both local and global
                     self.emit(Instruction::Dup);
                     let idx = self.declare_local(name);
                     self.emit(Instruction::StoreLocal(idx));
-                    self.emit(Instruction::StoreGlobal(name.clone()));
+                    self.emit(Instruction::StoreGlobal(Arc::from(name.as_str())));
                 }
             }
             Statement::Switch {
@@ -1077,6 +1080,7 @@ impl Compiler {
             }
             Statement::TryCatch {
                 try_body,
+                has_catch,
                 catch_param,
                 catch_body,
                 finally_body,
@@ -1089,6 +1093,7 @@ impl Compiler {
                 // completion inside finally still supersedes via EndFinally.
                 self.compile_try_catch_finally(
                     try_body,
+                    *has_catch,
                     catch_param.as_deref(),
                     catch_body,
                     finally_body.as_deref(),
@@ -1141,12 +1146,12 @@ impl Compiler {
     fn compile_try_catch_finally(
         &mut self,
         try_body: &[Statement],
+        has_catch: bool,
         catch_param: Option<&str>,
         catch_body: &[Statement],
         finally_body: Option<&[Statement]>,
         completion: Option<()>,
     ) -> Result<()> {
-        let has_catch = !catch_body.is_empty() || catch_param.is_some();
 
         // ---- No finally: the classic catch-only lowering. ----
         let Some(finally) = finally_body else {
@@ -1304,7 +1309,7 @@ impl Compiler {
                     sc.push(self.emit(Instruction::JumpIfNullish(0)));
                     self.emit(Instruction::Pop);
                 }
-                self.emit(Instruction::GetProperty(property.clone()));
+                self.emit(Instruction::GetProperty(Arc::from(property.as_str())));
             }
             Expr::ComputedMember {
                 object,
@@ -1357,13 +1362,13 @@ impl Compiler {
         if let Some(name) = name {
             if self.is_session_chunk() {
                 self.record_top_level_binding(name, TopLevelBindingKind::Function)?;
-                self.emit(Instruction::StoreGlobal(name.clone()));
+                self.emit(Instruction::StoreGlobal(Arc::from(name.as_str())));
             } else {
                 // Store as both local and global so recursion + globals resolve.
                 self.emit(Instruction::Dup);
                 let idx = self.declare_local(name);
                 self.emit(Instruction::StoreLocal(idx));
-                self.emit(Instruction::StoreGlobal(name.clone()));
+                self.emit(Instruction::StoreGlobal(Arc::from(name.as_str())));
             }
         } else {
             self.emit(Instruction::Pop);
@@ -1412,14 +1417,14 @@ impl Compiler {
                         self.compile_expr(expr)?;
                         self.emit(match idx {
                             Some(idx) => self.top_level_store_instruction(name, idx),
-                            None => Instruction::StoreGlobal(name.to_string()),
+                            None => Instruction::StoreGlobal(Arc::from(name.as_str())),
                         });
                     }
                     None => {
                         self.emit(Instruction::Push(Constant::Undefined));
                         self.emit(match idx {
                             Some(idx) => self.top_level_store_instruction(name, idx),
-                            None => Instruction::StoreGlobal(name.to_string()),
+                            None => Instruction::StoreGlobal(Arc::from(name.as_str())),
                         });
                     }
                 }
@@ -1524,7 +1529,7 @@ impl Compiler {
             if matches!(kind, VarKind::Const) {
                 self.const_globals.insert(name.to_string());
             }
-            self.emit(Instruction::StoreGlobal(name.to_string()));
+            self.emit(Instruction::StoreGlobal(Arc::from(name)));
         } else {
             let idx = self.declare_binding(name, kind)?;
             if matches!(kind, VarKind::Const) {
@@ -1642,7 +1647,7 @@ impl Compiler {
                     self.compile_expr(key_expr)?;
                     self.emit(Instruction::GetIndex);
                 } else {
-                    self.emit(Instruction::GetProperty(field.key.clone()));
+                    self.emit(Instruction::GetProperty(Arc::from(field.key.as_str())));
                 }
                 self.emit_apply_default(field.default.as_ref())?;
                 if let Some(nested) = &field.nested {
@@ -1740,7 +1745,7 @@ impl Compiler {
                 self.compile_expr(key_expr)?;
                 self.emit(Instruction::GetIndex);
             } else {
-                self.emit(Instruction::GetProperty(field.key.clone()));
+                self.emit(Instruction::GetProperty(Arc::from(field.key.as_str())));
             }
             self.emit_apply_default(Some(default))?;
             self.compile_destructure_pattern(nested, VarKind::Var)?;
@@ -1842,7 +1847,7 @@ impl Compiler {
                 self.emit(Instruction::Push(Constant::BigInt(v.clone())));
             }
             Expr::StringLit(s) => {
-                self.emit(Instruction::Push(Constant::String(s.clone())));
+                self.emit(Instruction::Push(Constant::String(Arc::from(s.as_str()))));
             }
             Expr::BoolLit(b) => {
                 self.emit(Instruction::Push(Constant::Bool(*b)));
@@ -1857,7 +1862,7 @@ impl Compiler {
                 let mut parts = 0;
                 for (i, quasi) in quasis.iter().enumerate() {
                     if !quasi.is_empty() {
-                        self.emit(Instruction::Push(Constant::String(quasi.clone())));
+                        self.emit(Instruction::Push(Constant::String(Arc::from(quasi.as_str()))));
                         parts += 1;
                     }
                     if i < exprs.len() {
@@ -1866,7 +1871,7 @@ impl Compiler {
                     }
                 }
                 if parts == 0 {
-                    self.emit(Instruction::Push(Constant::String(String::new())));
+                    self.emit(Instruction::Push(Constant::String(Arc::from(String::new().as_str()))));
                 } else {
                     // Always concat (even a single interpolated expression) so the
                     // result is string-coerced: `${obj}` yields "[object Object]".
@@ -1875,17 +1880,17 @@ impl Compiler {
             }
             Expr::RegExpLit { pattern, flags } => {
                 self.emit(Instruction::Push(Constant::String(
-                    "__regexp__".to_string(),
+                    Arc::from("__regexp__"),
                 )));
                 self.emit(Instruction::Push(Constant::Bool(true)));
-                self.emit(Instruction::Push(Constant::String("pattern".to_string())));
-                self.emit(Instruction::Push(Constant::String(pattern.clone())));
-                self.emit(Instruction::Push(Constant::String("flags".to_string())));
-                self.emit(Instruction::Push(Constant::String(flags.clone())));
+                self.emit(Instruction::Push(Constant::String(Arc::from("pattern"))));
+                self.emit(Instruction::Push(Constant::String(Arc::from(pattern.as_str()))));
+                self.emit(Instruction::Push(Constant::String(Arc::from("flags"))));
+                self.emit(Instruction::Push(Constant::String(Arc::from(flags.as_str()))));
                 // `lastIndex` is the mutable cursor maintained by `exec`/`test` on
                 // /g (and /y) regexes so that repeated calls advance through the
                 // subject string and eventually terminate (G3).
-                self.emit(Instruction::Push(Constant::String("lastIndex".to_string())));
+                self.emit(Instruction::Push(Constant::String(Arc::from("lastIndex"))));
                 self.emit(Instruction::Push(Constant::Int(0)));
                 self.emit(Instruction::CreateObject(4));
             }
@@ -1895,7 +1900,7 @@ impl Compiler {
                 } else if let Some(idx) = self.resolve_local(name) {
                     self.emit(Instruction::LoadLocal(idx));
                 } else {
-                    self.emit(Instruction::LoadGlobal(name.clone()));
+                    self.emit(Instruction::LoadGlobal(Arc::from(name.as_str())));
                 }
             }
             Expr::Array(elements) => {
@@ -1952,7 +1957,7 @@ impl Compiler {
                         match &prop.key_expr {
                             Some(key_expr) => c.compile_expr(key_expr),
                             None => {
-                                c.emit(Instruction::Push(Constant::String(prop.key.clone())));
+                                c.emit(Instruction::Push(Constant::String(Arc::from(prop.key.as_str()))));
                                 Ok(())
                             }
                         }
@@ -1989,7 +1994,7 @@ impl Compiler {
                         if accessors.is_empty() {
                             continue;
                         }
-                        self.emit(Instruction::Push(Constant::String(table.to_string())));
+                        self.emit(Instruction::Push(Constant::String(Arc::from(table))));
                         self.emit(Instruction::CreateObject(0));
                         for acc in accessors {
                             emit_key(self, acc)?;
@@ -2004,7 +2009,7 @@ impl Compiler {
                         match &prop.key_expr {
                             Some(key_expr) => self.compile_expr(key_expr)?,
                             None => {
-                                self.emit(Instruction::Push(Constant::String(prop.key.clone())));
+                                self.emit(Instruction::Push(Constant::String(Arc::from(prop.key.as_str()))));
                             }
                         }
                         self.compile_expr(&prop.value)?;
@@ -2025,7 +2030,7 @@ impl Compiler {
                                     Some(key_expr) => self.compile_expr(key_expr)?,
                                     None => {
                                         self.emit(Instruction::Push(Constant::String(
-                                            prop.key.clone(),
+                                            Arc::from(prop.key.as_str()),
                                         )));
                                     }
                                 }
@@ -2299,8 +2304,8 @@ impl Compiler {
                         )
                     })?;
                     self.emit(Instruction::LoadSuperProp {
-                        class,
-                        prop: property.clone(),
+                        class: Arc::from(class.as_str()),
+                        prop: Arc::from(property.as_str()),
                     });
                     return Ok(());
                 }
@@ -2309,7 +2314,7 @@ impl Compiler {
                     self.emit(Instruction::Dup);
                     let skip = self.emit(Instruction::JumpIfNullish(0));
                     self.emit(Instruction::Pop);
-                    self.emit(Instruction::GetProperty(property.clone()));
+                    self.emit(Instruction::GetProperty(Arc::from(property.as_str())));
                     let end = self.emit(Instruction::Jump(0));
                     let nullish = self.current_offset();
                     self.patch_jump(skip, nullish);
@@ -2319,7 +2324,7 @@ impl Compiler {
                     let after = self.current_offset();
                     self.patch_jump(end, after);
                 } else {
-                    self.emit(Instruction::GetProperty(property.clone()));
+                    self.emit(Instruction::GetProperty(Arc::from(property.as_str())));
                 }
             }
             Expr::ComputedMember {
@@ -2369,7 +2374,10 @@ impl Compiler {
                         }
                         self.emit(Instruction::CallSuper {
                             arg_count: args.len(),
-                            class: self.current_class.clone(),
+                            class: self
+                                .current_class
+                                .as_deref()
+                                .map(Arc::from),
                         });
                         return Ok(());
                     }
@@ -2389,8 +2397,8 @@ impl Compiler {
                             )
                         })?;
                         self.emit(Instruction::LoadSuperMethod {
-                            class,
-                            method: property.clone(),
+                            class: Arc::from(class.as_str()),
+                            method: Arc::from(property.as_str()),
                         });
                         for arg in args {
                             self.compile_expr(arg)?;
@@ -2411,12 +2419,12 @@ impl Compiler {
                     if self.external_functions.contains(name) {
                         if has_spread {
                             self.compile_spread_args(args)?;
-                            self.emit(Instruction::CallExternalSpread(name.clone()));
+                            self.emit(Instruction::CallExternalSpread(Arc::from(name.as_str())));
                         } else {
                             for arg in args {
                                 self.compile_expr(arg)?;
                             }
-                            self.emit(Instruction::CallExternalDeferred(name.clone(), args.len()));
+                            self.emit(Instruction::CallExternalDeferred(Arc::from(name.as_str()), args.len()));
                             self.emit(Instruction::MakeCallPromise);
                         }
                         return Ok(());
@@ -2462,7 +2470,7 @@ impl Compiler {
                                 for arg in args {
                                     self.compile_expr(arg)?;
                                 }
-                                self.emit(Instruction::CallExternal(name.clone(), args.len()));
+                                self.emit(Instruction::CallExternal(Arc::from(name.as_str()), args.len()));
                                 handled = true;
                             }
                         }
@@ -2533,7 +2541,7 @@ impl Compiler {
                         object, property, ..
                     } if is_place_expr(object) => {
                         self.compile_expr(object)?;
-                        self.emit(Instruction::DeleteProperty(property.clone()));
+                        self.emit(Instruction::DeleteProperty(Arc::from(property.as_str())));
                         // Write-back of the same (mutated) reference, not a const
                         // rebind — `delete` on a const object's key is allowed.
                         self.compile_store_inner(object, false)?;
@@ -2629,7 +2637,7 @@ impl Compiler {
                         for arg in &call_args {
                             self.compile_expr(arg)?;
                         }
-                        self.emit(Instruction::CallExternalDeferred(name, argc));
+                        self.emit(Instruction::CallExternalDeferred(Arc::from(name.as_str()), argc));
                     } else {
                         self.compile_expr(expr)?;
                     }
@@ -2675,7 +2683,7 @@ impl Compiler {
             if let Some(idx) = self.resolve_local(sc) {
                 self.emit(Instruction::LoadLocal(idx));
             } else {
-                self.emit(Instruction::LoadGlobal(sc.to_string()));
+                self.emit(Instruction::LoadGlobal(Arc::from(sc)));
             }
         }
 
@@ -2720,18 +2728,20 @@ impl Compiler {
 
         self.current_class = prev_class;
 
-        self.emit(Instruction::CreateClass {
-            name: class_name,
-            n_methods: inst_methods.len(),
-            n_statics: stat_methods.len(),
-            n_getters: inst_getters.len(),
-            n_setters: inst_setters.len(),
-            n_static_getters: stat_getters.len(),
-            n_static_setters: stat_setters.len(),
-            n_fields: fields.len(),
-            n_static_fields: static_fields.len(),
-            has_super: super_class.is_some(),
-        });
+        self.emit(Instruction::CreateClass(Box::new(
+            crate::compiler::instruction::CreateClassSpec {
+                name: Arc::from(class_name.as_str()),
+                n_methods: inst_methods.len(),
+                n_statics: stat_methods.len(),
+                n_getters: inst_getters.len(),
+                n_setters: inst_setters.len(),
+                n_static_getters: stat_getters.len(),
+                n_static_setters: stat_setters.len(),
+                n_fields: fields.len(),
+                n_static_fields: static_fields.len(),
+                has_super: super_class.is_some(),
+            },
+        )));
 
         Ok(())
     }
@@ -2739,7 +2749,7 @@ impl Compiler {
     /// Emit `(name_string, closure)` pairs for a group of class methods/accessors.
     fn push_class_method_pairs(&mut self, ms: &[ClassMethod]) -> Result<()> {
         for m in ms {
-            self.emit(Instruction::Push(Constant::String(m.name.clone())));
+            self.emit(Instruction::Push(Constant::String(Arc::from(m.name.as_str()))));
             let compiled = self.compile_function_def(&m.func)?;
             let func_idx = self.functions.borrow().len();
             self.functions.borrow_mut().push(compiled);
@@ -2754,7 +2764,7 @@ impl Compiler {
     /// instance/class so `this.other` references resolve.
     fn push_class_field_pairs(&mut self, fields: &[ClassField]) -> Result<()> {
         for f in fields {
-            self.emit(Instruction::Push(Constant::String(f.name.clone())));
+            self.emit(Instruction::Push(Constant::String(Arc::from(f.name.as_str()))));
             let init = FunctionDef {
                 name: None,
                 params: Vec::new(),
@@ -2824,7 +2834,7 @@ impl Compiler {
                         self.compile_expr(key_expr)?;
                         self.emit(Instruction::GetIndex);
                     } else {
-                        self.emit(Instruction::GetProperty(field.key.clone()));
+                        self.emit(Instruction::GetProperty(Arc::from(field.key.as_str())));
                     }
                     self.emit_apply_default(field.default.as_ref())?;
                     self.compile_assign_pattern_value(&field.pattern)?;
@@ -2846,14 +2856,29 @@ impl Compiler {
     /// to a `const`. The bytecode appends to whatever is on the stack; the throw
     /// unwinds it.
     fn emit_throw_type_error(&mut self, msg: &str) {
-        self.emit(Instruction::LoadGlobal("TypeError".to_string()));
-        self.emit(Instruction::Push(Constant::String(msg.to_string())));
+        self.emit(Instruction::LoadGlobal(Arc::from("TypeError")));
+        self.emit(Instruction::Push(Constant::String(Arc::from(msg))));
         self.emit(Instruction::Construct(1));
         self.emit(Instruction::Throw);
     }
 
     fn compile_store(&mut self, target: &Expr) -> Result<()> {
         self.compile_store_inner(target, true)
+    }
+
+    /// True for expressions that name a storable place (an identifier or a
+    /// member/index chain rooted in one) — the targets `compile_store_inner`
+    /// accepts. The chain must be walked to its root: `foo().bar` is a Member
+    /// node but names no storable place, and write-back would re-evaluate
+    /// `foo()`, duplicating its side effects.
+    fn is_store_target(expr: &Expr) -> bool {
+        match expr {
+            Expr::Ident(_) => true,
+            Expr::Member { object, .. } | Expr::ComputedMember { object, .. } => {
+                Self::is_store_target(object)
+            }
+            _ => false,
+        }
     }
 
     /// Compile a store to `target`. When `check_const` is true (a direct
@@ -2876,17 +2901,25 @@ impl Compiler {
                 } else if check_const && self.const_globals.contains(name) {
                     self.emit_throw_type_error("Assignment to constant variable.");
                 } else {
-                    self.emit(Instruction::StoreGlobal(name.clone()));
+                    self.emit(Instruction::StoreGlobal(Arc::from(name.as_str())));
                 }
             }
             Expr::Member {
                 object, property, ..
             } => {
                 self.compile_expr(object)?;
-                self.emit(Instruction::SetProperty(property.clone()));
-                // SetProperty pushes the modified object back — store it to the
-                // parent (a write-back of the same reference, never a const rebind).
-                self.compile_store_inner(object, false)?;
+                self.emit(Instruction::SetProperty(Arc::from(property.as_str())));
+                // SetProperty mutates the shared heap slot in place and pushes
+                // the same reference back. A nameable parent gets the formal
+                // write-back; an arbitrary object expression — a call result,
+                // a parenthesized assignment (`(o[k] = o[k] || {}).x = v`), a
+                // ternary — has no place to write to, and the mutation is
+                // already visible through every alias: drop the reference.
+                if Self::is_store_target(object) {
+                    self.compile_store_inner(object, false)?;
+                } else {
+                    self.emit(Instruction::Pop);
+                }
             }
             Expr::ComputedMember {
                 object, property, ..
@@ -2894,8 +2927,12 @@ impl Compiler {
                 self.compile_expr(object)?;
                 self.compile_expr(property)?;
                 self.emit(Instruction::SetIndex);
-                // SetIndex pushes the modified object back — write it to the parent.
-                self.compile_store_inner(object, false)?;
+                // Same write-back rule as `Expr::Member` above.
+                if Self::is_store_target(object) {
+                    self.compile_store_inner(object, false)?;
+                } else {
+                    self.emit(Instruction::Pop);
+                }
             }
             _ => {
                 return Err(ZapcodeError::CompileError(

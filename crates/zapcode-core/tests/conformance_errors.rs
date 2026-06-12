@@ -876,3 +876,22 @@ fn constructed_instance_has_no_phantom_global_methods() {
     assert_eq!(run_str("typeof new Map().set"), "function");
     assert_eq!(run_str("new Error('e').message"), "e");
 }
+
+#[test]
+fn bare_catch_block_swallows_with_and_without_finally() {
+    // `catch {}` — no binding, empty block — still swallows the exception.
+    // (The compiler used to treat it as NO handler when the block was empty.)
+    assert_eq!(
+        run_str("let closed = false; try { throw new Error('boom'); } catch {} finally { closed = true; } String(closed)"),
+        "true"
+    );
+    assert_eq!(
+        run_str("try { throw new Error('boom'); } catch {} 'survived'"),
+        "survived"
+    );
+    // A non-empty bare catch keeps working too.
+    assert_eq!(
+        run_str("let hits = 0; try { null.x; } catch { hits += 1; } String(hits)"),
+        "1"
+    );
+}

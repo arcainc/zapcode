@@ -282,11 +282,12 @@ fn in_operator_after_mutation() {
 }
 
 #[test]
-fn in_operator_does_not_walk_prototype() {
-    // DIVERGENCE-adjacent: zapcode objects have no reachable Object.prototype via
-    // `in`, so inherited names like toString are not "in" a plain object.
-    assert_eq!(run_str("'toString' in {}"), "false"); // real JS: true
-    assert_eq!(run_str("'hasOwnProperty' in {}"), "false"); // real JS: true
+fn in_operator_reports_object_prototype_members() {
+    // Promoted from a divergence: `in` reports the universal
+    // Object.prototype members on every object, matching real JS, even
+    // though no prototype chain is stored.
+    assert_eq!(run_str("'toString' in {}"), "true");
+    assert_eq!(run_str("'hasOwnProperty' in {}"), "true");
 }
 
 // ============================================================================

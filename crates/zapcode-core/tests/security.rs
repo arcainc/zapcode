@@ -919,13 +919,27 @@ fn test_new_function_constructor() {
 }
 
 #[test]
-fn test_settimeout_blocked() {
-    let result = eval_ts(r#"setTimeout(() => {}, 0)"#);
-    assert!(result.is_err(), "VULN: setTimeout available in sandbox");
+fn test_settimeout_is_deterministic_not_wall_clock() {
+    // setTimeout EXISTS (agents sleep with it constantly) but the sandbox
+    // contract is determinism: the delay is an ordering key, never a wall
+    // clock. The same program must produce the same firing order on every
+    // run — there is no way to observe real time through a timer.
+    let result = eval_ts(
+        r#"
+        const order = [];
+        setTimeout(() => order.push('b'), 5);
+        setTimeout(() => order.push('a'), 0);
+        await new Promise(r => setTimeout(r, 9));
+        order.join(',')
+    "#,
+    );
+    assert_eq!(format!("{result:?}"), "Ok(String(Valid(\"a,b\")))");
 }
 
 #[test]
 fn test_setinterval_blocked() {
+    // setInterval stays unavailable: an unbounded repeating schedule has no
+    // deterministic end and would let guest code monopolize every drain.
     let result = eval_ts(r#"setInterval(() => {}, 100)"#);
     assert!(result.is_err(), "VULN: setInterval available in sandbox");
 }
@@ -1401,5 +1415,32 @@ fn small_string_builders_still_work_under_tight_limit() {
     assert_eq!(
         eval_with_limits("Array.of(1, 2, 3).length", tight_mem_limits()).unwrap(),
         Value::Int(3)
+    );
+}
+
+#[test]
+fn test_timer_and_microtask_queues_are_allocation_limited() {
+    // Every queued timer/microtask is allocation-tracked: guest code cannot
+    // grow the scheduler queues unboundedly while staying under the VM's
+    // tracked limits (default max_allocations is 100k).
+    let result = eval_ts(
+        r#"
+        const f = () => {};
+        for (let i = 0; i < 200000; i++) setTimeout(f, i);
+    "#,
+    );
+    assert!(
+        matches!(result, Err(ZapcodeError::AllocationLimitExceeded)),
+        "Expected AllocationLimitExceeded, got: {result:?}"
+    );
+    let result = eval_ts(
+        r#"
+        const f = () => {};
+        for (let i = 0; i < 200000; i++) queueMicrotask(f);
+    "#,
+    );
+    assert!(
+        matches!(result, Err(ZapcodeError::AllocationLimitExceeded)),
+        "Expected AllocationLimitExceeded, got: {result:?}"
     );
 }

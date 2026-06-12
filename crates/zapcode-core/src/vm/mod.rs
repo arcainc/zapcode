@@ -141,6 +141,14 @@ pub(crate) struct CallFrame {
     /// (return → resolve with adoption, escaped throw → reject) instead.
     #[serde(default)]
     pub(crate) async_result: Option<Value>,
+    /// True for a frame running a class constructor (or a forwarded `super`
+    /// constructor): an implicit/`undefined` return yields the instance.
+    /// Ordinary methods return `undefined` like JS — substituting `this` for
+    /// every method that returned nothing (the old behavior) also clobbered
+    /// the receiver's source binding on the way out (`new T()` inside a
+    /// static method overwrote the global class `T` with the instance).
+    #[serde(default)]
+    pub(crate) is_constructor: bool,
 }
 
 /// A parked async function call (microtask-design Stage 3): its body frame,
@@ -266,6 +274,21 @@ pub(crate) struct Microtask {
     pub(crate) task: Option<u64>,
 }
 
+/// A pending `setTimeout` callback. The VM has no clock — `delay` is a
+/// deterministic ORDERING key (smaller fires first, ties broken by creation
+/// order), which preserves real-JS relative timer ordering without wall
+/// time. Timers fire as macrotasks: at the top-level drain, after the
+/// microtask queue empties (and the per-tick unhandled-rejection check
+/// passes), the earliest timer's callback runs as a job. Serialized so a
+/// suspension with timers in flight resumes them.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct TimerEntry {
+    pub(crate) id: u64,
+    pub(crate) delay: f64,
+    pub(crate) seq: u64,
+    pub(crate) callback: Value,
+}
+
 /// What a [`Continuation::PromiseCallback`] does with the callback's return value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum PromiseCallbackMode {
@@ -371,6 +394,9 @@ pub struct Vm {
     /// not a constructor `this`). Consumed immediately on push. Transient —
     /// never serialized and never live across a suspension.
     pub(crate) next_frame_is_field_init: bool,
+    /// One-shot: tag the next pushed frame as a constructor frame (set by
+    /// `Construct`/`CallSuper` before `push_call_frame`).
+    pub(crate) next_frame_is_constructor: bool,
     /// What to do with the value the host pushes when resuming a suspension that
     /// was triggered by *consuming a deferred single-call promise* (N5). For a
     /// plain `await p` this is `None` (the pushed value is exactly the await
@@ -404,6 +430,29 @@ pub struct Vm {
     /// Without this, a `yield` inside `try` leaked the try-frame onto
     /// `try_stack` pointing at a popped frame (latent, pre-main-loop bug).
     pub(crate) generator_try_frames: BTreeMap<u64, Vec<TryInfo>>,
+    /// When non-zero, `heap[0..builtin_base)` is this build's builtin template
+    /// (see [`builtin_template`]) and `globals` reuses its handles. Lets
+    /// snapshots elide the template prefix and restores skip re-registration.
+    /// Zero for heaps seeded with caller data (builtins appended on top).
+    pub(crate) builtin_base: usize,
+    /// Pending `setTimeout` callbacks (see [`TimerEntry`]).
+    pub(crate) timers: Vec<TimerEntry>,
+    pub(crate) next_timer_id: u64,
+}
+
+/// The builtin globals and the heap slots backing them, built once. Every
+/// fresh-heap VM starts as a clone of this template, so its layout (slot
+/// order and handles) is identical across VMs and across processes of the
+/// same build — which is what lets snapshots elide the prefix.
+pub(crate) fn builtin_template() -> &'static (HashMap<String, Value>, Heap) {
+    static TEMPLATE: std::sync::OnceLock<(HashMap<String, Value>, Heap)> =
+        std::sync::OnceLock::new();
+    TEMPLATE.get_or_init(|| {
+        let mut globals = HashMap::new();
+        let mut heap = Heap::new();
+        builtins::register_globals(&mut globals, &mut heap);
+        (globals, heap)
+    })
 }
 
 /// Deferred action applied to the value the host delivers when resuming a
@@ -544,22 +593,14 @@ impl Vm {
         // order), so snapshot determinism is unaffected. A non-empty seeded
         // heap (session chunks, compound inputs) must keep registering on
         // top so the caller's existing handles stay valid.
-        let (globals, heap) = if heap.is_empty() {
-            static TEMPLATE: std::sync::OnceLock<(HashMap<String, Value>, Heap)> =
-                std::sync::OnceLock::new();
-            TEMPLATE
-                .get_or_init(|| {
-                    let mut globals = HashMap::new();
-                    let mut heap = Heap::new();
-                    builtins::register_globals(&mut globals, &mut heap);
-                    (globals, heap)
-                })
-                .clone()
+        let (globals, heap, builtin_base) = if heap.is_empty() {
+            let (g, h) = builtin_template();
+            (g.clone(), h.clone(), h.len())
         } else {
             let mut globals = HashMap::new();
             let mut heap = heap;
             builtins::register_globals(&mut globals, &mut heap);
-            (globals, heap)
+            (globals, heap, 0)
         };
 
         Self {
@@ -589,12 +630,16 @@ impl Vm {
             pending_throw: None,
             to_primitive_depth: 0,
             next_frame_is_field_init: false,
+            next_frame_is_constructor: false,
             resume_action: None,
             microtasks: std::collections::VecDeque::new(),
             unhandled_rejections: Vec::new(),
             async_tasks: BTreeMap::new(),
             next_async_task_id: 0,
             generator_try_frames: BTreeMap::new(),
+            builtin_base,
+            timers: Vec::new(),
+            next_timer_id: 0,
         }
     }
 
@@ -617,6 +662,16 @@ impl Vm {
         "parseFloat",
         "isNaN",
         "isFinite",
+        "encodeURIComponent",
+        "decodeURIComponent",
+        "encodeURI",
+        "decodeURI",
+        "btoa",
+        "atob",
+        "setTimeout",
+        "clearTimeout",
+        "clearInterval",
+        "queueMicrotask",
         "Set",
         "Error",
         "TypeError",
@@ -646,12 +701,27 @@ impl Vm {
         last_global_name: Option<String>,
         last_load_source: Option<ReceiverSource>,
         heap: Heap,
+        builtin_base: usize,
     ) -> Self {
-        let mut globals = HashMap::new();
-        let mut heap = heap;
-        // Re-register builtins first (appended to the restored heap).
-        builtins::register_globals(&mut globals, &mut heap);
-        // Then overlay user globals (user globals take precedence if names collide)
+        // A heap that still starts with this build's builtin template reuses
+        // its handles: the template globals point straight into the restored
+        // prefix, so nothing is appended. This keeps snapshot size constant
+        // across suspend/resume hops (re-registration used to append ~40
+        // duplicate builtin objects per resume) and preserves any guest
+        // mutation of a builtin object across the hop, matching the
+        // in-memory run. Heaps without the prefix (seeded with caller data)
+        // keep the append path so their handles stay valid.
+        let (template_globals, template_heap) = builtin_template();
+        let (mut globals, heap, restored_base) =
+            if builtin_base == template_heap.len() && heap.len() >= builtin_base {
+                (template_globals.clone(), heap, builtin_base)
+            } else {
+                let mut globals = HashMap::new();
+                let mut heap = heap;
+                builtins::register_globals(&mut globals, &mut heap);
+                (globals, heap, 0)
+            };
+        // Overlay user globals (user globals take precedence if names collide)
         for (k, v) in user_globals {
             globals.insert(k, v);
         }
@@ -683,12 +753,16 @@ impl Vm {
             pending_throw: None,
             to_primitive_depth: 0,
             next_frame_is_field_init: false,
+            next_frame_is_constructor: false,
             resume_action: None,
             microtasks: std::collections::VecDeque::new(),
             unhandled_rejections: Vec::new(),
             async_tasks: BTreeMap::new(),
             next_async_task_id: 0,
             generator_try_frames: BTreeMap::new(),
+            builtin_base: restored_base,
+            timers: Vec::new(),
+            next_timer_id: 0,
         }
     }
 
@@ -1474,6 +1548,92 @@ impl Vm {
         }
     }
 
+    /// Dispatch the timer/microtask scheduling globals — they mutate VM
+    /// state, so the pure `builtins::call_global_fn` cannot host them.
+    /// Returns `None` for any other global (the caller falls through).
+    fn call_scheduler_global(&mut self, kind: &str, args: &[Value]) -> Option<Result<Value>> {
+        match kind {
+            "setTimeout" => {
+                // A queued timer is an allocation the guest controls — charge
+                // it like any other before creating the entry.
+                if let Err(e) = self.tracker.track_allocation(&self.limits) {
+                    return Some(Err(e));
+                }
+                let callback = args.first().cloned().unwrap_or(Value::Undefined);
+                let delay = args.get(1).map(|v| v.to_number()).unwrap_or(0.0);
+                let delay = if delay.is_finite() && delay > 0.0 { delay } else { 0.0 };
+                let id = self.next_timer_id;
+                self.next_timer_id += 1;
+                self.timers.push(TimerEntry {
+                    id,
+                    delay,
+                    seq: id,
+                    callback,
+                });
+                Some(Ok(Value::Int(id as i64)))
+            }
+            "clearTimeout" | "clearInterval" => {
+                if let Some(Value::Int(id)) = args.first() {
+                    let id = *id as u64;
+                    self.timers.retain(|t| t.id != id);
+                }
+                Some(Ok(Value::Undefined))
+            }
+            "queueMicrotask" => {
+                // Charge the queued job and its hidden result promise.
+                if let Err(e) = self.tracker.track_allocation(&self.limits) {
+                    return Some(Err(e));
+                }
+                let callback = args.first().cloned().unwrap_or(Value::Undefined);
+                let result_promise = builtins::make_pending_promise(&mut self.heap);
+                self.microtasks.push_back(Microtask {
+                    handler: callback,
+                    value: Value::Undefined,
+                    is_rejection: false,
+                    mode: PromiseCallbackMode::WrapResult,
+                    result_promise,
+                    task: None,
+                });
+                Some(Ok(Value::Undefined))
+            }
+            _ => None,
+        }
+    }
+
+    /// Remove and return the next due timer: smallest delay, creation order
+    /// breaking ties — the deterministic analogue of the timer wheel.
+    fn pop_due_timer(&mut self) -> Option<TimerEntry> {
+        let idx = self
+            .timers
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                a.delay
+                    .partial_cmp(&b.delay)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.seq.cmp(&b.seq))
+            })
+            .map(|(i, _)| i)?;
+        Some(self.timers.remove(idx))
+    }
+
+    /// Run a fired timer's callback as a job (the macrotask body): a frame
+    /// driven by the main loop via the microtask machinery, so a tool call
+    /// inside the callback suspends normally.
+    fn start_timer_job(&mut self, t: TimerEntry) -> Result<()> {
+        // The job's hidden result promise is a heap allocation.
+        self.tracker.track_allocation(&self.limits)?;
+        let result_promise = builtins::make_pending_promise(&mut self.heap);
+        self.start_microtask(Microtask {
+            handler: t.callback,
+            value: Value::Undefined,
+            is_rejection: false,
+            mode: PromiseCallbackMode::WrapResult,
+            result_promise,
+            task: None,
+        })
+    }
+
     /// Clear an unhandled-rejection mark: a reject handler attached to the
     /// promise, or its rejection was consumed (`await` rethrow, host boundary).
     fn mark_rejection_handled(&mut self, h: Handle) {
@@ -1531,6 +1691,25 @@ impl Vm {
                 Some(Value::String(s)) if s.as_ref() == "combine"
             ) {
                 return self.combine_step(*rh, m.value, m.is_rejection);
+            }
+            // A capability handed straight to the scheduler —
+            // `setTimeout(resolve, ms)` / `queueMicrotask(reject)` — is a
+            // callable marker, not a Function: invoke it (settle its
+            // promise with the job's value).
+            let capability = {
+                let map = self.heap.object_map(*rh);
+                map.contains_key("__promise_capability__").then(|| {
+                    (
+                        map.get("__promise_capability__")
+                            .cloned()
+                            .unwrap_or(Value::Undefined),
+                        matches!(map.get("__capability_reject__"), Some(Value::Bool(true))),
+                    )
+                })
+            };
+            if let Some((promise, is_reject)) = capability {
+                self.settle_capability(&promise, m.value, is_reject)?;
+                return Ok(());
             }
         }
         if let Value::Function(closure) = &m.handler {
@@ -1937,22 +2116,15 @@ impl Vm {
         // A field-initializer frame binds `this` but is not a constructor: its
         // return value IS the field value (even `undefined`), so skip the
         // constructor `this`-rewrite below.
-        let actual_return = if frame.is_field_init {
-            return_val
-        } else if let Some(ref this_val) = frame.this_value {
-            if let Some(parent) = self.frames.last_mut() {
-                if parent.this_value.is_some() {
-                    parent.this_value = Some(this_val.clone());
-                }
-            }
-            if let Some(ref source) = frame.receiver_source {
-                self.write_receiver_source(source, this_val.clone());
-            }
-            if matches!(return_val, Value::Undefined) {
-                this_val.clone()
-            } else {
-                return_val
-            }
+        // Only a CONSTRUCTOR substitutes the instance for an implicit/
+        // `undefined` return (`new C()` evaluates to `this`); an ordinary
+        // method returning nothing returns `undefined`, like JS. `this`
+        // mutations need no write-back — the receiver is a shared heap
+        // handle, so every alias already sees them; the old eager
+        // write-back let `new T()` inside a static method overwrite the
+        // class binding itself.
+        let actual_return = if frame.is_constructor && matches!(return_val, Value::Undefined) {
+            frame.this_value.clone().unwrap_or(Value::Undefined)
         } else {
             return_val
         };
@@ -2206,7 +2378,14 @@ impl Vm {
         }
 
         self.pending_batch = Some(PendingBatch { kind, items, call_ids });
-        let snapshot = ZapcodeSnapshot::capture(self)?;
+        let mut calls = calls;
+        let snapshot = ZapcodeSnapshot::capture_with(self, &mut |f| {
+            for c in calls.iter_mut() {
+                for v in c.args.iter_mut() {
+                    v.for_each_handle_mut(f);
+                }
+            }
+        })?;
         Ok(Some(VmState::SuspendedMany {
             calls,
             combinator: kind,
@@ -2230,10 +2409,11 @@ impl Vm {
                 ZapcodeError::RuntimeError(format!("unknown pending call {}", id))
             })?;
         let pc = self.pending_calls.remove(pos);
-        let snapshot = ZapcodeSnapshot::capture(self)?;
+        let mut args = pc.args;
+        let snapshot = ZapcodeSnapshot::capture_with_values(self, &mut args)?;
         Ok(Some(VmState::Suspended {
             function_name: pc.name,
-            args: pc.args,
+            args,
             snapshot,
         }))
     }
@@ -2675,6 +2855,7 @@ impl Vm {
 
         // Consume the one-shot field-initializer flag (set by `call_field_init`).
         let is_field_init = std::mem::take(&mut self.next_frame_is_field_init);
+        let is_constructor = std::mem::take(&mut self.next_frame_is_constructor);
 
         self.frames.push(CallFrame {
             program_index: closure.func_ref.program_id,
@@ -2688,6 +2869,7 @@ impl Vm {
             env,
             is_field_init,
             async_result: None,
+            is_constructor,
         });
         Ok(())
     }
@@ -2712,6 +2894,7 @@ impl Vm {
             env: BTreeMap::new(),
             is_field_init: false,
             async_result: None,
+            is_constructor: false,
         });
 
         self.execute_to_host()
@@ -2743,9 +2926,16 @@ impl Vm {
                         continue;
                     }
                     // End of drain: a rejection nobody handled fails the run
-                    // deterministically (JS's unhandled-rejection event).
+                    // deterministically (JS's unhandled-rejection event). Like
+                    // Node, this fires per-MACROTASK — before the next timer.
                     if let Some(err) = self.unhandled_rejection_error() {
                         return Err(err);
+                    }
+                    // Microtasks done: fire the next due timer (a macrotask),
+                    // then drain whatever it queued.
+                    if let Some(t) = self.pop_due_timer() {
+                        self.start_timer_job(t)?;
+                        continue;
                     }
                     // Top-level: return last value on stack or undefined
                     let result = if self.stack.is_empty() {
@@ -2768,10 +2958,12 @@ impl Vm {
                         continue;
                     }
                     let is_async = self.frame_is_async(&frame);
-                    // If this was a constructor, return `this`
-                    let ret = if let Some(this_val) = frame.this_value {
+                    // A CONSTRUCTOR falling off the end returns `this`; an
+                    // ordinary method returns `undefined` (see the Return
+                    // arm for the same rule and its rationale).
+                    let ret = if frame.is_constructor {
                         self.stack.truncate(frame.stack_base);
-                        this_val
+                        frame.this_value.unwrap_or(Value::Undefined)
                     } else {
                         Value::Undefined
                     };
@@ -3010,50 +3202,13 @@ impl Vm {
         // so an empty stack here indicates a VM bug.
         let callback_result = self.pop()?;
 
-        // `MicrotaskReaction` continuations adopt the callback's return value
-        // into the chain's dependent promise themselves, so we must NOT
-        // eagerly unwrap/error on internal promises here — that is the
-        // reaction arm's job. Array continuations, by contrast, expect a plain
-        // value per element, so they unwrap a resolved promise and treat a
-        // rejected one as an unhandled rejection.
-        let is_promise_cont = matches!(
-            self.continuations.last(),
-            Some(Continuation::MicrotaskReaction { .. })
-                | Some(Continuation::PromiseExecutor { .. })
-                | Some(Continuation::GeneratorNext { .. })
-        );
-
-        // Unwrap internal promise values: async callbacks return
-        // {__promise__: true, status: "resolved", value: X} or {status: "rejected", ...}.
-        // Only unwrap objects with the __promise__ marker to avoid mangling user objects.
-        let callback_result = if is_promise_cont {
-            callback_result
-        } else if let Value::Object(h) = &callback_result {
-            let map = self.heap.object_map(*h);
-            if !matches!(map.get("__promise__"), Some(Value::Bool(true))) {
-                // Not an internal promise — leave untouched
-                callback_result
-            } else {
-                match map.get("status") {
-                    Some(Value::String(s)) if s.as_ref() == "resolved" => {
-                        map.get("value").cloned().unwrap_or(Value::Undefined)
-                    }
-                    Some(Value::String(s)) if s.as_ref() == "rejected" => {
-                        let reason = map.get("reason").cloned().unwrap_or(Value::Undefined);
-                        let reason = reason.to_js_string(&self.heap);
-                        // Clean up the continuation before returning error
-                        self.continuations.pop();
-                        return Err(ZapcodeError::RuntimeError(format!(
-                            "Unhandled promise rejection: {}",
-                            reason
-                        )));
-                    }
-                    _ => callback_result,
-                }
-            }
-        } else {
-            callback_result
-        };
+        // The callback's result is collected AS-IS — an async callback hands
+        // its result promise to the driver, exactly as in Node:
+        // `arr.map(async cb)` yields an array of PROMISES (consume them with
+        // `Promise.all`/`allSettled`/`await`), never eagerly-unwrapped values.
+        // A rejected result stays an unhandled-marked promise until something
+        // consumes it; if nothing ever does, the end-of-drain check surfaces
+        // it — the deterministic analogue of Node's unhandledRejection event.
 
         // Pop the continuation, take ownership to avoid cloning results
         let cont = self.continuations.pop().unwrap();
@@ -3379,6 +3534,24 @@ impl Vm {
     /// Call a function value with the given arguments and run it to completion.
     /// Returns the function's return value.
     fn call_function_internal(&mut self, callee: &Value, args: Vec<Value>) -> Result<Value> {
+        // A builtin static passed as a callback (`Object.groupBy(xs, Math.floor)`,
+        // `arr.map(JSON.stringify)`): dispatch through the pure builtin layer.
+        if let Value::BuiltinMethod {
+            object_name,
+            method_name,
+            ..
+        } = callee
+        {
+            if let Some(v) = builtins::call_global_method(
+                object_name,
+                method_name,
+                &args,
+                &mut self.stdout,
+                &mut self.heap,
+            )? {
+                return Ok(v);
+            }
+        }
         // Bare conversion globals (`String`/`Number`/`Boolean`, marker
         // objects) are callable as callbacks too — `arr.map(String)` etc. —
         // with the same ToPrimitive shaping the Call instruction applies.
@@ -3392,6 +3565,9 @@ impl Vm {
                     _ => None,
                 });
             if let Some(kind) = kind {
+                if let Some(result) = self.call_scheduler_global(&kind, &args) {
+                    return result;
+                }
                 let mut args = args;
                 match kind.as_str() {
                     "String" => {
@@ -3445,6 +3621,49 @@ impl Vm {
 
     /// Shared body for the internal-call helpers: push a frame (optionally with a
     /// bound `this`) and run it to completion, returning the result.
+    /// Build (and register) a generator object for a call to a generator
+    /// function: args are captured as named params so the first pull can
+    /// bind them; the receiver (when this is a method call) rides as the
+    /// body's permanent `this`.
+    fn make_generator_object(
+        &mut self,
+        closure: &Closure,
+        args: &[Value],
+        this_value: Option<Value>,
+    ) -> GeneratorObject {
+        let params = self.current_function(closure.func_ref).params.clone();
+        let gen_id = self.alloc_generator_id();
+        let mut captured = closure.captured.clone();
+        for (i, param) in params.iter().enumerate() {
+            match param {
+                ParamPattern::Ident(name) => {
+                    captured.push((
+                        name.clone(),
+                        args.get(i).cloned().unwrap_or(Value::Undefined),
+                    ));
+                }
+                ParamPattern::Rest(name) => {
+                    let rest: Vec<Value> = args[i..].to_vec();
+                    let h = self.heap.alloc_array(rest);
+                    captured.push((name.clone(), Value::Array(h)));
+                }
+                _ => {}
+            }
+        }
+        let gen_obj = GeneratorObject {
+            id: gen_id,
+            func_ref: closure.func_ref,
+            captured,
+            env: closure.env.clone(),
+            suspended: None,
+            done: false,
+            this_value: this_value.map(Box::new),
+        };
+        self.globals
+            .insert(format!("__gen_{}", gen_id), Value::Generator(gen_obj.clone()));
+        gen_obj
+    }
+
     fn call_closure_internal(
         &mut self,
         callee: &Value,
@@ -3458,6 +3677,14 @@ impl Vm {
                 return Err(ZapcodeError::TypeError(format!("{} is not a function", msg)));
             }
         };
+
+        // A generator function called internally (e.g. a `*[Symbol.iterator]`
+        // method invoked by the iteration protocol) returns its generator
+        // object — running the body here would hit `Yield` with no driver.
+        if self.current_function(closure.func_ref).is_generator {
+            let gen_obj = self.make_generator_object(&closure, &args, this_value);
+            return Ok(Value::Generator(gen_obj));
+        }
 
         let target_frame_depth = self.frames.len();
         self.push_call_frame(&closure, &args, this_value)?;
@@ -4665,12 +4892,13 @@ impl Vm {
                     ip: 0,
                     locals,
                     stack_base,
-                    this_value: None,
+                    this_value: gen_obj.this_value.clone().map(|b| *b),
                     receiver_source: None,
                     boxed: BTreeMap::new(),
                     env,
                     is_field_init: false,
                     async_result: None,
+                    is_constructor: false,
                 });
                 self.run_generator_until_yield_or_return(gen_obj)
             }
@@ -4689,12 +4917,13 @@ impl Vm {
                     ip: suspended.ip,
                     locals: suspended.locals,
                     stack_base,
-                    this_value: None,
+                    this_value: gen_obj.this_value.clone().map(|b| *b),
                     receiver_source: None,
                     boxed: suspended.boxed,
                     env,
                     is_field_init: false,
                     async_result: None,
+                    is_constructor: false,
                 });
                 self.run_generator_until_yield_or_return(gen_obj)
             }
@@ -4835,12 +5064,13 @@ impl Vm {
                     ip: 0,
                     locals,
                     stack_base,
-                    this_value: None,
+                    this_value: gen_obj.this_value.clone().map(|b| *b),
                     receiver_source: None,
                     boxed: BTreeMap::new(),
                     env,
                     is_field_init: false,
                     async_result: None,
+                    is_constructor: false,
                 });
             }
             Some(suspended) => {
@@ -4859,12 +5089,13 @@ impl Vm {
                     ip: suspended.ip,
                     locals: suspended.locals,
                     stack_base,
-                    this_value: None,
+                    this_value: gen_obj.this_value.clone().map(|b| *b),
                     receiver_source: None,
                     boxed: suspended.boxed,
                     env,
                     is_field_init: false,
                     async_result: None,
+                    is_constructor: false,
                 });
             }
         }
@@ -5129,6 +5360,11 @@ impl Vm {
         // Call obj[Symbol.iterator]() (with `this` bound to the object) to
         // obtain the iterator object.
         let iterator = self.call_method_internal(&iter_fn, val.clone(), vec![])?;
+        // A generator METHOD (`*[Symbol.iterator]() { … }`) returns a
+        // generator object — drain it through the generator machinery.
+        if let Value::Generator(gen_obj) = iterator {
+            return Ok(Some(self.drain_generator(gen_obj)?));
+        }
         let iter_h = match &iterator {
             Value::Object(ih) => *ih,
             _ => {
@@ -5190,7 +5426,7 @@ impl Vm {
                     Constant::Int(n) => Value::Int(n),
                     Constant::Float(n) => Value::Float(n),
                     Constant::BigInt(v) => Value::BigInt(v.clone()),
-                    Constant::String(s) => Value::String(JsString::from(s.as_str())),
+                    Constant::String(s) => Value::String(JsString::from(s)),
                 };
                 self.push(value)?;
             }
@@ -5242,13 +5478,13 @@ impl Vm {
             Instruction::LoadGlobal(name) => {
                 // A captured free variable resolves to its shared cell via the
                 // current frame's env overlay before falling back to true globals.
-                if let Some(&cell) = self.current_frame().env.get(name.as_str()) {
+                if let Some(&cell) = self.current_frame().env.get(name.as_ref()) {
                     let val = self
                         .cells
                         .get(cell as usize)
                         .cloned()
                         .unwrap_or(Value::Undefined);
-                    self.last_global_name = Some(name.clone());
+                    self.last_global_name = Some(name.clone().to_string());
                     self.last_load_source = Some(ReceiverSource::Cell(cell));
                     self.last_place = Some(Place {
                         root: PlaceRoot::Cell(cell),
@@ -5257,18 +5493,18 @@ impl Vm {
                     self.push(val)?;
                     return Ok(None);
                 }
-                let val = self.globals.get(&name).cloned().unwrap_or(Value::Undefined);
-                self.last_global_name = Some(name.clone());
+                let val = self.globals.get(name.as_ref()).cloned().unwrap_or(Value::Undefined);
+                self.last_global_name = Some(name.to_string());
                 // Only track receiver source for user-defined globals — builtins
                 // (console, Math, JSON, etc.) contain non-serializable BuiltinMethod
                 // values that would break snapshot serialization if written back.
-                if Self::BUILTIN_GLOBAL_NAMES.contains(&name.as_str()) {
+                if Self::BUILTIN_GLOBAL_NAMES.contains(&name.as_ref()) {
                     self.last_load_source = None;
                     self.last_place = None;
                 } else {
-                    self.last_load_source = Some(ReceiverSource::Global(name.clone()));
+                    self.last_load_source = Some(ReceiverSource::Global(name.clone().to_string()));
                     self.last_place = Some(Place {
-                        root: PlaceRoot::Global(name),
+                        root: PlaceRoot::Global(name.to_string()),
                         path: Vec::new(),
                     });
                 }
@@ -5277,12 +5513,12 @@ impl Vm {
             Instruction::StoreGlobal(name) => {
                 let val = self.pop()?;
                 // Route writes to a captured variable through its shared cell.
-                if let Some(&cell) = self.current_frame().env.get(name.as_str()) {
+                if let Some(&cell) = self.current_frame().env.get(name.as_ref()) {
                     if let Some(slot_ref) = self.cells.get_mut(cell as usize) {
                         *slot_ref = val;
                     }
                 } else {
-                    self.globals.insert(name, val);
+                    self.globals.insert(name.to_string(), val);
                 }
             }
             Instruction::DeclareLocal(_) => {
@@ -5739,7 +5975,7 @@ impl Vm {
                             // Mutate the heap slot in place; the handle is shared so the
                             // write is visible through every alias (reference semantics).
                             if let Some(obj) = self.heap.object_mut(h) {
-                                obj.insert(Arc::from(name.as_str()), value);
+                                obj.insert(Arc::from(name), value);
                             }
                         }
                         // Push the (same) object handle back so compile_store can store it.
@@ -5917,7 +6153,7 @@ impl Vm {
                     // Frozen objects are non-configurable: delete is a no-op.
                     if !is_frozen_object(*h, &self.heap) {
                         if let Some(map) = self.heap.object_mut(*h) {
-                            map.shift_remove(name.as_str());
+                            map.shift_remove(name.as_ref());
                         }
                     }
                 }
@@ -6082,10 +6318,29 @@ impl Vm {
             Instruction::In => {
                 let right = self.pop()?;
                 let left = self.pop()?;
+                // Every object inherits Object.prototype's members, so `in`
+                // reports them even though our object model stores no
+                // prototype chain (`'toString' in {}` is true in JS).
+                fn universal_proto_member(key: &str) -> bool {
+                    matches!(
+                        key,
+                        "toString"
+                            | "toLocaleString"
+                            | "valueOf"
+                            | "hasOwnProperty"
+                            | "isPrototypeOf"
+                            | "propertyIsEnumerable"
+                            | "constructor"
+                    )
+                }
                 let result = match &right {
                     Value::Object(h) => {
                         let key = left.to_js_string(&self.heap);
-                        self.heap.object(*h).is_some_and(|m| m.contains_key(key.as_str()))
+                        universal_proto_member(&key)
+                            || self
+                                .heap
+                                .object(*h)
+                                .is_some_and(|m| m.contains_key(key.as_str()))
                     }
                     Value::Array(h) => {
                         let len = self.heap.array(*h).len();
@@ -6098,7 +6353,10 @@ impl Vm {
                             // stay absent — own-key membership only.)
                             _ => {
                                 let key = left.to_js_string(&self.heap);
-                                if key == "length" {
+                                if key == "length"
+                                    || universal_proto_member(&key)
+                                    || is_array_method(&key)
+                                {
                                     true
                                 } else if let Ok(idx) = key.parse::<usize>() {
                                     idx < len
@@ -6237,39 +6495,11 @@ impl Vm {
 
                         // Generator function: create a Generator object instead of running
                         if is_generator {
-                            let params = function.params.clone();
-                            let gen_id = self.alloc_generator_id();
-                            // Capture args as named params so generator_next can restore them
-                            let mut captured = closure.captured.clone();
-                            for (i, param) in params.iter().enumerate() {
-                                match param {
-                                    ParamPattern::Ident(name) => {
-                                        captured.push((
-                                            name.clone(),
-                                            args.get(i).cloned().unwrap_or(Value::Undefined),
-                                        ));
-                                    }
-                                    ParamPattern::Rest(name) => {
-                                        let rest: Vec<Value> = args[i..].to_vec();
-                                        let h = self.heap.alloc_array(rest);
-                                        captured.push((name.clone(), Value::Array(h)));
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            let gen_obj = GeneratorObject {
-                                id: gen_id,
-                                func_ref,
-                                captured,
-                                env: closure.env.clone(),
-                                suspended: None,
-                                done: false,
-                            };
-                            // Store in globals registry so we can look it up by ID later
-                            self.globals.insert(
-                                format!("__gen_{}", gen_id),
-                                Value::Generator(gen_obj.clone()),
-                            );
+                            // A generator METHOD binds the receiver as `this`
+                            // for the whole body's lifetime.
+                            let this_value = self.last_receiver.take();
+                            let gen_obj =
+                                self.make_generator_object(&closure, &args, this_value);
                             self.push(Value::Generator(gen_obj))?;
                             self.last_receiver = None;
                             self.last_receiver_source = None;
@@ -6635,8 +6865,25 @@ impl Vm {
                             }
                             "__date__" => {
                                 if let Some(Value::Object(date)) = receiver {
-                                    let map = self.heap.object_map(date);
-                                    execute_date_method(&map, &method_name)
+                                    if let Some(new_ms) = date_setter_millis(
+                                        &self.heap.object_map(date),
+                                        &method_name,
+                                        &args,
+                                    ) {
+                                        // Mutate the shared slot in place; the
+                                        // setter returns the new timestamp,
+                                        // like JS.
+                                        if let Some(m) = self.heap.object_mut(date) {
+                                            m.insert(
+                                                Arc::from("__date_ms__"),
+                                                Value::Float(new_ms),
+                                            );
+                                        }
+                                        Some(Value::Float(new_ms))
+                                    } else {
+                                        let map = self.heap.object_map(date);
+                                        execute_date_method(&map, &method_name)
+                                    }
                                 } else {
                                     None
                                 }
@@ -6668,6 +6915,104 @@ impl Vm {
                                 }
                                 let h = self.heap.alloc_array(out);
                                 Some(Value::Array(h))
+                            }
+                            // Handing a promise to a combinator attaches a
+                            // reaction to it in real JS, so an element's
+                            // rejection is CONSUMED by the combinator
+                            // (`Promise.allSettled([rejected])` reports it; it
+                            // must not surface as an unhandled rejection).
+                            // Clear the marks of already-settled elements, and
+                            // give each still-pending element a sink reaction
+                            // so a LATER settle doesn't mark either — the
+                            // batch reads element status directly, so the sink
+                            // only has to swallow the unhandled-mark.
+                            // Then run the normal builtin.
+                            "Promise"
+                                if matches!(
+                                    method_name.as_ref(),
+                                    "all" | "allSettled" | "race" | "any"
+                                ) =>
+                            {
+                                if let Some(Value::Array(h)) = args.first() {
+                                    for item in self.heap.array_vec(*h) {
+                                        if let Value::Object(eh) = &item {
+                                            self.mark_rejection_handled(*eh);
+                                            if self.is_internal_pending(&item) {
+                                                self.register_sink_reaction(*eh)?;
+                                            }
+                                        }
+                                    }
+                                }
+                                builtins::call_global_method(
+                                    "Promise",
+                                    &method_name,
+                                    &args,
+                                    &mut self.stdout,
+                                    &mut self.heap,
+                                )?
+                            }
+                            // Object.groupBy / Map.groupBy take a guest key
+                            // callback, so they group here (the pure builtin
+                            // layer cannot call closures). The callback runs
+                            // through the internal drive, like a JSON
+                            // replacer — a tool call inside it cannot suspend.
+                            "Object" | "Map" if method_name.as_ref() == "groupBy" => {
+                                let items = match args.first() {
+                                    Some(Value::Array(h)) => self.heap.array_vec(*h),
+                                    _ => Vec::new(),
+                                };
+                                let callback =
+                                    args.get(1).cloned().unwrap_or(Value::Undefined);
+                                let mut keyed = Vec::with_capacity(items.len());
+                                for (i, item) in items.iter().enumerate() {
+                                    let key = self.call_function_internal(
+                                        &callback,
+                                        vec![item.clone(), Value::Int(i as i64)],
+                                    )?;
+                                    keyed.push((key, item.clone()));
+                                }
+                                let value = if object_name.as_ref() == "Object" {
+                                    // Plain object keyed by ToPropertyKey; group
+                                    // order is first-occurrence, like Node.
+                                    let mut groups: IndexMap<Arc<str>, Vec<Value>> =
+                                        IndexMap::new();
+                                    for (key, item) in keyed {
+                                        let k = key.to_js_string(&self.heap);
+                                        groups.entry(Arc::from(k.as_str())).or_default().push(item);
+                                    }
+                                    self.tracker.track_allocation(&self.limits)?;
+                                    let mut obj = IndexMap::new();
+                                    for (k, group) in groups {
+                                        self.track_array_capacity(group.len())?;
+                                        let h = self.heap.alloc_array(group);
+                                        obj.insert(k, Value::Array(h));
+                                    }
+                                    Some(Value::Object(self.heap.alloc_object(obj)))
+                                } else {
+                                    // Map keyed by SameValueZero identity.
+                                    let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
+                                    for (key, item) in keyed {
+                                        match groups.iter_mut().find(|(k, _)| {
+                                            builtins::same_value_zero(k, &key)
+                                        }) {
+                                            Some((_, g)) => g.push(item),
+                                            None => groups.push((key, vec![item])),
+                                        }
+                                    }
+                                    self.tracker.track_allocation(&self.limits)?;
+                                    let entries = groups
+                                        .into_iter()
+                                        .map(|(k, g)| {
+                                            let gh = self.heap.alloc_array(g);
+                                            let mut em = IndexMap::new();
+                                            em.insert(Arc::from("key"), k);
+                                            em.insert(Arc::from("value"), Value::Array(gh));
+                                            Value::Object(self.heap.alloc_object(em))
+                                        })
+                                        .collect();
+                                    Some(make_map_object(entries, &mut self.heap))
+                                };
+                                value
                             }
                             // JSON.stringify must honor a user `toJSON()` on plain
                             // objects and a FUNCTION replacer; JSON.parse must invoke a
@@ -6820,6 +7165,13 @@ impl Vm {
                             Some(Value::String(s)) => Arc::<str>::from(s.as_str()),
                             _ => Arc::from(""),
                         };
+                        // setTimeout/clearTimeout/queueMicrotask mutate VM
+                        // scheduling state — dispatch here, not in builtins.
+                        if let Some(result) = self.call_scheduler_global(kind.as_ref(), &args) {
+                            let value = result?;
+                            self.push(value)?;
+                            return Ok(None);
+                        }
                         // String(x)/Number(x) run ToPrimitive on their argument so
                         // a user valueOf/toString hook is honored (String -> string
                         // hint, Number -> number hint).
@@ -6909,8 +7261,8 @@ impl Vm {
                 }
             }
             Instruction::CallExternal(name, arg_count) => {
-                if !self.external_functions.contains(&name) {
-                    return Err(ZapcodeError::UnknownExternalFunction(name));
+                if !self.external_functions.contains(name.as_ref() as &str) {
+                    return Err(ZapcodeError::UnknownExternalFunction(name.to_string()));
                 }
                 let mut args = Vec::with_capacity(arg_count);
                 for _ in 0..arg_count {
@@ -6918,9 +7270,10 @@ impl Vm {
                 }
                 args.reverse();
                 // Suspend execution
-                let snapshot = ZapcodeSnapshot::capture(self)?;
+                let mut args = args;
+                let snapshot = ZapcodeSnapshot::capture_with_values(self, &mut args)?;
                 return Ok(Some(VmState::Suspended {
-                    function_name: name,
+                    function_name: name.to_string(),
                     args,
                     snapshot,
                 }));
@@ -6953,8 +7306,8 @@ impl Vm {
                 return self.dispatch(Instruction::CallExternal(name, n));
             }
             Instruction::CallExternalDeferred(name, arg_count) => {
-                if !self.external_functions.contains(&name) {
-                    return Err(ZapcodeError::UnknownExternalFunction(name));
+                if !self.external_functions.contains(name.as_ref() as &str) {
+                    return Err(ZapcodeError::UnknownExternalFunction(name.to_string()));
                 }
                 let mut args = Vec::with_capacity(arg_count);
                 for _ in 0..arg_count {
@@ -6963,8 +7316,11 @@ impl Vm {
                 args.reverse();
                 let id = self.next_call_id;
                 self.next_call_id += 1;
-                self.pending_calls
-                    .push(PendingExternalCall { id, name, args });
+                self.pending_calls.push(PendingExternalCall {
+                    id,
+                    name: name.to_string(),
+                    args,
+                });
                 self.push(Value::Pending(id))?;
             }
             Instruction::MakeBatchPromise(kind, n) => {
@@ -7341,6 +7697,9 @@ impl Vm {
                                 // A user class value is callable (constructor), so
                                 // `typeof Class === "function"` like JS.
                                 || m.contains_key("__class_name__")
+                                // The resolve/reject capabilities handed to a
+                                // `new Promise(executor)` are callable markers.
+                                || m.contains_key("__promise_capability__")
                         }) =>
                     {
                         "function"
@@ -7593,6 +7952,21 @@ impl Vm {
                                     self.push(val)?;
                                     self.current_frame_mut().ip -= 1;
                                     self.start_microtask(m)?;
+                                } else if let Some(err) = self.unhandled_rejection_error() {
+                                    // Microtasks dry with a rejection nobody
+                                    // handled: fail before firing the next
+                                    // macrotask — the same per-macrotask rule
+                                    // the end-of-drain in `execute()` enforces.
+                                    return Err(err);
+                                } else if let Some(t) = self.pop_due_timer() {
+                                    // Microtasks dry but timers pending: a
+                                    // top-level await on a timer-settled
+                                    // promise (`await new Promise(r =>
+                                    // setTimeout(r, ms))`) fires the next
+                                    // macrotask and re-awaits.
+                                    self.push(val)?;
+                                    self.current_frame_mut().ip -= 1;
+                                    self.start_timer_job(t)?;
                                 } else {
                                     // Queue is dry and the promise can never
                                     // settle (e.g. `Promise.race([])`) — pass
@@ -7738,31 +8112,20 @@ impl Vm {
             }
 
             // Classes
-            Instruction::CreateClass {
-                name,
-                n_methods,
-                n_statics,
-                n_getters,
-                n_setters,
-                n_static_getters,
-                n_static_setters,
-                n_fields,
-                n_static_fields,
-                has_super,
-            } => {
+            Instruction::CreateClass(spec) => {
                 // Delegated to a dedicated method so this large arm does not bloat
                 // the `dispatch` stack frame (which recurses through ToPrimitive).
                 self.create_class(CreateClassParts {
-                    name: &name,
-                    n_methods,
-                    n_statics,
-                    n_getters,
-                    n_setters,
-                    n_static_getters,
-                    n_static_setters,
-                    n_fields,
-                    n_static_fields,
-                    has_super,
+                    name: &spec.name,
+                    n_methods: spec.n_methods,
+                    n_statics: spec.n_statics,
+                    n_getters: spec.n_getters,
+                    n_setters: spec.n_setters,
+                    n_static_getters: spec.n_static_getters,
+                    n_static_setters: spec.n_static_setters,
+                    n_fields: spec.n_fields,
+                    n_static_fields: spec.n_static_fields,
+                    has_super: spec.has_super,
                 })?;
             }
 
@@ -8065,6 +8428,7 @@ impl Vm {
                                 // Clear receiver source — constructors should not
                                 // write back to a receiver variable.
                                 self.last_receiver_source = None;
+                                self.next_frame_is_constructor = true;
                                 self.push_call_frame(&closure, &args, Some(instance_val))?;
                                 self.last_receiver = None;
                             }
@@ -8187,6 +8551,7 @@ impl Vm {
 
                 if let Some(Value::Function(closure)) = super_ctor {
                     self.last_receiver_source = None;
+                    self.next_frame_is_constructor = true;
                     self.push_call_frame(&closure, &args, Some(this_val))?;
                     self.last_receiver = None;
                 } else {
@@ -9650,7 +10015,119 @@ fn is_date_method(name: &str) -> bool {
             | "toString"
             | "toDateString"
             | "getTimezoneOffset"
+            | "setTime"
+            | "setUTCFullYear"
+            | "setFullYear"
+            | "setUTCMonth"
+            | "setMonth"
+            | "setUTCDate"
+            | "setDate"
+            | "setUTCHours"
+            | "setHours"
+            | "setUTCMinutes"
+            | "setMinutes"
+            | "setUTCSeconds"
+            | "setSeconds"
+            | "setUTCMilliseconds"
+            | "setMilliseconds"
     )
+}
+
+/// The new `__date_ms__` for a Date mutator call, or `None` for non-setters.
+/// Decompose the current timestamp into UTC civil fields, override the
+/// field(s) the setter names (with the spec's optional trailing arguments),
+/// recompose. Local setters alias the UTC ones (the sandbox runs in UTC).
+fn date_setter_millis(
+    map: &IndexMap<Arc<str>, Value>,
+    method: &str,
+    args: &[Value],
+) -> Option<f64> {
+    let cur = match map.get("__date_ms__") {
+        Some(Value::Int(ms)) => *ms as f64,
+        Some(Value::Float(ms)) => *ms,
+        _ => 0.0,
+    };
+    let arg = |i: usize| args.get(i).map(|v| v.to_number());
+    if method == "setTime" {
+        return Some(arg(0).unwrap_or(f64::NAN));
+    }
+    let base = if cur.is_nan() { 0.0 } else { cur };
+    let millis = base as i64;
+    let seconds = millis.div_euclid(1000);
+    let days = seconds.div_euclid(86_400);
+    let sod = seconds.rem_euclid(86_400);
+    let (mut year, mut month, mut day) = {
+        let (y, m, d) = civil_from_days(days);
+        (y as f64, m as f64, d as f64)
+    };
+    let mut hour = (sod / 3_600) as f64;
+    let mut minute = ((sod % 3_600) / 60) as f64;
+    let mut second = (sod % 60) as f64;
+    let mut ms = millis.rem_euclid(1000) as f64;
+    match method {
+        "setUTCFullYear" | "setFullYear" => {
+            year = arg(0)?;
+            if let Some(v) = arg(1) {
+                month = v + 1.0;
+            }
+            if let Some(v) = arg(2) {
+                day = v;
+            }
+        }
+        "setUTCMonth" | "setMonth" => {
+            month = arg(0)? + 1.0;
+            if let Some(v) = arg(1) {
+                day = v;
+            }
+        }
+        "setUTCDate" | "setDate" => day = arg(0)?,
+        "setUTCHours" | "setHours" => {
+            hour = arg(0)?;
+            if let Some(v) = arg(1) {
+                minute = v;
+            }
+            if let Some(v) = arg(2) {
+                second = v;
+            }
+            if let Some(v) = arg(3) {
+                ms = v;
+            }
+        }
+        "setUTCMinutes" | "setMinutes" => {
+            minute = arg(0)?;
+            if let Some(v) = arg(1) {
+                second = v;
+            }
+            if let Some(v) = arg(2) {
+                ms = v;
+            }
+        }
+        "setUTCSeconds" | "setSeconds" => {
+            second = arg(0)?;
+            if let Some(v) = arg(1) {
+                ms = v;
+            }
+        }
+        "setUTCMilliseconds" | "setMilliseconds" => ms = arg(0)?,
+        _ => return None,
+    }
+    if !(year.is_finite() && month.is_finite() && day.is_finite())
+        || !(hour.is_finite() && minute.is_finite() && second.is_finite() && ms.is_finite())
+    {
+        return Some(f64::NAN);
+    }
+    // Out-of-range fields roll over (month 12 -> next January, day 0 ->
+    // last of previous month), exactly the civil-day arithmetic JS does.
+    let month_total = (year as i64) * 12 + (month as i64) - 1;
+    let norm_year = month_total.div_euclid(12);
+    let norm_month = month_total.rem_euclid(12) + 1;
+    let day_count = days_from_civil(norm_year, norm_month, 1) + (day as i64) - 1;
+    let total_ms = day_count * 86_400_000
+        + (hour as i64) * 3_600_000
+        + (minute as i64) * 60_000
+        + (second as i64) * 1000
+        + (ms as i64);
+    Some(total_ms as f64)
 }
 
 fn execute_date_method(map: &IndexMap<Arc<str>, Value>, method: &str) -> Option<Value> {

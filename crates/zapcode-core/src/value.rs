@@ -124,6 +124,12 @@ pub struct GeneratorObject {
     pub suspended: Option<SuspendedFrame>,
     /// Whether the generator has completed.
     pub done: bool,
+    /// The `this` binding for a generator METHOD (`*vals()` / 
+    /// `*[Symbol.iterator]()` on an object or class instance), captured at
+    /// call time so the body's `this.x` reads resolve. Boxed: `Value`
+    /// contains `GeneratorObject`, so an inline field would be recursive.
+    #[serde(default)]
+    pub this_value: Option<Box<Value>>,
 }
 
 /// Saved execution state of a suspended generator.
@@ -310,6 +316,13 @@ impl Value {
                 if matches!(map.get("__promise__"), Some(Value::Bool(true))) {
                     return "[object Promise]".to_string();
                 }
+                // A WELL-KNOWN symbol object (`Symbol.iterator`) stringifies
+                // to its sentinel key so computed property keys keep landing
+                // on the slot the iteration protocol reads — while `typeof`
+                // reports "symbol" via the `__symbol__` brand.
+                if let Some(Value::String(k)) = map.get("__sym_key__") {
+                    return k.to_string();
+                }
                 // Error objects stringify as "Name: message" (like JS).
                 if matches!(map.get("__error__"), Some(Value::Bool(true))) {
                     let name = map
@@ -428,5 +441,56 @@ impl fmt::Display for Value {
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         self.strict_eq(other)
+    }
+}
+
+impl Value {
+    /// Visit every heap [`Handle`] reachable through this value WITHOUT going
+    /// through the heap: the handle itself plus handles nested in closure
+    /// captures, generator state, and bound-method receivers. The snapshot
+    /// compactor uses this for root collection and for handle rewriting; the
+    /// match is exhaustive on purpose — a new variant that can carry a handle
+    /// must be added here or compaction would corrupt it.
+    pub(crate) fn for_each_handle_mut(&mut self, f: &mut dyn FnMut(&mut Handle)) {
+        match self {
+            Value::Undefined
+            | Value::Null
+            | Value::Bool(_)
+            | Value::Int(_)
+            | Value::Float(_)
+            | Value::BigInt(_)
+            | Value::String(_)
+            | Value::Pending(_) => {}
+            Value::Array(h) | Value::Object(h) => f(h),
+            Value::Function(closure) => {
+                for (_, v) in &mut closure.captured {
+                    v.for_each_handle_mut(f);
+                }
+            }
+            Value::Generator(gen) => gen.for_each_handle_mut(f),
+            Value::BuiltinMethod { recv, .. } => {
+                if let Some(r) = recv {
+                    r.for_each_handle_mut(f);
+                }
+            }
+        }
+    }
+}
+
+impl GeneratorObject {
+    /// See [`Value::for_each_handle_mut`] — generator state carries values in
+    /// its captures and (when suspended) its detached locals/stack.
+    pub(crate) fn for_each_handle_mut(&mut self, f: &mut dyn FnMut(&mut Handle)) {
+        for (_, v) in &mut self.captured {
+            v.for_each_handle_mut(f);
+        }
+        if let Some(this_v) = &mut self.this_value {
+            this_v.for_each_handle_mut(f);
+        }
+        if let Some(sus) = &mut self.suspended {
+            for v in sus.locals.iter_mut().chain(sus.stack.iter_mut()) {
+                v.for_each_handle_mut(f);
+            }
+        }
     }
 }

@@ -80,3 +80,25 @@ fn object_from_entries() {
         r#"{"x":10,"y":20}"#
     );
 }
+
+#[test]
+fn atob_is_whatwg_forgiving() {
+    // WHATWG forgiving-base64-decode (what Node implements): unpadded input
+    // with length % 4 == 2 or 3 decodes via implicit padding…
+    assert_eq!(run_str("atob('eg')"), "z");
+    assert_eq!(run_str("atob('eno')"), "zz");
+    assert_eq!(run_str("atob('enp6')"), "zzz");
+    assert_eq!(run_str("atob('eg==')"), "z");
+    // …whitespace is stripped before the length/padding checks…
+    assert_eq!(run_str("atob(' e g ')"), "z");
+    // …and length % 4 == 1 stays invalid, as does '=' anywhere after the
+    // (only-on-multiple-of-4) padding strip.
+    assert_eq!(
+        run_str("let r; try { atob('egggg'); r = 'no'; } catch (e) { r = 'threw'; } r"),
+        "threw"
+    );
+    assert_eq!(
+        run_str("let r; try { atob('eg='); r = 'no'; } catch (e) { r = 'threw'; } r"),
+        "threw"
+    );
+}

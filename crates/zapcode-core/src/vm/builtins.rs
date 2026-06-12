@@ -149,6 +149,16 @@ pub fn register_globals(globals: &mut HashMap<String, Value>, heap: &mut Heap) {
         // Minimal Symbol factory (O8): callable, typeof === "function", and
         // `Symbol()` yields a unique marker value.
         "Symbol",
+        "encodeURIComponent",
+        "decodeURIComponent",
+        "encodeURI",
+        "decodeURI",
+        "btoa",
+        "atob",
+        "setTimeout",
+        "clearTimeout",
+        "clearInterval",
+        "queueMicrotask",
     ] {
         let v = global_fn(name, heap);
         globals.insert(name.to_string(), v);
@@ -194,14 +204,25 @@ fn global_fn(name: &str, heap: &mut Heap) -> Value {
     let mut obj = IndexMap::new();
     obj.insert(Arc::from("__global_fn__"), Value::String(JsString::from(name)));
     if name == "Symbol" {
-        // Well-known `Symbol.iterator`. Real JS exposes a unique symbol; this
-        // crate has no symbol-keyed property storage, so the well-known iterator
-        // resolves to a stable sentinel STRING. A computed key
-        // `{ [Symbol.iterator]() {} }` then stores the method under this string
-        // key, and `for...of`/spread/destructure look it up to run the protocol.
+        // Well-known `Symbol.iterator`. Real JS exposes a unique symbol;
+        // this crate has no symbol-keyed property storage, so the well-known
+        // iterator is a SYMBOL-BRANDED object (`typeof` reports "symbol")
+        // whose stringification is a stable sentinel key. A computed key
+        // `{ [Symbol.iterator]() {} }` stores the method under that string
+        // key, and `for...of`/spread/destructure look it up for the protocol.
+        let mut iter_sym = IndexMap::new();
+        iter_sym.insert(Arc::from("__symbol__"), Value::Bool(true));
+        iter_sym.insert(
+            Arc::from("__sym_key__"),
+            Value::String(JsString::from(SYMBOL_ITERATOR_KEY)),
+        );
+        iter_sym.insert(
+            Arc::from("description"),
+            Value::String(JsString::from("Symbol.iterator")),
+        );
         obj.insert(
             Arc::from("iterator"),
-            Value::String(JsString::from(SYMBOL_ITERATOR_KEY)),
+            Value::Object(heap.alloc_object(iter_sym)),
         );
         // Global symbol registry: Symbol.for(key) / Symbol.keyFor(sym).
         obj.insert(Arc::from("for"), global_fn_marker("Symbol.for", heap));
@@ -732,6 +753,48 @@ pub fn call_global_fn(kind: &str, args: &[Value], heap: &mut Heap) -> Result<Val
     let arg = args.first().cloned().unwrap_or(Value::Undefined);
     Ok(match kind {
         "String" => Value::String(JsString::from(arg.to_js_string(heap).as_str())),
+        // URI codecs (spec-faithful safe sets; agents build query strings
+        // constantly). Malformed percent-sequences raise a catchable
+        // URIError, like Node.
+        "encodeURIComponent" => Value::String(JsString::from(
+            uri_encode(&arg.to_js_string(heap), "-_.!~*'()").as_str(),
+        )),
+        "encodeURI" => Value::String(JsString::from(
+            uri_encode(&arg.to_js_string(heap), "-_.!~*'()#$&+,/:;=?@").as_str(),
+        )),
+        "decodeURIComponent" => {
+            Value::String(JsString::from(uri_decode(&arg.to_js_string(heap), "")?.as_str()))
+        }
+        "decodeURI" => Value::String(JsString::from(
+            uri_decode(&arg.to_js_string(heap), "#$&+,/:;=?@")?.as_str(),
+        )),
+        // Base64 codecs over latin-1 strings (the WHATWG btoa/atob Node also
+        // ships). A code point above U+00FF raises, like Node.
+        "btoa" => {
+            let s = arg.to_js_string(heap);
+            let mut bytes = Vec::with_capacity(s.len());
+            for ch in s.chars() {
+                let c = ch as u32;
+                if c > 0xff {
+                    return Err(ZapcodeError::RuntimeError(
+                        "InvalidCharacterError: btoa accepts latin-1 only".to_string(),
+                    ));
+                }
+                bytes.push(c as u8);
+            }
+            Value::String(JsString::from(base64_encode(&bytes).as_str()))
+        }
+        "atob" => {
+            let s = arg.to_js_string(heap);
+            let bytes = base64_decode(&s).ok_or_else(|| {
+                ZapcodeError::RuntimeError(
+                    "InvalidCharacterError: atob input is not valid base64".to_string(),
+                )
+            })?;
+            Value::String(JsString::from(
+                bytes.iter().map(|b| *b as char).collect::<String>().as_str(),
+            ))
+        }
         "Number" => finite_number(arg.to_number_heap(heap)),
         // BigInt(x): integers/booleans/numeric strings -> BigInt; a non-integer
         // Number or unparseable string is a RangeError/SyntaxError, like JS.
@@ -2589,7 +2652,7 @@ fn array_from_index(arg: Option<&Value>, len: usize) -> usize {
 }
 
 /// SameValueZero comparison: like `===` but `NaN` equals `NaN`.
-fn same_value_zero(a: &Value, b: &Value) -> bool {
+pub(crate) fn same_value_zero(a: &Value, b: &Value) -> bool {
     if a.strict_eq(b) {
         return true;
     }
@@ -3756,6 +3819,106 @@ fn call_promise_method(method: &str, args: &[Value], heap: &mut Heap) -> Result<
         }
         _ => Ok(None),
     }
+}
+
+/// Percent-encode `s` for a URI: ASCII alphanumerics and the characters in
+/// `safe` pass through; everything else becomes uppercase %XX UTF-8 bytes.
+fn uri_encode(s: &str, safe: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() || safe.contains(ch) {
+            out.push(ch);
+        } else {
+            let mut buf = [0u8; 4];
+            for b in ch.encode_utf8(&mut buf).bytes() {
+                out.push('%');
+                out.push(char::from_digit(u32::from(b >> 4), 16).unwrap().to_ascii_uppercase());
+                out.push(char::from_digit(u32::from(b & 0xf), 16).unwrap().to_ascii_uppercase());
+            }
+        }
+    }
+    out
+}
+
+/// Decode %XX sequences in `s`. A decoded single-byte character listed in
+/// `keep_encoded` stays as its original %XX text (`decodeURI` preserves the
+/// URI's reserved separators). Malformed sequences raise a URIError, like JS.
+fn uri_decode(s: &str, keep_encoded: &str) -> Result<String> {
+    let malformed = || ZapcodeError::RuntimeError("URIError: URI malformed".to_string());
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes.get(i + 1..i + 3).ok_or_else(malformed)?;
+            let hi = (hex[0] as char).to_digit(16).ok_or_else(malformed)?;
+            let lo = (hex[1] as char).to_digit(16).ok_or_else(malformed)?;
+            let byte = (hi * 16 + lo) as u8;
+            if byte < 0x80 && keep_encoded.contains(byte as char) {
+                out.extend_from_slice(&bytes[i..i + 3]);
+            } else {
+                out.push(byte);
+            }
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| malformed())
+}
+
+const B64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(B64_ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(B64_ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { B64_ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { B64_ALPHABET[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// WHATWG forgiving-base64-decode (what `atob` specifies, Node included):
+/// strip ASCII whitespace; a length that is a multiple of 4 may carry one or
+/// two trailing `=`; after that, a remaining length of 1 (mod 4) is invalid
+/// and `=` may not appear at all. A short final chunk (2 or 3 digits — i.e.
+/// unpadded input) decodes as if implicitly padded.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut data: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if data.len() % 4 == 0 {
+        let pad = data.iter().rev().take_while(|b| **b == b'=').take(2).count();
+        data.truncate(data.len() - pad);
+    }
+    if data.len() % 4 == 1 {
+        return None;
+    }
+    let val = |b: u8| -> Option<u32> {
+        B64_ALPHABET.iter().position(|a| *a == b).map(|i| i as u32)
+    };
+    let mut out = Vec::with_capacity(data.len() / 4 * 3 + 2);
+    for chunk in data.chunks(4) {
+        let mut n: u32 = 0;
+        for b in chunk {
+            n = (n << 6) | val(*b)?; // '=' is not in the alphabet → None
+        }
+        // Left-justify a short final chunk to a full 24-bit group; the
+        // surplus low bits are the implicit-padding bits and are dropped.
+        n <<= 6 * (4 - chunk.len() as u32);
+        out.push((n >> 16) as u8);
+        if chunk.len() > 2 {
+            out.push((n >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
 }
 
 /// Build the AggregateError-shaped object `Promise.any` rejects with when

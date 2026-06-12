@@ -146,6 +146,142 @@ identically false for array patterns in both VM and compiler):
 - Hygiene: the duplicate `make_array_iterator` in `vm/mod.rs` now delegates
   to the `builtins` copy.
 
+**Round 13 (branch `perf-template-globals`) — snapshot efficiency + the
+realistic-programs corpus.** The performance pass (first-execution template
+clone, 9.8 µs → 3.9 µs) extended into snapshot economics, and the differential
+corpus gained a section of REALISTIC programs (the shapes agent code actually
+takes: transform tool results, group/aggregate, format reports, retry loops,
+async fan-out) — which immediately caught two real bugs no torture-test had:
+- **Snapshots grew every suspend/resume hop.** `from_snapshot` re-registered
+  builtins, appending ~40 duplicate objects per resume (905 → 1215 bytes over
+  5 hops, unbounded; worse, the re-registration silently RESET guest-visible
+  builtin state, so a hopped run could diverge from the in-memory run). A
+  restored heap that still starts with this build's template now reuses its
+  handles — nothing is appended, and a guest-mutated builtin survives the hop.
+- **The heap was 67% of every snapshot — and ~40 of its 48 objects were the
+  deterministic builtin template.** Snapshots now ELIDE the template prefix
+  (wire v12): serialize only the guest tail plus an FNV fingerprint; restore
+  splices this build's template back in and refuses (catchable error) on a
+  fingerprint mismatch. A mutated prefix or a caller-seeded heap falls back
+  to full serialization. Typical agent snapshot: 1081 → 478 bytes; round-trip
+  69 → 48 µs. `ZapcodeSnapshot::heap()/heap_mut()` materialize the full heap
+  so host-allocated resume values keep valid handles.
+- **Driver callbacks eagerly unwrapped/propagated internal promises** (found
+  by the realistic corpus): `arr.map(async cb)` returned VALUES, and a
+  rejecting callback ABORTED the map with an unhandled-rejection error —
+  `Promise.allSettled(items.map(task))` could not even run. Node shape now:
+  the driver stores each callback's result promise as-is; combinators mark
+  consumed element rejections handled at dispatch; an unconsumed rejection
+  still fails the run at end-of-drain (the deterministic analogue of Node's
+  unhandledRejection event).
+- **`encodeURIComponent`/`decodeURIComponent`/`encodeURI`/`decodeURI` were
+  missing entirely** (also caught by the realistic corpus — agents build
+  query strings constantly). Spec-faithful safe sets; malformed sequences
+  raise a catchable URIError.
+- **Pin closed:** `typeof resolve` inside a `new Promise(executor)` now
+  reports `"function"` (capability markers join the callable-marker set in
+  `TypeOf`). The `Promise.any([])` → AggregateError behavior turned out to
+  already match Node and is now asserted in the corpus. Remaining pins: ONE
+  (`Symbol.toPrimitive` non-dispatch), plus the documented race([])
+  hang-vs-pending and generator-interleaving notes.
+
+Differential corpus after this round: 176 snippets agree with Node (29 of
+them whole realistic programs), 1 pin held.
+
+**Round 14 (branch `perf-template-globals`, third pass) — realistic corpus
+round 2: 65 more whole programs, 7 real bugs.** The corpus now also surfaces
+both-engine throws (a both-throw "agreement" usually means the snippet is
+broken — three round-13 snippets were silently degenerate that way and are
+fixed). The new programs (concurrency-limited batching, memoized lookups,
+middleware chains, circuit breakers, pivots, LRU caches, semver sorting,
+word-wrap, dependency resolution, …) caught:
+- **`catch {}` + `finally` lost the catch entirely.** The compiler treated a
+  bare empty catch block as NO handler (`has_catch` was inferred from
+  `!catch_body.is_empty() || catch_param.is_some()`); the throw escaped
+  `try { … } catch {} finally { … }`. The IR now carries an explicit
+  `has_catch` from the parser.
+- **`(o[k] = o[k] || {}).x = v` — "compile error: invalid assignment
+  target".** Member stores demanded a nameable parent for the write-back,
+  rejecting the grouping-accumulator idiom AND `getObj().x = v` and
+  `(cond ? a : b).x = v`. Since `SetProperty`/`SetIndex` mutate the shared
+  heap slot in place, an arbitrary object expression now just drops the
+  pushed-back reference instead of failing to compile.
+- **`setTimeout`/`clearTimeout`/`queueMicrotask` did not exist** — the
+  canonical `await new Promise(r => setTimeout(r, ms))` sleep failed. Timers
+  are now DETERMINISTIC macrotasks: delay is an ordering key (smaller fires
+  first, creation order on ties — no wall clock, replay-stable); they fire
+  at the top-level drain after microtasks empty and the per-tick
+  unhandled-rejection check passes, preserving every relative ordering real
+  JS guarantees. Timers serialize in snapshots (wire v13) and survive hops;
+  a capability handed to the scheduler (`setTimeout(resolve, ms)`) is
+  invoked, not pass-through'd.
+- **`Object.groupBy` / `Map.groupBy` missing** — grouped in the VM (the key
+  callback is a guest closure, run through the internal drive like a JSON
+  replacer). `Map.groupBy` keys by SameValueZero.
+- **`btoa`/`atob` missing** — WHATWG latin-1 base64, catchable
+  InvalidCharacterError on bad input.
+
+Differential corpus after this round: **241 snippets agree with Node**
+(~95 of them whole realistic programs), 1 pin held, 0 both-throw
+degenerates.
+
+**Round 15 (branch `perf-dispatch-hotpath2`) — dispatch perf, snapshot GC,
+batch-3 corpus + the stdlib sweep.** Three workstreams, each finding real
+bugs:
+
+*Dispatch hot path* (memory-first, per the optimization policy):
+- The per-instruction wall-clock read (`check_time` called `Instant::elapsed`
+  on EVERY dispatch) was ~30 ns of a ~70 ns instruction budget — now
+  amortized to one read per 1024 instructions (worst-case overshoot tens of
+  microseconds against millisecond limits). Tight loops −34%, call-heavy
+  code −21%.
+- `Instruction` shrank 96 → 40 bytes (`Arc<str>` payloads, boxed
+  `CreateClass`): every compiled program's bytecode is ~58% smaller and the
+  per-dispatch clone no longer allocates. Post-fix profile is FLAT (top leaf
+  4.7%) — the remaining cost is the dispatch match itself.
+
+*Snapshot-time heap compaction* (wire v14) — the arena never frees, so a
+churning agent persisted every dead temporary in every snapshot forever
+(3.4 → 12.2 KB over 8 hops in the probe; unbounded). Capture now
+mark-compacts from every serialized handle (order-preserving, so bytes stay
+deterministic; the template prefix is retained for elision). Probe snapshots
+now FLAT. Two corruption hazards found and fixed on the way:
+- Host-facing suspension `args`/`calls` ride OUTSIDE the snapshot and were
+  cloned before capture — compaction could move or even DROP their slots.
+  They are now extra compaction roots, remapped to the compacted layout, and
+  all three bindings marshal them against the SNAPSHOT's materialized heap
+  (the core contract) instead of the live VM heap.
+- The session layer re-captured (and re-compacted) after the suspension
+  already had, double-remapping the args into garbage. Sessions now REUSE
+  the suspension's capture.
+
+*Conformance round 3 + the stdlib sweep* (330 snippets agree with Node; the
+sweep probes every commonly-used method BY NAME):
+- **Methods returning `undefined` returned `this`** — and worse, the
+  value-semantics-era receiver write-back let `new T()` inside a static
+  method OVERWRITE the global class binding. Only constructors substitute
+  `this` now (`CallFrame.is_constructor`); the write-back is gone (heap
+  handles made it a no-op in every legitimate case).
+- **Generator methods** (`*method()`, `*[Symbol.iterator]()`) did not
+  compile as generators (class methods dropped `func.generator`; computed
+  `[Symbol.iterator]` class keys were skipped entirely; generator objects
+  had no `this`). All fixed — `[...new Range(2,5)]` with a generator
+  iterator and live `this` works.
+- **`Date.setUTC*` setters missing** (all of them; `setTime` too).
+- **`'toString' in obj` was false** — `in` now reports inherited
+  Object.prototype members and array prototype methods.
+- **`String.raw` missing** — statically desugared to raw-text concatenation.
+- **Builtins as callbacks failed**: `Object.groupBy(xs, Math.floor)` — the
+  internal call path now dispatches `BuiltinMethod` callees.
+- `typeof Symbol.iterator` now "symbol" (branded well-known symbol object
+  that stringifies to the protocol key).
+- Pre-existing: zapcode-py / zapcode-wasm did not COMPILE (`Value::BigInt`
+  unhandled in their marshalling) — fixed; BigInt marshals to native
+  int/BigInt.
+
+Three stale pins promoted to Node-truth tests (`in` prototype membership ×2,
+class generator methods).
+
 **Round 8 (branch `arca/conformance-fixes`) — cluster wrap-up + reflection / RegExp / coercion-builtin edges.**
 
 This round confirms the earlier-landed clusters are GREEN-by-construction (asserting

@@ -91,6 +91,10 @@ fn value_to_js_inner(
         Value::Bool(b) => Ok(JsValue::from(*b)),
         Value::Int(n) => Ok(JsValue::from(*n as f64)),
         Value::Float(n) => Ok(JsValue::from(*n)),
+        // A BigInt marshals to a JS BigInt via its decimal string.
+        Value::BigInt(n) => js_sys::BigInt::new(&JsValue::from_str(&n.to_string()))
+            .map(JsValue::from)
+            .map_err(|_| JsError::new("BigInt marshalling failed")),
         Value::String(s) => Ok(JsValue::from_str(s.as_ref())),
         Value::Array(h) => {
             if seen.contains(h) {
@@ -349,7 +353,7 @@ fn vm_state_to_js(
         VmState::Suspended {
             function_name,
             args,
-            snapshot,
+            mut snapshot,
         } => {
             Reflect::set(&obj, &JsValue::from_str("suspended"), &JsValue::from(true))
                 .map_err(|_| JsError::new("failed to set suspended"))?;
@@ -359,9 +363,12 @@ fn vm_state_to_js(
                 &JsValue::from_str(&function_name),
             )
             .map_err(|_| JsError::new("failed to set functionName"))?;
+            // Suspension args index the SNAPSHOT's heap (compacted at
+            // capture), not the live VM heap — marshal against it.
+            let snap_heap = snapshot.heap().clone();
             let js_args = Array::new_with_length(args.len() as u32);
             for (i, arg) in args.iter().enumerate() {
-                js_args.set(i as u32, value_to_js(arg, heap)?);
+                js_args.set(i as u32, value_to_js(arg, &snap_heap)?);
             }
             Reflect::set(&obj, &JsValue::from_str("args"), &js_args.into())
                 .map_err(|_| JsError::new("failed to set args"))?;
@@ -378,7 +385,7 @@ fn vm_state_to_js(
         VmState::SuspendedMany {
             calls,
             combinator,
-            snapshot,
+            mut snapshot,
         } => {
             Reflect::set(&obj, &JsValue::from_str("suspended"), &JsValue::from(true))
                 .map_err(|_| JsError::new("failed to set suspended"))?;
@@ -394,6 +401,7 @@ fn vm_state_to_js(
                 &JsValue::from_str(combinator.as_str()),
             )
             .map_err(|_| JsError::new("failed to set combinator"))?;
+            let snap_heap = snapshot.heap().clone();
             let js_calls = Array::new_with_length(calls.len() as u32);
             for (i, call) in calls.iter().enumerate() {
                 let call_obj = Object::new();
@@ -405,7 +413,7 @@ fn vm_state_to_js(
                 .map_err(|_| JsError::new("failed to set call name"))?;
                 let js_args = Array::new_with_length(call.args.len() as u32);
                 for (j, arg) in call.args.iter().enumerate() {
-                    js_args.set(j as u32, value_to_js(arg, heap)?);
+                    js_args.set(j as u32, value_to_js(arg, &snap_heap)?);
                 }
                 Reflect::set(&call_obj, &JsValue::from_str("args"), &js_args.into())
                     .map_err(|_| JsError::new("failed to set call args"))?;

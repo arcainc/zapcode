@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Which `Promise` combinator a deferred batch represents. Determines how the
 /// host settles the batched calls and how the VM assembles the final promise
@@ -40,9 +41,9 @@ pub enum Instruction {
     // Variables
     LoadLocal(usize),
     StoreLocal(usize),
-    LoadGlobal(String),
-    StoreGlobal(String),
-    DeclareLocal(String),
+    LoadGlobal(Arc<str>),
+    StoreGlobal(Arc<str>),
+    DeclareLocal(Arc<str>),
 
     // Arithmetic
     Add,
@@ -77,12 +78,12 @@ pub enum Instruction {
     CreateArray(usize),
     CreateObject(usize),
     ObjectRest(Vec<String>),
-    GetProperty(String),
-    SetProperty(String),
+    GetProperty(Arc<str>),
+    SetProperty(Arc<str>),
     GetIndex,
     SetIndex,
     /// Remove a property by name from the object on the stack: `[obj] -> [obj']`.
-    DeleteProperty(String),
+    DeleteProperty(Arc<str>),
     /// Remove a property by computed key: `[obj, key] -> [obj']`.
     DeleteIndex,
     /// Per-iteration rebinding for `for (let i ...)`: if the local slot has been
@@ -108,17 +109,17 @@ pub enum Instruction {
     CreateClosure(usize),
     Call(usize),
     Return,
-    CallExternal(String, usize),
+    CallExternal(Arc<str>, usize),
     /// Call with spread args: stack is `[callee, args_array]`. The flattened
     /// args array (built like an array literal) is expanded and the call runs.
     CallSpread,
     /// External call with spread args: stack is `[args_array]`.
-    CallExternalSpread(String),
+    CallExternalSpread(Arc<str>),
     /// Like `CallExternal` but does not suspend: pops the args, registers a
     /// deferred external call, and pushes a `Value::Pending`. Emitted only for
     /// direct external calls that are elements of a `Promise.all([...])` literal,
     /// so the calls can be batched and run in parallel by the host.
-    CallExternalDeferred(String, usize),
+    CallExternalDeferred(Arc<str>, usize),
     /// Pops `n` items (some may be `Value::Pending`) and builds a batch promise
     /// tagged with the combinator kind. When awaited it suspends once with all
     /// of its pending calls; the host settles them per the combinator and the
@@ -218,18 +219,7 @@ pub enum Instruction {
     /// getter/setter closures are installed as accessor descriptors. Pushes the
     /// class object (an Object with __constructor__, __prototype__, __class_name__,
     /// and any __getters__/__setters__/__field_inits__/__static_field_inits__).
-    CreateClass {
-        name: String,
-        n_methods: usize,
-        n_statics: usize,
-        n_getters: usize,
-        n_setters: usize,
-        n_static_getters: usize,
-        n_static_setters: usize,
-        n_fields: usize,
-        n_static_fields: usize,
-        has_super: bool,
-    },
+    CreateClass(Box<CreateClassSpec>),
     /// Construct: pops class object + args, creates instance, calls constructor, pushes instance.
     Construct(usize),
     /// Load `this` from the current call frame.
@@ -245,18 +235,18 @@ pub enum Instruction {
     /// global-scan heuristic for any bytecode compiled before this field existed.
     CallSuper {
         arg_count: usize,
-        class: Option<String>,
+        class: Option<Arc<str>>,
     },
     /// Resolve a parent-class method for `super.m(...)`: look up the lexically-defining
     /// `class`'s `__super__.__prototype__`, fetch method `method`, bind the current
     /// `this` as receiver, and push the resulting `Value::Function` so a following
     /// `Call` invokes the parent method with the current instance.
-    LoadSuperMethod { class: String, method: String },
+    LoadSuperMethod { class: Arc<str>, method: Arc<str> },
     /// Read a parent-class property for `super.prop` (non-call): look up the
     /// lexically-defining `class`'s `__super__.__prototype__` and fetch `prop`.
     /// Bare super-prototype data is rare (instance fields live on `this`), so this
     /// yields `undefined` when absent, matching JS prototype-chain reads.
-    LoadSuperProp { class: String, prop: String },
+    LoadSuperProp { class: Arc<str>, prop: Arc<str> },
 
     // Generators
     /// Create a generator object from a function index (like CreateClosure but for generators).
@@ -281,5 +271,23 @@ pub enum Constant {
     Int(i64),
     Float(f64),
     BigInt(num_bigint::BigInt),
-    String(String),
+    String(Arc<str>),
+}
+
+/// Payload of [`Instruction::CreateClass`], boxed to keep the `Instruction`
+/// enum small — it is cloned once per dispatched instruction, and this is by
+/// far the fattest variant. (`Box<T>` is serde-transparent: the wire bytes
+/// are identical to the unboxed struct.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateClassSpec {
+    pub name: Arc<str>,
+    pub n_methods: usize,
+    pub n_statics: usize,
+    pub n_getters: usize,
+    pub n_setters: usize,
+    pub n_static_getters: usize,
+    pub n_static_setters: usize,
+    pub n_fields: usize,
+    pub n_static_fields: usize,
+    pub has_super: bool,
 }

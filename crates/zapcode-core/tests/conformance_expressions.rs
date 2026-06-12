@@ -246,11 +246,14 @@ fn in_operator_after_mutation() {
 }
 
 #[test]
-fn in_operator_does_not_walk_prototype_documented_divergence() {
-    // DIVERGENCE asserted as actual: JS returns true (Object.prototype.toString);
-    // zapcode's `in` checks own keys only.
-    assert_eq!(run_str("'toString' in {}"), "false");
-    assert_eq!(run_str("'hasOwnProperty' in {}"), "false");
+fn in_operator_reports_inherited_object_prototype_members() {
+    // Promoted from a documented divergence: every object inherits
+    // Object.prototype's members, so `in` reports them even though the
+    // object model stores no prototype chain (Node truth).
+    assert_eq!(run_str("'toString' in {}"), "true");
+    assert_eq!(run_str("'hasOwnProperty' in {}"), "true");
+    assert_eq!(run_str("'valueOf' in [1]"), "true");
+    assert_eq!(run_str("'nope' in {}"), "false");
 }
 
 // ============================================================================
@@ -431,4 +434,57 @@ fn symbol_for_global_registry() {
     assert_eq!(run_str("typeof Symbol.for('x')"), "symbol");
     // A registered symbol works as a computed property key.
     assert_eq!(run_str("(function(){ const s = Symbol.for('k'); const o = { [s]: 1 }; return o[s]; })()"), "1");
+}
+
+#[test]
+fn member_store_through_arbitrary_object_expressions() {
+    // The accumulator idiom: the parenthesized assignment's RESULT is the
+    // store target. (Used to be "compile error: invalid assignment target".)
+    assert_eq!(
+        run_str("const p = {}; (p.a = p.a || {}).b = 1; JSON.stringify(p)"),
+        "{\"a\":{\"b\":1}}"
+    );
+    assert_eq!(
+        run_str("const p = {}; (p['x'] = p['x'] || {})['y'] = 2; JSON.stringify(p)"),
+        "{\"x\":{\"y\":2}}"
+    );
+    // A call result as the store target mutates the shared reference.
+    assert_eq!(
+        run_str("const o = { inner: {} }; function get() { return o.inner; } get().v = 7; o.inner.v"),
+        "7"
+    );
+    // Ternary-selected target.
+    assert_eq!(
+        run_str("const a = {}, b = {}; (true ? a : b).hit = 'yes'; a.hit + ',' + (b.hit ?? 'no')"),
+        "yes,no"
+    );
+}
+
+#[test]
+fn member_store_chain_rooted_in_call_evaluates_root_once() {
+    // `foo().bar.baz = v` names no storable place above the call: the chain
+    // is evaluated once and the mutation lands through the shared reference.
+    // The root expression must NOT be re-evaluated for a write-back (it used
+    // to run twice, duplicating its side effects).
+    assert_eq!(
+        run_str(
+            "let calls = 0; \
+             const obj = { bar: { baz: 0 } }; \
+             function foo() { calls++; return obj; } \
+             foo().bar.baz = 1; \
+             calls + ':' + obj.bar.baz"
+        ),
+        "1:1"
+    );
+    // Same through a computed link.
+    assert_eq!(
+        run_str(
+            "let calls = 0; \
+             const obj = { bar: [0] }; \
+             function foo() { calls++; return obj; } \
+             foo().bar[0] = 9; \
+             calls + ':' + obj.bar[0]"
+        ),
+        "1:9"
+    );
 }

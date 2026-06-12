@@ -58,7 +58,14 @@ const MAGIC: &[u8; 4] = b"ZPC1";
 /// `generator_try_frames` snapshot field, incompatible with v9.
 /// v11: generator-mainloop Stage 1 — `GeneratorNext.for_of` (shaped pulls
 /// for for…of / `yield*`), incompatible with v10.
-pub(crate) const FORMAT_VERSION: u16 = 11;
+/// v12: snapshot heap may elide the builtin-template prefix
+/// (`VmSnapshot::{builtin_base, heap_template_elided, template_fingerprint}`),
+/// incompatible with v11.
+/// v13: deterministic timers (`VmSnapshot::{timers, next_timer_id}` for
+/// `setTimeout`), incompatible with v12.
+/// v14: `CallFrame.is_constructor` (constructor-only implicit-`this` return)
+/// and snapshot-time heap compaction, incompatible with v13.
+pub(crate) const FORMAT_VERSION: u16 = 14;
 
 const HEADER_LEN: usize = 4 + 2 + 1 + 1 + 32;
 

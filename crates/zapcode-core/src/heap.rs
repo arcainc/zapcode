@@ -280,3 +280,116 @@ mod tests {
         ));
     }
 }
+
+impl Heap {
+    /// A heap holding clones of the first `n` slots (the builtin-template
+    /// prefix) — used by the snapshot layer to byte-compare the prefix
+    /// against the template before eliding it.
+    pub(crate) fn prefix(&self, n: usize) -> Heap {
+        Heap {
+            slots: self.slots[..n.min(self.slots.len())].to_vec(),
+        }
+    }
+
+    /// A heap holding clones of the slots from `n` on (everything past the
+    /// builtin-template prefix).
+    pub(crate) fn tail_from(&self, n: usize) -> Heap {
+        Heap {
+            slots: self.slots[n.min(self.slots.len())..].to_vec(),
+        }
+    }
+
+    /// Rebuild a full heap from the builtin template plus a serialized tail
+    /// (the inverse of `tail_from` after a template-elided snapshot load).
+    pub(crate) fn with_template_prefix(template: &Heap, tail: Heap) -> Heap {
+        let mut slots = template.slots.clone();
+        slots.extend(tail.slots);
+        Heap { slots }
+    }
+}
+
+impl Heap {
+    /// Drop every slot unreachable from `roots` (the builtin-template prefix
+    /// `keep_prefix` is always retained, so template elision keeps working),
+    /// compacting survivors IN ORDER — the remap is therefore deterministic
+    /// and snapshot bytes stay content-addressable. Inner handles of retained
+    /// slots are rewritten. Returns the old→new remap (`Handle::MAX` marks a
+    /// dropped slot; touching one afterwards is a compactor bug).
+    ///
+    /// This is the snapshot-time GC: the arena never frees during execution
+    /// (handles are stable indices), so a churning agent accumulates dead
+    /// slots — without this, every one of them rides in every snapshot
+    /// forever.
+    pub(crate) fn compact_retaining(
+        &mut self,
+        keep_prefix: usize,
+        roots: &[Handle],
+    ) -> Vec<Handle> {
+        let n = self.slots.len();
+        let mut live = vec![false; n];
+        let mut queue: Vec<usize> = Vec::new();
+        for i in 0..keep_prefix.min(n) {
+            live[i] = true;
+            queue.push(i);
+        }
+        for &h in roots {
+            let i = h as usize;
+            if i < n && !live[i] {
+                live[i] = true;
+                queue.push(i);
+            }
+        }
+        let mut children: Vec<Handle> = Vec::new();
+        while let Some(i) = queue.pop() {
+            children.clear();
+            match &mut self.slots[i] {
+                HeapSlot::Array(items) => {
+                    for v in items.iter_mut() {
+                        v.for_each_handle_mut(&mut |h| children.push(*h));
+                    }
+                }
+                HeapSlot::Object(map) => {
+                    for (_, v) in map.iter_mut() {
+                        v.for_each_handle_mut(&mut |h| children.push(*h));
+                    }
+                }
+            }
+            for &c in &children {
+                let ci = c as usize;
+                if ci < n && !live[ci] {
+                    live[ci] = true;
+                    queue.push(ci);
+                }
+            }
+        }
+        let mut remap = vec![Handle::MAX; n];
+        let mut next: Handle = 0;
+        for (i, is_live) in live.iter().enumerate() {
+            if *is_live {
+                remap[i] = next;
+                next += 1;
+            }
+        }
+        let mut new_slots = Vec::with_capacity(next as usize);
+        for (i, mut slot) in std::mem::take(&mut self.slots).into_iter().enumerate() {
+            if !live[i] {
+                continue;
+            }
+            match &mut slot {
+                HeapSlot::Array(items) => {
+                    for v in items.iter_mut() {
+                        v.for_each_handle_mut(&mut |h| *h = remap[*h as usize]);
+                    }
+                }
+                HeapSlot::Object(map) => {
+                    for (_, v) in map.iter_mut() {
+                        v.for_each_handle_mut(&mut |h| *h = remap[*h as usize]);
+                    }
+                }
+            }
+            new_slots.push(slot);
+        }
+        self.slots = new_slots;
+        remap
+    }
+}

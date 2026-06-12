@@ -83,6 +83,13 @@ fn value_to_py_inner(
         Value::Bool(b) => Ok(b.into_pyobject(py)?.to_owned().into_any().unbind()),
         Value::Int(n) => Ok(n.into_pyobject(py)?.into_any().unbind()),
         Value::Float(n) => Ok(n.into_pyobject(py)?.into_any().unbind()),
+        // A BigInt marshals to a native Python int (arbitrary precision on
+        // both sides; round-trips via the decimal string).
+        Value::BigInt(n) => {
+            let int_mod = py.import("builtins")?;
+            let v = int_mod.getattr("int")?.call1((n.to_string(),))?;
+            Ok(v.unbind())
+        }
         Value::String(s) => Ok(s.as_ref().into_pyobject(py)?.into_any().unbind()),
         Value::Array(h) => {
             if seen.contains(h) {
@@ -279,13 +286,15 @@ fn run_result_to_py(
         VmState::Suspended {
             function_name,
             args,
-            snapshot,
+            mut snapshot,
         } => {
             dict.set_item("suspended", true)?;
             dict.set_item("function_name", &function_name)?;
             let py_args = PyList::empty(py);
+            // Suspension args index the SNAPSHOT's heap (compacted at
+            // capture), not the live VM heap — marshal against it.
             for arg in &args {
-                py_args.append(value_to_py(py, arg, heap)?)?;
+                py_args.append(value_to_py(py, arg, snapshot.heap())?)?;
             }
             dict.set_item("args", py_args)?;
             dict.set_item("snapshot", ZapcodeSnapshot { inner: snapshot })?;
@@ -294,7 +303,7 @@ fn run_result_to_py(
         VmState::SuspendedMany {
             calls,
             combinator,
-            snapshot,
+            mut snapshot,
         } => {
             dict.set_item("suspended", true)?;
             dict.set_item("suspended_many", true)?;
@@ -305,7 +314,7 @@ fn run_result_to_py(
                 call_dict.set_item("name", &call.name)?;
                 let py_args = PyList::empty(py);
                 for arg in &call.args {
-                    py_args.append(value_to_py(py, arg, heap)?)?;
+                    py_args.append(value_to_py(py, arg, snapshot.heap())?)?;
                 }
                 call_dict.set_item("args", py_args)?;
                 py_calls.append(call_dict)?;

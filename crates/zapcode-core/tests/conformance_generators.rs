@@ -707,16 +707,18 @@ fn spread_and_destructure_of_generator_consume_it() {
 }
 
 #[test]
-fn class_generator_method_does_not_compile_as_generator_divergence() {
-    // DIVERGENCE (documented): a class method written `*method(){}` does not
-    // compile its body as a generator (object-literal `*m(){}` does — see
-    // object_literal_generator_method). Asserting actual behavior; the body
-    // errors that `yield` is outside a generator function.
+fn class_generator_methods_compile_as_generators() {
+    // Promoted from a documented divergence: a class method written
+    // `*method(){}` compiles its body as a generator (the parser now
+    // propagates `func.generator` for class methods), and the receiver is
+    // bound as `this` for the whole body's lifetime.
     let out = run_or_err("class C { *items(){ yield 'x'; yield 'y'; } } const c=new C(); let o=[]; for(const v of c.items()) o.push(v); o.join(',')");
-    assert!(
-        out.starts_with("ERR:"),
-        "expected class *method() generator body to be unsupported, got {out}"
+    assert_eq!(out, "x,y");
+    // `*[Symbol.iterator]()` makes instances spreadable, with `this` live.
+    let out = run_or_err(
+        "class R { constructor(a,b){ this.a=a; this.b=b; }          *[Symbol.iterator]() { for (let i=this.a; i<=this.b; i++) yield i; } }          [...new R(2,5)].join(',')",
     );
+    assert_eq!(out, "2,3,4,5");
 }
 
 #[test]

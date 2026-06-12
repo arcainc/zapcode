@@ -58,6 +58,21 @@ fn run_str(code: &str) -> String {
     }
 }
 
+/// Run `code` expecting a runtime error; return the error string.
+fn run_err(code: &str) -> String {
+    ZapcodeRun::new(
+        code.to_string(),
+        Vec::new(),
+        Vec::new(),
+        ResourceLimits::default(),
+    )
+    .unwrap()
+    .run(Vec::new())
+    .map(|r| panic!("expected error for `{code}`, got {:?}", r.state))
+    .unwrap_err()
+    .to_string()
+}
+
 /// Wrap a multi-statement async body in `async function main(){…} main();` so a
 /// top-level promise (and any `for await` / `try/catch` inside) is resolved to a
 /// plain completion value. `body` should `return` its result.
@@ -1032,4 +1047,77 @@ fn allsettled_reasons_remain_intact() {
         ),
         "R(a),F(1),R(b)"
     );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Driver callbacks hand back their result PROMISE (Node shape) — no eager
+//  unwrap, no eager rejection propagation
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn map_with_async_callback_yields_promises_not_values() {
+    // Node: `[..].map(async cb)` is an array of pending/settled PROMISES.
+    assert_eq!(
+        run_str(
+            "async function main() { \
+                 const ps = [1, 2].map(async n => n * 10); \
+                 const kinds = ps.map(p => typeof p?.then === 'undefined' ? 'plain' : 'thenable'); \
+                 const vals = await Promise.all(ps); \
+                 return kinds.join(',') + '|' + vals.join(','); \
+             } \
+             main();"
+        ),
+        "thenable,thenable|10,20"
+    );
+}
+
+#[test]
+fn rejected_async_map_element_is_stored_not_thrown() {
+    // A rejecting async callback must NOT abort `map`; the rejected promise
+    // is element N, and `allSettled` consumes it (Node-exact).
+    assert_eq!(
+        run_str(
+            "async function t(n) { if (n === 1) throw new Error('x'); return n; } \
+             async function main() { \
+                 const ps = [1, 2].map(t); \
+                 const o = await Promise.allSettled(ps); \
+                 return o.map(r => r.status + ':' + (r.value ?? r.reason.message)).join(','); \
+             } \
+             main();"
+        ),
+        "rejected:x,fulfilled:2"
+    );
+}
+
+#[test]
+fn rejected_async_map_element_consumed_by_sequential_awaits() {
+    assert_eq!(
+        run_str(
+            "async function t(n) { if (n === 1) throw new Error('x'); return n; } \
+             async function main() { \
+                 const out = []; \
+                 for (const p of [1, 2].map(t)) { \
+                     try { out.push(await p); } catch (e) { out.push('c:' + e.message); } \
+                 } \
+                 return out.join(','); \
+             } \
+             main();"
+        ),
+        "c:x,2"
+    );
+}
+
+#[test]
+fn unconsumed_map_rejection_still_fails_the_run() {
+    // Nothing ever consumes the rejection: the run fails deterministically
+    // (the analogue of Node's unhandledRejection process event).
+    let err = run_err(
+        "async function t(n) { if (n === 1) throw new Error('x'); return n; } \
+         async function main() { \
+             const ps = [1, 2].map(t); \
+             return ps.length; \
+         } \
+         main();",
+    );
+    assert!(err.contains("Unhandled promise rejection"), "got: {err}");
 }
