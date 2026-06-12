@@ -122,8 +122,24 @@ session chunks):
 - **Prepare-once API** — DONE (cycle 2): `ZapcodeProgramHandle` napi class
   exposes compile-once / run-many + dump/load through the binding (a
   zapcode-ai `prepare()` wrapper around it is the remaining follow-up).
-- **Tool-call introspection/trace**: a structured per-run trace (which
-  tools, what args, how long suspended) the host can log or feed back.
+- **Tool-call trace + run report** — DONE (cycle 3): `ExecutionResult.toolCalls`
+  carry per-call timing; `ExecutionResult.report` is a structured receipt
+  (completed / durationMs / toolCallCount / error{message,line,column}).
+- **dryRun** — DONE (cycle 3): `dryRun(code, tools)` typechecks then
+  smoke-executes against side-effect-free stub tools under a tight budget,
+  reporting reached-completion / error-site / the tool-call sequence it would
+  make. The "does agent code instantly error" pre-flight.
+- **Forking** — DONE (cycle 3): `forkSnapshot(bytes)` names the proven
+  snapshot-fork primitive (load the same suspension bytes N times → N
+  independent, deterministic, program-sharing continuations) for agent
+  checkpoint / rollback / speculative branching.
+- **`console.assert`** — DONE (cycle 3): falsy condition writes
+  "Assertion failed[: msg]" to stderr without throwing — in-sandbox
+  self-verification, pairing with the stdout/stderr split.
+- **Agent-DX e2e suite** — DONE (cycle 3): `tests/agent-dx.mjs` asserts the
+  QUALITY of feedback (clear error locations, type errors caught pre-run, no
+  silent hangs, partial output on failure, deterministic fork/rollback),
+  wired into `test:e2e-full`.
 - Watch monty's roadmap: dataclass-style typed returns, pydantic-ai
   "code mode" toolset packaging — the `zapcode({tools})` wrapper is the
   equivalent; keep its system-prompt contract tight as tools grow.
