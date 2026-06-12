@@ -333,7 +333,13 @@ struct CreateClassParts<'a> {
 
 /// The Zapcode VM.
 pub struct Vm {
-    pub(crate) programs: Vec<CompiledProgram>,
+    /// The compiled programs this VM runs against, shared behind `Arc` so that
+    /// constructing a VM and capturing a snapshot clone a refcount bump rather
+    /// than deep-copying the bytecode/constants/line-tables (the dominant live
+    /// cost of a parked VM). `Arc<CompiledProgram>` serializes identically to
+    /// `CompiledProgram`, so this is an in-memory-only change — the wire format
+    /// is unaffected.
+    pub(crate) programs: Vec<Arc<CompiledProgram>>,
     pub(crate) stack: Vec<Value>,
     pub(crate) frames: Vec<CallFrame>,
     pub(crate) globals: HashMap<String, Value>,
@@ -573,16 +579,8 @@ fn completion_escapes(completion: &Completion, info: &TryInfo) -> bool {
 }
 
 impl Vm {
-    fn new(
-        program: CompiledProgram,
-        limits: ResourceLimits,
-        external_functions: HashSet<String>,
-    ) -> Self {
-        Self::with_programs(vec![program], limits, external_functions)
-    }
-
     pub(crate) fn with_programs(
-        programs: Vec<CompiledProgram>,
+        programs: Vec<Arc<CompiledProgram>>,
         limits: ResourceLimits,
         external_functions: HashSet<String>,
     ) -> Self {
@@ -595,7 +593,7 @@ impl Vm {
     /// slots to the supplied heap — the same approach as [`from_snapshot`] — so
     /// user handles in the restored heap remain valid.
     pub(crate) fn with_programs_and_heap(
-        programs: Vec<CompiledProgram>,
+        programs: Vec<Arc<CompiledProgram>>,
         limits: ResourceLimits,
         external_functions: HashSet<String>,
         heap: Heap,
@@ -702,7 +700,7 @@ impl Vm {
     /// The return_value is pushed onto the stack (result of the external call).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_snapshot(
-        programs: Vec<CompiledProgram>,
+        programs: Vec<Arc<CompiledProgram>>,
         stack: Vec<Value>,
         frames: Vec<CallFrame>,
         user_globals: HashMap<String, Value>,
@@ -10501,7 +10499,7 @@ fn is_promise_method(name: &str) -> bool {
 /// [`crate::program::ZapcodeProgram`] (which reuses cached bytecode).
 /// `root_span` carries any parse/compile child spans already recorded.
 pub(crate) fn execute_compiled(
-    compiled: CompiledProgram,
+    compiled: Arc<CompiledProgram>,
     ext_set: HashSet<String>,
     limits: ResourceLimits,
     input_values: Vec<(String, Value)>,
@@ -10511,9 +10509,11 @@ pub(crate) fn execute_compiled(
 ) -> Result<RunResult> {
     let execute_span = SpanBuilder::new("execute");
     // An empty input heap is the common case (primitive or no inputs); take
-    // the plain constructor so the seeded-heap path stays opt-in.
+    // the plain constructor so the seeded-heap path stays opt-in. The program
+    // arrives as an `Arc` so a `ZapcodeProgram` run-many host shares one
+    // bytecode allocation across every VM it spawns instead of deep-cloning it.
     let mut vm = if input_heap.is_empty() {
-        Vm::new(compiled, limits, ext_set)
+        Vm::with_programs(vec![compiled], limits, ext_set)
     } else {
         Vm::with_programs_and_heap(vec![compiled], limits, ext_set, input_heap)
     };
@@ -10666,7 +10666,7 @@ impl ZapcodeRun {
         // original source rides along (transient) for the one-line code
         // frame on uncaught errors.
         let program = crate::program::ZapcodeProgram {
-            compiled,
+            compiled: Arc::new(compiled),
             external_functions: self.external_functions.clone(),
             source: self.source.clone(),
         };

@@ -107,7 +107,10 @@ enum SessionSnapshotData {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct IdleSessionState {
-    programs: Vec<CompiledProgram>,
+    /// Compiled chunks, shared behind `Arc` so an idle session captured between
+    /// chunks bumps refcounts instead of deep-copying every chunk's bytecode.
+    /// `Arc<T>` serializes identically to `T`, so the wire format is unchanged.
+    programs: Vec<std::sync::Arc<CompiledProgram>>,
     globals: Vec<(String, Value)>,
     top_level_bindings: Vec<(String, TopLevelBindingKind)>,
     limits: ResourceLimits,
@@ -259,7 +262,7 @@ impl ZapcodeSessionSnapshot {
         validate_new_top_level_bindings(&idle, &top_level_bindings)?;
 
         let mut programs = idle.programs;
-        programs.push(compiled);
+        programs.push(std::sync::Arc::new(compiled));
         let program_index = programs.len() - 1;
 
         let mut vm =

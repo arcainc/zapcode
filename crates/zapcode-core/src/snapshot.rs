@@ -15,7 +15,11 @@ use crate::wire::FrameKind;
 /// Internal serializable representation of VM state at a suspension point.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct VmSnapshot {
-    pub(crate) programs: Vec<crate::compiler::CompiledProgram>,
+    /// Compiled programs, shared behind `Arc` so capture clones a refcount
+    /// rather than the whole bytecode (a live snapshot used to own a full deep
+    /// copy of every program). `Arc<T>` serializes identically to `T`, so the
+    /// wire format is unchanged.
+    pub(crate) programs: Vec<std::sync::Arc<crate::compiler::CompiledProgram>>,
     pub(crate) stack: Vec<Value>,
     pub(crate) frames: Vec<CallFrame>,
     /// Shared upvalue cells (captured variables). Ids are indices; sharing is

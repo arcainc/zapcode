@@ -33,7 +33,12 @@ use crate::wire::FrameKind;
 /// A parsed + compiled Zapcode program, ready to run any number of times.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ZapcodeProgram {
-    pub(crate) compiled: CompiledProgram,
+    /// The compiled bytecode, behind `Arc` so every `run()` hands the VM a
+    /// shared pointer to one allocation instead of deep-cloning the program
+    /// per run — a run-many host (the whole point of this type) then keeps a
+    /// single bytecode copy no matter how many VMs it spawns. `Arc<T>`
+    /// serializes identically to `T`, so dump/load blobs are byte-unchanged.
+    pub(crate) compiled: std::sync::Arc<CompiledProgram>,
     /// External function names registered at compile time. Compilation decides
     /// which identifiers lower to external (suspending) calls, so the set is
     /// fixed per compiled program and travels with the bytecode.
@@ -54,7 +59,7 @@ impl ZapcodeProgram {
         let ext_set: HashSet<String> = external_functions.iter().cloned().collect();
         let compiled = crate::compiler::compile_with_externals(&program, ext_set)?;
         Ok(Self {
-            compiled,
+            compiled: std::sync::Arc::new(compiled),
             external_functions,
             source: source.to_string(),
         })
@@ -111,8 +116,9 @@ impl ZapcodeProgram {
         input_heap: Heap,
         limits: ResourceLimits,
     ) -> Result<RunResult> {
-        // One clone of the cached bytecode per run — far cheaper than the
-        // parse + compile it replaces, and the VM needs an owned program.
+        // `self.clone()` now bumps the bytecode's `Arc` refcount (plus the
+        // small ext-names / source strings) rather than deep-copying the
+        // program: every run shares the one cached bytecode allocation.
         self.clone()
             .run_consuming(input_values, input_heap, limits, SpanBuilder::new("zapcode.run"))
     }
