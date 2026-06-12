@@ -141,6 +141,7 @@ fn session_resume_then_continue_with_new_chunk() {
             args,
             stdout,
             session,
+            ..
         } => {
             assert_eq!(function_name, "fetch");
             assert_eq!(args, vec![Value::String("https://example.com".into())]);
@@ -469,6 +470,7 @@ fn session_stdout_is_step_local_across_suspend_resume_and_next_chunk() {
             output,
             stdout,
             session,
+            ..
         } => {
             assert_eq!(output, Value::String("value".into()));
             assert_eq!(stdout, "after value\n");

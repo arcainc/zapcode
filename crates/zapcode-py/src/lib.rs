@@ -337,11 +337,14 @@ fn full_run_result_to_py(
     result: RunResult,
     include_trace: bool,
 ) -> PyResult<PyObject> {
+    // stderr is not yet surfaced through the Python binding (follow-up); ignore
+    // the new RunResult.stderr field here.
     let RunResult {
         state,
         heap,
         stdout,
         trace,
+        ..
     } = result;
     let trace_ref = if include_trace { Some(&trace) } else { None };
     run_result_to_py(py, state, &heap, &stdout, trace_ref)

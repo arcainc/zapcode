@@ -61,12 +61,14 @@ pub enum ZapcodeSessionState {
     Complete {
         output: Value,
         stdout: String,
+        stderr: String,
         session: ZapcodeSessionSnapshot,
     },
     Suspended {
         function_name: String,
         args: Vec<Value>,
         stdout: String,
+        stderr: String,
         session: ZapcodeSessionSnapshot,
     },
     /// Suspended on a batch of external calls (`Promise.{all,race,any,
@@ -77,6 +79,7 @@ pub enum ZapcodeSessionState {
         calls: Vec<ExternalCall>,
         combinator: BatchKind,
         stdout: String,
+        stderr: String,
         session: ZapcodeSessionSnapshot,
     },
 }
@@ -142,6 +145,11 @@ struct IdleSessionState {
 struct SuspendedSessionState {
     vm: VmSnapshot,
     stdout_len: usize,
+    /// Length of the cumulative `stderr` at the start of this chunk, so the
+    /// next resume reports only the stderr this chunk/resume step produced
+    /// (mirrors `stdout_len`). Added at wire v16.
+    #[serde(default)]
+    stderr_len: usize,
     top_level_bindings: Vec<(String, TopLevelBindingKind)>,
     transient_input_names: Vec<String>,
 }
@@ -284,7 +292,7 @@ impl ZapcodeSessionSnapshot {
         vm.cells = idle.cells;
 
         let state = vm.run_program(program_index)?;
-        build_session_state(state, vm, top_level_bindings, 0, transient_input_names)
+        build_session_state(state, vm, top_level_bindings, 0, 0, transient_input_names)
     }
 
     pub fn resume(&self, return_value: Value) -> Result<ZapcodeSessionState> {
@@ -369,6 +377,7 @@ impl ZapcodeSessionSnapshot {
             vm,
             top_level_bindings,
             suspended.stdout_len,
+            suspended.stderr_len,
             suspended.transient_input_names,
         )
     }
@@ -406,15 +415,18 @@ fn build_session_state(
     vm: Vm,
     top_level_bindings: HashMap<String, TopLevelBindingKind>,
     stdout_prefix_len: usize,
+    stderr_prefix_len: usize,
     transient_input_names: Vec<String>,
 ) -> Result<ZapcodeSessionState> {
     let stdout = vm.stdout.get(stdout_prefix_len..).unwrap_or("").to_string();
+    let stderr = vm.stderr.get(stderr_prefix_len..).unwrap_or("").to_string();
     ensure_serializable_globals(&vm.globals, &vm.heap)?;
 
     match state {
         VmState::Complete(output) => Ok(ZapcodeSessionState::Complete {
             output,
             stdout,
+            stderr,
             session: ZapcodeSessionSnapshot {
                 data: SessionSnapshotData::Idle(IdleSessionState {
                     programs: vm.programs.clone(),
@@ -448,6 +460,7 @@ fn build_session_state(
                     // args pointing into the wrong layout.
                     vm: snapshot.into_vm_snapshot(),
                     stdout_len: vm.stdout.len(),
+                    stderr_len: vm.stderr.len(),
                     top_level_bindings: sorted_bindings(top_level_bindings),
                     transient_input_names,
                 })),
@@ -455,6 +468,7 @@ fn build_session_state(
             function_name,
             args,
             stdout,
+            stderr,
         }),
         VmState::SuspendedMany {
             calls,
@@ -465,6 +479,7 @@ fn build_session_state(
                 data: SessionSnapshotData::Suspended(Box::new(SuspendedSessionState {
                     vm: snapshot.into_vm_snapshot(),
                     stdout_len: vm.stdout.len(),
+                    stderr_len: vm.stderr.len(),
                     top_level_bindings: sorted_bindings(top_level_bindings),
                     transient_input_names,
                 })),
@@ -472,6 +487,7 @@ fn build_session_state(
             calls,
             combinator,
             stdout,
+            stderr,
         }),
     }
 }

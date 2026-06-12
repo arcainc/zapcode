@@ -31,6 +31,11 @@ pub(crate) struct VmSnapshot {
     pub(crate) try_stack: Vec<TryInfo>,
     pub(crate) continuations: Vec<Continuation>,
     pub(crate) stdout: String,
+    /// `console.error` / `console.warn` output, carried alongside `stdout` so a
+    /// suspension mid-run preserves both streams across resume. Added at wire
+    /// v16; v15 blobs are rejected by the version guard, so no positional
+    /// `#[serde(default)]` reconstruction is needed.
+    pub(crate) stderr: String,
     pub(crate) limits: ResourceLimits,
     pub(crate) external_functions: Vec<String>,
     pub(crate) next_generator_id: u64,
@@ -165,6 +170,7 @@ impl VmSnapshot {
             try_stack: vm.try_stack.clone(),
             continuations: vm.continuations.clone(),
             stdout: vm.stdout.clone(),
+            stderr: vm.stderr.clone(),
             limits: vm.limits.clone(),
             external_functions,
             next_generator_id: vm.next_generator_id,
@@ -395,6 +401,7 @@ impl VmSnapshot {
             self.try_stack,
             self.continuations,
             self.stdout,
+            self.stderr,
             self.limits,
             ext_set,
             self.next_generator_id,

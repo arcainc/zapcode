@@ -119,6 +119,8 @@ export interface ExecutionResult {
   code: string;
   output: unknown;
   stdout: string;
+  /** Captured stderr (`console.error`/`console.warn`), separate from stdout. */
+  stderr: string;
   toolCalls: Array<{
     name: string;
     /** Raw positional arguments emitted by the sandboxed code. */
@@ -942,6 +944,7 @@ async function executeCode(
 
     let state = sandbox.start();
     let stdout = "";
+    let stderr = "";
 
     // Validate + run one tool call, recording its span and a toolCalls entry.
     // Throws on a *malformed* call (a code bug → abort/autoFix). Returns a
@@ -1019,10 +1022,14 @@ async function executeCode(
     if (state.stdout) {
       stdout = state.stdout;
     }
+    if (state.stderr) {
+      stderr = state.stderr;
+    }
 
     if (execSpan) {
       execSpan.attributes["zapcode.output"] = JSON.stringify(state.output);
       if (stdout) execSpan.attributes["zapcode.stdout"] = stdout;
+      if (stderr) execSpan.attributes["zapcode.stderr"] = stderr;
       endSpan(execSpan);
     }
 
@@ -1034,6 +1041,7 @@ async function executeCode(
       code,
       output: state.output,
       stdout,
+      stderr,
       toolCalls,
       ...(execSpan ? { trace: execSpan } : {}),
     };
@@ -1058,6 +1066,7 @@ async function executeCode(
       code,
       output: null,
       stdout: "",
+      stderr: "",
       toolCalls,
       error: `Execution failed: ${errorMsg}. Please fix your code and try again.`,
       ...(execSpan ? { trace: execSpan } : {}),
@@ -1150,6 +1159,7 @@ export function zapcode(options: ZapcodeAIOptions): ZapcodeAIResult {
         code: "",
         output: null,
         stdout: "",
+        stderr: "",
         toolCalls: [],
         error: `Execution failed: ${message}. Please fix your code and try again.`,
         trace,
@@ -1514,6 +1524,8 @@ export interface SessionOptions {
 export interface SessionChunkResult {
   output: unknown;
   stdout: string;
+  /** Captured stderr (`console.error`/`console.warn`) for this chunk. */
+  stderr: string;
   toolCalls: ExecutionResult["toolCalls"];
 }
 
@@ -1573,7 +1585,7 @@ function makeSession(
 
     // Persist the new idle state for the next chunk / dump().
     sessionBytes = state.session;
-    return { output: state.output, stdout: state.stdout ?? "", toolCalls };
+    return { output: state.output, stdout: state.stdout ?? "", stderr: state.stderr ?? "", toolCalls };
   };
 
   return { runChunk, dump: () => sessionBytes };

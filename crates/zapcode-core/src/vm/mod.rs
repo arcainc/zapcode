@@ -352,6 +352,10 @@ pub struct Vm {
     /// semantics. Serialized with the snapshot so identity survives resume.
     pub(crate) heap: Heap,
     pub(crate) stdout: String,
+    /// `console.error` / `console.warn` output, kept separate from `stdout`
+    /// (which carries `console.log`/`info`/`debug`), matching Node's stream
+    /// split. Threaded through the snapshot and resume path like `stdout`.
+    pub(crate) stderr: String,
     pub(crate) limits: ResourceLimits,
     pub(crate) tracker: ResourceTracker,
     pub(crate) external_functions: HashSet<String>,
@@ -623,6 +627,7 @@ impl Vm {
             cells: Vec::new(),
             heap,
             stdout: String::new(),
+            stderr: String::new(),
             limits,
             tracker: ResourceTracker::default(),
             external_functions,
@@ -707,6 +712,7 @@ impl Vm {
         try_stack: Vec<TryInfo>,
         continuations: Vec<Continuation>,
         stdout: String,
+        stderr: String,
         limits: ResourceLimits,
         external_functions: HashSet<String>,
         next_generator_id: u64,
@@ -748,6 +754,7 @@ impl Vm {
             cells: Vec::new(),
             heap,
             stdout,
+            stderr,
             limits,
             tracker: ResourceTracker::default(),
             external_functions,
@@ -3635,6 +3642,7 @@ impl Vm {
                 method_name,
                 &args,
                 &mut self.stdout,
+                &mut self.stderr,
                 &mut self.heap,
             )? {
                 return Ok(v);
@@ -7072,6 +7080,7 @@ impl Vm {
                                     &method_name,
                                     &args,
                                     &mut self.stdout,
+                                    &mut self.stderr,
                                     &mut self.heap,
                                 )?
                             }
@@ -7174,6 +7183,7 @@ impl Vm {
                                     &method_name,
                                     &args,
                                     &mut self.stdout,
+                                    &mut self.stderr,
                                     &mut self.heap,
                                 )?
                             }
@@ -7256,6 +7266,7 @@ impl Vm {
                                     "fromEntries",
                                     &[Value::Array(arr)],
                                     &mut self.stdout,
+                                    &mut self.stderr,
                                     &mut self.heap,
                                 )?
                             }
@@ -7264,6 +7275,7 @@ impl Vm {
                                 &method_name,
                                 &args,
                                 &mut self.stdout,
+                                &mut self.stderr,
                                 &mut self.heap,
                             )?,
                         };
@@ -10544,6 +10556,7 @@ pub(crate) fn execute_compiled(
                     return Ok(RunResult {
                         state: s,
                         stdout: vm.stdout,
+                        stderr: vm.stderr,
                         heap: vm.heap,
                         trace,
                     });
@@ -10559,6 +10572,7 @@ pub(crate) fn execute_compiled(
                     return Ok(RunResult {
                         state: s,
                         stdout: vm.stdout,
+                        stderr: vm.stderr,
                         heap: vm.heap,
                         trace,
                     });
@@ -10583,6 +10597,7 @@ pub(crate) fn execute_compiled(
     Ok(RunResult {
         state,
         stdout: vm.stdout,
+        stderr: vm.stderr,
         heap: vm.heap,
         trace,
     })
@@ -10701,6 +10716,9 @@ impl ZapcodeRun {
 pub struct RunResult {
     pub state: VmState,
     pub stdout: String,
+    /// `console.error` / `console.warn` output, separate from `stdout`. For a
+    /// suspended run it is the stderr accumulated up to the suspension point.
+    pub stderr: String,
     /// The object heap at the end of the run. Needed to resolve the `Handle`s in
     /// `Value::Array`/`Value::Object` returned in `state` — e.g. to read array
     /// elements or coerce a returned array/object to a string. For a suspended
@@ -10720,6 +10738,7 @@ impl RunResult {
         RunResult {
             state,
             stdout: vm.stdout,
+            stderr: vm.stderr,
             heap: vm.heap,
             trace: ExecutionTrace {
                 root: root.finish_ok(),

@@ -984,10 +984,11 @@ pub fn call_global_method(
     method: &str,
     args: &[Value],
     stdout: &mut String,
+    stderr: &mut String,
     heap: &mut Heap,
 ) -> Result<Option<Value>> {
     match global_name {
-        "console" => call_console_method(method, args, stdout, heap),
+        "console" => call_console_method(method, args, stdout, stderr, heap),
         "Math" => call_math_method(method, args),
         "JSON" => call_json_method(method, args, heap),
         "Object" => call_object_method(method, args, heap),
@@ -999,13 +1000,25 @@ pub fn call_global_method(
 
 // ── Console ──────────────────────────────────────────────────────────
 
-fn call_console_method(method: &str, args: &[Value], stdout: &mut String, heap: &Heap) -> Result<Option<Value>> {
+fn call_console_method(
+    method: &str,
+    args: &[Value],
+    stdout: &mut String,
+    stderr: &mut String,
+    heap: &Heap,
+) -> Result<Option<Value>> {
     match method {
+        // Node routes `error`/`warn` to stderr; `log`/`info`/`debug` to stdout.
         "log" | "info" | "warn" | "error" | "debug" => {
             let output: Vec<String> = args.iter().map(|v| v.to_js_string(heap)).collect();
             let line = output.join(" ");
-            stdout.push_str(&line);
-            stdout.push('\n');
+            let sink = if matches!(method, "warn" | "error") {
+                stderr
+            } else {
+                stdout
+            };
+            sink.push_str(&line);
+            sink.push('\n');
             Ok(Some(Value::Undefined))
         }
         _ => Ok(None),

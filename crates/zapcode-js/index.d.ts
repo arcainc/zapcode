@@ -15,7 +15,10 @@ export interface ZapcodeResult {
   kind: "complete";
   completed: true;
   output: unknown;
+  /** Captured stdout (`console.log`/`info`/`debug`). */
   stdout: string;
+  /** Captured stderr (`console.error`/`console.warn`). */
+  stderr: string;
 }
 
 export interface ZapcodeSuspension {
@@ -57,6 +60,8 @@ export interface ZapcodeSessionResult {
   completed: true;
   output: unknown;
   stdout: string;
+  /** Captured stderr (`console.error`/`console.warn`) for this step. */
+  stderr: string;
   session: Buffer;
 }
 
@@ -66,6 +71,8 @@ export interface ZapcodeSessionSuspension {
   functionName: string;
   args: unknown[];
   stdout: string;
+  /** Captured stderr (`console.error`/`console.warn`) for this step. */
+  stderr: string;
   session: Buffer;
 }
 
@@ -77,6 +84,8 @@ export interface ZapcodeSessionBatchSuspension {
   /** The batched external calls, in order — run them in parallel. */
   calls: ExternalCall[];
   stdout: string;
+  /** Captured stderr (`console.error`/`console.warn`) for this step. */
+  stderr: string;
   session: Buffer;
 }
 
@@ -127,6 +136,20 @@ export class ZapcodeSessionHandle {
 
 export class Zapcode {
   constructor(code: string, options?: ZapcodeOptions);
+  run(inputs?: Record<string, unknown>): ZapcodeResult;
+  start(inputs?: Record<string, unknown>): ZapcodeResult | ZapcodeSuspension | ZapcodeBatchSuspension;
+}
+
+/**
+ * A parsed + compiled program, ready to run many times without re-paying
+ * parse + compile. Compile once, then `run`/`start` with different inputs; the
+ * compiled bytecode can be persisted with `dump()` and reloaded with `load()`.
+ * Memory / time limits are baked in at compile time (and re-supplied at load).
+ */
+export class ZapcodeProgramHandle {
+  static compile(code: string, options?: ZapcodeOptions): ZapcodeProgramHandle;
+  static load(bytes: Buffer, options?: ZapcodeOptions): ZapcodeProgramHandle;
+  dump(): Buffer;
   run(inputs?: Record<string, unknown>): ZapcodeResult;
   start(inputs?: Record<string, unknown>): ZapcodeResult | ZapcodeSuspension | ZapcodeBatchSuspension;
 }
