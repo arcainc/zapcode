@@ -30,6 +30,7 @@ import {
   Zapcode,
   ZapcodeSnapshotHandle,
   ZapcodeSessionHandle,
+  ZapcodeProgramHandle,
   type PromiseCombinator,
 } from "@unchartedfr/zapcode";
 import { jsonSchema, tool, type ToolSet } from "ai";
@@ -943,6 +944,13 @@ async function executeCode(
     debug?: boolean;
     autoFix?: boolean;
     typeCheck?: boolean;
+    /**
+     * Produce the initial VM state instead of compiling `code` fresh — used
+     * by {@link prepare} to start from an already-compiled, reusable program
+     * (parse + compile paid once, not per run). When omitted, a new `Zapcode`
+     * is compiled and started as usual.
+     */
+    starter?: () => ReturnType<Zapcode["start"]>;
   }
 ): Promise<ExecutionResult> {
   validateToolDefinitions(toolDefs);
@@ -965,13 +973,15 @@ async function executeCode(
       }
     }
 
-    const sandbox = new Zapcode(code, {
-      externalFunctions: toolNames,
-      timeLimitMs: options.timeLimitMs ?? 10_000,
-      memoryLimitMb: options.memoryLimitMb ?? 32,
-    });
-
-    let state = sandbox.start();
+    // `prepare()` supplies a starter that resumes from a pre-compiled program;
+    // otherwise compile and start a fresh sandbox here.
+    let state = options.starter
+      ? options.starter()
+      : new Zapcode(code, {
+          externalFunctions: toolNames,
+          timeLimitMs: options.timeLimitMs ?? 10_000,
+          memoryLimitMb: options.memoryLimitMb ?? 32,
+        }).start();
     let stdout = "";
     let stderr = "";
 
@@ -1503,6 +1513,61 @@ export async function dryRun(
  */
 export function forkSnapshot(snapshotBytes: Buffer): ZapcodeSnapshotHandle {
   return ZapcodeSnapshotHandle.load(snapshotBytes);
+}
+
+// ---------------------------------------------------------------------------
+// prepare — compile agent code ONCE, run it many times
+// ---------------------------------------------------------------------------
+
+/** A compiled, reusable program returned by {@link prepare}. */
+export interface PreparedProgram {
+  /** The source this program was compiled from. */
+  readonly code: string;
+  /**
+   * Run the compiled program, driving the tool loop with the same validation,
+   * trace, and structured report as {@link execute} — but WITHOUT re-parsing
+   * or re-compiling. Each call is an independent run.
+   */
+  run(
+    inputs?: Record<string, unknown>,
+    options?: { debug?: boolean; autoFix?: boolean }
+  ): Promise<ExecutionResult>;
+}
+
+/**
+ * Compile agent-written code once into a reusable program. A run-many host
+ * (the same code over many inputs, or a hot path) pays parse + compile a
+ * single time, then each `run()` only constructs a VM and dispatches — the
+ * package-level surface for the cycle-1 program cache. Tool validation, the
+ * tool-call trace, and the structured run report are identical to `execute`.
+ */
+export function prepare(
+  code: string,
+  toolDefs: Record<string, ToolDefinition>,
+  options?: { memoryLimitMb?: number; timeLimitMs?: number }
+): PreparedProgram {
+  validateToolDefinitions(toolDefs);
+  const handle = ZapcodeProgramHandle.compile(code, {
+    externalFunctions: Object.keys(toolDefs),
+    timeLimitMs: options?.timeLimitMs ?? 10_000,
+    memoryLimitMb: options?.memoryLimitMb ?? 32,
+  });
+  return {
+    code,
+    run(inputs, runOptions) {
+      return executeCode(code, toolDefs, {
+        ...runOptions,
+        memoryLimitMb: options?.memoryLimitMb,
+        timeLimitMs: options?.timeLimitMs,
+        // Reuse the whole executeCode loop, but start from the pre-compiled
+        // program rather than recompiling `code`.
+        starter: () =>
+          handle.start(
+            inputs as Record<string, unknown> | undefined
+          ) as ReturnType<Zapcode["start"]>,
+      });
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------

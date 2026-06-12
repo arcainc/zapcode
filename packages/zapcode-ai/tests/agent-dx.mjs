@@ -11,7 +11,7 @@
  *   - recoverable state: fork a suspension into independent branches
  */
 import assert from "node:assert/strict";
-import { execute, dryRun, forkSnapshot } from "../dist/index.js";
+import { execute, dryRun, forkSnapshot, prepare } from "../dist/index.js";
 import { Zapcode } from "@unchartedfr/zapcode";
 
 let passed = 0;
@@ -185,6 +185,28 @@ await test("fork: checkpoint/rollback — a bad branch leaves the checkpoint int
   // Roll back: a fresh fork from the same checkpoint takes a good branch.
   const good = forkSnapshot(checkpoint).resume(21);
   assert.equal(good.output, 42);
+});
+
+// ── prepare: compile once, run many ────────────────────────────────────────
+
+await test("prepare: a compiled program runs many times, identical to execute", async () => {
+  const code = "const u = await getUser({ id: 1 }); u.age + 1";
+  const program = prepare(code, tools);
+  const r1 = await program.run();
+  const r2 = await program.run();
+  // Same ergonomics as execute(): output, trace, report.
+  const direct = await execute(code, tools);
+  assert.equal(r1.output, direct.output);
+  assert.equal(r1.output, r2.output); // independent runs, identical result
+  assert.equal(r1.report.completed, true);
+  assert.equal(r1.toolCalls[0].name, "getUser");
+});
+
+await test("prepare: a runtime error still reports its location", async () => {
+  const program = prepare("const y = null;\ny.field", tools);
+  const r = await program.run({}, { autoFix: true });
+  assert.equal(r.report.completed, false);
+  assert.equal(r.report.error.line, 2);
 });
 
 console.log(`\n${passed} agent-DX checks passed.`);
