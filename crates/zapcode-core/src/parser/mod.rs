@@ -47,7 +47,21 @@ pub fn parse(source: &str) -> Result<Program> {
     Ok(Program {
         body: lowerer.body,
         functions: lowerer.functions,
+        // Computed over the wrapped source, which is what the IR spans index.
+        line_starts: compute_line_starts(&source),
     })
+}
+
+/// Byte offset of the start of every line: entry 0 is offset 0, plus one entry
+/// per `\n`. Used to map span offsets to 1-based line/column at error time.
+fn compute_line_starts(source: &str) -> Vec<u32> {
+    let mut starts = vec![0u32];
+    for (i, b) in source.bytes().enumerate() {
+        if b == b'\n' {
+            starts.push(i as u32 + 1);
+        }
+    }
+    starts
 }
 
 /// Scan the source and reject it (with a catchable `ParseError`) if the

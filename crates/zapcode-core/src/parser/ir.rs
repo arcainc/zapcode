@@ -37,6 +37,11 @@ impl From<oxc_span::Span> for Span {
 pub struct Program {
     pub body: Vec<Statement>,
     pub functions: Vec<FunctionDef>,
+    /// Byte offset of the start of each source line (entry 0 is always 0),
+    /// computed by the parser over the (possibly auto-wrapped) source the spans
+    /// refer to. Lets the compiler/VM turn a span offset into a 1-based
+    /// line/column for runtime error reporting without keeping the source.
+    pub line_starts: Vec<u32>,
 }
 
 /// Function definition stored separately (hoisted).
@@ -196,6 +201,31 @@ pub enum Statement {
         static_fields: Vec<ClassField>,
         span: Span,
     },
+}
+
+impl Statement {
+    /// The source span of this statement (every variant carries one).
+    pub fn span(&self) -> Span {
+        match self {
+            Statement::VariableDecl { span, .. }
+            | Statement::Expression { span, .. }
+            | Statement::Return { span, .. }
+            | Statement::If { span, .. }
+            | Statement::While { span, .. }
+            | Statement::ForOf { span, .. }
+            | Statement::For { span, .. }
+            | Statement::Block { span, .. }
+            | Statement::Throw { span, .. }
+            | Statement::TryCatch { span, .. }
+            | Statement::Break { span, .. }
+            | Statement::Continue { span, .. }
+            | Statement::Labeled { span, .. }
+            | Statement::FunctionDecl { span, .. }
+            | Statement::Switch { span, .. }
+            | Statement::DoWhile { span, .. }
+            | Statement::ClassDecl { span, .. } => *span,
+        }
+    }
 }
 
 /// What kind of member a [`ClassMethod`] is: an ordinary method, or a getter /

@@ -16,34 +16,7 @@
  * Run: npm run build && node tests/differential.mjs
  */
 import assert from "node:assert/strict";
-import { execute } from "../dist/index.js";
-
-const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-
-/** Normalize per the host-boundary marshalling rules (cluster L). */
-function normalize(v) {
-  if (v === undefined) return null;
-  if (typeof v === "number" && !Number.isFinite(v)) return null;
-  if (Array.isArray(v)) return v.map(normalize);
-  if (v && typeof v === "object") {
-    const out = {};
-    for (const [k, val] of Object.entries(v)) {
-      if (val === undefined) continue; // dropped at the boundary
-      out[k] = normalize(val);
-    }
-    return out;
-  }
-  return v;
-}
-
-async function runZapcode(body) {
-  const r = await execute(`async function main() { ${body} } main();`, {});
-  return normalize(r.output);
-}
-
-async function runNode(body) {
-  return normalize(await new AsyncFunction(body)());
-}
+import { runNode, runZapcode } from "./diff-harness-lib.mjs";
 
 // ════════════════════════════════════════════════════════════════════════════
 //  Corpus — every snippet must agree with Node byte-for-byte (normalized)
@@ -499,6 +472,23 @@ const realistic = [
      trace.push(state);
    }
    return trace.join(">");`,
+
+
+  // ── evaluation counts: side effects run exactly as often as in JS ─────
+  // (double evaluation is invisible to value-only assertions — these thread
+  // call counters through the result)
+  `let calls = 0; const o = { a: { x: 10 } }; function f() { calls++; return o; } f().a.x = 1; f().a.x += 5; f().a.x++; return calls + ':' + o.a.x;`,
+  `let kc = 0, oc = 0; const o = { k: 5 }; const key = () => (kc++, 'k'); const obj = () => (oc++, o); obj()[key()] += 1; obj()[key()]++; return oc + ',' + kc + ':' + o.k;`,
+  `let calls = 0; const o = { v: 0, w: 1, m: null }; function f() { calls++; return o; } f().v ||= 9; f().w &&= 7; f().m ??= 3; return calls + ':' + [o.v, o.w, o.m].join(',');`,
+  `let calls = 0; const o = { x: 1, y: 2 }; function f() { calls++; return o; } const d1 = delete f().x; delete f()['y']; return calls + ':' + ('x' in o) + ',' + ('y' in o) + ':' + d1;`,
+  // ── evaluation ORDER: target reference (object, then key) before value ──
+  `const log = []; const t = (x) => (log.push(x), x); const o = {}; o[t('key')] = t('val'); return log.join(',');`,
+  `const log = []; const t = (x) => (log.push(x), x); const o = {}; o[t('k1')] = t('v1'); o[t('k2')] = t('v2'); return log.join(',');`,
+  // ── lazy iterator: early break pulls exactly k, not to exhaustion ──────
+  `let n = 0; const it = { [Symbol.iterator]() { return { next() { n++; return n < 100 ? { value: n, done: false } : { done: true }; } }; } }; for (const x of it) { if (x >= 3) break; } return n;`,
+  `let calls = 0; const it = { [Symbol.iterator]() { calls++; let i = 0; return { next() { return i < 2 ? { value: i++, done: false } : { done: true }; } }; } }; const o = []; for (const a of it) for (const b of it) o.push(a + ':' + b); return o.join(',') + '|' + calls;`,
+  // ── getter invoked once per read site; compound = one get + one set ────
+  `let reads = 0, writes = 0; const o = { _v: 5, get v() { reads++; return this._v; }, set v(x) { writes++; this._v = x; } }; const sum = o.v + o.v; o.v += 10; return reads + ',' + writes + ',' + sum + ',' + o._v;`,
 
   // ── round 2: orchestration patterns ───────────────────────────────────
   // concurrency-limited batches, order preserved

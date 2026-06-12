@@ -884,9 +884,11 @@ fn private_fields_and_methods() {
 fn computed_method_names_unsupported() {
     // Computed method names `[k](){}` do not install a callable method; the lookup
     // misses and calling it is a TypeError. (JS: defines a method named by `k`.)
-    assert_eq!(
-        run_err("const k = 'foo'; class C { [k](){ return 7; } } new C().foo()"),
-        r#"TypeError("undefined is not a function")"#
+    // (contains, not eq: uncaught errors now append "    at line:col" + frame.)
+    let e = run_err("const k = 'foo'; class C { [k](){ return 7; } } new C().foo()");
+    assert!(
+        e.starts_with(r#"TypeError("undefined is not a function"#),
+        "unexpected error: {e}"
     );
 }
 

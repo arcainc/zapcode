@@ -296,9 +296,11 @@ fn escaped_arrow_this_documented_divergence() {
     // undefined, so `this.n` throws). Synchronously-invoked nested arrows keep it
     // (see arrow_this_is_lexical). JS would bind the method's `this` permanently and
     // return 11 here.
-    assert_eq!(
-        run_err("const o = {n: 11, mk(){ return () => this.n; }}; const f = o.mk(); f()"),
-        "type error: Cannot read properties of undefined (reading 'n')"
+    // (starts_with, not eq: uncaught errors now append "    at line:col" + frame.)
+    let e = run_err("const o = {n: 11, mk(){ return () => this.n; }}; const f = o.mk(); f()");
+    assert!(
+        e.starts_with("type error: Cannot read properties of undefined (reading 'n')"),
+        "unexpected error: {e}"
     );
 }
 
@@ -315,18 +317,18 @@ fn call_apply_bind_are_absent_documented_divergence() {
     assert_eq!(run_str("function f(){} typeof f.bind"), "undefined");
     assert_eq!(run_str("function f(){} 'call' in f"), "false");
     // attempting to invoke them surfaces a TypeError
-    assert_eq!(
-        run_err("function f(){ return this.x; } f.call({ x: 42 })"),
-        "type error: undefined is not a function"
-    );
-    assert_eq!(
-        run_err("function f(){} f.apply(null, [])"),
-        "type error: undefined is not a function"
-    );
-    assert_eq!(
-        run_err("function f(){} f.bind(null)"),
-        "type error: undefined is not a function"
-    );
+    // (starts_with, not eq: uncaught errors now append "    at line:col" + frame.)
+    for code in [
+        "function f(){ return this.x; } f.call({ x: 42 })",
+        "function f(){} f.apply(null, [])",
+        "function f(){} f.bind(null)",
+    ] {
+        let e = run_err(code);
+        assert!(
+            e.starts_with("type error: undefined is not a function"),
+            "unexpected error for `{code}`: {e}"
+        );
+    }
 }
 
 #[test]
@@ -370,9 +372,11 @@ fn arguments_object_is_bound() {
 fn new_with_plain_function_documented_divergence() {
     // DIVERGENCE (documented): `new fn()` does not allocate-and-bind a fresh `this`
     // for a plain function, so assigning `this.x` throws. JS would create `{x:3}`.
-    assert_eq!(
-        run_err("function F(x){ this.x = x; } new F(3)"),
-        "type error: cannot set property 'x' on undefined"
+    // (starts_with, not eq: uncaught errors now append "    at line:col" + frame.)
+    let e = run_err("function F(x){ this.x = x; } new F(3)");
+    assert!(
+        e.starts_with("type error: cannot set property 'x' on undefined"),
+        "unexpected error: {e}"
     );
     // BUT a constructor that explicitly RETURNS an object works (the return value
     // is what `new` yields), matching JS for the explicit-return case.

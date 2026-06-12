@@ -1030,9 +1030,12 @@ fn call_math_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
         }
         "round" => {
             // JS rounds halves toward +Infinity (Math.round(-2.5) === -2),
-            // unlike Rust's round-half-away-from-zero.
+            // unlike Rust's round-half-away-from-zero. Inputs in [-0.5, -0.0]
+            // round to NEGATIVE zero (Object.is(Math.round(-0.25), -0)); the
+            // `+ 0.5` trick loses that sign, so restore it explicitly.
             let n = arg_num(args, 0);
-            Value::Float((n + 0.5).floor())
+            let r = (n + 0.5).floor();
+            Value::Float(if r == 0.0 && n.is_sign_negative() { -0.0 } else { r })
         }
         "trunc" => {
             let n = arg_num(args, 0);
@@ -1133,7 +1136,9 @@ fn call_math_method(method: &str, args: &[Value]) -> Result<Option<Value>> {
             } else if n < 0.0 {
                 Value::Float(-1.0)
             } else {
-                Value::Float(0.0)
+                // ±0 and NaN pass through: Math.sign(-0) === -0,
+                // Math.sign(NaN) is NaN (was: 0 for both).
+                Value::Float(n)
             }
         }
         "hypot" => {
@@ -4040,10 +4045,14 @@ fn arg_str(args: &[Value], idx: usize, heap: &Heap) -> String {
         .unwrap_or_default()
 }
 
+/// Spec-style relative-index clamping (`slice`, `fill`, `copyWithin`):
+/// negative counts from the end, and BOTH directions clamp into `[0, len]`.
+/// Without the positive clamp, `[].slice(1, 2)` indexed `arr[1..0]` — a panic
+/// that aborts the host process through the bindings.
 fn normalize_index(idx: i64, len: i64) -> usize {
     if idx < 0 {
         (len + idx).max(0) as usize
     } else {
-        idx as usize
+        idx.min(len) as usize
     }
 }

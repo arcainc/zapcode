@@ -65,7 +65,10 @@ const MAGIC: &[u8; 4] = b"ZPC1";
 /// `setTimeout`), incompatible with v12.
 /// v14: `CallFrame.is_constructor` (constructor-only implicit-`this` return)
 /// and snapshot-time heap compaction, incompatible with v13.
-pub(crate) const FORMAT_VERSION: u16 = 14;
+/// v15: runtime error fidelity — `CompiledProgram.line_table`/`line_starts`
+/// and `CompiledFunction.line_table` (source-location side tables for
+/// "at line:col" on uncaught errors), incompatible with v14.
+pub(crate) const FORMAT_VERSION: u16 = 15;
 
 const HEADER_LEN: usize = 4 + 2 + 1 + 1 + 32;
 
@@ -87,6 +90,8 @@ const DEFLATE_LEVEL: u8 = 6;
 pub(crate) enum FrameKind {
     Snapshot = 1,
     Session = 2,
+    /// A pre-compiled program (`ZapcodeProgram`) — bytecode cached across runs.
+    Program = 3,
 }
 
 impl FrameKind {
@@ -94,6 +99,7 @@ impl FrameKind {
         match self {
             FrameKind::Snapshot => "snapshot",
             FrameKind::Session => "session",
+            FrameKind::Program => "program",
         }
     }
 
@@ -101,6 +107,7 @@ impl FrameKind {
         match byte {
             1 => Some(FrameKind::Snapshot),
             2 => Some(FrameKind::Session),
+            3 => Some(FrameKind::Program),
             _ => None,
         }
     }
