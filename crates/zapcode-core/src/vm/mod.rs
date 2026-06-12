@@ -17,6 +17,32 @@ use crate::value::{
     MAX_RENDER_DEPTH,
 };
 
+// ── In-run heap compaction tuning (see docs/in-run-memory-design.md) ──────
+/// Compaction is considered once per this many dispatched instructions.
+/// Power of two so the gate is a cheap mask.
+const GC_CHECK_INTERVAL: u32 = 1024;
+/// Don't scan heaps below this many slots — not worth the walk.
+const MIN_GC_SLOTS: usize = 4096;
+/// Compact when the heap has grown by this factor since the last GC.
+const GC_GROWTH: usize = 2;
+
+/// Test-only switch: when set, the VM compacts the heap at EVERY top-level
+/// instruction boundary. Running the conformance/durable suites under this
+/// is the proof that the live-root walk is complete — maximally aggressive
+/// in-run rewriting that stays green means no root is missed. A process
+/// global `AtomicBool` (NOT an env var — `zapcode-core` takes no host I/O).
+static GC_STRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enable [`GC_STRESS`] for the rest of the process. Test support only.
+pub fn enable_gc_stress_for_tests() {
+    GC_STRESS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Disable [`GC_STRESS`]. Test support only.
+pub fn disable_gc_stress_for_tests() {
+    GC_STRESS.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
 mod builtins;
 
 /// Re-exported so the napi binding can apply the SAME exact reserved-marker
@@ -465,6 +491,13 @@ pub struct Vm {
     /// execute loop's `Err` arm on the very next iteration (so it can never
     /// go stale). Transient — the durable copy rides in `Completion::Throw`.
     pub(crate) pending_throw_loc: Option<(u32, u32)>,
+    /// In-run heap compaction (see `docs/in-run-memory-design.md`): an
+    /// instruction tick counter and the live slot count after the last GC,
+    /// driving the growth-based trigger. Transient — not serialized; a
+    /// resumed VM simply starts its own GC accounting (the heap it resumes
+    /// from was already compacted at capture).
+    pub(crate) gc_instr_counter: u32,
+    pub(crate) heap_slots_at_last_gc: usize,
 }
 
 /// The builtin globals and the heap slots backing them, built once. Every
@@ -667,6 +700,8 @@ impl Vm {
             source: None,
             key_interner: crate::intern::KeyInterner::new(),
             pending_throw_loc: None,
+            gc_instr_counter: 0,
+            heap_slots_at_last_gc: 0,
         }
     }
 
@@ -804,6 +839,8 @@ impl Vm {
             source: None,
             key_interner,
             pending_throw_loc: None,
+            gc_instr_counter: 0,
+            heap_slots_at_last_gc: 0,
         }
     }
 
@@ -3004,10 +3041,185 @@ impl Vm {
         self.execute_to_host()
     }
 
+    /// Visit every heap handle reachable from a LIVE VM field — the in-run
+    /// compactor's roots and rewrite targets. This is the structural mirror
+    /// of `VmSnapshot::for_each_handle_mut`: the two MUST stay in lockstep
+    /// (a new handle-bearing field added to one belongs in the other). The
+    /// `gc_stress` harness force-compacts at every tick, so a missing root
+    /// here surfaces as a corrupted result, not a silent leak.
+    fn for_each_root_handle_mut(&mut self, f: &mut dyn FnMut(&mut Handle)) {
+        fn walk_frame(fr: &mut CallFrame, f: &mut dyn FnMut(&mut Handle)) {
+            for v in &mut fr.locals {
+                v.for_each_handle_mut(f);
+            }
+            if let Some(v) = &mut fr.this_value {
+                v.for_each_handle_mut(f);
+            }
+            if let Some(v) = &mut fr.async_result {
+                v.for_each_handle_mut(f);
+            }
+        }
+        for v in &mut self.stack {
+            v.for_each_handle_mut(f);
+        }
+        for fr in &mut self.frames {
+            walk_frame(fr, f);
+        }
+        for v in &mut self.cells {
+            v.for_each_handle_mut(f);
+        }
+        for v in self.globals.values_mut() {
+            v.for_each_handle_mut(f);
+        }
+        for c in &mut self.continuations {
+            match c {
+                Continuation::ArrayMap {
+                    callback,
+                    source,
+                    results,
+                    ..
+                } => {
+                    callback.for_each_handle_mut(f);
+                    for v in source.iter_mut().chain(results.iter_mut()) {
+                        v.for_each_handle_mut(f);
+                    }
+                }
+                Continuation::ArrayForEach {
+                    callback, source, ..
+                } => {
+                    callback.for_each_handle_mut(f);
+                    for v in source.iter_mut() {
+                        v.for_each_handle_mut(f);
+                    }
+                }
+                Continuation::MicrotaskReaction {
+                    result_promise,
+                    original_value,
+                    ..
+                } => {
+                    result_promise.for_each_handle_mut(f);
+                    original_value.for_each_handle_mut(f);
+                }
+                Continuation::GeneratorNext { gen_obj, .. } => {
+                    gen_obj.for_each_handle_mut(f);
+                }
+                Continuation::PromiseExecutor { promise, .. } => {
+                    promise.for_each_handle_mut(f);
+                }
+            }
+        }
+        if let Some(v) = &mut self.last_receiver {
+            v.for_each_handle_mut(f);
+        }
+        for pc in &mut self.pending_calls {
+            for v in &mut pc.args {
+                v.for_each_handle_mut(f);
+            }
+        }
+        for v in self.resolved.values_mut() {
+            v.for_each_handle_mut(f);
+        }
+        if let Some(b) = &mut self.pending_batch {
+            for v in &mut b.items {
+                v.for_each_handle_mut(f);
+            }
+        }
+        match &mut self.resume_action {
+            Some(ResumeAction::PromiseMethod { args, .. }) => {
+                for v in args {
+                    v.for_each_handle_mut(f);
+                }
+            }
+            Some(ResumeAction::SettleResult {
+                result_promise,
+                pass_original,
+            }) => {
+                result_promise.for_each_handle_mut(f);
+                if let Some((v, _)) = pass_original {
+                    v.for_each_handle_mut(f);
+                }
+            }
+            Some(ResumeAction::CacheValue { .. }) | None => {}
+        }
+        for m in &mut self.microtasks {
+            m.handler.for_each_handle_mut(f);
+            m.value.for_each_handle_mut(f);
+            m.result_promise.for_each_handle_mut(f);
+        }
+        for h in &mut self.unhandled_rejections {
+            f(h);
+        }
+        for t in self.async_tasks.values_mut() {
+            walk_frame(&mut t.frame, f);
+            for v in &mut t.stack {
+                v.for_each_handle_mut(f);
+            }
+        }
+        for t in &mut self.timers {
+            t.callback.for_each_handle_mut(f);
+        }
+    }
+
+    /// Mark-compact the live heap (see `docs/in-run-memory-design.md`):
+    /// collect roots from live VM fields, drop unreachable slots (retaining
+    /// the builtin-template prefix), rewrite every handle to the dense
+    /// layout, and reset `memory_bytes` to the surviving live estimate (so
+    /// `memory_limit_bytes` is a LIVE ceiling, not cumulative-allocation).
+    /// Order-preserving. MUST only be called at a top-level instruction
+    /// boundary — never from a nested interpreter loop, which would hold
+    /// live handles in Rust locals the rewrite cannot reach.
+    fn compact_live_heap(&mut self) {
+        let mut roots: Vec<Handle> = Vec::new();
+        self.for_each_root_handle_mut(&mut |h| roots.push(*h));
+        let remap = self.heap.compact_retaining(self.builtin_base, &roots);
+        self.for_each_root_handle_mut(&mut |h| {
+            let new = remap[*h as usize];
+            debug_assert_ne!(new, Handle::MAX, "in-run compactor dropped a rooted slot");
+            *h = new;
+        });
+        // The limit now reflects LIVE memory. `max_allocations` (cumulative)
+        // and `time_limit_ms` remain the total-work / DoS bounds.
+        self.tracker.memory_bytes = self.heap.byte_estimate();
+        self.heap_slots_at_last_gc = self.heap.len();
+    }
+
+    /// Growth-triggered in-run GC, called only at the top-level `execute()`
+    /// loop boundary. O(1) per tick except when it actually compacts (at most
+    /// once per heap-doubling → amortized O(1) per allocation).
+    fn maybe_compact_heap(&mut self) {
+        self.gc_instr_counter = self.gc_instr_counter.wrapping_add(1);
+        let stress = GC_STRESS.load(std::sync::atomic::Ordering::Relaxed);
+        if !stress && self.gc_instr_counter & (GC_CHECK_INTERVAL - 1) != 0 {
+            return;
+        }
+        // Slot-count trigger: the heap doubled since the last GC (catches
+        // churn of many small objects).
+        let slot_threshold =
+            MIN_GC_SLOTS.max(self.heap_slots_at_last_gc.saturating_mul(GC_GROWTH));
+        let slot_trigger = self.heap.len() > slot_threshold;
+        // Byte high-water trigger: accounted bytes (live + not-yet-collected
+        // garbage) have passed half the memory limit. Compacting here keeps a
+        // churn of LARGE temporaries from tripping the limit on garbage —
+        // this is what makes `memory_limit_bytes` a LIVE ceiling. Half the
+        // limit leaves a full window's worth of headroom before the next tick.
+        let byte_trigger = self
+            .tracker
+            .memory_bytes
+            .saturating_mul(2)
+            > self.limits.memory_limit_bytes;
+        if stress || slot_trigger || byte_trigger {
+            self.compact_live_heap();
+        }
+    }
+
     fn execute(&mut self) -> Result<VmState> {
         loop {
             // Resource checks
             self.tracker.check_time(&self.limits)?;
+            // In-run heap compaction at a safe (top-level) instruction
+            // boundary — before any frame borrow or instruction fetch, so no
+            // live handle sits in a Rust local.
+            self.maybe_compact_heap();
 
             let frame = self.frames.last().unwrap();
             let instructions = match frame.func_index {

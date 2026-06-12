@@ -42,6 +42,21 @@ impl Heap {
         self.slots.is_empty()
     }
 
+    /// Estimated live byte footprint of the arena: element/entry counts ×
+    /// `size_of::<Value>()`, consistent with how `ResourceTracker` charges
+    /// allocations. Used to reset `memory_bytes` to a live figure after
+    /// in-run compaction (see `docs/in-run-memory-design.md`).
+    pub(crate) fn byte_estimate(&self) -> usize {
+        let vsz = std::mem::size_of::<Value>();
+        self.slots
+            .iter()
+            .map(|slot| match slot {
+                HeapSlot::Array(items) => items.len().saturating_mul(vsz),
+                HeapSlot::Object(map) => map.len().saturating_mul(vsz),
+            })
+            .sum()
+    }
+
     /// Allocate an array slot, returning its handle. (Wrap in `Value::Array`.)
     pub fn alloc_array(&mut self, items: Vec<Value>) -> Handle {
         let handle = self.slots.len() as Handle;
