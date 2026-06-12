@@ -15,6 +15,16 @@ pub struct CompiledProgram {
     pub instructions: Vec<Instruction>,
     pub functions: Vec<CompiledFunction>,
     pub local_names: Vec<String>,
+    /// Source-location side table for the top-level instructions: one
+    /// `(instruction_index, source_byte_offset)` entry per statement boundary,
+    /// strictly increasing in instruction index. Combined with `line_starts`
+    /// this maps a runtime `ip` to a line/column for error reporting. Compact:
+    /// 8 bytes per statement in memory, varint-encoded on the wire.
+    pub line_table: Vec<(u32, u32)>,
+    /// Byte offset of the start of each source line (from the parser). Shared
+    /// by the top-level `line_table` and every function's. Travels in
+    /// snapshots, so resumed runs report the same lines without the source.
+    pub line_starts: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -48,6 +58,10 @@ pub struct CompiledFunction {
     /// True iff the body references `arguments` and the function is non-arrow, so
     /// the VM must bind an array-like `arguments` local right after the params.
     pub needs_arguments: bool,
+    /// Source-location side table for this function's instructions — same
+    /// shape as [`CompiledProgram::line_table`], offsets into the same source
+    /// (resolved via the program's `line_starts`).
+    pub line_table: Vec<(u32, u32)>,
 }
 
 impl CompiledFunction {
@@ -64,6 +78,7 @@ impl CompiledFunction {
             is_async: false,
             is_generator: false,
             needs_arguments: false,
+            line_table: Vec::new(),
         }
     }
 }
@@ -113,6 +128,10 @@ struct Compiler {
     /// Counter for the hidden locals `prepare_rmw_target` allocates (one per
     /// read-modify-write member target in this function).
     rmw_temp_counter: usize,
+    /// Statement-boundary source positions for the instructions this compiler
+    /// emits — becomes `CompiledProgram::line_table` / a function's
+    /// `CompiledFunction::line_table`.
+    line_table: Vec<(u32, u32)>,
 }
 
 /// A read-modify-write member reference whose object/index live in hidden
@@ -153,6 +172,7 @@ impl Compiler {
             hoisted_funcs: std::collections::HashSet::new(),
             current_class: None,
             rmw_temp_counter: 0,
+            line_table: Vec::new(),
         }
     }
 
@@ -176,6 +196,7 @@ impl Compiler {
             hoisted_funcs: std::collections::HashSet::new(),
             current_class: None,
             rmw_temp_counter: 0,
+            line_table: Vec::new(),
         }
     }
 
@@ -183,6 +204,22 @@ impl Compiler {
         let idx = self.instructions.len();
         self.instructions.push(instr);
         idx
+    }
+
+    /// Record a statement boundary: the next instruction emitted corresponds to
+    /// source byte offset `offset`. When a nested statement starts at the same
+    /// instruction index (e.g. the first statement of a block), the inner —
+    /// more precise — position wins, keeping indices strictly increasing so the
+    /// VM can binary-search the table.
+    fn record_source_pos(&mut self, offset: u32) {
+        let idx = self.instructions.len() as u32;
+        if let Some(last) = self.line_table.last_mut() {
+            if last.0 == idx {
+                last.1 = offset;
+                return;
+            }
+        }
+        self.line_table.push((idx, offset));
     }
 
     fn current_offset(&self) -> usize {
@@ -589,10 +626,12 @@ impl Compiler {
             is_async: func.is_async,
             is_generator: func.is_generator,
             needs_arguments,
+            line_table: func_compiler.line_table,
         })
     }
 
     fn compile_statement(&mut self, stmt: &Statement) -> Result<()> {
+        self.record_source_pos(stmt.span().start);
         match stmt {
             Statement::VariableDecl {
                 kind, declarations, ..
@@ -1063,6 +1102,7 @@ impl Compiler {
     /// Expression/Block/If/TryCatch produce a value; anything else keeps its
     /// normal (value-less) compilation.
     fn compile_completion_statement(&mut self, stmt: &Statement) -> Result<()> {
+        self.record_source_pos(stmt.span().start);
         match stmt {
             Statement::Expression { expr, .. } => {
                 self.compile_expr(expr)?; // leave value, no Pop
@@ -3124,6 +3164,8 @@ pub fn compile_with_externals(
         instructions: compiler.instructions,
         functions,
         local_names: compiler.locals,
+        line_table: compiler.line_table,
+        line_starts: program.line_starts.clone(),
     })
 }
 
@@ -3141,6 +3183,8 @@ pub fn compile_session_chunk(
             instructions: compiler.instructions,
             functions,
             local_names: compiler.locals,
+            line_table: compiler.line_table,
+            line_starts: program.line_starts.clone(),
         },
         compiler.top_level_bindings,
     ))

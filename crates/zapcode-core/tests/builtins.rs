@@ -94,6 +94,26 @@ fn test_math_round() {
     assert_eq!(result, Value::Float(5.0));
 }
 
+#[test]
+fn test_math_round_and_sign_negative_zero() {
+    // Found by fuzz-differential. Node: Math.round of [-0.5, -0] is -0,
+    // Math.sign(-0) is -0, Math.sign(NaN) is NaN. `Object.is` distinguishes
+    // -0 from 0, so the sign must survive.
+    for code in [
+        "Object.is(Math.round(-0.25), -0)",
+        "Object.is(Math.round(-0.5), -0)",
+        "Object.is(Math.round(-0), -0)",
+        "Object.is(Math.sign(-0), -0)",
+        "Number.isNaN(Math.sign(NaN))",
+        // unchanged positive-side behavior
+        "Object.is(Math.round(0.25), 0)",
+        "Math.round(-2.5) === -2",
+        "Math.sign(-3) === -1",
+    ] {
+        assert_eq!(eval_ts(code).unwrap(), Value::Bool(true), "{code}");
+    }
+}
+
 // ── String methods ───────────────────────────────────────────────────
 
 #[test]
@@ -201,6 +221,32 @@ fn test_array_slice() {
             assert_eq!(arr[0], Value::Int(2));
         }
         other => panic!("expected array, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_array_slice_out_of_range_indices_clamp() {
+    // Found by fuzz-differential: `[].slice(1, 2)` used to index `arr[1..0]`
+    // and panic (aborting the host process via the bindings). Node: all of
+    // these clamp into range and yield empty results.
+    for (code, expected_len) in [
+        ("[].slice(1, 2)", 0),
+        ("[1, 2].slice(5)", 0),
+        ("[1, 2, 3].slice(2, 1)", 0),
+        ("[1, 2, 3].slice(1, 99)", 2),
+    ] {
+        let (result, heap) = run(code);
+        match result {
+            Value::Array(h) => assert_eq!(heap.array_vec(h).len(), expected_len, "{code}"),
+            other => panic!("expected array for {code}, got {other:?}"),
+        }
+    }
+    let result = eval_ts("\"ab\".slice(5, 9)").unwrap();
+    assert_eq!(result, Value::String("".into()));
+    let (result, heap) = run("[0, 0].fill(1, 5, 9)");
+    match result {
+        Value::Array(h) => assert_eq!(heap.array_vec(h), vec![Value::Int(0), Value::Int(0)]),
+        other => panic!("expected array, got {other:?}"),
     }
 }
 

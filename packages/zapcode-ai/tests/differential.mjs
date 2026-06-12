@@ -16,34 +16,7 @@
  * Run: npm run build && node tests/differential.mjs
  */
 import assert from "node:assert/strict";
-import { execute } from "../dist/index.js";
-
-const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-
-/** Normalize per the host-boundary marshalling rules (cluster L). */
-function normalize(v) {
-  if (v === undefined) return null;
-  if (typeof v === "number" && !Number.isFinite(v)) return null;
-  if (Array.isArray(v)) return v.map(normalize);
-  if (v && typeof v === "object") {
-    const out = {};
-    for (const [k, val] of Object.entries(v)) {
-      if (val === undefined) continue; // dropped at the boundary
-      out[k] = normalize(val);
-    }
-    return out;
-  }
-  return v;
-}
-
-async function runZapcode(body) {
-  const r = await execute(`async function main() { ${body} } main();`, {});
-  return normalize(r.output);
-}
-
-async function runNode(body) {
-  return normalize(await new AsyncFunction(body)());
-}
+import { runNode, runZapcode } from "./diff-harness-lib.mjs";
 
 // ════════════════════════════════════════════════════════════════════════════
 //  Corpus — every snippet must agree with Node byte-for-byte (normalized)

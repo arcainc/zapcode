@@ -438,6 +438,16 @@ pub struct Vm {
     /// Pending `setTimeout` callbacks (see [`TimerEntry`]).
     pub(crate) timers: Vec<TimerEntry>,
     pub(crate) next_timer_id: u64,
+    /// The original source text, used only to render a one-line code frame on
+    /// an uncaught runtime error. Transient and host-side: set by `ZapcodeRun`,
+    /// NEVER serialized into snapshots (line/column come from the compiled
+    /// line tables instead, so resumed runs still report correct lines).
+    pub(crate) source: Option<String>,
+    /// Hand-off slot for a re-raised exception's ORIGINAL throw site: set by
+    /// `resume_completion` immediately before its `Err`, consumed by the
+    /// execute loop's `Err` arm on the very next iteration (so it can never
+    /// go stale). Transient — the durable copy rides in `Completion::Throw`.
+    pub(crate) pending_throw_loc: Option<(u32, u32)>,
 }
 
 /// The builtin globals and the heap slots backing them, built once. Every
@@ -539,7 +549,11 @@ pub(crate) enum Completion {
     /// Resume a pending `return value;`.
     Return(Value),
     /// Re-raise a pending exception once the finally finishes.
-    Throw(Value),
+    /// Re-raise a pending exception once the finally finishes. The second
+    /// field is the ORIGINAL throw site — without it, the re-raise would be
+    /// attributed to wherever the finally body happened to end (pointing the
+    /// agent at an innocent cleanup line).
+    Throw(Value, Option<(u32, u32)>),
     /// Resume a pending `break`/`continue`, transferring control to `target`.
     Break(usize),
     Continue(usize),
@@ -551,7 +565,7 @@ pub(crate) enum Completion {
 /// only when its target lands outside that try statement's ip range.
 fn completion_escapes(completion: &Completion, info: &TryInfo) -> bool {
     match completion {
-        Completion::Return(_) | Completion::Throw(_) | Completion::Normal => true,
+        Completion::Return(_) | Completion::Throw(..) | Completion::Normal => true,
         Completion::Break(target) | Completion::Continue(target) => {
             !(info.region_start..info.region_end).contains(target)
         }
@@ -640,6 +654,8 @@ impl Vm {
             builtin_base,
             timers: Vec::new(),
             next_timer_id: 0,
+            source: None,
+            pending_throw_loc: None,
         }
     }
 
@@ -763,6 +779,8 @@ impl Vm {
             builtin_base: restored_base,
             timers: Vec::new(),
             next_timer_id: 0,
+            source: None,
+            pending_throw_loc: None,
         }
     }
 
@@ -907,11 +925,17 @@ impl Vm {
         }
         // Route the rejection to the nearest catch or finally (running finallys
         // on the way), exactly as the execute loop does for a runtime error.
-        if self.route_thrown(error.clone(), 0)? {
+        // Capture the suspension site (the awaited external call) first —
+        // routing unwinds the frames that locate it.
+        let suspend_loc = self.current_source_location();
+        if self.route_thrown(error.clone(), 0, suspend_loc)? {
             self.execute_to_host()
         } else {
             // No handler — the failure is the program's failure.
-            Err(ZapcodeError::ExternalError(error.to_js_string(&self.heap)))
+            Err(self.annotate_uncaught(
+                ZapcodeError::ExternalError(error.to_js_string(&self.heap)),
+                suspend_loc,
+            ))
         }
     }
 
@@ -923,7 +947,12 @@ impl Vm {
     /// `min_frame_depth` limits how far unwinding may go: only try frames at
     /// depth `> min_frame_depth` are considered, so an internal call (which sets
     /// it to the caller's depth) does not steal the caller's handlers.
-    fn route_thrown(&mut self, error_val: Value, min_frame_depth: usize) -> Result<bool> {
+    fn route_thrown(
+        &mut self,
+        error_val: Value,
+        min_frame_depth: usize,
+        throw_loc: Option<(u32, u32)>,
+    ) -> Result<bool> {
         loop {
             let Some(try_info) = self
                 .try_stack
@@ -975,7 +1004,7 @@ impl Vm {
                 // No catch (or catch already consumed): run the finally with the
                 // exception pending, then re-raise it via EndFinally.
                 let mut info = try_info;
-                info.pending = Some(Completion::Throw(error_val));
+                info.pending = Some(Completion::Throw(error_val, throw_loc));
                 info.in_finally = true;
                 info.has_catch = false;
                 self.try_stack.push(info);
@@ -1042,12 +1071,15 @@ impl Vm {
                 }
                 self.perform_return(v)
             }
-            Completion::Throw(v) => {
+            Completion::Throw(v, loc) => {
                 // Re-raise the pending exception. Routing to the next handler is
                 // done uniformly by the execute loop's error path, which reads
-                // `pending_throw` so the original value/identity is preserved.
+                // `pending_throw` so the original value/identity is preserved —
+                // and `pending_throw_loc` so the error stays attributed to the
+                // ORIGINAL throw site, not the end of the finally body.
                 let msg = v.to_js_string(&self.heap);
                 self.pending_throw = Some(v);
+                self.pending_throw_loc = loc;
                 Err(ZapcodeError::RuntimeError(msg))
             }
             Completion::Break(target) => {
@@ -1815,7 +1847,8 @@ impl Vm {
         }
         self.frames.push(frame);
         if is_rejection {
-            if !self.route_thrown(value, below)? {
+            let loc = self.current_source_location();
+            if !self.route_thrown(value, below, loc)? {
                 let reason = self.pending_throw.take().unwrap_or(Value::Undefined);
                 self.reject_detached_body(below, reason)?;
             }
@@ -2729,6 +2762,54 @@ impl Vm {
             .expect("internal error: invalid function reference")
     }
 
+    /// Resolve the innermost frame's current instruction to a 1-based
+    /// (line, column) via the compiled line tables. `dispatch()` pre-increments
+    /// `ip`, so the instruction that just faulted is `ip - 1`. Returns `None`
+    /// when no frame is active or the tables are empty (e.g. a program
+    /// compiled by a build that predates them).
+    fn current_source_location(&self) -> Option<(u32, u32)> {
+        let frame = self.frames.last()?;
+        let prog = self.programs.get(frame.program_index)?;
+        let table = match frame.func_index {
+            Some(idx) => &prog.functions.get(idx)?.line_table,
+            None => &prog.line_table,
+        };
+        if table.is_empty() || prog.line_starts.is_empty() {
+            return None;
+        }
+        let ip = frame.ip.saturating_sub(1) as u32;
+        // Last statement boundary at or before `ip`.
+        let pos = match table.binary_search_by_key(&ip, |&(i, _)| i) {
+            Ok(i) => i,
+            Err(0) => 0,
+            Err(i) => i - 1,
+        };
+        let offset = table[pos].1;
+        let line_idx = match prog.line_starts.binary_search(&offset) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        };
+        Some((line_idx as u32 + 1, offset - prog.line_starts[line_idx] + 1))
+    }
+
+    /// Attach "    at <line>:<col>" — plus a one-line code frame with a caret
+    /// when the original source is available (it isn't after a snapshot
+    /// resume) — to an error escaping to the host. The first line of the
+    /// message is preserved exactly; see `ZapcodeError::with_location_suffix`.
+    fn annotate_uncaught(&self, err: ZapcodeError, loc: Option<(u32, u32)>) -> ZapcodeError {
+        let Some((line, col)) = loc else { return err };
+        let mut suffix = format!("\n    at {line}:{col}");
+        if let Some(src) = &self.source {
+            if let Some(text) = src.lines().nth(line as usize - 1) {
+                // The column is a byte offset into the (possibly auto-wrapped)
+                // source line; clamp so the caret never lands past the text.
+                let caret_pad = " ".repeat((col as usize - 1).min(text.len()));
+                suffix.push_str(&format!("\n    {text}\n    {caret_pad}^"));
+            }
+        }
+        err.with_location_suffix(&suffix)
+    }
+
     /// JS `Function.prototype.length`: the count of leading parameters that have
     /// neither a default value nor are a rest element (counting stops at the
     /// first such parameter).
@@ -2997,6 +3078,13 @@ impl Vm {
                     }
                 }
                 Err(err) => {
+                    // Capture the throw site NOW — the routing below may unwind
+                    // the frames that locate it. A re-raise out of a finally
+                    // hands the ORIGINAL site through `pending_throw_loc`.
+                    let throw_loc = self
+                        .pending_throw_loc
+                        .take()
+                        .or_else(|| self.current_source_location());
                     let error_val = self.caught_error_value(&err);
                     // A throw inside a *microtask* callback is its own turn: it
                     // may route to handlers within the callback, but escaping
@@ -3048,7 +3136,7 @@ impl Vm {
                     };
                     match boundary {
                         Some((depth, is_async_frame)) if is_async_frame => {
-                            if !self.route_thrown(error_val, depth)? {
+                            if !self.route_thrown(error_val, depth, throw_loc)? {
                                 let reason = self.pending_throw.take().unwrap_or(Value::Undefined);
                                 if self.frames[depth].async_result.is_some() {
                                     // Detached body: reject the promise the
@@ -3080,7 +3168,7 @@ impl Vm {
                             }
                         }
                         Some((depth, _)) => {
-                            if !self.route_thrown(error_val, depth)? {
+                            if !self.route_thrown(error_val, depth, throw_loc)? {
                                 // No handler inside the callback — unwind its
                                 // frames and reject the chain with the original
                                 // thrown value (identity preserved for `.catch`).
@@ -3111,9 +3199,11 @@ impl Vm {
                             }
                         }
                         None => {
-                            if !self.route_thrown(error_val, 0)? {
-                                // No handler remains — propagate to the host.
-                                return Err(err);
+                            if !self.route_thrown(error_val, 0, throw_loc)? {
+                                // No handler remains — propagate to the host,
+                                // annotated with the throw site for agent
+                                // self-correction.
+                                return Err(self.annotate_uncaught(err, throw_loc));
                             }
                         }
                     }
@@ -3746,7 +3836,11 @@ impl Vm {
                     // frame this call started at) may engage here; an outer
                     // handler belongs to the caller and is left for it.
                     let error_val = self.caught_error_value(&err);
-                    if !self.route_thrown(error_val, target_frame_depth)? {
+                    let throw_loc = self
+                        .pending_throw_loc
+                        .take()
+                        .or_else(|| self.current_source_location());
+                    if !self.route_thrown(error_val, target_frame_depth, throw_loc)? {
                         // Unwind the frame(s) this call pushed so the frame stack is
                         // restored to the caller's depth before propagating. Without
                         // this, a nested internal call (e.g. a cyclic ToPrimitive
@@ -5232,7 +5326,11 @@ impl Vm {
                     // generator's base) may catch here; an outer handler belongs
                     // to the caller and is left for it.
                     let error_val = self.caught_error_value(&err);
-                    if !self.route_thrown(error_val, target_frame_depth)? {
+                    let throw_loc = self
+                        .pending_throw_loc
+                        .take()
+                        .or_else(|| self.current_source_location());
+                    if !self.route_thrown(error_val, target_frame_depth, throw_loc)? {
                         return Err(err);
                     }
                 }
@@ -5618,6 +5716,10 @@ impl Vm {
                 let right = self.to_primitive(&right, ToPrimitiveHint::Number)?;
                 let result = match (&left, &right) {
                     (Value::Int(a), Value::Int(b)) => match a.checked_mul(*b) {
+                        // JS: a zero product takes the XOR of the operand signs
+                        // (-5 * 0 is -0); the integer fast path would lose it
+                        // (same -0 treatment as Instruction::Neg).
+                        Some(0) if (*a < 0) != (*b < 0) => Value::Float(-0.0),
                         Some(r) => int_arith_result(r),
                         None => Value::Float(*a as f64 * *b as f64),
                     },
@@ -5659,7 +5761,14 @@ impl Vm {
                 let left = self.to_primitive(&left, ToPrimitiveHint::Number)?;
                 let right = self.to_primitive(&right, ToPrimitiveHint::Number)?;
                 let result = match (&left, &right) {
-                    (Value::Int(a), Value::Int(b)) if *b != 0 => Value::Int(a % b),
+                    // JS: a zero remainder takes the dividend's sign (-5 % 5 is
+                    // -0). checked_rem also guards i64::MIN % -1, which panics
+                    // in Rust; its JS value is -0 (negative dividend) too.
+                    (Value::Int(a), Value::Int(b)) if *b != 0 => match a.checked_rem(*b) {
+                        Some(0) if *a < 0 => Value::Float(-0.0),
+                        Some(r) => Value::Int(r),
+                        None => Value::Float(-0.0),
+                    },
                     (Value::BigInt(a), Value::BigInt(b)) => {
                         if num_traits::Zero::is_zero(b) {
                             return Err(ZapcodeError::RangeError("Division by zero".to_string()));
@@ -10300,6 +10409,99 @@ fn is_promise_method(name: &str) -> bool {
     matches!(name, "then" | "catch" | "finally")
 }
 
+/// Execute an already-compiled program: construct the VM, seed inputs, run to
+/// completion or suspension, and finish the trace. This is the shared back end
+/// of [`ZapcodeRun::run_with_input_heap`] (which parses + compiles first) and
+/// [`crate::program::ZapcodeProgram`] (which reuses cached bytecode).
+/// `root_span` carries any parse/compile child spans already recorded.
+pub(crate) fn execute_compiled(
+    compiled: CompiledProgram,
+    ext_set: HashSet<String>,
+    limits: ResourceLimits,
+    input_values: Vec<(String, Value)>,
+    input_heap: Heap,
+    source: Option<String>,
+    mut root_span: SpanBuilder,
+) -> Result<RunResult> {
+    let execute_span = SpanBuilder::new("execute");
+    // An empty input heap is the common case (primitive or no inputs); take
+    // the plain constructor so the seeded-heap path stays opt-in.
+    let mut vm = if input_heap.is_empty() {
+        Vm::new(compiled, limits, ext_set)
+    } else {
+        Vm::with_programs_and_heap(vec![compiled], limits, ext_set, input_heap)
+    };
+    // For the one-line code frame on uncaught errors. Transient — a resumed
+    // snapshot reports line:col from the compiled line tables alone.
+    vm.source = source;
+
+    for (name, value) in input_values {
+        vm.globals.insert(name, value);
+    }
+
+    let state = match vm.run() {
+        Ok(s) => {
+            let status = match &s {
+                VmState::Complete(_) => TraceStatus::Ok,
+                VmState::Suspended {
+                    function_name,
+                    args,
+                    ..
+                } => {
+                    let mut span = execute_span;
+                    span.set_attr("zapcode.suspended_on", function_name);
+                    span.set_attr("zapcode.args_count", args.len());
+                    root_span.add_child(span.finish(TraceStatus::Ok));
+                    let trace = ExecutionTrace {
+                        root: root_span.finish_ok(),
+                    };
+                    return Ok(RunResult {
+                        state: s,
+                        stdout: vm.stdout,
+                        heap: vm.heap,
+                        trace,
+                    });
+                }
+                VmState::SuspendedMany { calls, .. } => {
+                    let mut span = execute_span;
+                    span.set_attr("zapcode.suspended_on", "Promise.all batch");
+                    span.set_attr("zapcode.args_count", calls.len());
+                    root_span.add_child(span.finish(TraceStatus::Ok));
+                    let trace = ExecutionTrace {
+                        root: root_span.finish_ok(),
+                    };
+                    return Ok(RunResult {
+                        state: s,
+                        stdout: vm.stdout,
+                        heap: vm.heap,
+                        trace,
+                    });
+                }
+            };
+            root_span.add_child(execute_span.finish(status));
+            s
+        }
+        Err(e) => {
+            root_span.add_child(execute_span.finish_error(&e.to_string()));
+            let _trace = ExecutionTrace {
+                root: root_span.finish(TraceStatus::Error),
+            };
+            return Err(e);
+        }
+    };
+
+    let trace = ExecutionTrace {
+        root: root_span.finish_ok(),
+    };
+
+    Ok(RunResult {
+        state,
+        stdout: vm.stdout,
+        heap: vm.heap,
+        trace,
+    })
+}
+
 /// Main entry point: compile and run TypeScript code.
 pub struct ZapcodeRun {
     source: String,
@@ -10359,7 +10561,7 @@ impl ZapcodeRun {
         // Compile
         let compile_span = SpanBuilder::new("compile");
         let ext_set: HashSet<String> = self.external_functions.iter().cloned().collect();
-        let compiled = match crate::compiler::compile_with_externals(&program, ext_set.clone()) {
+        let compiled = match crate::compiler::compile_with_externals(&program, ext_set) {
             Ok(c) => {
                 root_span.add_child(compile_span.finish_ok());
                 c
@@ -10373,81 +10575,16 @@ impl ZapcodeRun {
             }
         };
 
-        // Execute
-        let execute_span = SpanBuilder::new("execute");
-        // An empty input heap is the common case (primitive or no inputs); take
-        // the plain constructor so the seeded-heap path stays opt-in.
-        let mut vm = if input_heap.is_empty() {
-            Vm::new(compiled, self.limits.clone(), ext_set)
-        } else {
-            Vm::with_programs_and_heap(vec![compiled], self.limits.clone(), ext_set, input_heap)
+        // Execute — delegate to the same pre-compiled path as `ZapcodeProgram`
+        // so a cached program behaves identically to a fresh compile. The
+        // original source rides along (transient) for the one-line code
+        // frame on uncaught errors.
+        let program = crate::program::ZapcodeProgram {
+            compiled,
+            external_functions: self.external_functions.clone(),
+            source: self.source.clone(),
         };
-
-        for (name, value) in input_values {
-            vm.globals.insert(name, value);
-        }
-
-        let state = match vm.run() {
-            Ok(s) => {
-                let status = match &s {
-                    VmState::Complete(_) => TraceStatus::Ok,
-                    VmState::Suspended {
-                        function_name,
-                        args,
-                        ..
-                    } => {
-                        let mut span = execute_span;
-                        span.set_attr("zapcode.suspended_on", function_name);
-                        span.set_attr("zapcode.args_count", args.len());
-                        root_span.add_child(span.finish(TraceStatus::Ok));
-                        let trace = ExecutionTrace {
-                            root: root_span.finish_ok(),
-                        };
-                        return Ok(RunResult {
-                            state: s,
-                            stdout: vm.stdout,
-                            heap: vm.heap,
-                            trace,
-                        });
-                    }
-                    VmState::SuspendedMany { calls, .. } => {
-                        let mut span = execute_span;
-                        span.set_attr("zapcode.suspended_on", "Promise.all batch");
-                        span.set_attr("zapcode.args_count", calls.len());
-                        root_span.add_child(span.finish(TraceStatus::Ok));
-                        let trace = ExecutionTrace {
-                            root: root_span.finish_ok(),
-                        };
-                        return Ok(RunResult {
-                            state: s,
-                            stdout: vm.stdout,
-                            heap: vm.heap,
-                            trace,
-                        });
-                    }
-                };
-                root_span.add_child(execute_span.finish(status));
-                s
-            }
-            Err(e) => {
-                root_span.add_child(execute_span.finish_error(&e.to_string()));
-                let _trace = ExecutionTrace {
-                    root: root_span.finish(TraceStatus::Error),
-                };
-                return Err(e);
-            }
-        };
-
-        let trace = ExecutionTrace {
-            root: root_span.finish_ok(),
-        };
-
-        Ok(RunResult {
-            state,
-            stdout: vm.stdout,
-            heap: vm.heap,
-            trace,
-        })
+        program.run_consuming(input_values, input_heap, self.limits.clone(), root_span)
     }
 
     /// Start execution. Like `run()`, but returns the raw `VmState` directly

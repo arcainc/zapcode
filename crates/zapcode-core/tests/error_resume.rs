@@ -60,7 +60,12 @@ fn uncaught_error_propagates_to_host() {
         .unwrap_err();
 
     match err {
-        ZapcodeError::ExternalError(msg) => assert_eq!(msg, "upstream 500"),
+        // starts_with, not eq: the uncaught failure now appends the
+        // "    at line:col" of the awaited call for agent self-correction.
+        ZapcodeError::ExternalError(msg) => assert!(
+            msg.starts_with("upstream 500"),
+            "unexpected message: {msg}"
+        ),
         other => panic!("expected ExternalError, got {other:?}"),
     }
 }

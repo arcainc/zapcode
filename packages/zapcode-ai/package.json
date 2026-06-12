@@ -22,7 +22,8 @@
     "test:scenarios3": "npm run sync-local-binding && npm run build && for f in scheduling support-triage etl compliance durable pricing inventory analytics knowledge statemachine; do echo \"# scenarios3-$f\"; node tests/scenarios3-$f.mjs; done",
     "test:scenarios": "npm run build && for f in data datetime text errors sessions; do echo \"# scenarios-$f\"; node tests/scenarios-$f.mjs || true; done",
     "test": "npm run test:e2e",
-    "test:differential": "npm run sync-local-binding && npm run build && node tests/differential.mjs"
+    "test:differential": "npm run sync-local-binding && npm run build && node tests/differential.mjs",
+    "test:fuzz": "npm run sync-local-binding && npm run build && node tests/fuzz-differential.mjs"
   },
   "dependencies": {
     "@unchartedfr/zapcode": "^1.0.0"

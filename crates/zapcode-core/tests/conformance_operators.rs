@@ -45,6 +45,22 @@ fn arithmetic_basic() {
 }
 
 #[test]
+fn integer_mul_rem_preserve_negative_zero() {
+    // Found by fuzz-differential. JS: a zero product takes the XOR of the
+    // operand signs, a zero remainder takes the dividend's sign. The Int
+    // fast paths used to collapse these to +0.
+    assert_eq!(run_str("Object.is(-5 * 0, -0)"), "true");
+    assert_eq!(run_str("Object.is(0 * -5, -0)"), "true");
+    assert_eq!(run_str("Object.is(0 * 5, 0)"), "true");
+    assert_eq!(run_str("Object.is(-5 * -0, 0)"), "true");
+    assert_eq!(run_str("Object.is(-5 % 5, -0)"), "true");
+    assert_eq!(run_str("Object.is(-5 % -5, -0)"), "true");
+    assert_eq!(run_str("Object.is(5 % 5, 0)"), "true");
+    assert_eq!(run_str("-7 % 5"), "-2"); // nonzero results keep Int path
+    assert_eq!(run_str("String(-5 % 5)"), "0"); // -0 still renders as "0"
+}
+
+#[test]
 fn exponentiation_is_right_associative() {
     assert_eq!(run_str("2 ** 10"), "1024");
     assert_eq!(run_str("2 ** 3 ** 2"), "512"); // 2 ** (3 ** 2) = 2**9

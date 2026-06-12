@@ -809,9 +809,11 @@ fn math_sign() {
     assert_eq!(run_str("Math.sign(-0)"), "0");
     assert_eq!(run_str("Math.sign(Infinity)"), "1");
     assert_eq!(run_str("Math.sign(-Infinity)"), "-1");
-    // NOTE: Math.sign(NaN) → 0 in zapcode (its fold maps the non-positive/non-
-    // negative case to 0); JS returns NaN. Documented divergence; assert actual.
-    assert_eq!(run_str("Math.sign(NaN)"), "0");
+    // Fixed via fuzz-differential: ±0 and NaN now pass through the fold, so
+    // Math.sign(NaN) is NaN and Math.sign(-0) is -0, matching JS (String(-0)
+    // is still "0", which the -0 assertion above relies on).
+    assert_eq!(run_str("Math.sign(NaN)"), "NaN");
+    assert_eq!(run_str("Object.is(Math.sign(-0), -0)"), "true");
 }
 
 // ============================================================================

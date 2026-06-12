@@ -12,7 +12,7 @@
 
 ## 1. Speed
 
-**Current state** (apple silicon, release): simple expression ~4–5 µs
+**Current state** (apple silicon, release): `ZapcodeProgram` prepare-once API ships (dump/load with wire framing; realistic agent program 30→22 µs/run, ~28% saved). Simple expression ~4–5 µs
 end-to-end (parse 0.3 µs, compile 0.15 µs, VM construct+dispatch ~4 µs);
 loop iterations ~50 µs/100; calls ~0.8 µs each. Dispatch profile is flat —
 per-instruction clock reads amortized, `Instruction` is 40 bytes.
@@ -35,7 +35,10 @@ with headroom). The remaining structural wins are *avoiding repeated work*:
 
 **Current state**: typical agent snapshot 472 B (template-elided,
 mark-compacted); per-hop snapshot growth is live-state-only; `Instruction`
-40 B; builtin template shared per-process via `OnceLock`.
+40 B; builtin template shared per-process via `OnceLock`. Measured (cycle
+1): parked-as-bytes ~2 KiB RSS/VM vs ~63 KiB live (park as bytes!); object
+keys have ZERO sharing today (3,069 occurrences → 3,069 Arc allocations) —
+interning is a GO; Arc-sharing `CompiledProgram` is the next density lead.
 
 **Direction**: the arena still never frees *during* a run — compaction
 happens only at snapshot capture. In-run pressure is bounded by
@@ -55,7 +58,10 @@ high.
 
 ## 3. Conformance
 
-**Current state**: differential gate = 330 snippets (whole realistic
+**Current state**: differential gate = 334 snippets + a seeded fuzzer
+(`test:fuzz`, auto-minimizing; its first run found a host-aborting slice
+panic and three negative-zero bugs) + an evaluation-count suite (the RMW
+double-eval class). Previously: 330 snippets (whole realistic
 programs + a by-name stdlib sweep), 1 deliberate pin (`Symbol.toPrimitive`).
 Known residuals: tagged-template `strings.raw` companion,
 deeper-than-top-level param field defaults, `Promise.race([])` hang-vs-pend,

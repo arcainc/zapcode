@@ -44,6 +44,7 @@ pub mod error;
 pub mod heap;
 pub mod jsstring;
 pub mod parser;
+pub mod program;
 pub mod sandbox;
 pub mod session;
 pub mod snapshot;
@@ -54,6 +55,7 @@ pub(crate) mod wire;
 
 pub use compiler::instruction::BatchKind;
 pub use error::ZapcodeError;
+pub use program::ZapcodeProgram;
 pub use sandbox::ResourceLimits;
 pub use session::{ZapcodeSessionSnapshot, ZapcodeSessionState};
 pub use snapshot::ZapcodeSnapshot;
