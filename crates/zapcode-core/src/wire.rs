@@ -71,7 +71,11 @@ const MAGIC: &[u8; 4] = b"ZPC1";
 /// v16: stdout/stderr split — `VmSnapshot.stderr` (a new trailing field
 /// carrying the `console.error`/`console.warn` stream alongside stdout so a
 /// suspension mid-run preserves both), incompatible with v15.
-pub(crate) const FORMAT_VERSION: u16 = 16;
+/// v17: content-addressed programs — `VmSnapshot::{programs_elided,
+/// program_fingerprints}` (new trailing fields; `dump_referenced()` elides the
+/// program bytecode and records per-program fnv1a fingerprints, spliced back by
+/// `load_with_programs()`), incompatible with v16.
+pub(crate) const FORMAT_VERSION: u16 = 17;
 
 const HEADER_LEN: usize = 4 + 2 + 1 + 1 + 32;
 

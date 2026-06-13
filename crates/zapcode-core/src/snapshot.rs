@@ -104,6 +104,18 @@ pub(crate) struct VmSnapshot {
     pub(crate) timers: Vec<crate::vm::TimerEntry>,
     #[serde(default)]
     pub(crate) next_timer_id: u64,
+    /// When true, `programs` is empty on the wire (content-addressed): the
+    /// program bytecode is elided and the loader must splice in programs
+    /// matching `program_fingerprints` positionally via
+    /// [`ZapcodeSnapshot::load_with_programs`]. Default `dump()` keeps this
+    /// false (self-contained). v17.
+    #[serde(default)]
+    pub(crate) programs_elided: bool,
+    /// fnv1a fingerprint of each elided program, in `programs` order — guards
+    /// against resuming against a different build of the same source (same
+    /// guard class as `template_fingerprint`). v17.
+    #[serde(default)]
+    pub(crate) program_fingerprints: Vec<u64>,
 }
 
 /// Postcard bytes + FNV-1a fingerprint of the builtin-template heap, built
@@ -127,6 +139,19 @@ fn fnv1a(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+/// Content fingerprint of a compiled program: fnv1a over its full postcard
+/// serialization. Covers every field execution dereferences (instructions,
+/// functions, local_names, line tables, and the baked-in external-call
+/// lowering), so a byte-identical program — the only kind whose fingerprint
+/// matches — is structurally interchangeable with the captured one. A drift
+/// guard, not an integrity primitive: the wire SHA already covers the stored
+/// bytes against tampering, and the program is supplied by the host's own
+/// store, never by the untrusted blob.
+pub(crate) fn program_fingerprint(program: &crate::compiler::CompiledProgram) -> u64 {
+    let bytes = postcard::to_allocvec(program).expect("compiled program serializes");
+    fnv1a(&bytes)
 }
 
 impl VmSnapshot {
@@ -196,6 +221,8 @@ impl VmSnapshot {
             template_fingerprint: 0,
             timers: vm.timers.clone(),
             next_timer_id: vm.next_timer_id,
+            programs_elided: false,
+            program_fingerprints: Vec::new(),
         };
         // Drop dead heap slots first (the arena never frees during
         // execution, so a churning agent otherwise persists every dead
@@ -371,7 +398,74 @@ impl VmSnapshot {
         }
     }
 
+    /// Content-address the programs: replace the bytecode with per-program
+    /// fingerprints so the wire carries none of it. The loader must re-supply
+    /// the programs (see [`Self::splice_programs`]). Idempotent.
+    pub(crate) fn elide_programs(&mut self) {
+        if self.programs_elided {
+            return;
+        }
+        self.program_fingerprints = self.programs.iter().map(|p| program_fingerprint(p)).collect();
+        self.programs.clear();
+        self.programs_elided = true;
+    }
+
+    /// Splice host-supplied programs back into a referenced snapshot, validating
+    /// before any execution (never `panic!`): (1) the count matches the recorded
+    /// fingerprints, (2) each supplied program is byte-identical to the captured
+    /// one (fingerprint match — which also makes its internal function indices
+    /// valid by construction), and (3) every frame's `program_index` is in range.
+    /// A self-contained snapshot (programs already present) is left untouched.
+    pub(crate) fn splice_programs(
+        &mut self,
+        programs: &[std::sync::Arc<crate::compiler::CompiledProgram>],
+    ) -> Result<()> {
+        if !self.programs_elided {
+            return Ok(());
+        }
+        if programs.len() != self.program_fingerprints.len() {
+            return Err(ZapcodeError::SnapshotError(format!(
+                "referenced snapshot needs {} program(s) but {} were supplied",
+                self.program_fingerprints.len(),
+                programs.len()
+            )));
+        }
+        for (i, p) in programs.iter().enumerate() {
+            if program_fingerprint(p) != self.program_fingerprints[i] {
+                return Err(ZapcodeError::SnapshotError(format!(
+                    "program {} changed since capture (fingerprint mismatch)",
+                    i
+                )));
+            }
+        }
+        // Guard a malformed blob whose frames reference a program index past the
+        // supplied set — `Vm::program()` would otherwise `.expect()`-panic across
+        // the host boundary.
+        if let Some(max_idx) = self.frames.iter().map(|f| f.program_index).max() {
+            if max_idx >= programs.len() {
+                return Err(ZapcodeError::SnapshotError(format!(
+                    "referenced snapshot frame references program index {} but only {} supplied",
+                    max_idx,
+                    programs.len()
+                )));
+            }
+        }
+        self.programs = programs.to_vec();
+        self.programs_elided = false;
+        self.program_fingerprints.clear();
+        Ok(())
+    }
+
     pub(crate) fn restore_vm(self) -> Result<Vm> {
+        // Defense in depth: a program-referenced snapshot must have its programs
+        // spliced in (splice_programs) before restore — reaching here still
+        // elided means the programs vec is empty and the first frame deref would
+        // panic. Fail cleanly instead.
+        if self.programs_elided {
+            return Err(ZapcodeError::SnapshotError(
+                "cannot restore a program-referenced snapshot without its programs".to_string(),
+            ));
+        }
         let user_globals: HashMap<String, Value> = self.globals.into_iter().collect();
         let ext_set: HashSet<String> = self.external_functions.into_iter().collect();
 
@@ -495,8 +589,52 @@ impl ZapcodeSnapshot {
         Ok(crate::wire::encode_frame(FrameKind::Snapshot, &payload))
     }
 
-    /// Deserialize a snapshot from bytes produced by [`Self::dump`].
+    /// Serialize the snapshot with the program bytecode **elided**
+    /// (content-addressed): the blob carries per-program fingerprints instead of
+    /// the programs, so N snapshots of one workflow store the program once.
+    /// Resume with [`Self::load_with_programs`], supplying the same programs.
+    /// `dump()` stays self-contained — this is the opt-in referenced form.
+    pub fn dump_referenced(&self) -> Result<Vec<u8>> {
+        let mut snapshot = (*self.snapshot).clone();
+        snapshot.elide_programs();
+        let payload = postcard::to_allocvec(&snapshot)
+            .map_err(|e| ZapcodeError::SnapshotError(format!("dump failed: {}", e)))?;
+        crate::wire::check_state_size(payload.len(), snapshot.limits.max_snapshot_bytes)?;
+        Ok(crate::wire::encode_frame(FrameKind::Snapshot, &payload))
+    }
+
+    /// Deserialize a snapshot from bytes produced by [`Self::dump`]. A blob
+    /// produced by [`Self::dump_referenced`] is rejected here (it carries no
+    /// programs) — use [`Self::load_with_programs`].
     pub fn load(bytes: &[u8]) -> Result<Self> {
+        let snapshot = Self::decode(bytes)?;
+        if snapshot.snapshot.programs_elided {
+            return Err(ZapcodeError::SnapshotError(
+                "snapshot is program-referenced (dumped with dump_referenced); \
+                 load it with load_with_programs and supply its programs"
+                    .to_string(),
+            ));
+        }
+        Ok(snapshot)
+    }
+
+    /// Deserialize a referenced snapshot (from [`Self::dump_referenced`]),
+    /// splicing in the host-supplied `programs` — validated positionally against
+    /// the recorded fingerprints before any resume (a missing/mismatched/short
+    /// program is a `SnapshotError`, never a panic). Supply the same
+    /// [`crate::ZapcodeProgram`]s the snapshot was captured from (a recompile of
+    /// the same source works too — compilation is deterministic). Also accepts a
+    /// self-contained blob (the supplied programs are then ignored).
+    pub fn load_with_programs(bytes: &[u8], programs: &[crate::ZapcodeProgram]) -> Result<Self> {
+        let compiled: Vec<std::sync::Arc<crate::compiler::CompiledProgram>> =
+            programs.iter().map(|p| p.compiled_arc()).collect();
+        let mut snapshot = Self::decode(bytes)?;
+        snapshot.snapshot.splice_programs(&compiled)?;
+        Ok(snapshot)
+    }
+
+    /// Shared decode + limit-clamp for [`Self::load`] / [`Self::load_with_programs`].
+    fn decode(bytes: &[u8]) -> Result<Self> {
         let payload = crate::wire::decode_frame(
             FrameKind::Snapshot,
             bytes,

@@ -91,7 +91,21 @@ export interface ZapcodeSessionBatchSuspension {
 
 export class ZapcodeSnapshotHandle {
   static load(bytes: Buffer): ZapcodeSnapshotHandle;
+  /**
+   * Load a referenced snapshot (from `dumpReferenced`), splicing in the
+   * program(s) — each `ZapcodeProgramHandle.dump()` bytes, in the same order.
+   * Fingerprints are validated before resume; a missing/mismatched/wrong-count
+   * program is a catchable error, never a crash. Accepts a self-contained blob
+   * too (programs ignored).
+   */
+  static loadWithPrograms(bytes: Buffer, programBytes: Buffer[]): ZapcodeSnapshotHandle;
   dump(): Buffer;
+  /**
+   * Serialize with the program bytecode elided (content-addressed): N snapshots
+   * of one workflow store the program once, not N times. Resume via
+   * `loadWithPrograms`. `dump()` stays self-contained.
+   */
+  dumpReferenced(): Buffer;
   resume(returnValue: unknown): ZapcodeResult | ZapcodeSuspension | ZapcodeBatchSuspension;
   /**
    * Resume by raising an error at the suspended external call instead of

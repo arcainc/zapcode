@@ -192,6 +192,36 @@ impl ZapcodeSnapshotHandle {
         Ok(Self { inner: snapshot })
     }
 
+    /// Serialize the snapshot with the program bytecode **elided**
+    /// (content-addressed): N snapshots of one workflow then store the program
+    /// once, not N times. Resume with `loadWithPrograms`, supplying the program
+    /// bytes (`ZapcodeProgramHandle.dump()`). `dump()` stays self-contained.
+    #[napi]
+    pub fn dump_referenced(&self) -> napi::Result<Buffer> {
+        let bytes = self
+            .inner
+            .dump_referenced()
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        Ok(Buffer::from(bytes))
+    }
+
+    /// Load a referenced snapshot (from `dumpReferenced`), splicing in the
+    /// program(s) — each supplied as bytes from `ZapcodeProgramHandle.dump()`,
+    /// in the same order. The fingerprints are validated before resume; a
+    /// missing / mismatched / wrong-count program is a catchable error, never a
+    /// crash. A self-contained blob is accepted too (programs ignored).
+    #[napi(factory)]
+    pub fn load_with_programs(bytes: Buffer, program_bytes: Vec<Buffer>) -> napi::Result<Self> {
+        let programs: Vec<ZapcodeProgram> = program_bytes
+            .iter()
+            .map(|b| ZapcodeProgram::load(b))
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let snapshot = ZapcodeSnapshot::load_with_programs(&bytes, &programs)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        Ok(Self { inner: snapshot })
+    }
+
     /// Resume execution with the return value from the external function.
     ///
     /// Returns either a `ZapcodeResult` (complete) or a `ZapcodeSuspension`

@@ -574,3 +574,104 @@ fn resume_after_reintern_preserves_object_behavior() {
     assert_eq!(drive(false), expected);
     assert_eq!(drive(true), expected, "resume after reintern diverged");
 }
+
+// ---------------------------------------------------------------------------
+// Content-addressed programs (dump_referenced / load_with_programs) — v17
+// ---------------------------------------------------------------------------
+
+use zapcode_core::ZapcodeProgram;
+
+/// Suspend a program at its first external call and hand back both the program
+/// and the captured snapshot.
+fn suspend_program(code: &str) -> (ZapcodeProgram, ZapcodeSnapshot) {
+    let program = ZapcodeProgram::compile(code, vec!["f".to_string()]).unwrap();
+    match program.start(Vec::new(), ResourceLimits::default()).unwrap() {
+        VmState::Suspended { snapshot, .. } => (program, snapshot),
+        other => panic!("expected suspension, got {other:?}"),
+    }
+}
+
+#[test]
+fn referenced_dump_is_smaller_and_round_trips() {
+    let code = "let s = 0; for (let i = 0; i < 30; i++) { s += i * 2 + 1; } const r = await f(); s + r";
+    let (program, snapshot) = suspend_program(code);
+
+    let self_contained = snapshot.dump().unwrap();
+    let referenced = snapshot.dump_referenced().unwrap();
+    assert!(
+        referenced.len() < self_contained.len(),
+        "referenced ({}) should be smaller than self-contained ({})",
+        referenced.len(),
+        self_contained.len()
+    );
+
+    let loaded =
+        ZapcodeSnapshot::load_with_programs(&referenced, std::slice::from_ref(&program)).unwrap();
+    let resumed = loaded.resume(Value::Int(100)).unwrap();
+    match resumed.state {
+        VmState::Complete(Value::Int(n)) => {
+            assert_eq!(n, (0..30).map(|i| i * 2 + 1).sum::<i64>() + 100)
+        }
+        other => panic!("expected completion, got {other:?}"),
+    }
+}
+
+#[test]
+fn referenced_blob_recompiled_program_round_trips() {
+    // The host re-compiles the same source in a fresh process — deterministic
+    // compilation makes the fingerprint match, so resume succeeds.
+    let code = "const r = await f(); r * 3";
+    let (_program, snapshot) = suspend_program(code);
+    let referenced = snapshot.dump_referenced().unwrap();
+
+    let recompiled = ZapcodeProgram::compile(code, vec!["f".to_string()]).unwrap();
+    let loaded =
+        ZapcodeSnapshot::load_with_programs(&referenced, std::slice::from_ref(&recompiled)).unwrap();
+    match loaded.resume(Value::Int(7)).unwrap().state {
+        VmState::Complete(Value::Int(n)) => assert_eq!(n, 21),
+        other => panic!("expected completion, got {other:?}"),
+    }
+}
+
+#[test]
+fn plain_load_rejects_a_referenced_blob() {
+    let (_program, snapshot) = suspend_program("const r = await f(); r");
+    let referenced = snapshot.dump_referenced().unwrap();
+    let err = ZapcodeSnapshot::load(&referenced).unwrap_err().to_string();
+    assert!(err.contains("referenced"), "unexpected error: {err}");
+}
+
+#[test]
+fn referenced_load_rejects_a_mismatched_program() {
+    let (_program, snapshot) = suspend_program("const r = await f(); r");
+    let referenced = snapshot.dump_referenced().unwrap();
+
+    let wrong = ZapcodeProgram::compile("const r = await f(); r + 999", vec!["f".to_string()]).unwrap();
+    let err = ZapcodeSnapshot::load_with_programs(&referenced, std::slice::from_ref(&wrong))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("fingerprint mismatch"), "unexpected error: {err}");
+}
+
+#[test]
+fn referenced_load_rejects_wrong_program_count() {
+    let (_program, snapshot) = suspend_program("const r = await f(); r");
+    let referenced = snapshot.dump_referenced().unwrap();
+    let err = ZapcodeSnapshot::load_with_programs(&referenced, &[])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("needs 1 program") || err.contains("but 0"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn self_contained_dump_unchanged_and_loads_with_programs_too() {
+    let (program, snapshot) = suspend_program("const r = await f(); r");
+    let self_contained = snapshot.dump().unwrap();
+    assert!(ZapcodeSnapshot::load(&self_contained).is_ok());
+    let loaded =
+        ZapcodeSnapshot::load_with_programs(&self_contained, std::slice::from_ref(&program)).unwrap();
+    assert!(matches!(loaded.resume(Value::Int(5)).unwrap().state, VmState::Complete(_)));
+}

@@ -1,10 +1,10 @@
 # Content-addressed programs — design
 
-> Status: **reviewed, implementing the foundation**. Three independent
-> pre-implementation reviews incorporated (see the box under "Design"). The
-> `VmSnapshot` foundation + panic-safety is unblocked and being built; the
-> session strategy (A/B/C below) needs sign-off. Lever from the optimization
-> pass; see `axes-roadmap.md` §2.
+> Status: **foundation SHIPPED** (`VmSnapshot` referencing + panic-safety +
+> bindings, v17), measured 50–80% smaller snapshots for substantial programs.
+> Three pre-implementation reviews incorporated (see the box under "Design").
+> Session referencing is the chosen follow-up (Option B: explicit program
+> persistence). Lever from the optimization pass; see `axes-roadmap.md` §2.
 
 ## Problem
 
@@ -197,15 +197,28 @@ safe-but-small fallback if we want to ship incrementally.
    are entries in one program's `functions` vec, not separate programs). Elide the
    whole vec; restore rebuilds it **positionally** from `program_fingerprints`.
 
-## Expected payoff
+## Payoff — measured (post-DEFLATE, foundation shipped)
 
-- **Headline (post-DEFLATE-proof): dedup.** N parked snapshots / N session dumps
-  of one workflow store the program **once**, not N times — the unassailable win.
-- Per-snapshot shrink toward the floor + live state (~527 B class) for large
-  programs — real, but **must be measured compressed** (current ~15 B/stmt /
-  5.5 KB figures are pre-DEFLATE; bytecode is higher-entropy than repeated keys,
-  so the post-DEFLATE delta is the honest number to quote). Lead with dedup.
-- Zero change for self-contained callers (default `dump()` untouched).
+The win scales with **program size** (bytecode volume), because DEFLATE already
+compresses the rest of the snapshot well. Measured referenced vs self-contained
+snapshot size (apple silicon, the `ZapcodeProgramHandle` path):
+
+| program | self-contained | referenced | smaller |
+|---|---|---|---|
+| ~10 stmts | 1106 B | 946 B | 14% |
+| ~100 stmts | 2431 B | 1158 B | **52%** |
+| ~300 stmts | 5566 B | 1563 B | **72%** |
+| ~800 stmts | 13354 B | 2593 B | **81%** |
+
+So: negligible for trivial programs, **50–80% for substantial agent programs**
+(realistic agent code is often hundreds of statements). For a parked fleet of N
+snapshots of one workflow, the program is stored **once** (the per-snapshot
+column already reflects this, since each parked snapshot independently carried
+the program before). Zero change for self-contained callers (default `dump()`
+untouched).
+
+The honest caveat the first draft missed: don't reach for this on small
+programs — the ~15 B/stmt figure was pre-DEFLATE.
 
 ## Plan
 

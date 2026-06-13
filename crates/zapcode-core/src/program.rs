@@ -70,6 +70,14 @@ impl ZapcodeProgram {
         &self.external_functions
     }
 
+    /// Clone the `Arc` to this program's compiled bytecode — the shared
+    /// allocation a `VmSnapshot` captures. Used to splice programs back into a
+    /// content-addressed (`dump_referenced`) snapshot at load
+    /// (`ZapcodeSnapshot::load_with_programs`).
+    pub(crate) fn compiled_arc(&self) -> std::sync::Arc<CompiledProgram> {
+        self.compiled.clone()
+    }
+
     /// Serialize the compiled program for storage / transport, wrapped in the
     /// versioned, integrity-checked wire frame (kind: program).
     pub fn dump(&self) -> Result<Vec<u8>> {
