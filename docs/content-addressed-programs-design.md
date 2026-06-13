@@ -1,8 +1,10 @@
 # Content-addressed programs — design
 
-> Status: **proposal** (needs a decision on the durable-artifact contract before
-> implementation). Lever identified in the cycle-N optimization pass; see
-> `axes-roadmap.md` §2.
+> Status: **reviewed, implementing the foundation**. Three independent
+> pre-implementation reviews incorporated (see the box under "Design"). The
+> `VmSnapshot` foundation + panic-safety is unblocked and being built; the
+> session strategy (A/B/C below) needs sign-off. Lever from the optimization
+> pass; see `axes-roadmap.md` §2.
 
 ## Problem
 
@@ -51,97 +53,185 @@ The builtin template gets away with a process `OnceLock` because it is *one set
 per build*. User programs are arbitrary and per-code, so there is no global
 singleton — **the host must supply the program (or a store) at load time.**
 
+> **Pre-implementation review (3 independent passes) — incorporated below.**
+> Verdict: direction sound (mirror template elision), but four correctness items
+> and one scope correction were required. Determinism prerequisite **verified**:
+> `compile(source)` is byte-identical across runs (incl. classes/statics), so
+> content-addressing is feasible. Key changes from the first draft: the
+> fingerprint covers the WHOLE program (incl. external-functions), load is
+> panic-safe, the primitive is `&[Arc<CompiledProgram>]` (not a `ProgramStore`
+> trait), and the real beneficiary — sessions — has a genuine API fork.
+
 ## Design
 
 Mirror template elision, but for `programs`, with the program supplied by the
 host instead of a process static.
 
-### Wire (bumps `FORMAT_VERSION`; updates `tests/wire_format.rs`)
+### Wire (bumps `FORMAT_VERSION` 16 → 17; updates `tests/wire_format.rs`)
 
-`VmSnapshot` gains, alongside the existing `heap_template_elided` /
-`template_fingerprint`:
+`VmSnapshot` gains two **trailing** fields, alongside the existing
+`heap_template_elided` / `template_fingerprint` (no `#[serde(default)]` — the
+version guard hard-rejects old blobs before postcard runs, matching the v16
+convention; `programs` keeps its position, emitted empty when elided):
 
 ```rust
-/// When true, `programs` is empty on the wire and the loader must splice in
-/// programs matching `program_fingerprints` (same order).
+/// When true, `programs` is empty on the wire; the loader splices in programs
+/// matching `program_fingerprints` positionally (index i ↔ fingerprint i).
 programs_elided: bool,
-/// FNV/sha fingerprint of each elided program, in `programs` order. Guards
-/// against resuming against a different build of the same source.
+/// fnv1a fingerprint of each elided program, in `programs` order.
 program_fingerprints: Vec<u64>,
 ```
 
-`dump()` stays **self-contained by default** (programs embedded, `programs_elided
-= false`) — existing callers and existing blobs are unaffected. A new
-`dump_referenced()` (or a `DumpMode` arg) elides the programs and records their
-fingerprints.
+**The fingerprint covers the WHOLE program, not just bytecode.** It is
+`fnv1a(postcard::to_allocvec(program))` over the entire serialized
+`CompiledProgram` *and* the program's `external_functions` set — because which
+calls suspend is compiled into the bytecode at compile time, but
+`external_functions` lives beside the program, so a fingerprint over bytecode
+alone could match a program compiled with a different external set and desync
+resume. Fingerprint = the exact bytes that are elided. **Computed from the actual
+program on BOTH capture and load** — the loader never trusts a host-supplied
+fingerprint; it hashes the program the host hands it and compares to the
+snapshot's recorded fingerprint.
 
-### Load
+Why `u64` fnv (not sha256): the fingerprint is a **drift guard**, not an
+integrity primitive. The frame's sha256 already covers all *stored* bytes
+(including these fingerprint fields) against tampering, and the program is
+supplied by the host's own store — never by the untrusted blob. So fnv's job is
+only "is the program the host handed me the same build that was captured?", for
+which u64 over the few-to-thousands distinct programs a host holds is ample
+(birthday bound is irrelevant at that scale). Reuse `snapshot::fnv1a`, exactly as
+`template_heap_bytes()` does. *If `ProgramStore` ever becomes blob-controlled,
+this flips to requiring sha256 — documented so the assumption is explicit.*
+
+`dump()` stays **self-contained by default** (`programs_elided = false`) —
+existing callers and existing blobs are unaffected. New `dump_referenced()`
+elides the programs and records fingerprints.
+
+### Load — panic-safe by construction
 
 ```rust
-// Self-contained (unchanged):
-ZapcodeSnapshot::load(&bytes) -> Result<…>
-
-// Referenced — caller supplies the programs (or a store) to splice back:
-ZapcodeSnapshot::load_with_programs(&bytes, &[Arc<CompiledProgram>]) -> Result<…>
-ZapcodeSnapshot::load_with_store(&bytes, &dyn ProgramStore) -> Result<…>
+ZapcodeSnapshot::load(&bytes)                                   // self-contained, unchanged
+ZapcodeSnapshot::load_with_programs(&bytes, &[Arc<CompiledProgram>])  // referenced — PRIMITIVE
 ```
 
-`ProgramStore` is a host-provided `fn get(fingerprint: u64) -> Option<Arc<CompiledProgram>>`.
-On load of a referenced snapshot, each fingerprint is resolved through the store;
-a miss is a clear `SnapshotError("program <hash> not available")`, a fingerprint
-mismatch is `SnapshotError("program changed since capture")` — never a panic,
-never silent corruption (the bytecode indexes the heap/handles, so a wrong
-program would mis-resume everything).
+`load_with_programs` is the primitive (a `ProgramStore` convenience can layer on
+later — the real callers below already hold the `Arc`s in order, so a fingerprint
+→ program map buys nothing). Before any execution it **validates, returning
+`SnapshotError` (never `panic!`)**:
+
+1. `programs_elided` ⟹ supplied `programs.len() == program_fingerprints.len()`;
+2. each supplied program's recomputed fnv1a == `program_fingerprints[i]`
+   (mismatch → `"program N changed since capture"`);
+3. every `program_index` / `func_index` reachable from frames, closures, and
+   generators is in range for the spliced `programs` (length + per-program
+   `functions.len()`).
+
+This is required regardless of this feature — `from_snapshot` currently
+`.expect()`s on these indices, so a malformed referenced snapshot would abort the
+host process across the napi/PyO3 boundary (a sandbox-invariant-class failure).
+Turning the reachable `.expect()`s into validated `SnapshotError`s is part of the
+change (and hardens self-contained loads too).
+
+### Sessions — the real beneficiary, and the API fork
+
+Standalone `VmSnapshot` referencing (above) is clean but limited: only raw
+`ZapcodeSnapshotHandle` / `forkSnapshot` / a `prepare`d suspension expose a
+snapshot, and those callers already hold the program.
+
+The workload that actually re-serializes programs per hop is the **session**:
+`makeSession` writes `sessionBytes` after every chunk and every tool round-trip,
+and each `runChunk` appends a freshly compiled chunk-program to
+`IdleSessionState.programs` (`session.rs`) — a 20-chunk session carries and
+re-writes all 20 programs on every dump. `ZapcodeSessionSnapshot` has its **own**
+`programs` vec (separate from any `VmSnapshot.programs`), so the snapshot-only
+change does NOT cover idle-between-chunks state. Sessions need the same elision on
+`IdleSessionState`.
+
+**The fork (needs sign-off):** unlike `prepare()` (host holds the program),
+`loadSession(bytes, { tools })` is given *tools, not chunk source* — the chunk
+programs only exist in the session bytes. So sessions cannot reference
+transparently; the host must get the programs from somewhere on reload. Options:
+
+- **(A) In-process program registry.** A bounded, refcounted process-level
+  `Map<fnv1a, Arc<CompiledProgram>>` that `runChunk` populates as it compiles and
+  `loadSession`/resume consult. Referencing becomes transparent *within a
+  process* (the dominant case: one worker compiles and resumes), no API change.
+  Cross-process still needs (B). Cost: a registry with a lifetime policy (LRU /
+  capacity bound) so it can't leak programs forever.
+- **(B) Explicit program persistence.** `session.dump()` returns/streams the
+  referenced programs by hash; the host stores them and supplies them to
+  `loadSession(bytes, { tools, programs })`. Fully durable cross-process, but a
+  new API surface and host responsibility.
+- **(C) Snapshots only for now.** Ship `VmSnapshot` referencing (prepare /
+  forkSnapshot), leave sessions self-contained. Smaller win, zero session risk.
+
+Recommendation: **(A) for the in-process fleet** (captures most of the win with
+no API change), with **(B) as the opt-in cross-process escape hatch**. (C) is the
+safe-but-small fallback if we want to ship incrementally.
 
 ### Bindings / zapcode-ai
 
 - `ZapcodeProgramHandle` / `prepare()` already hold the `Arc<CompiledProgram>`,
-  so they ARE the natural store: a `prepare`d program can `dump_referenced()` its
-  suspensions and `load_with_programs()` them back for free.
-- A `ProgramStore` impl over a `Map<u64, Arc<CompiledProgram>>` covers the
-  "host caches its known workflows by hash" case (the real durable-fleet shape).
-- The in-process **driver** (PR for lever #1) never serializes between hops, so
-  it doesn't need this at all — content-addressing is specifically for the
-  *persisted* / cross-process artifacts.
+  so a prepared suspension can `dumpReferenced()` and `loadWithPrograms()` for
+  free. The referenced suspension result must also surface the program
+  fingerprint(s) to JS so the host knows which program to keep.
+- `index.d.ts` AND `index.js` are hand-maintained — every new `#[napi]` method
+  needs a `.d.ts` line, every new class needs a `module.exports.X` line (the
+  driver work hit exactly this).
+- The in-process **driver** (lever #1) never serializes between hops, so it
+  doesn't need this — content-addressing is for the *persisted* artifacts.
 
 ## Hazards
 
-1. **Program unavailable on load.** A referenced snapshot resumed where the
-   program isn't known → hard error, by design. The host opts into referencing
-   precisely when it controls the program store; everyone else keeps
-   self-contained `dump()`.
-2. **Program drift.** Recompiling the same source on a new build can change
-   bytecode; the per-program fingerprint catches it (same guard class as
-   `template_fingerprint`).
-3. **Program GC.** The store now owns program lifetime — a content-addressed
-   store can refcount/evict by hash; document that evicting a program strands
-   its referenced snapshots (same as losing the bytecode would).
-4. **Mixed batches.** `programs` is a `Vec` (nested function programs); elide
-   all-or-nothing per snapshot to keep the fingerprint vector simple.
+1. **Program unavailable on load** → hard `SnapshotError`, by design (no
+   per-program process singleton to fall back to, unlike the template `OnceLock`).
+2. **Program drift** → caught by the whole-program fnv1a (same guard class as
+   `template_fingerprint`); relies on the verified compile determinism.
+3. **Index out-of-range on a malformed referenced snapshot** → validated to a
+   `SnapshotError` before execution, never a host-process panic (see Load).
+4. **Program GC / lifetime.** Referencing shifts program lifetime to the store /
+   registry; evicting a program strands its referenced snapshots (same as losing
+   the bytecode). Option (A)'s registry needs a bounded eviction policy.
+5. **All-or-nothing per snapshot.** `programs` is a `Vec` (a snapshot can
+   reference >1 distinct program via `CallFrame.program_index`; nested *functions*
+   are entries in one program's `functions` vec, not separate programs). Elide the
+   whole vec; restore rebuilds it **positionally** from `program_fingerprints`.
 
 ## Expected payoff
 
-- Referenced snapshots drop to ~the floor + live state (the ~527 B class)
-  regardless of program size — e.g. the 300-stmt / 5.5 KB case → ~1 KB.
-- N parked snapshots of one workflow store the program **once**, not N times.
+- **Headline (post-DEFLATE-proof): dedup.** N parked snapshots / N session dumps
+  of one workflow store the program **once**, not N times — the unassailable win.
+- Per-snapshot shrink toward the floor + live state (~527 B class) for large
+  programs — real, but **must be measured compressed** (current ~15 B/stmt /
+  5.5 KB figures are pre-DEFLATE; bytecode is higher-entropy than repeated keys,
+  so the post-DEFLATE delta is the honest number to quote). Lead with dedup.
 - Zero change for self-contained callers (default `dump()` untouched).
 
 ## Plan
 
-1. Wire fields + `FORMAT_VERSION` bump + `wire_format.rs` round-trip test
-   (both self-contained and referenced).
-2. Core: `dump_referenced()`, `load_with_programs()` / `load_with_store()`,
-   fingerprinting (reuse the template-fingerprint hasher).
-3. Bindings: `ZapcodeProgramHandle.dumpReferenced()` /
-   `loadReferencedSnapshot(bytes, programHandle)`; a `ProgramStore` shim.
-4. Bench: extend `profile_density.rs` with a referenced-mode column (per-VM
-   stored bytes with the program shared) to quantify the win.
-5. Gate: full e2e + differential + the 104-binary suite stay green.
+1. **Determinism guard** — a test asserting `compile(src)` is byte-identical
+   across two compiles (locks the content-addressing premise; verified manually).
+2. **Panic-safety** — validate program count + all reachable program/func indices
+   in `from_snapshot`, returning `SnapshotError` (helps self-contained loads too).
+3. **Wire** — `programs_elided` + `program_fingerprints` trailing fields,
+   `FORMAT_VERSION` → 17 (+ changelog line in `wire.rs`), bump the hardcoded
+   `16u16` in `wire_format.rs::forge_frame`.
+4. **Core** — `dump_referenced()` + `load_with_programs()`; whole-program fnv1a
+   (incl. `external_functions`); the same on `IdleSessionState` per the session
+   decision (A/B/C).
+5. **Bindings + zapcode-ai** — `dumpReferenced` / `loadWithPrograms` (+ surface
+   fingerprints to JS); session integration per the decision; `.d.ts`/`.js` lines.
+6. **Bench** — extend `profile_density.rs` with a referenced column measuring
+   **compressed** per-VM stored bytes with the program shared.
+7. **Tests** (`wire_format.rs`): referenced round-trip (+ assert `programs` empty
+   on the wire), referenced < self-contained (compressed), fingerprint-mismatch →
+   error, missing/length-mismatch → error, self-contained default unchanged.
+8. **Gate** — full e2e + differential + the binary suite stay green.
 
 ## Open question for sign-off
 
-Do we want referencing as an **opt-in** (default `dump()` stays self-contained
-forever — recommended; zero risk to existing durability) or eventually the
-**default** for sessions/prepare (smaller blobs, but the host must always have
-the program)? The proposal above ships opt-in; flipping the default is a later,
-separate decision once the store ergonomics are proven.
+**Which session strategy — (A) in-process registry, (B) explicit program
+persistence, or (C) snapshots-only first?** This determines whether sessions (the
+main win) get referencing now and how. The `VmSnapshot` foundation (prepare /
+forkSnapshot, all the safety fixes) is unblocked and being built regardless;
+referencing stays **opt-in** (`dump()` self-contained forever).
