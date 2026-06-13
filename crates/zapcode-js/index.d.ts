@@ -26,6 +26,11 @@ export interface ZapcodeSuspension {
   completed: false;
   functionName: string;
   args: unknown[];
+  /** stdout (`console.log`/`info`/`debug`) so far — cumulative up to this
+   * suspension (console output carries across snapshot restores). */
+  stdout: string;
+  /** stderr (`console.error`/`console.warn`) so far — cumulative. */
+  stderr: string;
   snapshot: Buffer;
 }
 
@@ -52,6 +57,11 @@ export interface ZapcodeBatchSuspension {
   combinator: PromiseCombinator;
   /** The batched external calls, in order — run them in parallel. */
   calls: ExternalCall[];
+  /** stdout (`console.log`/`info`/`debug`) so far — cumulative up to this
+   * suspension (console output carries across snapshot restores). */
+  stdout: string;
+  /** stderr (`console.error`/`console.warn`) so far — cumulative. */
+  stderr: string;
   snapshot: Buffer;
 }
 

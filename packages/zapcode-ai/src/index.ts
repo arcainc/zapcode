@@ -1083,12 +1083,12 @@ async function executeCode(
         : snapshot.resumeErrorObject(outcome.message, outcome.name);
     }
 
-    if (state.stdout) {
-      stdout = state.stdout;
-    }
-    if (state.stderr) {
-      stderr = state.stderr;
-    }
+    // Console output is cumulative across snapshot restores, so the final
+    // (completed) state carries the whole run's stdout/stderr. (The binding used
+    // to hardcode these empty on the resume path, dropping all console output
+    // from any program that called a tool — this reads the real values.)
+    stdout = state.stdout ?? "";
+    stderr = state.stderr ?? "";
 
     if (execSpan) {
       execSpan.attributes["zapcode.output"] = JSON.stringify(state.output);
@@ -1699,7 +1699,7 @@ async function settleBatch<S>(
       throw new BatchToolError("__fatal__");
     }
     if (outcome.ok) return outcome.result;
-    throw new BatchToolError(outcome.message);
+    throw new BatchToolError(outcome.message, outcome.name);
   });
 
   // Run the real combinator for value + timing semantics, then translate the
@@ -1717,7 +1717,7 @@ async function settleBatch<S>(
         const objects = settled.map(s =>
           s.status === "fulfilled"
             ? { status: "fulfilled", value: s.value }
-            : { status: "rejected", reason: batchErrorMessage(s.reason) }
+            : { status: "rejected", reason: batchErrorReason(s.reason) }
         );
         resume = () => handle.resumeMany(objects);
         break;
@@ -1740,18 +1740,28 @@ async function settleBatch<S>(
     }
   } catch (err) {
     if (sawFatal) throw fatal; // malformed call — abort
-    // A catchable tool rejection (all/race) or an all-rejected any.
-    // Batch rejection: raise as an Error object (message preserved); the
-    // combinator-specific name (AggregateError for `any`) is folded into the
-    // message by batchErrorMessage.
-    return handle.resumeErrorObject(batchErrorMessage(err));
+    // A catchable tool rejection (all/race) or an all-rejected any. Raise as a
+    // real Error object, preserving both the host tool's error name (TypeError,
+    // …) and — for `any` — the `AggregateError` name.
+    return handle.resumeErrorObject(batchErrorMessage(err), batchErrorName(err));
   }
   if (sawFatal) throw fatal; // fatal lost the race but must still abort
   return resume();
 }
 
-/** A tool rejection carried through a real JS promise inside {@link settleBatch}. */
-class BatchToolError extends Error {}
+/**
+ * A tool rejection carried through a real JS promise inside {@link settleBatch}.
+ * Holds the host error's `name` (e.g. `TypeError`) separately so it survives back
+ * into the guest — `this.name` is left as `"Error"` so the fatal path's toString
+ * is unsurprising.
+ */
+class BatchToolError extends Error {
+  readonly toolErrorName: string;
+  constructor(message: string, toolErrorName = "Error") {
+    super(message);
+    this.toolErrorName = toolErrorName;
+  }
+}
 
 /** Best-effort message extraction for a rejection reason or AggregateError. */
 function batchErrorMessage(err: unknown): string {
@@ -1761,6 +1771,36 @@ function batchErrorMessage(err: unknown): string {
   }
   if (err instanceof Error) return err.message;
   return String(err);
+}
+
+/**
+ * The error NAME to surface for a batch rejection: the host tool's subclass
+ * (`TypeError`, …) for a single rejection, or `AggregateError` when every call
+ * in a `Promise.any` rejected.
+ */
+function batchErrorName(err: unknown): string {
+  if (err instanceof AggregateError) return "AggregateError";
+  if (err instanceof BatchToolError) return err.toolErrorName;
+  if (err instanceof Error && typeof err.name === "string") return err.name;
+  return "Error";
+}
+
+/**
+ * Build a guest-visible Error for a `Promise.allSettled` rejected `reason`. The
+ * `__error__` brand makes `reason instanceof Error` hold (and hides `name`/
+ * `message`/`stack` from enumeration, matching a real Error) once `resumeMany`
+ * marshals it into the VM — so allSettled reasons are real Errors like every
+ * other rejection path, not bare strings.
+ */
+function batchErrorReason(err: unknown): {
+  __error__: true;
+  name: string;
+  message: string;
+  stack: string;
+} {
+  const name = batchErrorName(err);
+  const message = batchErrorMessage(err);
+  return { __error__: true, name, message, stack: `${name}: ${message}` };
 }
 
 /** Options for {@link createSession} / {@link loadSession}. */

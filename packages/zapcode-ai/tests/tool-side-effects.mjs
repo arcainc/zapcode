@@ -401,18 +401,17 @@ await test("Promise.allSettled over tools keeps successful effects when one fail
       return id;
     },
   };
-  // NB: a BATCH (Promise.all/allSettled) rejection reason is still surfaced
-  // as the message STRING (it travels through resumeMany, which marshals
-  // plain values) — unlike a direct `await tool()` rejection, which is now a
-  // real Error. Making batch reasons real Errors too is a documented
-  // follow-up. `String(x.reason)` reads the message either way.
+  // A BATCH (Promise.all/allSettled) rejection reason is a real Error in the
+  // guest — `instanceof Error` holds and `.message` reads the message — exactly
+  // like a direct `await tool()` rejection. (allSettled reasons travel through
+  // resumeMany as `__error__`-branded objects so the VM treats them as Errors.)
   const r = await execute(
     "const rs = await Promise.allSettled([maybe({ id: 2 }), maybe({ id: 3 }), maybe({ id: 4 })]); \
-     rs.map(x => x.status === 'fulfilled' ? 'f' + x.value : 'r:' + String(x.reason)).join(',')",
+     rs.map(x => x.status === 'fulfilled' ? 'f' + x.value : 'r:' + (x.reason instanceof Error) + ':' + x.reason.message).join(',')",
     tools
   );
-  // The two even calls performed their effect; the odd one rejected.
-  assert.equal(r.output, "f2,r:odd:3,f4");
+  // The two even calls performed their effect; the odd one rejected with a real Error.
+  assert.equal(r.output, "f2,r:true:odd:3,f4");
   assert.deepEqual(world.log.filter((l) => l.startsWith("ok:")).sort(), ["ok:2", "ok:4"]);
 });
 

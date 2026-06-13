@@ -106,6 +106,26 @@ await test("a session names the erring chunk by index in the thrown error", asyn
   );
 });
 
+await test("console output survives across tool-call suspensions", async () => {
+  // Regression: the snapshot/resume path used to drop ALL console output from
+  // any program that called a tool. stdout/stderr must capture every segment.
+  const t = (fn) => ({ description: "t", parameters: {}, execute: fn });
+  const r = await execute(
+    `
+    console.log("start"); console.warn("w0");
+    await tick();
+    console.log("middle"); console.error("e1");
+    await tick();
+    console.log("end");
+    "done";
+    `,
+    { tick: t(async () => 1) }
+  );
+  assert.equal(r.output, "done");
+  assert.equal(r.stdout, "start\nmiddle\nend\n");
+  assert.equal(r.stderr, "w0\ne1\n");
+});
+
 // ── catch-before-commit: dryRun ────────────────────────────────────────────
 
 await test("dryRun passes valid code and records the tool-call sequence", async () => {
