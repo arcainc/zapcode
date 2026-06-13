@@ -11,7 +11,7 @@
  *   - recoverable state: fork a suspension into independent branches
  */
 import assert from "node:assert/strict";
-import { execute, dryRun, forkSnapshot, prepare } from "../dist/index.js";
+import { execute, dryRun, forkSnapshot, prepare, createSession } from "../dist/index.js";
 import { Zapcode } from "@unchartedfr/zapcode";
 
 let passed = 0;
@@ -72,6 +72,38 @@ await test("a failed run reports the throw site (line) in the report", async () 
   assert.equal(r.report.completed, false);
   assert.ok(r.report.error, "expected a structured error");
   assert.equal(r.report.error.line, 3, `expected line 3, got ${r.report.error.line}`);
+});
+
+// ── provenance: scriptName names which script erred ────────────────────────
+
+await test("scriptName labels the failure across autoFix, throw, and report.error", async () => {
+  const BAD = "const x = nope.field; x"; // property access on undefined → throws
+
+  // autoFix: the label rides on report.error.script and the human error string,
+  // without disturbing the line/column the core attached.
+  const r = await execute(BAD, {}, { scriptName: "planner", autoFix: true });
+  assert.equal(r.report.error.script, "planner");
+  assert.equal(r.report.error.line, 1);
+  assert.match(r.error, /\[planner\]/);
+
+  // throw path: the thrown Error's message is prefixed with the label.
+  await assert.rejects(
+    () => execute(BAD, {}, { scriptName: "planner" }),
+    (e) => e.message.startsWith("[planner] ")
+  );
+
+  // opt-in: with no scriptName the message is unchanged (no bracket prefix).
+  await assert.rejects(() => execute(BAD, {}), (e) => !e.message.startsWith("["));
+});
+
+await test("a session names the erring chunk by index in the thrown error", async () => {
+  const session = createSession({ tools: {}, scriptName: "agent-7" });
+  await session.runChunk("const a = 1;"); // chunk #1 — fine
+  // chunk #2 throws; the label carries both the session name and chunk index.
+  await assert.rejects(
+    () => session.runChunk("const b = nope.field; b"),
+    (e) => e.message.startsWith("[agent-7 #2] ")
+  );
 });
 
 // ── catch-before-commit: dryRun ────────────────────────────────────────────

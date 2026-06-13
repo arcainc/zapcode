@@ -158,8 +158,10 @@ export interface RunReport {
   /** Number of tool calls the code made. */
   toolCallCount: number;
   /** When the run failed: the message plus the source location, when the
-   * core attached one (`at line:col` in the error). */
-  error?: { message: string; line?: number; column?: number };
+   * core attached one (`at line:col` in the error). `script` is the caller's
+   * `scriptName` label, when one was supplied — for error provenance across a
+   * fleet of agent scripts / session chunks. */
+  error?: { message: string; line?: number; column?: number; script?: string };
 }
 
 /** Pull `at <line>:<col>` out of a core error message, when present. */
@@ -945,6 +947,12 @@ async function executeCode(
     autoFix?: boolean;
     typeCheck?: boolean;
     /**
+     * Optional label identifying this script (monty's `script_name`). When set,
+     * a failure prefixes the error with `[scriptName]` and records it as
+     * `report.error.script`, so a thrown error names *which* agent script erred.
+     */
+    scriptName?: string;
+    /**
      * Produce the initial VM state instead of compiling `code` fresh — used
      * by {@link prepare} to start from an already-compiled, reusable program
      * (parse + compile paid once, not per run). When omitted, a new `Zapcode`
@@ -1108,6 +1116,7 @@ async function executeCode(
     };
   } catch (err: any) {
     const errorMsg = err.message ?? String(err);
+    const label = options.scriptName ? `[${options.scriptName}] ` : "";
 
     if (execSpan) {
       execSpan.attributes["zapcode.error"] = errorMsg;
@@ -1115,6 +1124,10 @@ async function executeCode(
     }
 
     if (!autoFix) {
+      // Name the erring script on the thrown error itself, so a host catching
+      // it across many scripts knows which one failed (opt-in: no label → no
+      // change to the message).
+      if (label && err instanceof Error) err.message = label + err.message;
       if (debug && execSpan) printTrace(execSpan);
       throw err;
     }
@@ -1129,12 +1142,16 @@ async function executeCode(
       stdout: "",
       stderr: "",
       toolCalls,
-      error: `Execution failed: ${errorMsg}. Please fix your code and try again.`,
+      error: `Execution failed: ${label}${errorMsg}. Please fix your code and try again.`,
       report: {
         completed: false,
         durationMs: Date.now() - runStartedAt,
         toolCallCount: toolCalls.length,
-        error: { message: errorMsg, ...parseErrorLocation(errorMsg) },
+        error: {
+          message: errorMsg,
+          ...parseErrorLocation(errorMsg),
+          ...(options.scriptName ? { script: options.scriptName } : {}),
+        },
       },
       ...(execSpan ? { trace: execSpan } : {}),
     };
@@ -1426,6 +1443,8 @@ export async function execute(
     debug?: boolean;
     autoFix?: boolean;
     typeCheck?: boolean;
+    /** Label identifying this script — named in error messages / `report.error.script`. */
+    scriptName?: string;
   }
 ): Promise<ExecutionResult> {
   return executeCode(code, tools, options ?? {});
@@ -1752,6 +1771,13 @@ export interface SessionOptions {
   memoryLimitMb?: number;
   /** Execution time limit per chunk in ms (default: 10000). */
   timeLimitMs?: number;
+  /**
+   * Optional label for this session (monty's `script_name`). When set, an error
+   * thrown by any chunk is prefixed `[scriptName #<chunkIndex>]`, so a failure
+   * names which session — and which chunk within it — erred. Chunks are indexed
+   * from 1 in the order `runChunk` is called.
+   */
+  scriptName?: string;
 }
 
 /** Result of running one session chunk. */
@@ -1792,36 +1818,49 @@ export interface ZapcodeSession {
 
 function makeSession(
   initialBytes: Buffer,
-  toolDefs: Record<string, ToolDefinition>
+  toolDefs: Record<string, ToolDefinition>,
+  scriptName?: string
 ): ZapcodeSession {
   validateToolDefinitions(toolDefs);
   const toolNames = Object.keys(toolDefs);
   let sessionBytes = initialBytes;
+  let chunkIndex = 0;
 
   const runChunk = async (
     code: string,
     inputs?: Record<string, unknown>
   ): Promise<SessionChunkResult> => {
+    chunkIndex++;
     const toolCalls: ExecutionResult["toolCalls"] = [];
-    let state = ZapcodeSessionHandle.load(sessionBytes).runChunk(code, inputs ?? {});
+    try {
+      let state = ZapcodeSessionHandle.load(sessionBytes).runChunk(code, inputs ?? {});
 
-    while (!state.completed) {
-      const handle = ZapcodeSessionHandle.load(state.session);
-      if (state.kind === "suspended_many") {
-        state = await settleBatch(handle, state.combinator, state.calls, (name, args) =>
-          invokeToolCall(toolDefs, toolNames, name, args, toolCalls)
-        );
-      } else {
-        const outcome = await invokeToolCall(toolDefs, toolNames, state.functionName, state.args, toolCalls);
-        state = outcome.ok
-          ? handle.resume(outcome.result)
-          : handle.resumeErrorObject(outcome.message, outcome.name);
+      while (!state.completed) {
+        const handle = ZapcodeSessionHandle.load(state.session);
+        if (state.kind === "suspended_many") {
+          state = await settleBatch(handle, state.combinator, state.calls, (name, args) =>
+            invokeToolCall(toolDefs, toolNames, name, args, toolCalls)
+          );
+        } else {
+          const outcome = await invokeToolCall(toolDefs, toolNames, state.functionName, state.args, toolCalls);
+          state = outcome.ok
+            ? handle.resume(outcome.result)
+            : handle.resumeErrorObject(outcome.message, outcome.name);
+        }
       }
-    }
 
-    // Persist the new idle state for the next chunk / dump().
-    sessionBytes = state.session;
-    return { output: state.output, stdout: state.stdout ?? "", stderr: state.stderr ?? "", toolCalls };
+      // Persist the new idle state for the next chunk / dump().
+      sessionBytes = state.session;
+      return { output: state.output, stdout: state.stdout ?? "", stderr: state.stderr ?? "", toolCalls };
+    } catch (err: any) {
+      // Name the erring session + chunk on the thrown error (opt-in via
+      // scriptName); the failed chunk does NOT advance sessionBytes, so the
+      // last good checkpoint stays usable.
+      if (scriptName && err instanceof Error) {
+        err.message = `[${scriptName} #${chunkIndex}] ${err.message}`;
+      }
+      throw err;
+    }
   };
 
   return { runChunk, dump: () => sessionBytes };
@@ -1835,12 +1874,12 @@ export function createSession(options: SessionOptions): ZapcodeSession {
     memoryLimitMb: options.memoryLimitMb,
     timeLimitMs: options.timeLimitMs,
   });
-  return makeSession(handle.dump(), options.tools);
+  return makeSession(handle.dump(), options.tools, options.scriptName);
 }
 
 /** Reload a durable session from bytes produced by {@link ZapcodeSession.dump}. */
 export function loadSession(bytes: Buffer, options: SessionOptions): ZapcodeSession {
   // Validate the bytes are loadable up front (throws on a bad/incompatible blob).
   ZapcodeSessionHandle.load(bytes);
-  return makeSession(bytes, options.tools);
+  return makeSession(bytes, options.tools, options.scriptName);
 }
