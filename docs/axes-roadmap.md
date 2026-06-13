@@ -54,12 +54,27 @@ every instruction across diverse program shapes). No wire change. The
 remaining memory ideas are lower-value:
 
 - **Key interning** — already shipped (cycle 2).
-- **Key interning**: object keys are `Arc<str>` per-insert; a per-VM (or
-  template-level) intern pool for hot keys (`status`, `value`, `id`, …)
-  would dedupe thousands of tiny allocations. Measure first.
-- **Many-VM density benchmark**: add a bench that holds N=1000 suspended
-  VMs and reports RSS/VM — this is the real production metric; we do not
-  currently measure it.
+- **Many-VM density** — MEASURED (`examples/profile_density.rs`, N=1000).
+  Current numbers (apple silicon, release): **~527 B serialized per parked
+  VM**; **~19 KiB live RSS per VM when each re-compiles its own program
+  (`ZapcodeRun::new`), but ~0 KiB/VM when the program is `Arc`-shared
+  (prepare-once)** — the per-VM live cost is almost entirely the program copy,
+  and prepare-once already removes it. In-run compaction confirmed working (a
+  1000-dead-slot churn leaves ~3 residual heap slots).
+- **The two remaining levers** (both deliberately unshipped — real tradeoffs):
+  - *Snapshot size*: program bytecode is serialized into every snapshot
+    (~15 B/stmt; floor ~527 B). DEFLATE already dedupes repeated object keys/
+    strings on the wire, so wire-level string interning is NOT worth it
+    (measured: 100 key-sharing objects add ~7.6 B each, not the ~22 B of raw
+    key text). The real win is **content-addressing the program** (store once,
+    keyed by hash; snapshots reference it) — but that changes the
+    self-contained durable-artifact contract, so it needs a design decision.
+  - *Speed*: the suspend/resume loop dumps+loads the full snapshot on every
+    tool hop (~30 µs dump + ~36 µs load, in-process, then discarded — larger
+    than the ~22 µs run itself). A **live in-process driver** that keeps the
+    VM resident across hops (dumping only on demand) removes it; additive API,
+    no wire change. Marginal for I/O-bound agents, real for high-throughput /
+    fast-tool hosts.
 
 ## 3. Conformance
 
