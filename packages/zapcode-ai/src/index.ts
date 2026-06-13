@@ -32,6 +32,7 @@ import {
   ZapcodeSessionHandle,
   ZapcodeProgramHandle,
   type PromiseCombinator,
+  type ZapcodeReferencedSession,
 } from "@unchartedfr/zapcode";
 import { jsonSchema, tool, type ToolSet } from "ai";
 
@@ -1744,6 +1745,12 @@ export interface SessionOptions {
   memoryLimitMb?: number;
   /** Execution time limit per chunk in ms (default: 10000). */
   timeLimitMs?: number;
+  /**
+   * The program bundle from a `dumpReferenced()` export — supply alongside the
+   * program-free session bytes to {@link loadSession} to reconstruct a
+   * content-addressed session. Omit for a self-contained {@link ZapcodeSession.dump}.
+   */
+  programs?: Buffer;
 }
 
 /** Result of running one session chunk. */
@@ -1780,6 +1787,14 @@ export interface ZapcodeSession {
   runChunk(code: string, inputs?: Record<string, unknown>): Promise<SessionChunkResult>;
   /** Serialize the whole session state to bytes for storage / transport. */
   dump(): Buffer;
+  /**
+   * Serialize with the chunk programs elided (content-addressed): returns the
+   * program-free `session` bytes plus the `programs` bundle. Store the session
+   * bytes per parked agent / per checkpoint; store the bundle once and pass it
+   * back as `loadSession(session, { tools, programs })`. For a fleet of parked
+   * sessions of one workflow, the programs are stored once instead of N times.
+   */
+  dumpReferenced(): ZapcodeReferencedSession;
 }
 
 function makeSession(
@@ -1814,7 +1829,11 @@ function makeSession(
     return { output: state.output, stdout: state.stdout ?? "", stderr: state.stderr ?? "", toolCalls };
   };
 
-  return { runChunk, dump: () => sessionBytes };
+  return {
+    runChunk,
+    dump: () => sessionBytes,
+    dumpReferenced: () => ZapcodeSessionHandle.load(sessionBytes).dumpReferenced(),
+  };
 }
 
 /** Create a new durable session. */
@@ -1828,9 +1847,16 @@ export function createSession(options: SessionOptions): ZapcodeSession {
   return makeSession(handle.dump(), options.tools);
 }
 
-/** Reload a durable session from bytes produced by {@link ZapcodeSession.dump}. */
+/**
+ * Reload a durable session from bytes produced by {@link ZapcodeSession.dump}
+ * (self-contained), or from a {@link ZapcodeSession.dumpReferenced} export by
+ * also passing its `programs` bundle in {@link SessionOptions.programs}.
+ */
 export function loadSession(bytes: Buffer, options: SessionOptions): ZapcodeSession {
-  // Validate the bytes are loadable up front (throws on a bad/incompatible blob).
-  ZapcodeSessionHandle.load(bytes);
-  return makeSession(bytes, options.tools);
+  // A referenced export: splice the program bundle back, then drive the session
+  // from the reconstituted (self-contained) bytes. Otherwise validate + use as-is.
+  const initialBytes = options.programs
+    ? ZapcodeSessionHandle.loadWithPrograms(bytes, options.programs).dump()
+    : (ZapcodeSessionHandle.load(bytes), bytes);
+  return makeSession(initialBytes, options.tools);
 }

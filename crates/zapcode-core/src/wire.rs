@@ -75,7 +75,12 @@ const MAGIC: &[u8; 4] = b"ZPC1";
 /// program_fingerprints}` (new trailing fields; `dump_referenced()` elides the
 /// program bytecode and records per-program fnv1a fingerprints, spliced back by
 /// `load_with_programs()`), incompatible with v16.
-pub(crate) const FORMAT_VERSION: u16 = 17;
+/// v18: content-addressed *sessions* — `IdleSessionState::{programs_elided,
+/// program_fingerprints}` (new trailing fields) + the `ProgramBundle` frame kind
+/// (4): `ZapcodeSessionSnapshot::dump_referenced()` elides the session's chunk
+/// programs (idle or the suspended `VmSnapshot`) into a separately-stored bundle,
+/// spliced back by `load_with_programs()`, incompatible with v17.
+pub(crate) const FORMAT_VERSION: u16 = 18;
 
 const HEADER_LEN: usize = 4 + 2 + 1 + 1 + 32;
 
@@ -99,6 +104,10 @@ pub(crate) enum FrameKind {
     Session = 2,
     /// A pre-compiled program (`ZapcodeProgram`) — bytecode cached across runs.
     Program = 3,
+    /// The program bundle a content-addressed *session* elides
+    /// (`ZapcodeSessionSnapshot::dump_referenced`) — the chunk programs the host
+    /// stores once and re-supplies to `load_with_programs`.
+    ProgramBundle = 4,
 }
 
 impl FrameKind {
@@ -107,6 +116,7 @@ impl FrameKind {
             FrameKind::Snapshot => "snapshot",
             FrameKind::Session => "session",
             FrameKind::Program => "program",
+            FrameKind::ProgramBundle => "program bundle",
         }
     }
 
@@ -115,6 +125,7 @@ impl FrameKind {
             1 => Some(FrameKind::Snapshot),
             2 => Some(FrameKind::Session),
             3 => Some(FrameKind::Program),
+            4 => Some(FrameKind::ProgramBundle),
             _ => None,
         }
     }

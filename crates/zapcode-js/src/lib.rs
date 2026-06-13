@@ -316,6 +316,15 @@ impl ZapcodeSnapshotHandle {
 // Ongoing session handle
 // ---------------------------------------------------------------------------
 
+/// The two blobs `ZapcodeSessionHandle.dumpReferenced()` returns: the
+/// program-free `session` bytes and the `programs` bundle to store once and
+/// re-supply to `loadWithPrograms`.
+#[napi(object)]
+pub struct ZapcodeReferencedSession {
+    pub session: Buffer,
+    pub programs: Buffer,
+}
+
 #[napi]
 pub struct ZapcodeSessionHandle {
     inner: ZapcodeSessionSnapshot,
@@ -353,6 +362,33 @@ impl ZapcodeSessionHandle {
             .dump()
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
         Ok(Buffer::from(bytes))
+    }
+
+    /// Dump with the chunk programs elided (content-addressed): returns the
+    /// program-free `session` bytes plus the `programs` bundle. Store the session
+    /// bytes per hop / per parked agent; store the bundle once and re-supply it
+    /// to `loadWithPrograms`. `dump()` stays self-contained.
+    #[napi]
+    pub fn dump_referenced(&self) -> napi::Result<ZapcodeReferencedSession> {
+        let (session, programs) = self
+            .inner
+            .dump_referenced()
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        Ok(ZapcodeReferencedSession {
+            session: Buffer::from(session),
+            programs: Buffer::from(programs),
+        })
+    }
+
+    /// Load a referenced session (from `dumpReferenced`), splicing the chunk
+    /// programs from the `programs` bundle. Fingerprints are validated before any
+    /// chunk runs; a missing / mismatched / wrong-count bundle is a catchable
+    /// error, never a crash. A self-contained session blob is accepted too.
+    #[napi(factory)]
+    pub fn load_with_programs(session: Buffer, programs: Buffer) -> napi::Result<Self> {
+        let inner = ZapcodeSessionSnapshot::load_with_programs(&session, &programs)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        Ok(Self { inner })
     }
 
     #[napi(

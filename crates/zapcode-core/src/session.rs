@@ -139,6 +139,15 @@ struct IdleSessionState {
     /// the `Vec` keeps every closure's `env` ids aligned across reload.
     #[serde(default)]
     cells: Vec<Value>,
+    /// When true, `programs` is empty on the wire (content-addressed): the chunk
+    /// bytecode is elided into a separately-stored bundle and the loader must
+    /// splice it back, matching `program_fingerprints` positionally, via
+    /// [`ZapcodeSessionSnapshot::load_with_programs`]. v18.
+    #[serde(default)]
+    programs_elided: bool,
+    /// fnv1a fingerprint of each elided chunk program, in `programs` order. v18.
+    #[serde(default)]
+    program_fingerprints: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,6 +161,76 @@ struct SuspendedSessionState {
     stderr_len: usize,
     top_level_bindings: Vec<(String, TopLevelBindingKind)>,
     transient_input_names: Vec<String>,
+}
+
+impl IdleSessionState {
+    /// Content-address the chunk programs: replace the bytecode with per-program
+    /// fingerprints so the idle session carries none of it. The loader must
+    /// re-supply the programs (see [`Self::splice_programs`]). Idempotent.
+    fn elide_programs(&mut self) {
+        if self.programs_elided {
+            return;
+        }
+        self.program_fingerprints = self
+            .programs
+            .iter()
+            .map(|p| crate::snapshot::program_fingerprint(p))
+            .collect();
+        self.programs.clear();
+        self.programs_elided = true;
+    }
+
+    /// Splice host-supplied programs back into a referenced idle session,
+    /// validating count + per-program fingerprint before any chunk runs (never
+    /// `panic!`). A fingerprint match means the supplied program is byte-identical
+    /// to the captured one, so every persisted closure's program id stays valid.
+    fn splice_programs(&mut self, programs: &[std::sync::Arc<CompiledProgram>]) -> Result<()> {
+        if !self.programs_elided {
+            return Ok(());
+        }
+        if programs.len() != self.program_fingerprints.len() {
+            return Err(ZapcodeError::SnapshotError(format!(
+                "referenced session needs {} program(s) but {} were supplied",
+                self.program_fingerprints.len(),
+                programs.len()
+            )));
+        }
+        for (i, p) in programs.iter().enumerate() {
+            if crate::snapshot::program_fingerprint(p) != self.program_fingerprints[i] {
+                return Err(ZapcodeError::SnapshotError(format!(
+                    "session program {} changed since capture (fingerprint mismatch)",
+                    i
+                )));
+            }
+        }
+        self.programs = programs.to_vec();
+        self.programs_elided = false;
+        self.program_fingerprints.clear();
+        Ok(())
+    }
+}
+
+/// Frame a session's elided chunk programs into a standalone, versioned,
+/// integrity-checked bundle the host stores alongside the (program-free) session
+/// bytes and re-supplies at load.
+fn encode_program_bundle(programs: &[std::sync::Arc<CompiledProgram>]) -> Result<Vec<u8>> {
+    let payload = postcard::to_allocvec(programs)
+        .map_err(|e| ZapcodeError::SnapshotError(format!("program bundle dump failed: {}", e)))?;
+    crate::wire::check_state_size(payload.len(), ResourceLimits::default().max_snapshot_bytes)?;
+    Ok(crate::wire::encode_frame(
+        FrameKind::ProgramBundle,
+        &payload,
+    ))
+}
+
+fn decode_program_bundle(bytes: &[u8]) -> Result<Vec<std::sync::Arc<CompiledProgram>>> {
+    let payload = crate::wire::decode_frame(
+        FrameKind::ProgramBundle,
+        bytes,
+        crate::wire::MAX_LOAD_DECOMPRESSED_BYTES,
+    )?;
+    postcard::from_bytes(&payload)
+        .map_err(|e| ZapcodeError::SnapshotError(format!("program bundle load failed: {}", e)))
 }
 
 impl ZapcodeSessionSnapshot {
@@ -169,6 +248,8 @@ impl ZapcodeSessionSnapshot {
                 rng_state: 0,
                 heap: crate::heap::Heap::new(),
                 cells: Vec::new(),
+                programs_elided: false,
+                program_fingerprints: Vec::new(),
             }),
         })
     }
@@ -178,6 +259,30 @@ impl ZapcodeSessionSnapshot {
             .map_err(|e| ZapcodeError::SnapshotError(format!("dump failed: {}", e)))?;
         crate::wire::check_state_size(payload.len(), self.max_snapshot_bytes())?;
         Ok(crate::wire::encode_frame(FrameKind::Session, &payload))
+    }
+
+    /// Dump the session with the chunk programs **elided** (content-addressed):
+    /// returns `(session_bytes, program_bundle)`. The session bytes carry no
+    /// bytecode — store them per hop / per parked agent — while the program
+    /// bundle is stored once and re-supplied to [`Self::load_with_programs`].
+    /// `dump()` stays self-contained — this is the opt-in referenced form.
+    pub fn dump_referenced(&self) -> Result<(Vec<u8>, Vec<u8>)> {
+        let mut snap = self.clone();
+        let programs = match &mut snap.data {
+            SessionSnapshotData::Idle(idle) => {
+                let progs = idle.programs.clone();
+                idle.elide_programs();
+                progs
+            }
+            SessionSnapshotData::Suspended(s) => {
+                let progs = s.vm.programs.clone();
+                s.vm.elide_programs();
+                progs
+            }
+        };
+        let session_bytes = snap.dump()?;
+        let program_bundle = encode_program_bundle(&programs)?;
+        Ok((session_bytes, program_bundle))
     }
 
     /// Borrow the object heap backing this session. Array/object `Value`s held in
@@ -204,6 +309,36 @@ impl ZapcodeSessionSnapshot {
     }
 
     pub fn load(bytes: &[u8]) -> Result<Self> {
+        let snapshot = Self::decode_session(bytes)?;
+        if snapshot.is_program_referenced() {
+            return Err(ZapcodeError::SnapshotError(
+                "session is program-referenced (dumped with dump_referenced); \
+                 load it with load_with_programs and supply its program bundle"
+                    .to_string(),
+            ));
+        }
+        Ok(snapshot)
+    }
+
+    /// Load a referenced session (from [`Self::dump_referenced`]), splicing the
+    /// chunk programs from `program_bundle` — validated positionally against the
+    /// recorded fingerprints before any chunk runs (a missing / mismatched /
+    /// wrong-count bundle is a `SnapshotError`, never a panic). Also accepts a
+    /// self-contained session blob (the bundle is then ignored).
+    pub fn load_with_programs(session_bytes: &[u8], program_bundle: &[u8]) -> Result<Self> {
+        let mut snapshot = Self::decode_session(session_bytes)?;
+        if snapshot.is_program_referenced() {
+            let programs = decode_program_bundle(program_bundle)?;
+            match &mut snapshot.data {
+                SessionSnapshotData::Idle(idle) => idle.splice_programs(&programs)?,
+                SessionSnapshotData::Suspended(s) => s.vm.splice_programs(&programs)?,
+            }
+        }
+        Ok(snapshot)
+    }
+
+    /// Decode + limit-clamp, shared by [`Self::load`] / [`Self::load_with_programs`].
+    fn decode_session(bytes: &[u8]) -> Result<Self> {
         let payload = crate::wire::decode_frame(
             FrameKind::Session,
             bytes,
@@ -220,6 +355,13 @@ impl ZapcodeSessionSnapshot {
             SessionSnapshotData::Suspended(s) => s.vm.limits.clamp_to_default(),
         }
         Ok(snapshot)
+    }
+
+    fn is_program_referenced(&self) -> bool {
+        match &self.data {
+            SessionSnapshotData::Idle(idle) => idle.programs_elided,
+            SessionSnapshotData::Suspended(s) => s.vm.programs_elided,
+        }
     }
 
     pub fn run_chunk(
@@ -249,6 +391,18 @@ impl ZapcodeSessionSnapshot {
                 ))
             }
         };
+
+        // A program-referenced session must have its programs spliced in
+        // (load_with_programs) before a chunk runs — its `programs` vec is empty,
+        // so the new chunk's program_index would be wrong and persisted closures'
+        // program ids would dangle. Fail cleanly.
+        if idle.programs_elided {
+            return Err(ZapcodeError::RuntimeError(
+                "cannot run a chunk on a program-referenced session without its programs; \
+                 load it with load_with_programs first"
+                    .to_string(),
+            ));
+        }
 
         // Merge the host-supplied input heap into the session's live heap and
         // rebase the input handles so any array/object inputs stay valid.
@@ -443,6 +597,8 @@ fn build_session_state(
                     // Carry the upvalue-cell arena so persisted closures keep
                     // their captured function-local state across the reload.
                     cells: vm.cells.clone(),
+                    programs_elided: false,
+                    program_fingerprints: Vec::new(),
                 }),
             },
         }),

@@ -120,10 +120,31 @@ export class ZapcodeSnapshotHandle {
   resumeMany(results: unknown[]): ZapcodeResult | ZapcodeSuspension | ZapcodeBatchSuspension;
 }
 
+/** The two blobs {@link ZapcodeSessionHandle.dumpReferenced} returns. */
+export interface ZapcodeReferencedSession {
+  /** Program-free session bytes — store per hop / per parked agent. */
+  session: Buffer;
+  /** The chunk-program bundle — store once, re-supply to `loadWithPrograms`. */
+  programs: Buffer;
+}
+
 export class ZapcodeSessionHandle {
   static create(options?: ZapcodeSessionOptions): ZapcodeSessionHandle;
   static load(bytes: Buffer): ZapcodeSessionHandle;
+  /**
+   * Load a referenced session (from `dumpReferenced`), splicing the chunk
+   * programs from the `programs` bundle. Fingerprints are validated before any
+   * chunk runs; a missing/mismatched/wrong-count bundle is a catchable error,
+   * never a crash. A self-contained session blob is accepted too.
+   */
+  static loadWithPrograms(session: Buffer, programs: Buffer): ZapcodeSessionHandle;
   dump(): Buffer;
+  /**
+   * Dump with the chunk programs elided (content-addressed): the program-free
+   * `session` bytes + the `programs` bundle (store once). `dump()` stays
+   * self-contained.
+   */
+  dumpReferenced(): ZapcodeReferencedSession;
   runChunk(
     code: string,
     inputs?: Record<string, unknown>,
