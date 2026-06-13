@@ -13,8 +13,8 @@
  *     — a deterministic normalization, asserted as ACTUAL (the historical
  *     "insertion order preserved" note does not hold for the current binding);
  *   - calls are recorded in execution order; a call in a not-taken branch is absent;
- *   - a tool error is recorded as a STRING `error` (the message), and `e instanceof
- *     Error` is false in the guest catch (documented L4 residual, asserted as actual);
+ *   - a tool error is recorded as a STRING `error` (the message) on the trace record,
+ *     while in the guest catch it surfaces as a real Error (message/name/instanceof);
  *   - primitive type validation (number/string/boolean) accepts well-typed args and
  *     rejects mismatches / missing-required with a descriptive, abort-level error;
  *   - `array` / `object` typed params pass their structured payload through intact.
@@ -108,7 +108,7 @@ await test("a loop records one entry per invocation", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Error recording (documented L4 residual)
+// Error recording + in-guest error fidelity
 // ---------------------------------------------------------------------------
 
 await test("a failed call records a string error and an undefined result", async () => {
@@ -117,18 +117,21 @@ await test("a failed call records a string error and an undefined result", async
   });
   const rec = r.toolCalls[0];
   assert.equal(rec.name, "fail");
+  // The trace record's `error` is the message string (host-loggable).
   assert.equal(rec.error, "boom");
   // result is present-but-undefined on the failure record.
   assert.equal(rec.result, undefined);
 });
 
-await test("a caught tool error is a string in the guest (instanceof Error is false)", async () => {
-  // Documented L4 residual asserted as actual.
+await test("a caught tool error is a real Error in the guest (message/name/instanceof)", async () => {
+  // A thrown tool now rejects the guest's await with a real Error object, so
+  // idiomatic `catch (e) { e.message }` works and the host error's subclass
+  // name is preserved.
   const r = await execute(
-    `try { await fail({}); 'no'; } catch (e) { (typeof e) + ':' + (e instanceof Error); }`,
-    { fail: tool(async () => { throw new Error("kaboom"); }) }
+    `try { await fail({}); 'no'; } catch (e) { [e instanceof Error, e.name, e.message].join(':'); }`,
+    { fail: tool(async () => { throw new TypeError("kaboom"); }) }
   );
-  assert.equal(r.output, "string:false");
+  assert.equal(r.output, "true:TypeError:kaboom");
 });
 
 // ---------------------------------------------------------------------------

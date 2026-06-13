@@ -84,11 +84,12 @@ await test("parallel batch + tool errors work through the session bridge", async
       await fetchRow("missing");
       out = "no-error";
     } catch (e) {
-      out = "caught:" + e;
+      // A failed tool surfaces as a real Error through the session bridge too.
+      out = "caught:" + e.message + ":" + (e instanceof Error);
     }
     out
   `);
-  assert.equal(recovered.output, "caught:not found");
+  assert.equal(recovered.output, "caught:not found:true");
 });
 
 console.log(`\n${passed} ai-session checks passed.`);

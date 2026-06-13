@@ -564,6 +564,19 @@ impl ZapcodeSnapshot {
         Ok(RunResult::from_resume(state, vm))
     }
 
+    /// Resume by raising a real `Error` OBJECT (`name`/`message`, with
+    /// `e instanceof Error` true) at the suspended call — the faithful
+    /// representation of a host tool that threw. `resume_with_error` raises
+    /// whatever `Value` it is given (e.g. a bare string, like `throw "x"`);
+    /// this builds the Error so idiomatic guest `catch (e) { e.message }`
+    /// works.
+    pub fn resume_with_error_object(self, name: &str, message: &str) -> Result<RunResult> {
+        let mut vm = self.snapshot.restore_vm()?;
+        let err = vm.make_error_value(name, message);
+        let state = vm.resume_with_error(err)?;
+        Ok(RunResult::from_resume(state, vm))
+    }
+
     /// Resume a batch suspension (`VmState::SuspendedMany`) with one result per
     /// call, in the order the calls were presented. The host can run those
     /// calls in parallel and pass back all results at once.

@@ -100,6 +100,15 @@ export class ZapcodeSnapshotHandle {
    */
   resumeError(error: unknown): ZapcodeResult | ZapcodeSuspension | ZapcodeBatchSuspension;
   /**
+   * Resume by raising a real Error OBJECT (name/message, with
+   * `e instanceof Error` true) — the faithful shape of a host tool that threw,
+   * so guest `catch (e) { e.message }` works. `name` defaults to "Error".
+   */
+  resumeErrorObject(
+    message: string,
+    name?: string,
+  ): ZapcodeResult | ZapcodeSuspension | ZapcodeBatchSuspension;
+  /**
    * Resume a batch suspension (Promise.all) with one result per call, in the
    * order the calls were presented. Run the calls in parallel on the host.
    */
@@ -124,6 +133,15 @@ export class ZapcodeSessionHandle {
    */
   resumeError(
     error: unknown,
+  ): ZapcodeSessionResult | ZapcodeSessionSuspension | ZapcodeSessionBatchSuspension;
+  /**
+   * Resume by raising a real Error OBJECT (name/message, `e instanceof Error`
+   * true) — the faithful shape of a host tool that threw. `name` defaults to
+   * "Error".
+   */
+  resumeErrorObject(
+    message: string,
+    name?: string,
   ): ZapcodeSessionResult | ZapcodeSessionSuspension | ZapcodeSessionBatchSuspension;
   /**
    * Resume a batch suspension (Promise.all) with one result per call, in order.
