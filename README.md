@@ -470,6 +470,9 @@ A tool is `{ description, parameters, returns?, execute }`. Guest code calls it 
 named-object argument — `await getUser({ id })` — and your `execute` receives the validated
 object. A tool that *receives* arguments must declare them in `parameters`.
 
+> **Runnable:** [`examples/typescript/workflows`](examples/typescript/workflows) executes every
+> pattern below offline (mock tools, no API key) and asserts the results — `npm install && npm start`.
+
 ### Parallel fan-out (map-reduce over tools)
 
 `Promise.all` over tool calls suspends **once** with the whole batch; the host runs them
