@@ -31,6 +31,8 @@ import {
   ZapcodeSnapshotHandle,
   ZapcodeSessionHandle,
   ZapcodeProgramHandle,
+  ZapcodeDriver,
+  type ZapcodeStep,
   type PromiseCombinator,
 } from "@unchartedfr/zapcode";
 import { jsonSchema, tool, type ToolSet } from "ai";
@@ -953,12 +955,15 @@ async function executeCode(
      */
     scriptName?: string;
     /**
-     * Produce the initial VM state instead of compiling `code` fresh — used
-     * by {@link prepare} to start from an already-compiled, reusable program
-     * (parse + compile paid once, not per run). When omitted, a new `Zapcode`
-     * is compiled and started as usual.
+     * Supply the in-process driver instead of compiling `code` fresh — used by
+     * {@link prepare} to drive an already-compiled, reusable program (parse +
+     * compile paid once, not per run). When omitted, a driver is built from
+     * `code`. The driver keeps the VM resident across tool hops, so the
+     * suspend/resume loop never serializes the snapshot.
      */
-    starter?: () => ReturnType<Zapcode["start"]>;
+    makeDriver?: () => ZapcodeDriver;
+    /** Inputs bound as variables in the program (used by {@link prepare}). */
+    inputs?: Record<string, unknown>;
   }
 ): Promise<ExecutionResult> {
   validateToolDefinitions(toolDefs);
@@ -981,15 +986,18 @@ async function executeCode(
       }
     }
 
-    // `prepare()` supplies a starter that resumes from a pre-compiled program;
-    // otherwise compile and start a fresh sandbox here.
-    let state = options.starter
-      ? options.starter()
-      : new Zapcode(code, {
+    // Drive the run with the VM kept resident in-process: the suspend/resume
+    // loop never serializes the snapshot between tool hops (only on completion
+    // do we read the cumulative stdout/stderr). `prepare()` supplies a driver
+    // bound to its pre-compiled program; otherwise compile one from `code`.
+    const driver = options.makeDriver
+      ? options.makeDriver()
+      : ZapcodeDriver.fromCode(code, {
           externalFunctions: toolNames,
           timeLimitMs: options.timeLimitMs ?? 10_000,
           memoryLimitMb: options.memoryLimitMb ?? 32,
-        }).start();
+        });
+    let state: ZapcodeStep = driver.start(options.inputs);
     let stdout = "";
     let stderr = "";
 
@@ -1063,24 +1071,23 @@ async function executeCode(
       }
     };
 
-    // Snapshot/resume loop — resolve tool calls as the VM suspends.
+    // In-process driver loop — resolve tool calls as the VM suspends. The
+    // driver keeps the VM resident, so resuming costs no dump+load round-trip.
     while (!state.completed) {
-      const snapshot = ZapcodeSnapshotHandle.load(state.snapshot);
-
       if (state.kind === "suspended_many") {
         // Parallel batch (Promise.{all,race,any,allSettled}). Run every call
         // concurrently as a real JS promise so race/any honor real settle
         // timing, then settle with the matching combinator. A malformed call
         // throws and aborts the whole execution.
-        state = await settleBatch(snapshot, state.combinator, state.calls, invokeTool);
+        state = await settleBatch(driver, state.combinator!, state.calls!, invokeTool);
         continue;
       }
 
       // Single external call.
-      const outcome = await invokeTool(state.functionName, state.args);
+      const outcome = await invokeTool(state.functionName!, state.args!);
       state = outcome.ok
-        ? snapshot.resume(outcome.result)
-        : snapshot.resumeErrorObject(outcome.message, outcome.name);
+        ? driver.resume(outcome.result)
+        : driver.resumeErrorObject(outcome.message, outcome.name);
     }
 
     // Console output is cumulative across snapshot restores, so the final
@@ -1581,12 +1588,10 @@ export function prepare(
         ...runOptions,
         memoryLimitMb: options?.memoryLimitMb,
         timeLimitMs: options?.timeLimitMs,
-        // Reuse the whole executeCode loop, but start from the pre-compiled
-        // program rather than recompiling `code`.
-        starter: () =>
-          handle.start(
-            inputs as Record<string, unknown> | undefined
-          ) as ReturnType<Zapcode["start"]>,
+        // Reuse the whole executeCode loop, but drive the pre-compiled program
+        // (shared bytecode, no recompile) instead of compiling `code` again.
+        makeDriver: () => handle.makeDriver(),
+        inputs: inputs as Record<string, unknown> | undefined,
       });
     },
   };

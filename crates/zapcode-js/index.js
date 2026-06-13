@@ -60,3 +60,4 @@ module.exports.Zapcode = binding.Zapcode
 module.exports.ZapcodeSnapshotHandle = binding.ZapcodeSnapshotHandle
 module.exports.ZapcodeSessionHandle = binding.ZapcodeSessionHandle
 module.exports.ZapcodeProgramHandle = binding.ZapcodeProgramHandle
+module.exports.ZapcodeDriver = binding.ZapcodeDriver

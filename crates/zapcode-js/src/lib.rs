@@ -646,6 +646,243 @@ impl ZapcodeProgramHandle {
 
         run_result_to_either_with_stdout(result)
     }
+
+    /// Build an in-process [`ZapcodeDriver`] from this compiled program, sharing
+    /// the same `Arc`-backed bytecode (no recompile). Drives a run's
+    /// suspend/resume loop without serializing the snapshot between hops.
+    #[napi]
+    pub fn make_driver(&self) -> ZapcodeDriver {
+        ZapcodeDriver {
+            program: self.inner.clone(),
+            limits: self.limits.clone(),
+            pending: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// In-process driver — suspend/resume without serializing between hops
+// ---------------------------------------------------------------------------
+
+/// One step of a driven run: completion, a single external call, or a parallel
+/// batch. Unlike [`ZapcodeSuspension`], it carries NO snapshot bytes — the live
+/// VM state stays resident inside the [`ZapcodeDriver`], so a multi-tool-call
+/// run pays the dump+load cost ZERO times instead of once per hop.
+#[napi(object)]
+pub struct ZapcodeStep {
+    /// "complete" | "suspended" | "suspended_many".
+    pub kind: String,
+    pub completed: bool,
+    /// Output value — present only when `kind == "complete"`.
+    pub output: Option<serde_json::Value>,
+    /// External function name — present only when `kind == "suspended"`.
+    pub function_name: Option<String>,
+    /// External call args — present only when `kind == "suspended"`.
+    pub args: Option<Vec<serde_json::Value>>,
+    /// Combinator ("all"/"race"/"any"/"allSettled") — present only when
+    /// `kind == "suspended_many"`.
+    pub combinator: Option<String>,
+    /// Batched calls — present only when `kind == "suspended_many"`.
+    pub calls: Option<Vec<JsExternalCall>>,
+    /// Cumulative stdout (`console.log`/`info`/`debug`) so far.
+    pub stdout: String,
+    /// Cumulative stderr (`console.error`/`console.warn`) so far.
+    pub stderr: String,
+}
+
+/// Drives a single run's suspend/resume loop with the VM kept resident in
+/// memory — no per-hop serialization. Use for the common "run agent code,
+/// resolve its tool calls, get the result" loop. For cross-process durability
+/// (store bytes now, resume elsewhere) call `dump()` at a suspension, or use the
+/// snapshot / session handles instead.
+#[napi]
+pub struct ZapcodeDriver {
+    program: ZapcodeProgram,
+    limits: ResourceLimits,
+    /// Live captured suspension between hops; `None` before `start()` or after
+    /// completion. The VM state lives here in memory, never on the wire unless
+    /// `dump()` is called.
+    pending: Option<ZapcodeSnapshot>,
+}
+
+#[napi]
+impl ZapcodeDriver {
+    /// Compile `code` and prepare to drive it. Accepts the same options as
+    /// `Zapcode` (`externalFunctions`, `memoryLimitMb`, `timeLimitMs`).
+    #[napi(factory)]
+    pub fn from_code(code: String, options: Option<ZapcodeOptions>) -> napi::Result<Self> {
+        let opts = options.unwrap_or(ZapcodeOptions {
+            inputs: None,
+            external_functions: None,
+            memory_limit_mb: None,
+            time_limit_ms: None,
+        });
+        let limits = resource_limits_from_options(&opts);
+        let program = ZapcodeProgram::compile(&code, opts.external_functions.unwrap_or_default())
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        Ok(Self {
+            program,
+            limits,
+            pending: None,
+        })
+    }
+
+    /// Start execution; returns the first step (completion or suspension).
+    #[napi]
+    pub fn start(
+        &mut self,
+        inputs: Option<HashMap<String, serde_json::Value>>,
+    ) -> napi::Result<ZapcodeStep> {
+        let (input_values, input_heap) = inputs_to_vec(inputs);
+        let result = self
+            .program
+            .run_with_input_heap(input_values, input_heap, self.limits.clone())
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        self.step_from(result)
+    }
+
+    /// Resume the suspended external call with its return value.
+    #[napi]
+    pub fn resume(&mut self, value: serde_json::Value) -> napi::Result<ZapcodeStep> {
+        let mut snap = self.take_pending()?;
+        let v = json_to_value(&value, snap.heap_mut());
+        let result = snap
+            .resume(v)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        self.step_from(result)
+    }
+
+    /// Resume a batch suspension with one result per call, in order.
+    #[napi]
+    pub fn resume_many(&mut self, results: Vec<serde_json::Value>) -> napi::Result<ZapcodeStep> {
+        let mut snap = self.take_pending()?;
+        let values: Vec<Value> = results
+            .iter()
+            .map(|v| json_to_value(v, snap.heap_mut()))
+            .collect();
+        let result = snap
+            .resume_many(values)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        self.step_from(result)
+    }
+
+    /// Resume by raising a raw value as the thrown error at the suspended call.
+    #[napi]
+    pub fn resume_error(&mut self, error: serde_json::Value) -> napi::Result<ZapcodeStep> {
+        let mut snap = self.take_pending()?;
+        let v = json_to_value(&error, snap.heap_mut());
+        let result = snap
+            .resume_with_error(v)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        self.step_from(result)
+    }
+
+    /// Resume by raising a real `Error` object (name/message, `instanceof Error`
+    /// true) — the faithful shape of a host tool that threw. `name` defaults to
+    /// "Error".
+    #[napi]
+    pub fn resume_error_object(
+        &mut self,
+        message: String,
+        name: Option<String>,
+    ) -> napi::Result<ZapcodeStep> {
+        let snap = self.take_pending()?;
+        let result = snap
+            .resume_with_error_object(name.as_deref().unwrap_or("Error"), &message)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        self.step_from(result)
+    }
+
+    /// Serialize the current suspension to bytes (fork / cross-process
+    /// durability). Errors if the driver is not currently suspended.
+    #[napi]
+    pub fn dump(&self) -> napi::Result<Buffer> {
+        match &self.pending {
+            Some(snap) => {
+                let bytes = snap
+                    .dump()
+                    .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+                Ok(Buffer::from(bytes))
+            }
+            None => Err(napi::Error::from_reason(
+                "driver is not suspended; nothing to dump".to_string(),
+            )),
+        }
+    }
+}
+
+impl ZapcodeDriver {
+    fn take_pending(&mut self) -> napi::Result<ZapcodeSnapshot> {
+        self.pending.take().ok_or_else(|| {
+            napi::Error::from_reason("driver has no suspension to resume".to_string())
+        })
+    }
+
+    /// Fold a `RunResult` into a `ZapcodeStep`, retaining the (in-memory)
+    /// suspension for the next hop and never serializing it.
+    fn step_from(&mut self, result: RunResult) -> napi::Result<ZapcodeStep> {
+        let RunResult {
+            state,
+            heap,
+            stdout,
+            stderr,
+            ..
+        } = result;
+        match state {
+            VmState::Complete(v) => {
+                self.pending = None;
+                Ok(ZapcodeStep {
+                    kind: "complete".to_string(),
+                    completed: true,
+                    output: Some(value_to_json(&v, &heap)?),
+                    function_name: None,
+                    args: None,
+                    combinator: None,
+                    calls: None,
+                    stdout,
+                    stderr,
+                })
+            }
+            VmState::Suspended {
+                function_name,
+                args,
+                mut snapshot,
+            } => {
+                let js_args = values_to_json(&args, snapshot.heap())?;
+                self.pending = Some(snapshot);
+                Ok(ZapcodeStep {
+                    kind: "suspended".to_string(),
+                    completed: false,
+                    output: None,
+                    function_name: Some(function_name),
+                    args: Some(js_args),
+                    combinator: None,
+                    calls: None,
+                    stdout,
+                    stderr,
+                })
+            }
+            VmState::SuspendedMany {
+                calls,
+                combinator,
+                mut snapshot,
+            } => {
+                let js_calls = external_calls_to_js(&calls, snapshot.heap())?;
+                self.pending = Some(snapshot);
+                Ok(ZapcodeStep {
+                    kind: "suspended_many".to_string(),
+                    completed: false,
+                    output: None,
+                    function_name: None,
+                    args: None,
+                    combinator: Some(combinator.as_str().to_string()),
+                    calls: Some(js_calls),
+                    stdout,
+                    stderr,
+                })
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

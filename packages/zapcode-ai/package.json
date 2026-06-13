@@ -16,7 +16,7 @@
     "dev": "tsc --watch",
     "sync-local-binding": "node scripts/sync-local-binding.mjs",
     "test:agent-scenarios": "npm run build && node tests/agent-scenarios.mjs",
-    "test:e2e": "npm run sync-local-binding && npm run build && node tests/agent-scenarios.mjs && node tests/durable-sessions.mjs && node tests/tool-errors.mjs && node tests/parallel.mjs && node tests/ai-session.mjs && node tests/type-check.mjs && node tests/agent-dx.mjs && node tests/tool-side-effects.mjs && node tests/stress.mjs && node tests/workflow.mjs && node tests/marshalling.mjs",
+    "test:e2e": "npm run sync-local-binding && npm run build && node tests/agent-scenarios.mjs && node tests/durable-sessions.mjs && node tests/tool-errors.mjs && node tests/parallel.mjs && node tests/driver.mjs && node tests/ai-session.mjs && node tests/type-check.mjs && node tests/agent-dx.mjs && node tests/tool-side-effects.mjs && node tests/stress.mjs && node tests/workflow.mjs && node tests/marshalling.mjs",
     "test:e2e-conformance": "npm run sync-local-binding && npm run build && for f in agent-integration tool-contract session-inputs session-workflows durable-serialization ai-sdk-adapters; do echo \"# e2e-$f\"; node tests/e2e-$f.mjs; done",
     "test:e2e-full": "npm run test:e2e && npm run test:e2e-conformance && npm run test:scenarios3 && node tests/differential.mjs",
     "test:scenarios3": "npm run sync-local-binding && npm run build && for f in scheduling support-triage etl compliance durable pricing inventory analytics knowledge statemachine; do echo \"# scenarios3-$f\"; node tests/scenarios3-$f.mjs; done",
