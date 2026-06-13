@@ -26,6 +26,11 @@ export interface ZapcodeSuspension {
   completed: false;
   functionName: string;
   args: unknown[];
+  /** stdout (`console.log`/`info`/`debug`) so far — cumulative up to this
+   * suspension (console output carries across snapshot restores). */
+  stdout: string;
+  /** stderr (`console.error`/`console.warn`) so far — cumulative. */
+  stderr: string;
   snapshot: Buffer;
 }
 
@@ -52,6 +57,11 @@ export interface ZapcodeBatchSuspension {
   combinator: PromiseCombinator;
   /** The batched external calls, in order — run them in parallel. */
   calls: ExternalCall[];
+  /** stdout (`console.log`/`info`/`debug`) so far — cumulative up to this
+   * suspension (console output carries across snapshot restores). */
+  stdout: string;
+  /** stderr (`console.error`/`console.warn`) so far — cumulative. */
+  stderr: string;
   snapshot: Buffer;
 }
 
@@ -170,4 +180,51 @@ export class ZapcodeProgramHandle {
   dump(): Buffer;
   run(inputs?: Record<string, unknown>): ZapcodeResult;
   start(inputs?: Record<string, unknown>): ZapcodeResult | ZapcodeSuspension | ZapcodeBatchSuspension;
+  /**
+   * Build an in-process driver from this compiled program (shares the same
+   * `Arc`-backed bytecode, no recompile). Drives the suspend/resume loop
+   * without serializing the snapshot between hops.
+   */
+  makeDriver(): ZapcodeDriver;
+}
+
+/**
+ * One step of a {@link ZapcodeDriver} run. Carries NO snapshot bytes — the live
+ * VM state stays resident in the driver, so a multi-tool-call run pays the
+ * dump+load cost zero times instead of once per hop.
+ */
+export interface ZapcodeStep {
+  kind: "complete" | "suspended" | "suspended_many";
+  completed: boolean;
+  /** Output value — present only when `kind === "complete"`. */
+  output?: unknown;
+  /** External function name — present only when `kind === "suspended"`. */
+  functionName?: string;
+  /** External call args — present only when `kind === "suspended"`. */
+  args?: unknown[];
+  /** Combinator — present only when `kind === "suspended_many"`. */
+  combinator?: PromiseCombinator;
+  /** Batched calls — present only when `kind === "suspended_many"`. */
+  calls?: ExternalCall[];
+  /** Cumulative stdout so far. */
+  stdout: string;
+  /** Cumulative stderr so far. */
+  stderr: string;
+}
+
+/**
+ * Drives a single run's suspend/resume loop with the VM kept resident in memory
+ * — no per-hop serialization. For the common "run agent code, resolve its tool
+ * calls, get the result" loop. For cross-process durability call `dump()` at a
+ * suspension, or use the snapshot / session handles.
+ */
+export class ZapcodeDriver {
+  static fromCode(code: string, options?: ZapcodeOptions): ZapcodeDriver;
+  start(inputs?: Record<string, unknown>): ZapcodeStep;
+  resume(value: unknown): ZapcodeStep;
+  resumeMany(results: unknown[]): ZapcodeStep;
+  resumeError(error: unknown): ZapcodeStep;
+  resumeErrorObject(message: string, name?: string): ZapcodeStep;
+  /** Serialize the current suspension to bytes (fork / durability). */
+  dump(): Buffer;
 }

@@ -221,12 +221,44 @@ await test("Promise.allSettled reports fulfilled/rejected per element", async ()
   const result = await execute(
     `
     const r = await Promise.allSettled([maybe("a"), maybe("bad"), maybe("c")]);
+    // The rejected element's reason is a real Error (instanceof + .message),
+    // consistent with every other tool-rejection path.
     r.map(x => x.status).join(",") + "|" +
-      (r[0].value || "?") + "|" + (r[1].reason || "?")
+      (r[0].value || "?") + "|" +
+      (r[1].reason instanceof Error) + ":" + r[1].reason.message
   `,
     tools
   );
-  assert.equal(result.output, "fulfilled,rejected,fulfilled|ok:a|failed:bad");
+  assert.equal(result.output, "fulfilled,rejected,fulfilled|ok:a|true:failed:bad");
+});
+
+await test("batch rejections preserve the host error's name (allSettled + any)", async () => {
+  const tools = {
+    boom: {
+      description: "Throws a typed error.",
+      parameters: { kind: { type: "string" } },
+      execute: async ({ kind }) => {
+        if (kind === "type") throw new TypeError("bad type");
+        throw new RangeError("out of range");
+      },
+    },
+  };
+
+  // allSettled: each rejected reason carries its own host error name.
+  const settled = await execute(
+    `const r = await Promise.allSettled([boom("type"), boom("range")]);
+     r.map(x => x.reason.name).join(",")`,
+    tools
+  );
+  assert.equal(settled.output, "TypeError,RangeError");
+
+  // any: when every call rejects, the catchable error is an AggregateError.
+  const anyAllReject = await execute(
+    `try { await Promise.any([boom("type"), boom("range")]); "no"; }
+     catch (e) { e.name + ":" + (e instanceof Error); }`,
+    tools
+  );
+  assert.equal(anyAllReject.output, "AggregateError:true");
 });
 
 console.log(`\n${passed} parallel checks passed.`);

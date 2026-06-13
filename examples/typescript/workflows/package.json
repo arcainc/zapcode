@@ -1,0 +1,16 @@
+{
+  "name": "zapcode-workflows-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx main.ts"
+  },
+  "dependencies": {
+    "@unchartedfr/zapcode": "file:../../../crates/zapcode-js",
+    "@unchartedfr/zapcode-ai": "file:../../../packages/zapcode-ai"
+  },
+  "devDependencies": {
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
+  }
+}

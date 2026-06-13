@@ -453,6 +453,189 @@ langchain_tool = b.custom["langchain"]
 The adapter receives an `AdapterContext` with everything needed: system prompt, tool name, tool JSON schema, and a `handleToolCall` function. Return whatever shape your SDK expects.
 </details>
 
+## Workflow patterns (half-deterministic, half-agentic)
+
+The point of code mode is that the model writes **real control flow** — loops, conditionals,
+retries, error handling, data transforms — with tool calls woven through it. The model
+supplies the judgment; the sandbox supplies deterministic execution. These run with
+`execute(code, tools)` from `@unchartedfr/zapcode-ai` (the same code an LLM emits through the
+`zapcode({ tools })` wrapper above). The **last expression** is the output — there's no
+top-level `return`.
+
+```typescript
+import { execute, createSession, loadSession, prepare, dryRun, typecheck, forkSnapshot } from "@unchartedfr/zapcode-ai";
+```
+
+A tool is `{ description, parameters, returns?, execute }`. Guest code calls it with a
+named-object argument — `await getUser({ id })` — and your `execute` receives the validated
+object. A tool that *receives* arguments must declare them in `parameters`.
+
+> **Runnable:** [`examples/typescript/workflows`](examples/typescript/workflows) executes every
+> pattern below offline (mock tools, no API key) and asserts the results — `npm install && npm start`.
+
+### Parallel fan-out (map-reduce over tools)
+
+`Promise.all` over tool calls suspends **once** with the whole batch; the host runs them
+concurrently and resumes with every result. Deterministic aggregation, real concurrency, one
+model turn.
+
+```typescript
+const r = await execute(`
+  const ids  = await searchDocs({ query: "Q3 incidents" });   // → string[]
+  const docs = await Promise.all(ids.map(id => fetchDoc({ id })));
+  const bySeverity = {};
+  for (const d of docs) bySeverity[d.severity] = (bySeverity[d.severity] ?? 0) + 1;
+  bySeverity;
+`, { searchDocs, fetchDoc });
+// r.output → { high: 3, low: 7 }
+```
+
+`Promise.race`, `Promise.any`, and `Promise.allSettled` are supported and settle on the host
+with real timing.
+
+### Retry with fallback (real error handling)
+
+A tool that throws rejects the guest's `await` with a **real `Error`** — `e.message`,
+`e.name` (the host error's subclass, e.g. `TypeError`), and `e instanceof Error` all behave
+as in Node — so idiomatic retry/fallback code just works:
+
+```typescript
+await execute(`
+  async function withRetry(fn, attempts) {
+    let lastErr;
+    for (let i = 0; i < attempts; i++) {
+      try { return await fn(); }
+      catch (e) { lastErr = e; console.warn("attempt " + (i + 1) + " failed: " + e.message); }
+    }
+    throw lastErr;
+  }
+  try { await withRetry(() => primaryModel({ prompt }), 2); }
+  catch (e) { await fallbackModel({ prompt }); }   // primary exhausted — fall back
+`, { primaryModel, fallbackModel });
+```
+
+### Conditional routing
+
+Branch on a tool result to choose the next tool — the agent encodes the policy as code:
+
+```typescript
+await execute(`
+  const ticket = await classify({ text: input });
+  if (ticket.category === "billing")            await refund({ orderId: ticket.orderId });
+  else if (ticket.severity >= 3)                await pageOncall({ summary: ticket.summary });
+  else                                          await replyTemplate({ template: ticket.category });
+`, { classify, refund, pageOncall, replyTemplate });
+```
+
+### Saga / compensation (transaction with rollback)
+
+If a later step fails, unwind the steps that already succeeded — the canonical distributed-
+workflow pattern, expressed as a `try/catch`:
+
+```typescript
+await execute(`
+  const done = [];
+  try {
+    const order = await createOrder({ items });  done.push(["order", order.id]);
+    await reserveStock({ orderId: order.id });    done.push(["stock", order.id]);
+    await chargeCard({ orderId: order.id });      done.push(["charge", order.id]);
+    "confirmed:" + order.id;
+  } catch (e) {
+    for (const [step, id] of done.reverse()) {     // compensate only what happened
+      if (step === "charge") await refundCard({ orderId: id });
+      if (step === "stock")  await releaseStock({ orderId: id });
+      if (step === "order")  await cancelOrder({ orderId: id });
+    }
+    "rolled-back: " + e.message;
+  }
+`, { createOrder, reserveStock, chargeCard, refundCard, releaseStock, cancelOrder });
+```
+
+### Durable workflows across turns (sessions)
+
+A **session** keeps state — bindings, functions, classes — across `runChunk` calls, and the
+whole VM serializes to compact bytes with `dump()`. Define a workflow now, persist it, resume
+it later **in another process** (a Temporal activity, a queue worker, after a restart) with
+`loadSession`.
+
+```typescript
+// Turn 1: the agent defines reusable helpers.
+const session = createSession({ tools: { fetchRow, enrich }, scriptName: "etl-job" });
+await session.runChunk(`
+  async function step(id) { return await enrich({ row: await fetchRow({ id }) }); }
+`);
+
+const bytes = session.dump();          // store in a DB / hand to a Temporal activity
+// ...minutes or days later, in a different process...
+const resumed = loadSession(bytes, { tools: { fetchRow, enrich } });
+const out = await resumed.runChunk(`await step("42")`);   // helpers still in scope
+```
+
+Tool *implementations* aren't serialized (only VM state is), so re-supply the same `tools` on
+reload. `scriptName` tags errors with the session and chunk (`[etl-job #2] …`).
+
+### Human-in-the-loop approval gate
+
+Execution **suspends** at any unresolved tool call. Persist the suspension, get a human (or
+another system) to produce the value, and resume — possibly hours later, on another machine:
+
+```typescript
+// The agent code reads naturally — the suspend/resume is invisible to it:
+//   const decision = await requestApproval({ amount });   // ← suspends here
+//   if (decision.approved) await issueRefund({ orderId, by: decision.by });
+
+const handle = forkSnapshot(storedSuspensionBytes);
+const final = handle.resume({ approved: true, by: "alice" });
+// ...or reject the awaited call as a real error the guest can catch:
+// handle.resumeErrorObject("approval denied", "ApprovalError");
+```
+
+### Self-correcting agent (typecheck → dryRun → autoFix)
+
+Catch bad agent code **before** it touches a real tool, and let the model fix itself:
+
+```typescript
+// (a) Static type-check generated code against the tool signatures.
+const tc = await typecheck(code, tools);
+if (!tc.ok) { /* feed tc.diagnostics back to the model — cheapest correction signal */ }
+
+// (b) Pre-flight: typecheck + run against side-effect-free stubs under a tight budget.
+const dry = await dryRun(code, tools);
+dry.reachedCompletion;   // did it run clean?
+dry.toolCalls;           // the call sequence it WOULD make
+dry.error;               // throw site (message + line/column) if it failed
+
+// (c) Run for real with autoFix: errors come back as a structured result (not a throw),
+// so a generateText({ maxSteps }) loop can self-correct.
+const r = await execute(code, tools, { autoFix: true, scriptName: "planner" });
+if (!r.report.completed) r.report.error;   // { message, line, column, script }
+```
+
+### Speculative branching (fork a checkpoint)
+
+`forkSnapshot` loads the same suspension bytes any number of times — each an independent,
+deterministic continuation that **shares the compiled program**. Explore N strategies from
+one checkpoint, keep the best, discard the rest:
+
+```typescript
+const a = forkSnapshot(checkpoint).resume({ strategy: "aggressive" });
+const b = forkSnapshot(checkpoint).resume({ strategy: "conservative" });
+// score a.output vs b.output, commit to the winner — the other branch never happened.
+```
+
+### Hot path: compile once, run many (`prepare`)
+
+When the **same** agent code runs over many inputs, `prepare` pays parse + compile once; each
+`run()` only spins up a VM. Inputs are bound as variables by name.
+
+```typescript
+const program = prepare(
+  `const u = await getUser({ id }); u.tier === "pro" ? await applyDiscount({ id }) : null;`,
+  { getUser, applyDiscount }
+);
+for (const id of userIds) await program.run({ id });   // `id` is in scope in the program
+```
+
 ## Auto-Fix, Debug & Execution Tracing
 
 ### Auto-fix (`autoFix`)
