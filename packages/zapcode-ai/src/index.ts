@@ -158,8 +158,10 @@ export interface RunReport {
   /** Number of tool calls the code made. */
   toolCallCount: number;
   /** When the run failed: the message plus the source location, when the
-   * core attached one (`at line:col` in the error). */
-  error?: { message: string; line?: number; column?: number };
+   * core attached one (`at line:col` in the error). `script` is the caller's
+   * `scriptName` label, when one was supplied — for error provenance across a
+   * fleet of agent scripts / session chunks. */
+  error?: { message: string; line?: number; column?: number; script?: string };
 }
 
 /** Pull `at <line>:<col>` out of a core error message, when present. */
@@ -945,6 +947,12 @@ async function executeCode(
     autoFix?: boolean;
     typeCheck?: boolean;
     /**
+     * Optional label identifying this script (monty's `script_name`). When set,
+     * a failure prefixes the error with `[scriptName]` and records it as
+     * `report.error.script`, so a thrown error names *which* agent script erred.
+     */
+    scriptName?: string;
+    /**
      * Produce the initial VM state instead of compiling `code` fresh — used
      * by {@link prepare} to start from an already-compiled, reusable program
      * (parse + compile paid once, not per run). When omitted, a new `Zapcode`
@@ -1075,12 +1083,12 @@ async function executeCode(
         : snapshot.resumeErrorObject(outcome.message, outcome.name);
     }
 
-    if (state.stdout) {
-      stdout = state.stdout;
-    }
-    if (state.stderr) {
-      stderr = state.stderr;
-    }
+    // Console output is cumulative across snapshot restores, so the final
+    // (completed) state carries the whole run's stdout/stderr. (The binding used
+    // to hardcode these empty on the resume path, dropping all console output
+    // from any program that called a tool — this reads the real values.)
+    stdout = state.stdout ?? "";
+    stderr = state.stderr ?? "";
 
     if (execSpan) {
       execSpan.attributes["zapcode.output"] = JSON.stringify(state.output);
@@ -1108,6 +1116,7 @@ async function executeCode(
     };
   } catch (err: any) {
     const errorMsg = err.message ?? String(err);
+    const label = options.scriptName ? `[${options.scriptName}] ` : "";
 
     if (execSpan) {
       execSpan.attributes["zapcode.error"] = errorMsg;
@@ -1115,6 +1124,10 @@ async function executeCode(
     }
 
     if (!autoFix) {
+      // Name the erring script on the thrown error itself, so a host catching
+      // it across many scripts knows which one failed (opt-in: no label → no
+      // change to the message).
+      if (label && err instanceof Error) err.message = label + err.message;
       if (debug && execSpan) printTrace(execSpan);
       throw err;
     }
@@ -1129,12 +1142,16 @@ async function executeCode(
       stdout: "",
       stderr: "",
       toolCalls,
-      error: `Execution failed: ${errorMsg}. Please fix your code and try again.`,
+      error: `Execution failed: ${label}${errorMsg}. Please fix your code and try again.`,
       report: {
         completed: false,
         durationMs: Date.now() - runStartedAt,
         toolCallCount: toolCalls.length,
-        error: { message: errorMsg, ...parseErrorLocation(errorMsg) },
+        error: {
+          message: errorMsg,
+          ...parseErrorLocation(errorMsg),
+          ...(options.scriptName ? { script: options.scriptName } : {}),
+        },
       },
       ...(execSpan ? { trace: execSpan } : {}),
     };
@@ -1426,6 +1443,8 @@ export async function execute(
     debug?: boolean;
     autoFix?: boolean;
     typeCheck?: boolean;
+    /** Label identifying this script — named in error messages / `report.error.script`. */
+    scriptName?: string;
   }
 ): Promise<ExecutionResult> {
   return executeCode(code, tools, options ?? {});
@@ -1680,7 +1699,7 @@ async function settleBatch<S>(
       throw new BatchToolError("__fatal__");
     }
     if (outcome.ok) return outcome.result;
-    throw new BatchToolError(outcome.message);
+    throw new BatchToolError(outcome.message, outcome.name);
   });
 
   // Run the real combinator for value + timing semantics, then translate the
@@ -1698,7 +1717,7 @@ async function settleBatch<S>(
         const objects = settled.map(s =>
           s.status === "fulfilled"
             ? { status: "fulfilled", value: s.value }
-            : { status: "rejected", reason: batchErrorMessage(s.reason) }
+            : { status: "rejected", reason: batchErrorReason(s.reason) }
         );
         resume = () => handle.resumeMany(objects);
         break;
@@ -1721,18 +1740,28 @@ async function settleBatch<S>(
     }
   } catch (err) {
     if (sawFatal) throw fatal; // malformed call — abort
-    // A catchable tool rejection (all/race) or an all-rejected any.
-    // Batch rejection: raise as an Error object (message preserved); the
-    // combinator-specific name (AggregateError for `any`) is folded into the
-    // message by batchErrorMessage.
-    return handle.resumeErrorObject(batchErrorMessage(err));
+    // A catchable tool rejection (all/race) or an all-rejected any. Raise as a
+    // real Error object, preserving both the host tool's error name (TypeError,
+    // …) and — for `any` — the `AggregateError` name.
+    return handle.resumeErrorObject(batchErrorMessage(err), batchErrorName(err));
   }
   if (sawFatal) throw fatal; // fatal lost the race but must still abort
   return resume();
 }
 
-/** A tool rejection carried through a real JS promise inside {@link settleBatch}. */
-class BatchToolError extends Error {}
+/**
+ * A tool rejection carried through a real JS promise inside {@link settleBatch}.
+ * Holds the host error's `name` (e.g. `TypeError`) separately so it survives back
+ * into the guest — `this.name` is left as `"Error"` so the fatal path's toString
+ * is unsurprising.
+ */
+class BatchToolError extends Error {
+  readonly toolErrorName: string;
+  constructor(message: string, toolErrorName = "Error") {
+    super(message);
+    this.toolErrorName = toolErrorName;
+  }
+}
 
 /** Best-effort message extraction for a rejection reason or AggregateError. */
 function batchErrorMessage(err: unknown): string {
@@ -1744,6 +1773,36 @@ function batchErrorMessage(err: unknown): string {
   return String(err);
 }
 
+/**
+ * The error NAME to surface for a batch rejection: the host tool's subclass
+ * (`TypeError`, …) for a single rejection, or `AggregateError` when every call
+ * in a `Promise.any` rejected.
+ */
+function batchErrorName(err: unknown): string {
+  if (err instanceof AggregateError) return "AggregateError";
+  if (err instanceof BatchToolError) return err.toolErrorName;
+  if (err instanceof Error && typeof err.name === "string") return err.name;
+  return "Error";
+}
+
+/**
+ * Build a guest-visible Error for a `Promise.allSettled` rejected `reason`. The
+ * `__error__` brand makes `reason instanceof Error` hold (and hides `name`/
+ * `message`/`stack` from enumeration, matching a real Error) once `resumeMany`
+ * marshals it into the VM — so allSettled reasons are real Errors like every
+ * other rejection path, not bare strings.
+ */
+function batchErrorReason(err: unknown): {
+  __error__: true;
+  name: string;
+  message: string;
+  stack: string;
+} {
+  const name = batchErrorName(err);
+  const message = batchErrorMessage(err);
+  return { __error__: true, name, message, stack: `${name}: ${message}` };
+}
+
 /** Options for {@link createSession} / {@link loadSession}. */
 export interface SessionOptions {
   /** Tools available to guest code across the whole session. */
@@ -1752,6 +1811,13 @@ export interface SessionOptions {
   memoryLimitMb?: number;
   /** Execution time limit per chunk in ms (default: 10000). */
   timeLimitMs?: number;
+  /**
+   * Optional label for this session (monty's `script_name`). When set, an error
+   * thrown by any chunk is prefixed `[scriptName #<chunkIndex>]`, so a failure
+   * names which session — and which chunk within it — erred. Chunks are indexed
+   * from 1 in the order `runChunk` is called.
+   */
+  scriptName?: string;
 }
 
 /** Result of running one session chunk. */
@@ -1792,36 +1858,49 @@ export interface ZapcodeSession {
 
 function makeSession(
   initialBytes: Buffer,
-  toolDefs: Record<string, ToolDefinition>
+  toolDefs: Record<string, ToolDefinition>,
+  scriptName?: string
 ): ZapcodeSession {
   validateToolDefinitions(toolDefs);
   const toolNames = Object.keys(toolDefs);
   let sessionBytes = initialBytes;
+  let chunkIndex = 0;
 
   const runChunk = async (
     code: string,
     inputs?: Record<string, unknown>
   ): Promise<SessionChunkResult> => {
+    chunkIndex++;
     const toolCalls: ExecutionResult["toolCalls"] = [];
-    let state = ZapcodeSessionHandle.load(sessionBytes).runChunk(code, inputs ?? {});
+    try {
+      let state = ZapcodeSessionHandle.load(sessionBytes).runChunk(code, inputs ?? {});
 
-    while (!state.completed) {
-      const handle = ZapcodeSessionHandle.load(state.session);
-      if (state.kind === "suspended_many") {
-        state = await settleBatch(handle, state.combinator, state.calls, (name, args) =>
-          invokeToolCall(toolDefs, toolNames, name, args, toolCalls)
-        );
-      } else {
-        const outcome = await invokeToolCall(toolDefs, toolNames, state.functionName, state.args, toolCalls);
-        state = outcome.ok
-          ? handle.resume(outcome.result)
-          : handle.resumeErrorObject(outcome.message, outcome.name);
+      while (!state.completed) {
+        const handle = ZapcodeSessionHandle.load(state.session);
+        if (state.kind === "suspended_many") {
+          state = await settleBatch(handle, state.combinator, state.calls, (name, args) =>
+            invokeToolCall(toolDefs, toolNames, name, args, toolCalls)
+          );
+        } else {
+          const outcome = await invokeToolCall(toolDefs, toolNames, state.functionName, state.args, toolCalls);
+          state = outcome.ok
+            ? handle.resume(outcome.result)
+            : handle.resumeErrorObject(outcome.message, outcome.name);
+        }
       }
-    }
 
-    // Persist the new idle state for the next chunk / dump().
-    sessionBytes = state.session;
-    return { output: state.output, stdout: state.stdout ?? "", stderr: state.stderr ?? "", toolCalls };
+      // Persist the new idle state for the next chunk / dump().
+      sessionBytes = state.session;
+      return { output: state.output, stdout: state.stdout ?? "", stderr: state.stderr ?? "", toolCalls };
+    } catch (err: any) {
+      // Name the erring session + chunk on the thrown error (opt-in via
+      // scriptName); the failed chunk does NOT advance sessionBytes, so the
+      // last good checkpoint stays usable.
+      if (scriptName && err instanceof Error) {
+        err.message = `[${scriptName} #${chunkIndex}] ${err.message}`;
+      }
+      throw err;
+    }
   };
 
   return { runChunk, dump: () => sessionBytes };
@@ -1835,12 +1914,12 @@ export function createSession(options: SessionOptions): ZapcodeSession {
     memoryLimitMb: options.memoryLimitMb,
     timeLimitMs: options.timeLimitMs,
   });
-  return makeSession(handle.dump(), options.tools);
+  return makeSession(handle.dump(), options.tools, options.scriptName);
 }
 
 /** Reload a durable session from bytes produced by {@link ZapcodeSession.dump}. */
 export function loadSession(bytes: Buffer, options: SessionOptions): ZapcodeSession {
   // Validate the bytes are loadable up front (throws on a bad/incompatible blob).
   ZapcodeSessionHandle.load(bytes);
-  return makeSession(bytes, options.tools);
+  return makeSession(bytes, options.tools, options.scriptName);
 }

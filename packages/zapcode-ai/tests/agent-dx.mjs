@@ -11,7 +11,7 @@
  *   - recoverable state: fork a suspension into independent branches
  */
 import assert from "node:assert/strict";
-import { execute, dryRun, forkSnapshot, prepare } from "../dist/index.js";
+import { execute, dryRun, forkSnapshot, prepare, createSession } from "../dist/index.js";
 import { Zapcode } from "@unchartedfr/zapcode";
 
 let passed = 0;
@@ -72,6 +72,58 @@ await test("a failed run reports the throw site (line) in the report", async () 
   assert.equal(r.report.completed, false);
   assert.ok(r.report.error, "expected a structured error");
   assert.equal(r.report.error.line, 3, `expected line 3, got ${r.report.error.line}`);
+});
+
+// ── provenance: scriptName names which script erred ────────────────────────
+
+await test("scriptName labels the failure across autoFix, throw, and report.error", async () => {
+  const BAD = "const x = nope.field; x"; // property access on undefined → throws
+
+  // autoFix: the label rides on report.error.script and the human error string,
+  // without disturbing the line/column the core attached.
+  const r = await execute(BAD, {}, { scriptName: "planner", autoFix: true });
+  assert.equal(r.report.error.script, "planner");
+  assert.equal(r.report.error.line, 1);
+  assert.match(r.error, /\[planner\]/);
+
+  // throw path: the thrown Error's message is prefixed with the label.
+  await assert.rejects(
+    () => execute(BAD, {}, { scriptName: "planner" }),
+    (e) => e.message.startsWith("[planner] ")
+  );
+
+  // opt-in: with no scriptName the message is unchanged (no bracket prefix).
+  await assert.rejects(() => execute(BAD, {}), (e) => !e.message.startsWith("["));
+});
+
+await test("a session names the erring chunk by index in the thrown error", async () => {
+  const session = createSession({ tools: {}, scriptName: "agent-7" });
+  await session.runChunk("const a = 1;"); // chunk #1 — fine
+  // chunk #2 throws; the label carries both the session name and chunk index.
+  await assert.rejects(
+    () => session.runChunk("const b = nope.field; b"),
+    (e) => e.message.startsWith("[agent-7 #2] ")
+  );
+});
+
+await test("console output survives across tool-call suspensions", async () => {
+  // Regression: the snapshot/resume path used to drop ALL console output from
+  // any program that called a tool. stdout/stderr must capture every segment.
+  const t = (fn) => ({ description: "t", parameters: {}, execute: fn });
+  const r = await execute(
+    `
+    console.log("start"); console.warn("w0");
+    await tick();
+    console.log("middle"); console.error("e1");
+    await tick();
+    console.log("end");
+    "done";
+    `,
+    { tick: t(async () => 1) }
+  );
+  assert.equal(r.output, "done");
+  assert.equal(r.stdout, "start\nmiddle\nend\n");
+  assert.equal(r.stderr, "w0\ne1\n");
 });
 
 // ── catch-before-commit: dryRun ────────────────────────────────────────────

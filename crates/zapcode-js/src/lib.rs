@@ -77,6 +77,11 @@ pub struct ZapcodeSuspension {
     pub function_name: String,
     /// Arguments passed to the external function.
     pub args: Vec<serde_json::Value>,
+    /// Captured stdout (`console.log`/`info`/`debug`) so far — cumulative up to
+    /// this suspension point (console output carries across snapshot restores).
+    pub stdout: String,
+    /// Captured stderr (`console.error`/`console.warn`) so far — cumulative.
+    pub stderr: String,
     /// Opaque snapshot bytes -- pass to `ZapcodeSnapshotHandle.load()` to resume.
     pub snapshot: Buffer,
 }
@@ -103,6 +108,11 @@ pub struct ZapcodeBatchSuspension {
     pub combinator: String,
     /// The batched external calls, in order.
     pub calls: Vec<JsExternalCall>,
+    /// Captured stdout (`console.log`/`info`/`debug`) so far — cumulative up to
+    /// this suspension point (console output carries across snapshot restores).
+    pub stdout: String,
+    /// Captured stderr (`console.error`/`console.warn`) so far — cumulative.
+    pub stderr: String,
     /// Opaque snapshot bytes -- pass to `ZapcodeSnapshotHandle.load()` to resume.
     pub snapshot: Buffer,
 }
@@ -864,14 +874,23 @@ fn run_result_to_either(
     result: RunResult,
     trace: ExecutionTrace,
 ) -> napi::Result<Either3<ZapcodeResult, ZapcodeSuspension, ZapcodeBatchSuspension>> {
-    let RunResult { state, heap, .. } = result;
+    // Thread the segment's captured output through every arm — completion AND
+    // suspension. (Output is per-segment, reset on each snapshot restore, so the
+    // caller accumulates across segments to reconstruct a run's full stdout.)
+    let RunResult {
+        state,
+        heap,
+        stdout,
+        stderr,
+        ..
+    } = result;
     match state {
         VmState::Complete(v) => Ok(Either3::A(ZapcodeResult {
             kind: "complete".to_string(),
             completed: true,
             output: value_to_json(&v, &heap)?,
-            stdout: String::new(),
-            stderr: String::new(),
+            stdout,
+            stderr,
             trace: trace_to_js(&trace),
         })),
         VmState::Suspended {
@@ -890,6 +909,8 @@ fn run_result_to_either(
                 completed: false,
                 function_name,
                 args: js_args,
+                stdout,
+                stderr,
                 snapshot: Buffer::from(snap_bytes),
             }))
         }
@@ -907,6 +928,8 @@ fn run_result_to_either(
                 completed: false,
                 combinator: combinator.as_str().to_string(),
                 calls: js_calls,
+                stdout,
+                stderr,
                 snapshot: Buffer::from(snap_bytes),
             }))
         }
@@ -950,6 +973,8 @@ fn run_result_to_either_with_stdout(
                 completed: false,
                 function_name,
                 args: js_args,
+                stdout,
+                stderr,
                 snapshot: Buffer::from(snap_bytes),
             }))
         }
@@ -967,6 +992,8 @@ fn run_result_to_either_with_stdout(
                 completed: false,
                 combinator: combinator.as_str().to_string(),
                 calls: js_calls,
+                stdout,
+                stderr,
                 snapshot: Buffer::from(snap_bytes),
             }))
         }

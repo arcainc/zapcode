@@ -29,8 +29,8 @@ containers, sandbox services, or running untrusted code directly on the host.
 - Use `import` / `require` / dynamic imports
 - Access `process`, `globalThis`, `eval`, `Function()`, `setTimeout`/`setInterval`
 - Use proxies, WeakMap/WeakRef, `Symbol`, or `with` statements
-- Execute regular expressions (parsed but execution is a no-op)
 - Use `var` declarations (use `let`/`const`)
+- Use regex lookaround / backreferences (the linear-time engine rejects them with a clear error)
 
 ---
 
@@ -104,7 +104,7 @@ The parser walks the oxc AST and emits `ZapcodeIR`. Unsupported syntax produces
 | Array methods (25+) | ✅ |
 | Math, JSON, Object, Array, Promise | ✅ |
 | `import` / `require` / `eval` | ❌ sandbox violation |
-| Regular expressions | Parsed, not executed |
+| Regular expressions (`test`/`exec`/`match`/`matchAll`/`replace`/`split`/`search`, flags `i`/`m`/`s`/`g`/`y`) | ✅ (linear-time engine; no lookaround/backrefs) |
 | `var` declarations | ❌ not supported |
 | Decorators, Symbol, WeakMap/WeakSet | ❌ not supported |
 
