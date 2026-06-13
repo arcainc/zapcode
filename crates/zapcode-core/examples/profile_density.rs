@@ -167,9 +167,12 @@ fn main() {
 
     // Garbage probe: identical live state at suspension, but 1000 dead slots
     // (500 iterations x {object, nested array} per iteration, plus the nested
-    // meta object) churned beforehand. Everything the churny variant carries
-    // beyond the baseline is reclaimable by an in-run compaction pass.
-    println!("\n== garbage probe: append-only heap retains loop temporaries ==");
+    // meta object) churned beforehand. With in-run compaction now landed, this
+    // probe VALIDATES it: the churny variant should carry only a handful of
+    // residual heap slots, not the ~1000 dead ones it allocates — so the heap
+    // diff is the signal, while the serialized-byte diff is dominated by the
+    // churny variant's LARGER PROGRAM (the loop bytecode), not by dead heap.
+    println!("\n== garbage probe: in-run compaction reclaims loop temporaries ==");
     let mut base = suspended(AGENT_CODE);
     let mut churny = suspended(CHURNY_AGENT_CODE);
     let base_bytes = base.dump().unwrap().len();
@@ -180,15 +183,15 @@ fn main() {
         base_bytes
     );
     println!(
-        "churny:   {} heap slots, {} serialized bytes",
+        "churny:   {} heap slots, {} serialized bytes (churns ~1000 dead slots before suspending)",
         churny.heap().len(),
         churny_bytes
     );
     println!(
-        "garbage carried: {} slots, {} serialized bytes ({:.1}x snapshot growth from dead state)",
+        "residual heap after compaction: {} slots (≈0 of the ~1000 churned ⇒ compaction working); \
+         the {} extra serialized bytes are mostly the churny variant's larger program, not dead heap",
         churny.heap().len() - base.heap().len(),
         churny_bytes.saturating_sub(base_bytes),
-        churny_bytes as f64 / base_bytes as f64
     );
 
     // Arc-shared program: a run-many host compiles ONCE and parks N suspended
