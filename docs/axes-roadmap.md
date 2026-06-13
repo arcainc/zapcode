@@ -69,6 +69,9 @@ remaining memory ideas are lower-value:
     key text). The real win is **content-addressing the program** (store once,
     keyed by hash; snapshots reference it) — but that changes the
     self-contained durable-artifact contract, so it needs a design decision.
+    Proposal drafted: `docs/content-addressed-programs-design.md` (opt-in
+    `dump_referenced()`, host-supplied program store; default `dump()` stays
+    self-contained).
   - *Speed*: the suspend/resume loop dumps+loads the full snapshot on every
     tool hop (~30 µs dump + ~36 µs load, in-process, then discarded — larger
     than the ~22 µs run itself). A **live in-process driver** that keeps the
